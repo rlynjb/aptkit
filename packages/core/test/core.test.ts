@@ -1,12 +1,22 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import {
+  ANOMALY_MONITORING_CAPABILITY_ID,
+  AnomalyMonitoringAgent,
   DEFAULT_ACTION_TAXONOMY,
+  DIAGNOSTIC_INVESTIGATION_CAPABILITY_ID,
+  DiagnosticInvestigationAgent,
   FixtureModelProvider,
   InMemoryToolRegistry,
+  QUERY_CAPABILITY_ID,
+  QueryAgent,
   RecommendationAgent,
+  anomalyMonitoringToolPolicy,
+  diagnosticInvestigationToolPolicy,
+  parseIntent,
   recommendationPromptPackage,
   recommendationToolPolicy,
+  queryToolPolicy,
   schemaSummary,
 } from '../src/index.js';
 
@@ -19,5 +29,19 @@ describe('@aptkit/core', () => {
     assert.equal(recommendationToolPolicy.capabilityId, 'recommendation-agent');
     assert.equal(recommendationPromptPackage.capabilityId, 'recommendation-agent');
     assert.ok(DEFAULT_ACTION_TAXONOMY.features.length > 0);
+  });
+
+  it('re-exports the remaining Blooming agent entry points', () => {
+    assert.equal(typeof AnomalyMonitoringAgent, 'function');
+    assert.equal(typeof DiagnosticInvestigationAgent, 'function');
+    assert.equal(typeof QueryAgent, 'function');
+    assert.equal(typeof parseIntent, 'function');
+    assert.equal(ANOMALY_MONITORING_CAPABILITY_ID, 'anomaly-monitoring-agent');
+    assert.equal(DIAGNOSTIC_INVESTIGATION_CAPABILITY_ID, 'diagnostic-investigation-agent');
+    assert.equal(QUERY_CAPABILITY_ID, 'query-agent');
+    assert.equal(anomalyMonitoringToolPolicy.capabilityId, 'anomaly-monitoring-agent');
+    assert.equal(diagnosticInvestigationToolPolicy.capabilityId, 'diagnostic-investigation-agent');
+    assert.equal(queryToolPolicy.capabilityId, 'query-agent');
+    assert.equal(parseIntent('recommendation'), 'recommendation');
   });
 });

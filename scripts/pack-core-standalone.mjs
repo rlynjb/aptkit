@@ -13,6 +13,9 @@ const packageSpecs = [
   { workspace: '@aptkit/context', tarball: 'aptkit-context-0.0.0.tgz' },
   { workspace: '@aptkit/prompts', tarball: 'aptkit-prompts-0.0.0.tgz' },
   { workspace: '@aptkit/evals', tarball: 'aptkit-evals-0.0.0.tgz' },
+  { workspace: '@aptkit/agent-anomaly-monitoring', tarball: 'aptkit-agent-anomaly-monitoring-0.0.0.tgz' },
+  { workspace: '@aptkit/agent-diagnostic-investigation', tarball: 'aptkit-agent-diagnostic-investigation-0.0.0.tgz' },
+  { workspace: '@aptkit/agent-query', tarball: 'aptkit-agent-query-0.0.0.tgz' },
   { workspace: '@aptkit/agent-recommendation', tarball: 'aptkit-agent-recommendation-0.0.0.tgz' },
 ];
 
