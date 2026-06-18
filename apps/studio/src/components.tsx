@@ -1,7 +1,8 @@
 import React from 'react';
-import { BrainCircuit, FileText, ShieldCheck } from 'lucide-react';
+import { Boxes, BrainCircuit, Cloud, FileText, KeyRound, ShieldCheck } from 'lucide-react';
 import type { PromptPackage } from '@aptkit/prompts';
 import type { CapabilityEvent } from '@aptkit/runtime';
+import type { ProviderStatus, ReplayMode } from './types';
 
 export function Metric({ icon, label, value, tone = 'neutral' }: { icon: React.ReactNode; label: string; value: string; tone?: 'neutral' | 'good' }) {
   return (
@@ -211,6 +212,51 @@ export function PromptPackagePanel({
   );
 }
 
+export function ProviderStatusPanel<M extends ReplayMode>({
+  mode,
+  providerStatus,
+  supportedModes,
+  trace,
+}: {
+  mode: M;
+  providerStatus: ProviderStatus;
+  supportedModes: readonly M[];
+  trace: CapabilityEvent[];
+}) {
+  const fallback = fallbackSummary(mode, providerStatus);
+  const warnings = trace.filter(isProviderFallbackWarning);
+
+  return (
+    <Panel title="Providers" icon={<KeyRound size={17} />}>
+      <div className="providerStatusPanel">
+        <div className="providerStatusList">
+          {providerRows(providerStatus, supportedModes).map((provider) => (
+            <div className={`providerStatusRow ${provider.available ? 'ready' : 'missing'} ${provider.id === mode ? 'active' : ''}`} key={provider.id}>
+              <div>
+                {provider.icon}
+                <strong>{provider.label}</strong>
+              </div>
+              <span>{provider.badge}</span>
+              <code>{provider.model}</code>
+            </div>
+          ))}
+        </div>
+        <div className={fallback.available ? 'providerFallback ready' : 'providerFallback'}>
+          <strong>{fallback.title}</strong>
+          <span>{fallback.detail}</span>
+        </div>
+        {warnings.length ? (
+          <div className="providerWarnings">
+            {warnings.slice(-3).map((event, index) => (
+              <p key={`${event.timestamp}-${index}`}>{event.message}</p>
+            ))}
+          </div>
+        ) : null}
+      </div>
+    </Panel>
+  );
+}
+
 export function TraceItem({ event, index }: { event: CapabilityEvent; index: number }) {
   const detail =
     event.type === 'model_usage'
@@ -239,6 +285,70 @@ export function TraceItem({ event, index }: { event: CapabilityEvent; index: num
       </div>
     </div>
   );
+}
+
+function providerRows<M extends ReplayMode>(
+  providerStatus: ProviderStatus,
+  supportedModes: readonly M[],
+): { id: ReplayMode; label: string; available: boolean; model: string; badge: string; icon: React.ReactNode }[] {
+  return (['fixture', 'openai', 'anthropic'] as ReplayMode[]).map((id) => {
+    const status = providerStatus[id];
+    const primary = supportedModes.includes(id as M);
+    return {
+      id,
+      label: providerLabel(id),
+      available: status.available,
+      model: status.model,
+      badge: id === 'fixture'
+        ? 'ready'
+        : status.available
+          ? primary ? 'primary ready' : 'fallback ready'
+          : 'missing key',
+      icon: providerIcon(id),
+    };
+  });
+}
+
+function isProviderFallbackWarning(event: CapabilityEvent): event is Extract<CapabilityEvent, { type: 'warning' }> {
+  return event.type === 'warning' && /fallback provider|Provider .* failed/.test(event.message);
+}
+
+function fallbackSummary(mode: ReplayMode, providerStatus: ProviderStatus): { title: string; detail: string; available: boolean } {
+  if (mode === 'fixture') {
+    return {
+      title: 'Fixture mode',
+      detail: 'Uses recorded fake model responses and fixture tools.',
+      available: true,
+    };
+  }
+
+  const fallbackMode: ReplayMode = mode === 'openai' ? 'anthropic' : 'openai';
+  const fallback = providerStatus[fallbackMode];
+  if (fallback.available) {
+    return {
+      title: `${providerLabel(mode)} fallback ready`,
+      detail: `${providerLabel(mode)} can fail over to ${providerLabel(fallbackMode)} (${fallback.model}).`,
+      available: true,
+    };
+  }
+
+  return {
+    title: 'No fallback configured',
+    detail: `Set ${fallbackMode === 'openai' ? 'OPENAI_API_KEY' : 'ANTHROPIC_API_KEY'} to enable ${providerLabel(fallbackMode)} fallback.`,
+    available: false,
+  };
+}
+
+function providerLabel(mode: ReplayMode): string {
+  if (mode === 'openai') return 'OpenAI';
+  if (mode === 'anthropic') return 'Anthropic';
+  return 'Fixture';
+}
+
+function providerIcon(mode: ReplayMode): React.ReactNode {
+  if (mode === 'openai') return <KeyRound size={15} />;
+  if (mode === 'anthropic') return <Cloud size={15} />;
+  return <Boxes size={15} />;
 }
 
 function summarizeTrace(trace: CapabilityEvent[]) {

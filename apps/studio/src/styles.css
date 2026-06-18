@@ -686,6 +686,118 @@ h1 {
   grid-template-columns: 1fr;
 }
 
+.providerStatusPanel {
+  display: grid;
+  gap: 10px;
+}
+
+.providerStatusList {
+  display: grid;
+  gap: 8px;
+}
+
+.providerStatusRow {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 7px 10px;
+  align-items: center;
+  padding: 9px;
+  border: 1px solid #e2e7e0;
+  border-radius: 6px;
+  background: #fafbf9;
+}
+
+.providerStatusRow.active {
+  border-color: #9cc5ad;
+  background: #f2faf5;
+}
+
+.providerStatusRow > div {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.providerStatusRow svg {
+  color: #5f6d64;
+  flex: 0 0 auto;
+}
+
+.providerStatusRow strong {
+  color: #24362e;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.providerStatusRow span {
+  justify-self: end;
+  min-height: 22px;
+  padding: 4px 7px;
+  border-radius: 999px;
+  color: #5f6d64;
+  background: #eef2ed;
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.providerStatusRow.ready span {
+  color: #145438;
+  background: #e3f3ea;
+}
+
+.providerStatusRow.missing span {
+  color: #842d24;
+  background: #fae7e4;
+}
+
+.providerStatusRow code {
+  grid-column: 1 / -1;
+  color: #405149;
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.providerFallback,
+.providerWarnings {
+  display: grid;
+  gap: 4px;
+  padding: 10px;
+  border: 1px solid #ece2c8;
+  border-radius: 6px;
+  background: #fbf6e7;
+}
+
+.providerFallback.ready {
+  border-color: #d8e7dd;
+  background: #f2faf5;
+}
+
+.providerFallback strong {
+  color: #24362e;
+  font-size: 13px;
+}
+
+.providerFallback span,
+.providerWarnings p {
+  margin: 0;
+  color: #5e6d64;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.providerWarnings {
+  border-color: #f0c9c3;
+  background: #fff0ee;
+}
+
+.providerWarnings p {
+  color: #842d24;
+  font-weight: 700;
+}
+
 .promptPackage {
   display: grid;
   gap: 10px;

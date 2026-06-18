@@ -2,9 +2,9 @@ import React from 'react';
 import { BadgeCheck, Boxes, BrainCircuit, ChevronDown, CircleDollarSign, FileCheck, FileText, Gauge, KeyRound, MessageSquareText, Play, RefreshCw, Save, Timer } from 'lucide-react';
 import { queryPromptPackage, renderPromptTemplate } from '@aptkit/prompts';
 import { schemaSummary } from '@aptkit/context';
-import { loadPromotedQueryFixtures, loadSavedQueryReplays, promoteQueryReplay, runServerQueryReplay, saveReplayArtifact } from './api';
+import { loadPromotedQueryFixtures, loadProviderStatus, loadSavedQueryReplays, promoteQueryReplay, runServerQueryReplay, saveReplayArtifact } from './api';
 import { runQueryFixtureReplay } from './agent-runners';
-import { EvalPanel, Metric, Panel, PromptPackagePanel, ReplayModeSwitch, TracePanel } from './components';
+import { EvalPanel, Metric, Panel, PromptPackagePanel, ProviderStatusPanel, ReplayModeSwitch, TracePanel } from './components';
 import { queryFixtures } from './fixtures';
 import { buildQueryReplayArtifact, estimateCost, formatCost, formatDuration, summarizeUsage } from './replay-artifacts';
 import type { PromotedQueryFixtureSummary, ProviderStatus, QueryPromoteResult, QueryReplayMode, QueryReplayState, SavedQueryReplaySummary } from './types';
@@ -76,9 +76,8 @@ export function QueryWorkspace({ onHome }: { onHome: () => void }) {
   }, [startReplay]);
 
   React.useEffect(() => {
-    fetch('/api/model-status')
-      .then((response) => response.json())
-      .then((payload) => setProviderStatus(payload.providers))
+    loadProviderStatus()
+      .then(setProviderStatus)
       .catch(() => {
         setProviderStatus((current) => current);
       });
@@ -327,6 +326,13 @@ export function QueryWorkspace({ onHome }: { onHome: () => void }) {
         </section>
 
         <aside className="rightPane">
+          <ProviderStatusPanel
+            mode={mode}
+            providerStatus={providerStatus}
+            supportedModes={['fixture', 'openai']}
+            trace={visibleTrace}
+          />
+
           <PromptPackagePanel
             promptPackage={queryPromptPackage}
             renderedPrompt={{ label: 'Rendered for fixture', prompt: renderedPrompt }}

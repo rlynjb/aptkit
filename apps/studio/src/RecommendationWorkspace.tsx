@@ -3,9 +3,9 @@ import { Activity, BadgeCheck, Boxes, BrainCircuit, ChevronDown, CircleDollarSig
 import { recommendationPromptPackage, renderPromptTemplate } from '@aptkit/prompts';
 import { schemaSummary } from '@aptkit/context';
 import { fixtures } from './fixtures';
-import { loadPromotedFixtures, loadSavedReplays, promoteReplay, runServerReplay, saveReplayArtifact } from './api';
+import { loadPromotedFixtures, loadProviderStatus, loadSavedReplays, promoteReplay, runServerReplay, saveReplayArtifact } from './api';
 import { runFixtureReplay } from './agent-runners';
-import { EvalPanel, Metric, Panel, PromptPackagePanel, ReplayModeSwitch, TracePanel } from './components';
+import { EvalPanel, Metric, Panel, PromptPackagePanel, ProviderStatusPanel, ReplayModeSwitch, TracePanel } from './components';
 import { buildReplayArtifact, comparableFromArtifact, comparisonForFixture, estimateCost, findReviewReplay, formatCost, formatDuration, summarizeUsage, toReplayState } from './replay-artifacts';
 import { ComparisonPanel, PromotedFixturesPanel, ReplayHistoryPanel, ReviewPanel, WorkflowPanel } from './recommendation-panels';
 import type { ComparisonState, PromoteResult, PromotedFixtureSummary, ProviderStatus, ReplayMode, ReplayState, SavedReplaySummary } from './types';
@@ -82,9 +82,8 @@ export function RecommendationWorkspace({ onHome }: { onHome: () => void }) {
   }, [startReplay]);
 
   React.useEffect(() => {
-    fetch('/api/model-status')
-      .then((response) => response.json())
-      .then((payload) => setProviderStatus(payload.providers))
+    loadProviderStatus()
+      .then(setProviderStatus)
       .catch(() => {
         setProviderStatus((current) => current);
       });
@@ -377,6 +376,13 @@ export function RecommendationWorkspace({ onHome }: { onHome: () => void }) {
         </section>
 
         <aside className="rightPane">
+          <ProviderStatusPanel
+            mode={mode}
+            providerStatus={providerStatus}
+            supportedModes={['fixture', 'anthropic', 'openai']}
+            trace={visibleTrace}
+          />
+
           <PromptPackagePanel
             promptPackage={recommendationPromptPackage}
             renderedPrompt={{ label: 'Rendered for fixture', prompt: renderedPrompt }}

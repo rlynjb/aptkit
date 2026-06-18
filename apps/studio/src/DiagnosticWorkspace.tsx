@@ -2,9 +2,9 @@ import React from 'react';
 import { Activity, BadgeCheck, Boxes, BrainCircuit, ChevronDown, CircleDollarSign, FileCheck, Gauge, History, KeyRound, Play, RefreshCw, Route, Save, SearchCheck, Timer } from 'lucide-react';
 import { diagnosticPromptPackage, renderPromptTemplate } from '@aptkit/prompts';
 import { schemaSummary } from '@aptkit/context';
-import { loadPromotedDiagnosticFixtures, loadSavedDiagnosticReplays, promoteDiagnosticReplay, runServerDiagnosticReplay, saveReplayArtifact } from './api';
+import { loadPromotedDiagnosticFixtures, loadProviderStatus, loadSavedDiagnosticReplays, promoteDiagnosticReplay, runServerDiagnosticReplay, saveReplayArtifact } from './api';
 import { runDiagnosticFixtureReplay } from './agent-runners';
-import { EvalPanel, Metric, Panel, PromptPackagePanel, ReplayModeSwitch, TracePanel } from './components';
+import { EvalPanel, Metric, Panel, PromptPackagePanel, ProviderStatusPanel, ReplayModeSwitch, TracePanel } from './components';
 import { diagnosticFixtures } from './fixtures';
 import { buildDiagnosticReplayArtifact, estimateCost, formatCost, formatDuration, summarizeUsage } from './replay-artifacts';
 import type { DiagnosticPromoteResult, DiagnosticReplayMode, DiagnosticReplayState, PromotedDiagnosticFixtureSummary, ProviderStatus, SavedDiagnosticReplaySummary } from './types';
@@ -76,9 +76,8 @@ export function DiagnosticWorkspace({ onHome }: { onHome: () => void }) {
   }, [startReplay]);
 
   React.useEffect(() => {
-    fetch('/api/model-status')
-      .then((response) => response.json())
-      .then((payload) => setProviderStatus(payload.providers))
+    loadProviderStatus()
+      .then(setProviderStatus)
       .catch(() => {
         setProviderStatus((current) => current);
       });
@@ -310,6 +309,13 @@ export function DiagnosticWorkspace({ onHome }: { onHome: () => void }) {
         </section>
 
         <aside className="rightPane">
+          <ProviderStatusPanel
+            mode={mode}
+            providerStatus={providerStatus}
+            supportedModes={['fixture', 'openai']}
+            trace={visibleTrace}
+          />
+
           <PromptPackagePanel
             promptPackage={diagnosticPromptPackage}
             renderedPrompt={{ label: 'Rendered for fixture', prompt: renderedPrompt }}

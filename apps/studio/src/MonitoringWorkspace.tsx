@@ -4,9 +4,9 @@ import { ECOMMERCE_ANOMALY_CATEGORIES, coverageReport, formatCategoryChecklist, 
 import { monitoringPromptPackage, renderPromptTemplate } from '@aptkit/prompts';
 import { schemaSummary } from '@aptkit/context';
 import { monitoringFixtures } from './fixtures';
-import { loadPromotedMonitoringFixtures, loadSavedMonitoringReplays, promoteMonitoringReplay, runServerMonitoringReplay, saveReplayArtifact } from './api';
+import { loadPromotedMonitoringFixtures, loadProviderStatus, loadSavedMonitoringReplays, promoteMonitoringReplay, runServerMonitoringReplay, saveReplayArtifact } from './api';
 import { runMonitoringFixtureReplay } from './agent-runners';
-import { EvalPanel, Metric, Panel, PromptPackagePanel, ReplayModeSwitch, TracePanel } from './components';
+import { EvalPanel, Metric, Panel, PromptPackagePanel, ProviderStatusPanel, ReplayModeSwitch, TracePanel } from './components';
 import { CoverageItem, MonitoringAnomalyCard, MonitoringComparisonPanel, MonitoringReplayHistoryPanel, MonitoringReviewPanel, PromotedMonitoringFixturesPanel } from './monitoring-panels';
 import { buildMonitoringReplayArtifact, comparableMonitoringFromArtifact, comparisonForMonitoringFixture, estimateCost, findMonitoringReviewReplay, formatCost, formatDuration, summarizeUsage, toMonitoringReplayState } from './replay-artifacts';
 import type { MonitoringComparisonState, MonitoringPromoteResult, MonitoringReplayMode, MonitoringReplayState, PromotedMonitoringFixtureSummary, ProviderStatus, SavedMonitoringReplaySummary } from './types';
@@ -86,9 +86,8 @@ export function MonitoringWorkspace({ onHome }: { onHome: () => void }) {
   }, [startReplay]);
 
   React.useEffect(() => {
-    fetch('/api/model-status')
-      .then((response) => response.json())
-      .then((payload) => setProviderStatus(payload.providers))
+    loadProviderStatus()
+      .then(setProviderStatus)
       .catch(() => {
         setProviderStatus((current) => current);
       });
@@ -383,6 +382,13 @@ export function MonitoringWorkspace({ onHome }: { onHome: () => void }) {
         </section>
 
         <aside className="rightPane">
+          <ProviderStatusPanel
+            mode={mode}
+            providerStatus={providerStatus}
+            supportedModes={['fixture', 'openai']}
+            trace={visibleTrace}
+          />
+
           <PromptPackagePanel
             promptPackage={monitoringPromptPackage}
             renderedPrompt={{ label: 'Rendered for fixture', prompt: renderedPrompt }}

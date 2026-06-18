@@ -1,10 +1,20 @@
 import { decodeNdjsonStream } from '@aptkit/runtime';
 import type { CapabilityEvent } from '@aptkit/runtime';
 import type { DiagnosticFixture, DiagnosticPromoteResult, DiagnosticReplayArtifact, DiagnosticReplayMode, DiagnosticReplayResult, MonitoringFixture, MonitoringPromoteResult, MonitoringReplayResult, MonitoringReplayMode, MonitoringReplayArtifact, PromoteResult, PromotedDiagnosticFixtureSummary, PromotedFixtureSummary, PromotedMonitoringFixtureSummary, PromotedQueryFixtureSummary, QueryFixture, QueryPromoteResult, QueryReplayArtifact, QueryReplayMode, QueryReplayResult, RecommendationFixture, ReplayArtifact, ReplayMode, ReplayResult, SavedDiagnosticReplaySummary, SavedMonitoringReplaySummary, SavedQueryReplaySummary, SavedReplaySummary } from './types';
+import type { ProviderStatus } from './types';
 
 type StreamReplayOptions = {
   onEvent?: (event: CapabilityEvent) => void;
 };
+
+export async function loadProviderStatus(): Promise<ProviderStatus> {
+  const response = await fetch('/api/model-status');
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(payload?.error ?? 'load model status failed');
+  }
+  return payload.providers;
+}
 
 export async function runServerQueryReplay(
   fixture: QueryFixture,
