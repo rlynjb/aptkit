@@ -12,6 +12,12 @@
   "scripts": {
     "build": "npm run build --workspaces --if-present",
     "dev:studio": "npm run dev -w @aptkit/studio",
+    "preeval:replays": "npm run build -w @aptkit/evals",
+    "eval:replays": "node scripts/eval-replay-artifacts.mjs",
+    "prereplay:model": "npm run build --workspaces --if-present",
+    "replay:model": "node scripts/replay-model-recommendation.mjs",
+    "prereplay:openai": "npm run build --workspaces --if-present",
+    "replay:openai": "node scripts/replay-model-recommendation.mjs --provider openai",
     "test": "npm run test --workspaces --if-present",
     "replay:recommendation": "npm run replay:fixture -w @aptkit/agent-recommendation"
   },

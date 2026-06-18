@@ -95,6 +95,43 @@ When Studio is in `OpenAI` mode, AptKit is using live OpenAI-generated model out
 
 That makes `OpenAI` mode a middle stage: real model behavior, but safe fake data. It is useful before connecting the capability to real tools or production data.
 
+## Saved Model Replays
+
+Studio is useful for interactive inspection, but durable evidence should come from a CLI replay. The current OpenAI replay command is:
+
+```bash
+npm run replay:model -- --provider openai
+npm run replay:openai
+```
+
+Useful variants:
+
+```bash
+npm run replay:model -- --provider openai --fixture voucher-dropoff
+npm run replay:model -- --provider openai --fixture electronics-spike --model gpt-4.1
+npm run replay:openai -- voucher-dropoff
+```
+
+The generic command shape is provider-oriented, but the CLI currently implements only the `openai` provider. That keeps the runner aligned with the model-provider architecture without expanding scope before we need Claude, Ollama, Gemma, or another adapter.
+
+The command loads `.env`, runs the recommendation capability with:
+
+- real OpenAI model output
+- fake fixture tool results
+- the same shape eval used by fixture tests
+
+It writes a timestamped JSON file under `artifacts/replays/`. Those generated replay JSON files are ignored by Git by default because they may contain model output, trace details, and local experiment data.
+
+Saved replays are the bridge between experimentation and regression testing. If a live model run is useful, keep its artifact, inspect the trace, and later promote the behavior into a deterministic fixture or eval.
+
+Local replay artifacts can be evaluated with:
+
+```bash
+npm run eval:replays
+```
+
+This does not re-run a model. It validates saved artifact JSON files under `artifacts/replays/` so useful live-model runs can be checked consistently before they are promoted into deterministic fixtures or stronger behavioral evals.
+
 ## Why This Matters
 
 This architecture keeps each failure mode isolated:
