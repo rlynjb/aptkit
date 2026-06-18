@@ -1,11 +1,17 @@
 import type { CapabilityEvent } from '@aptkit/runtime';
+import { ECOMMERCE_ANOMALY_CATEGORIES, formatCategoryChecklist, runnableCategories, schemaCapabilities, schemaSummary as monitoringSchemaSummary } from '@aptkit/agent-anomaly-monitoring';
+import { schemaSummary as diagnosticSchemaSummary } from '@aptkit/agent-diagnostic-investigation';
+import { schemaSummary as querySchemaSummary } from '@aptkit/agent-query';
+import { schemaSummary as recommendationSchemaSummary } from '@aptkit/agent-recommendation';
+import { diagnosticPromptPackage, monitoringPromptPackage, queryPromptPackage, recommendationPromptPackage, renderPromptTemplate } from '@aptkit/prompts';
+import type { PromptPackage } from '@aptkit/prompts';
 import monitoringFixture from '../../../packages/agents/anomaly-monitoring/fixtures/sp-revenue-monitoring.json';
 import diagnosticFixture from '../../../packages/agents/diagnostic-investigation/fixtures/sp-revenue-diagnostic.json';
 import queryFixture from '../../../packages/agents/query/fixtures/revenue-by-state-query.json';
 import electronicsSpikeFixture from '../../../packages/agents/recommendation/fixtures/electronics-spike.json';
 import spRevenueDropFixture from '../../../packages/agents/recommendation/fixtures/sp-revenue-drop.json';
 import voucherDropoffFixture from '../../../packages/agents/recommendation/fixtures/voucher-dropoff.json';
-import type { ComparableMonitoringReplay, ComparableReplay, ComparisonState, CostEstimate, DiagnosticFixture, DiagnosticReplayArtifact, DiagnosticReplayMode, DiagnosticReplayState, MonitoringComparisonState, MonitoringFixture, MonitoringReplayMode, MonitoringReplayArtifact, MonitoringReplayResult, MonitoringReplayState, QueryFixture, QueryReplayArtifact, QueryReplayMode, QueryReplayState, RecommendationFixture, ReplayArtifact, ReplayMode, ReplayResult, ReplayState, SavedMonitoringReplaySummary, SavedReplaySummary, TokenUsageSummary } from './types';
+import type { ComparableMonitoringReplay, ComparableReplay, ComparisonState, CostEstimate, DiagnosticFixture, DiagnosticReplayArtifact, DiagnosticReplayMode, DiagnosticReplayState, MonitoringComparisonState, MonitoringFixture, MonitoringReplayMode, MonitoringReplayArtifact, MonitoringReplayResult, MonitoringReplayState, PromptPackageProvenance, QueryFixture, QueryReplayArtifact, QueryReplayMode, QueryReplayState, RecommendationFixture, ReplayArtifact, ReplayMode, ReplayResult, ReplayState, SavedMonitoringReplaySummary, SavedReplaySummary, TokenUsageSummary } from './types';
 
 export function buildQueryReplayArtifact(
   fixture: QueryFixture,
@@ -30,6 +36,14 @@ export function buildQueryReplayArtifact(
       description: fixture.description,
       path: queryFixturePath(fixture.id),
     },
+    promptPackage: promptPackageProvenance(
+      queryPromptPackage,
+      renderPromptTemplate(queryPromptPackage.system, {
+        schema: querySchemaSummary(fixture.workspace),
+        project_id: fixture.workspace.projectId,
+        intent: fixture.intent,
+      }),
+    ),
     question: fixture.question,
     intent: fixture.intent,
     answer: replay.answer,
@@ -74,6 +88,14 @@ export function buildDiagnosticReplayArtifact(
       description: fixture.description,
       path: diagnosticFixturePath(fixture.id),
     },
+    promptPackage: promptPackageProvenance(
+      diagnosticPromptPackage,
+      renderPromptTemplate(diagnosticPromptPackage.system, {
+        schema: diagnosticSchemaSummary(fixture.workspace),
+        project_id: fixture.workspace.projectId,
+        anomaly: JSON.stringify(fixture.anomaly),
+      }),
+    ),
     diagnosis: replay.diagnosis,
     trace: replay.trace,
     ...(costEstimate ? { costEstimate } : {}),
@@ -116,6 +138,13 @@ export function buildMonitoringReplayArtifact(
       description: fixture.description,
       path: monitoringFixturePath(fixture.id),
     },
+    promptPackage: promptPackageProvenance(
+      monitoringPromptPackage,
+      renderPromptTemplate(monitoringPromptPackage.system, {
+        schema: monitoringSchemaSummary(fixture.workspace),
+        categories: formatCategoryChecklist(runnableCategories(ECOMMERCE_ANOMALY_CATEGORIES, schemaCapabilities(fixture.workspace))),
+      }),
+    ),
     anomalies: replay.anomalies,
     trace: replay.trace,
     ...(costEstimate ? { costEstimate } : {}),
@@ -157,6 +186,14 @@ export function buildReplayArtifact(
       description: fixture.description,
       path: fixturePath(fixture.id),
     },
+    promptPackage: promptPackageProvenance(
+      recommendationPromptPackage,
+      renderPromptTemplate(recommendationPromptPackage.system, {
+        schema: recommendationSchemaSummary(fixture.workspace),
+        project_id: fixture.workspace.projectId,
+        diagnosis: JSON.stringify(fixture.diagnosis),
+      }),
+    ),
     recommendations: replay.recommendations,
     trace: replay.trace,
     ...(costEstimate ? { costEstimate } : {}),
@@ -176,6 +213,30 @@ export function fixturePath(fixtureId: string): string {
     [voucherDropoffFixture.id]: 'packages/agents/recommendation/fixtures/voucher-dropoff.json',
   };
   return knownPaths[fixtureId] ?? `packages/agents/recommendation/fixtures/${fixtureId}.json`;
+}
+
+export function promptPackageProvenance(
+  promptPackage: PromptPackage,
+  renderedPrompt: string,
+): PromptPackageProvenance {
+  return {
+    id: promptPackage.id,
+    version: promptPackage.version,
+    capabilityId: promptPackage.capabilityId,
+    templateHash: stableTextHash(promptPackage.system),
+    templateChars: promptPackage.system.length,
+    renderedHash: stableTextHash(renderedPrompt),
+    renderedChars: renderedPrompt.length,
+  };
+}
+
+export function stableTextHash(value: string): string {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return `fnv1a32:${(hash >>> 0).toString(16).padStart(8, '0')}`;
 }
 
 export function summarizeUsage(trace: CapabilityEvent[]) {

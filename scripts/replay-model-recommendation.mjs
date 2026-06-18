@@ -2,8 +2,9 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
-import { RecommendationAgent } from '@aptkit/agent-recommendation';
+import { RecommendationAgent, schemaSummary } from '@aptkit/agent-recommendation';
 import { assertRecommendationShape } from '@aptkit/evals';
+import { recommendationPromptPackage, renderPromptTemplate } from '@aptkit/prompts';
 import { OpenAIModelProvider } from '@aptkit/provider-openai';
 import { InMemoryToolRegistry } from '@aptkit/tools';
 
@@ -75,6 +76,14 @@ const artifact = {
     description: fixture.description,
     path: relativeFromRoot(fixturePath),
   },
+  promptPackage: promptPackageProvenance(
+    recommendationPromptPackage,
+    renderPromptTemplate(recommendationPromptPackage.system, {
+      schema: schemaSummary(fixture.workspace),
+      project_id: fixture.workspace.projectId,
+      diagnosis: JSON.stringify(fixture.diagnosis),
+    }),
+  ),
   recommendations,
   trace,
   eval: evalResult,
@@ -125,6 +134,27 @@ function createProvider(provider, modelOverride) {
 function resolveFixturePath(selector) {
   if (fixturePathsById[selector]) return fixturePathsById[selector];
   return resolve(process.cwd(), selector);
+}
+
+function promptPackageProvenance(promptPackage, renderedPrompt) {
+  return {
+    id: promptPackage.id,
+    version: promptPackage.version,
+    capabilityId: promptPackage.capabilityId,
+    templateHash: stableTextHash(promptPackage.system),
+    templateChars: promptPackage.system.length,
+    renderedHash: stableTextHash(renderedPrompt),
+    renderedChars: renderedPrompt.length,
+  };
+}
+
+function stableTextHash(value) {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return `fnv1a32:${(hash >>> 0).toString(16).padStart(8, '0')}`;
 }
 
 async function loadDotEnv(path) {

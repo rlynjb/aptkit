@@ -115,6 +115,8 @@ export function assertReplayArtifactShape(output: unknown): EvalAssertionResult 
     issues.push({ path: 'eval.ok', message: 'expected embedded replay eval to pass' });
   }
 
+  validatePromptPackageProvenance(output, issues);
+
   const secretIssue = findSecretLikeString(output);
   if (secretIssue) {
     issues.push(secretIssue);
@@ -187,6 +189,8 @@ export function assertMonitoringReplayArtifactShape(output: unknown): EvalAssert
   if (!isRecord(replayEval) || replayEval.ok !== true) {
     issues.push({ path: 'eval.ok', message: 'expected embedded replay eval to pass' });
   }
+
+  validatePromptPackageProvenance(output, issues);
 
   const secretIssue = findSecretLikeString(output);
   if (secretIssue) {
@@ -283,6 +287,8 @@ export function assertDiagnosticReplayArtifactShape(output: unknown): EvalAssert
     issues.push({ path: 'eval.ok', message: 'expected embedded replay eval to pass' });
   }
 
+  validatePromptPackageProvenance(output, issues);
+
   const secretIssue = findSecretLikeString(output);
   if (secretIssue) {
     issues.push(secretIssue);
@@ -351,6 +357,8 @@ export function assertQueryReplayArtifactShape(output: unknown): EvalAssertionRe
     issues.push({ path: 'eval.ok', message: 'expected embedded replay eval to pass' });
   }
 
+  validatePromptPackageProvenance(output, issues);
+
   const secretIssue = findSecretLikeString(output);
   if (secretIssue) {
     issues.push(secretIssue);
@@ -361,6 +369,29 @@ export function assertQueryReplayArtifactShape(output: unknown): EvalAssertionRe
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function validatePromptPackageProvenance(
+  output: Record<string, unknown>,
+  issues: { path: string; message: string }[],
+): void {
+  if (output.promptPackage === undefined) return;
+  if (!isRecord(output.promptPackage)) {
+    issues.push({ path: 'promptPackage', message: 'expected an object' });
+    return;
+  }
+
+  for (const path of ['id', 'version', 'capabilityId', 'templateHash', 'renderedHash']) {
+    if (typeof output.promptPackage[path] !== 'string' || output.promptPackage[path].trim().length === 0) {
+      issues.push({ path: `promptPackage.${path}`, message: 'expected a non-empty string' });
+    }
+  }
+
+  for (const path of ['templateChars', 'renderedChars']) {
+    if (typeof output.promptPackage[path] !== 'number' || output.promptPackage[path] <= 0) {
+      issues.push({ path: `promptPackage.${path}`, message: 'expected a positive number' });
+    }
+  }
 }
 
 function findSecretLikeString(value: unknown, path = ''): { path: string; message: string } | null {

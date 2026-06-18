@@ -723,6 +723,7 @@ async function listReplaySummaries() {
       createdAt: typeof artifact.createdAt === 'string' ? artifact.createdAt : '',
       provider: artifact.provider,
       fixture: artifact.fixture,
+      promptPackage: parsePromptPackageProvenance(artifact.promptPackage),
       evalOk: evaluation.ok,
       issues: evaluation.issues,
       recommendations: Array.isArray(artifact.recommendations) ? artifact.recommendations : [],
@@ -1340,6 +1341,30 @@ function parseCostEstimate(value: unknown): CostEstimate | undefined {
     return undefined;
   }
   return value as CostEstimate;
+}
+
+function parsePromptPackageProvenance(value: unknown) {
+  if (!isRecord(value)) return undefined;
+  if (
+    typeof value.id !== 'string'
+    || typeof value.version !== 'string'
+    || typeof value.capabilityId !== 'string'
+    || typeof value.templateHash !== 'string'
+    || typeof value.templateChars !== 'number'
+    || typeof value.renderedHash !== 'string'
+    || typeof value.renderedChars !== 'number'
+  ) {
+    return undefined;
+  }
+  return {
+    id: value.id,
+    version: value.version,
+    capabilityId: value.capabilityId,
+    templateHash: value.templateHash,
+    templateChars: value.templateChars,
+    renderedHash: value.renderedHash,
+    renderedChars: value.renderedChars,
+  };
 }
 
 function normalizeReplayArtifact(value: unknown): Record<string, unknown> & {

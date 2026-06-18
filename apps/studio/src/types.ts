@@ -131,6 +131,16 @@ export type CostEstimate = {
   estimated: true;
 };
 
+export type PromptPackageProvenance = {
+  id: string;
+  version: string;
+  capabilityId: string;
+  templateHash: string;
+  templateChars: number;
+  renderedHash: string;
+  renderedChars: number;
+};
+
 export type ReplayArtifact = {
   schemaVersion: 1;
   createdAt: string;
@@ -144,6 +154,7 @@ export type ReplayArtifact = {
     description: string;
     path: string;
   };
+  promptPackage: PromptPackageProvenance;
   recommendations: Recommendation[];
   trace: CapabilityEvent[];
   costEstimate?: CostEstimate;
@@ -169,6 +180,7 @@ export type MonitoringReplayArtifact = {
     description: string;
     path: string;
   };
+  promptPackage: PromptPackageProvenance;
   anomalies: MonitoringAnomaly[];
   trace: CapabilityEvent[];
   costEstimate?: CostEstimate;
@@ -194,6 +206,7 @@ export type DiagnosticReplayArtifact = {
     description: string;
     path: string;
   };
+  promptPackage: PromptPackageProvenance;
   diagnosis: DiagnosticDiagnosis;
   trace: CapabilityEvent[];
   costEstimate?: CostEstimate;
@@ -219,6 +232,7 @@ export type QueryReplayArtifact = {
     description: string;
     path: string;
   };
+  promptPackage: PromptPackageProvenance;
   question: string;
   intent: QueryIntent;
   answer: string;
@@ -238,6 +252,7 @@ export type SavedReplaySummary = {
   createdAt: string;
   provider: { id: string; model: string };
   fixture: { id: string; description?: string; path?: string };
+  promptPackage?: PromptPackageProvenance;
   evalOk: boolean;
   issues: { path: string; message: string }[];
   recommendations: Recommendation[];
@@ -258,6 +273,7 @@ export type SavedMonitoringReplaySummary = {
   createdAt: string;
   provider: { id: string; model: string };
   fixture: { id: string; description?: string; path?: string };
+  promptPackage?: PromptPackageProvenance;
   evalOk: boolean;
   issues: { path: string; message: string }[];
   anomalies: MonitoringAnomaly[];
@@ -274,6 +290,7 @@ export type SavedDiagnosticReplaySummary = {
   createdAt: string;
   provider: { id: string; model: string };
   fixture: { id: string; description?: string; path?: string };
+  promptPackage?: PromptPackageProvenance;
   evalOk: boolean;
   issues: { path: string; message: string }[];
   diagnosis: DiagnosticDiagnosis;
@@ -290,6 +307,7 @@ export type SavedQueryReplaySummary = {
   createdAt: string;
   provider: { id: string; model: string };
   fixture: { id: string; description?: string; path?: string };
+  promptPackage?: PromptPackageProvenance;
   evalOk: boolean;
   issues: { path: string; message: string }[];
   question?: string;
