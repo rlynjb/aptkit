@@ -51,7 +51,7 @@ Maturity follows the plan's Level 0-6 model, where Level 6 means a reusable pack
 | P1 | `content-generation-workflow` | Content chunking and multi-angle generation | Workflow | `dryrun` | `packages/workflows` or `packages/prompts` | Medium | Candidate |
 | P1 | `eval-harness` | Eval runners and golden fixtures | Evaluator | `blooming_insights` | `packages/evals` | High | Packaged |
 | P1 | `structural-diff-evaluator` | Structural diff evaluator | Evaluator | `blooming_insights` | `packages/evals` | High | Packaged |
-| P1 | `detection-scorer` | Detection scorer | Evaluator | `blooming_insights` | `packages/evals` | Medium | Candidate |
+| P1 | `detection-scorer` | Detection scorer | Evaluator | `blooming_insights` | `packages/evals` | Medium | Packaged |
 
 ## P0 Candidates
 

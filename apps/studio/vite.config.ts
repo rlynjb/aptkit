@@ -32,6 +32,7 @@ import {
   assertRecommendationShape,
   assertReplayArtifactShape,
   evaluateStructuralDiff,
+  scoreDetections,
   type StructuralDiffRule,
 } from '@aptkit/evals';
 import { AnthropicModelProvider } from '@aptkit/provider-anthropic';
@@ -1054,39 +1055,14 @@ function assertMonitoringBehavioralExpectations(
   expectations: MonitoringBehaviorExpectations | undefined,
 ) {
   if (!expectations) return { name: 'monitoring-behavior', ok: true, issues: [] };
-  const minAnomalyCount = expectations.minAnomalyCount ?? 0;
-  const rules: StructuralDiffRule[] = [
-    { type: 'arrayCount', path: '', min: minAnomalyCount, message: `expected at least ${minAnomalyCount} anomalies, got ${anomalies.length}` },
-    ...(expectations.requiredCategories ?? []).map((category): StructuralDiffRule => ({
-      type: 'arrayIncludes',
-      path: '',
-      itemPath: 'category',
-      value: category,
-      message: `expected category=${category}`,
-    })),
-    ...(expectations.requiredMetrics ?? []).map((metric): StructuralDiffRule => ({
-      type: 'arrayIncludes',
-      path: '',
-      itemPath: 'metric',
-      value: metric,
-      message: `expected metric=${metric}`,
-    })),
-    ...(expectations.requiredScopes ?? []).map((scope): StructuralDiffRule => ({
-      type: 'arrayIncludes',
-      path: '',
-      itemPath: 'scope',
-      value: scope,
-      message: `expected scope=${scope}`,
-    })),
-    ...(expectations.requiredSeverities ?? []).map((severity): StructuralDiffRule => ({
-      type: 'arrayIncludes',
-      path: '',
-      itemPath: 'severity',
-      value: severity,
-      message: `expected severity=${severity}`,
-    })),
-  ];
-  return { name: 'monitoring-behavior', ...evaluateStructuralDiff(anomalies, rules) };
+  const result = scoreDetections(anomalies, {
+    minCount: expectations.minAnomalyCount,
+    requiredCategories: expectations.requiredCategories,
+    requiredMetrics: expectations.requiredMetrics,
+    requiredScopes: expectations.requiredScopes,
+    requiredSeverities: expectations.requiredSeverities,
+  });
+  return { name: 'monitoring-behavior', ok: result.ok, issues: result.issues };
 }
 
 function assertDiagnosticBehavioralExpectations(
