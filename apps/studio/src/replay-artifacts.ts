@@ -1,3 +1,4 @@
+import { estimateCost, formatCost, pricingForModel, summarizeUsage } from '@aptkit/runtime';
 import type { CapabilityEvent } from '@aptkit/runtime';
 import { ECOMMERCE_ANOMALY_CATEGORIES, formatCategoryChecklist, runnableCategories, schemaCapabilities } from '@aptkit/agent-anomaly-monitoring';
 import { schemaSummary } from '@aptkit/context';
@@ -237,52 +238,7 @@ export function stableTextHash(value: string): string {
   return `fnv1a32:${(hash >>> 0).toString(16).padStart(8, '0')}`;
 }
 
-export function summarizeUsage(trace: CapabilityEvent[]) {
-  return trace.reduce(
-    (summary, event) => {
-      if (event.type !== 'model_usage') return summary;
-      return {
-        inputTokens: summary.inputTokens + (event.inputTokens ?? 0),
-        outputTokens: summary.outputTokens + (event.outputTokens ?? 0),
-        totalTokens: summary.totalTokens + (event.inputTokens ?? 0) + (event.outputTokens ?? 0),
-        modelName: event.model || summary.modelName,
-      };
-    },
-    { inputTokens: 0, outputTokens: 0, totalTokens: 0, modelName: '' },
-  );
-}
-
-export function estimateCost(provider: string, usage: TokenUsageSummary, modelName: string): CostEstimate | undefined {
-  const pricing = pricingForModel(provider, modelName);
-  if (!pricing) return undefined;
-  const inputCost = (usage.inputTokens / 1_000_000) * pricing.inputUsdPerMillion;
-  const outputCost = (usage.outputTokens / 1_000_000) * pricing.outputUsdPerMillion;
-  return {
-    currency: 'USD',
-    inputCost,
-    outputCost,
-    totalCost: inputCost + outputCost,
-    inputUsdPerMillion: pricing.inputUsdPerMillion,
-    outputUsdPerMillion: pricing.outputUsdPerMillion,
-    estimated: true,
-  };
-}
-
-export function pricingForModel(provider: string, modelName: string): Pick<CostEstimate, 'inputUsdPerMillion' | 'outputUsdPerMillion'> | undefined {
-  if (provider !== 'openai') return undefined;
-  const normalized = modelName.toLowerCase();
-  if (normalized.startsWith('gpt-4.1-nano')) return { inputUsdPerMillion: 0.1, outputUsdPerMillion: 0.4 };
-  if (normalized.startsWith('gpt-4.1-mini')) return { inputUsdPerMillion: 0.4, outputUsdPerMillion: 1.6 };
-  if (normalized.startsWith('gpt-4.1')) return { inputUsdPerMillion: 2, outputUsdPerMillion: 8 };
-  return undefined;
-}
-
-export function formatCost(costEstimate: CostEstimate | undefined): string {
-  if (!costEstimate) return 'n/a';
-  if (costEstimate.totalCost === 0) return '$0.00';
-  if (costEstimate.totalCost < 0.01) return `$${costEstimate.totalCost.toFixed(4)}`;
-  return `$${costEstimate.totalCost.toFixed(2)}`;
-}
+export { estimateCost, formatCost, pricingForModel, summarizeUsage };
 
 export function formatDuration(durationMs: number): string {
   if (durationMs < 1000) return `${durationMs}ms`;
@@ -373,7 +329,7 @@ export function comparisonForMonitoringFixture(
 
 export function latestReplayFor(replays: SavedReplaySummary[], fixtureId: string, providerId: string): ComparableReplay | undefined {
   const replay = replays.find((candidate) => candidate.fixture.id === fixtureId && candidate.provider.id === providerId);
-  return replay ? { ...replay } : undefined;
+  return replay ? { ...replay, usage: normalizeUsageSummary(replay.usage) } : undefined;
 }
 
 export function latestMonitoringReplayFor(
@@ -382,7 +338,20 @@ export function latestMonitoringReplayFor(
   providerId: string,
 ): ComparableMonitoringReplay | undefined {
   const replay = replays.find((candidate) => candidate.fixture.id === fixtureId && candidate.provider.id === providerId);
-  return replay ? { ...replay } : undefined;
+  return replay ? { ...replay, usage: normalizeUsageSummary(replay.usage) } : undefined;
+}
+
+function normalizeUsageSummary(
+  usage: Pick<TokenUsageSummary, 'inputTokens' | 'outputTokens' | 'totalTokens'> & Partial<TokenUsageSummary>,
+): TokenUsageSummary {
+  return {
+    inputTokens: usage.inputTokens,
+    outputTokens: usage.outputTokens,
+    totalTokens: usage.totalTokens,
+    modelName: usage.modelName ?? '',
+    turns: usage.turns ?? 0,
+    estimated: usage.estimated ?? false,
+  };
 }
 
 export function featureSet(replay: ComparableReplay | undefined): Set<string> {

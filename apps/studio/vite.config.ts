@@ -35,8 +35,8 @@ import {
 import { AnthropicModelProvider } from '@aptkit/provider-anthropic';
 import { OpenAIModelProvider } from '@aptkit/provider-openai';
 import { InMemoryToolRegistry, type ToolDefinition, type ToolHandler } from '@aptkit/tools';
-import { encodeNdjsonRecord } from '@aptkit/runtime';
-import type { CapabilityEvent, ModelProvider, ModelResponse } from '@aptkit/runtime';
+import { encodeNdjsonRecord, estimateCost, isCapabilityEvent, modelTurnCount, summarizeUsage } from '@aptkit/runtime';
+import type { CapabilityEvent, CostEstimate, ModelProvider, ModelResponse } from '@aptkit/runtime';
 import type { Anomaly, Diagnosis, Recommendation, WorkspaceDescriptor } from '@aptkit/agent-recommendation';
 import type { Anomaly as MonitoringAnomaly, WorkspaceDescriptor as MonitoringWorkspaceDescriptor } from '@aptkit/agent-anomaly-monitoring';
 import monitoringFixture from '../../packages/agents/anomaly-monitoring/fixtures/sp-revenue-monitoring.json';
@@ -141,22 +141,6 @@ type QueryBehaviorExpectations = {
 
 type TraceRunOptions = {
   onEvent?: (event: CapabilityEvent) => void;
-};
-
-type TokenUsageSummary = {
-  inputTokens: number;
-  outputTokens: number;
-  totalTokens: number;
-};
-
-type CostEstimate = {
-  currency: 'USD';
-  inputCost: number;
-  outputCost: number;
-  totalCost: number;
-  inputUsdPerMillion: number;
-  outputUsdPerMillion: number;
-  estimated: true;
 };
 
 const fixtures = [
@@ -539,7 +523,7 @@ async function runReplay(fixture: RecommendationFixture, mode: ReplayMode, optio
     recommendations,
     trace,
     eval: evalResult,
-    modelTurns: trace.filter((event) => event.type === 'model_usage').length,
+    modelTurns: modelTurnCount(trace),
     durationMs: Date.now() - startedAt,
   };
 }
@@ -581,7 +565,7 @@ async function runMonitoringReplay(fixture: MonitoringFixture, mode: MonitoringR
       ok: validation.ok,
       issues,
     },
-    modelTurns: trace.filter((event) => event.type === 'model_usage').length,
+    modelTurns: modelTurnCount(trace),
     durationMs: Date.now() - startedAt,
   };
 }
@@ -623,7 +607,7 @@ async function runDiagnosticReplay(fixture: DiagnosticFixture, mode: DiagnosticR
       ok: validation.ok,
       issues,
     },
-    modelTurns: trace.filter((event) => event.type === 'model_usage').length,
+    modelTurns: modelTurnCount(trace),
     durationMs: Date.now() - startedAt,
   };
 }
@@ -667,7 +651,7 @@ async function runQueryReplay(fixture: QueryFixture, mode: QueryReplayMode, opti
       ok: validation.ok,
       issues,
     },
-    modelTurns: trace.filter((event) => event.type === 'model_usage').length,
+    modelTurns: modelTurnCount(trace),
     durationMs: Date.now() - startedAt,
   };
 }
@@ -824,7 +808,7 @@ async function listReplaySummaries() {
     const path = join(dir, entry.name);
     const artifact = JSON.parse(await readFile(path, 'utf8'));
     const evaluation = assertCapabilityReplayArtifactShape(artifact);
-    const usage = summarizeTraceUsage(artifact.trace);
+    const usage = summarizeUnknownTraceUsage(artifact.trace);
     const costEstimate = parseCostEstimate(artifact.costEstimate)
       ?? estimateCost(String(artifact.provider?.id ?? ''), usage, String(artifact.provider?.model ?? ''));
     summaries.push({
@@ -873,7 +857,7 @@ async function listPromotedFixtureSummaries() {
     const fixture = JSON.parse(await readFile(path, 'utf8')) as RecommendationFixture;
     const replay = await runReplay(fixture, 'fixture');
     const behavior = assertBehavioralExpectations(replay.recommendations, fixture.expectations);
-    const usage = summarizeTraceUsage(replay.trace);
+    const usage = summarizeUsage(replay.trace);
     const costEstimate = estimateCost(
       fixture.promotion?.sourceProvider?.id ?? 'fixture',
       usage,
@@ -919,7 +903,7 @@ async function listPromotedMonitoringFixtureSummaries() {
     const fixture = JSON.parse(await readFile(path, 'utf8')) as MonitoringFixture;
     const replay = await runMonitoringReplay(fixture, 'fixture');
     const behavior = assertMonitoringBehavioralExpectations(replay.anomalies, fixture.expectations);
-    const usage = summarizeTraceUsage(replay.trace);
+    const usage = summarizeUsage(replay.trace);
     const costEstimate = estimateCost(
       fixture.promotion?.sourceProvider?.id ?? 'fixture',
       usage,
@@ -965,7 +949,7 @@ async function listPromotedDiagnosticFixtureSummaries() {
     const fixture = JSON.parse(await readFile(path, 'utf8')) as DiagnosticFixture;
     const replay = await runDiagnosticReplay(fixture, 'fixture');
     const behavior = assertDiagnosticBehavioralExpectations(replay.diagnosis, fixture.expectations);
-    const usage = summarizeTraceUsage(replay.trace);
+    const usage = summarizeUsage(replay.trace);
     const costEstimate = estimateCost(
       fixture.promotion?.sourceProvider?.id ?? 'fixture',
       usage,
@@ -1011,7 +995,7 @@ async function listPromotedQueryFixtureSummaries() {
     const fixture = JSON.parse(await readFile(path, 'utf8')) as QueryFixture;
     const replay = await runQueryReplay(fixture, 'fixture');
     const behavior = assertQueryBehavioralExpectations(replay.answer, fixture.expectations);
-    const usage = summarizeTraceUsage(replay.trace);
+    const usage = summarizeUsage(replay.trace);
     const costEstimate = estimateCost(
       fixture.promotion?.sourceProvider?.id ?? 'fixture',
       usage,
@@ -1263,7 +1247,7 @@ async function promoteCapabilityReplayArtifact(artifactPath: string, adapter: Pr
   const sourceFixture = JSON.parse(await readFile(sourceFixturePath, 'utf8'));
   const providerId = artifact.provider.id;
   const promotedId = `${artifact.fixture.id}-${providerId}-promoted`;
-  const usage = summarizeTraceUsage(artifact.trace);
+  const usage = summarizeUnknownTraceUsage(artifact.trace);
   const promoted = {
     ...sourceFixture,
     id: promotedId,
@@ -1396,46 +1380,9 @@ function asciiString(value: string): string {
     .replace(/[^\x09\x0A\x0D\x20-\x7E]/g, '');
 }
 
-function summarizeTraceUsage(trace: unknown) {
-  const events = Array.isArray(trace) ? trace : [];
-  return events.reduce(
-    (summary, event) => {
-      if (!isRecord(event) || event.type !== 'model_usage') return summary;
-      const inputTokens = typeof event.inputTokens === 'number' ? event.inputTokens : 0;
-      const outputTokens = typeof event.outputTokens === 'number' ? event.outputTokens : 0;
-      return {
-        inputTokens: summary.inputTokens + inputTokens,
-        outputTokens: summary.outputTokens + outputTokens,
-        totalTokens: summary.totalTokens + inputTokens + outputTokens,
-      };
-    },
-    { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
-  );
-}
-
-function estimateCost(provider: string, usage: TokenUsageSummary, modelName: string): CostEstimate | undefined {
-  const pricing = pricingForModel(provider, modelName);
-  if (!pricing) return undefined;
-  const inputCost = (usage.inputTokens / 1_000_000) * pricing.inputUsdPerMillion;
-  const outputCost = (usage.outputTokens / 1_000_000) * pricing.outputUsdPerMillion;
-  return {
-    currency: 'USD',
-    inputCost,
-    outputCost,
-    totalCost: inputCost + outputCost,
-    inputUsdPerMillion: pricing.inputUsdPerMillion,
-    outputUsdPerMillion: pricing.outputUsdPerMillion,
-    estimated: true,
-  };
-}
-
-function pricingForModel(provider: string, modelName: string): Pick<CostEstimate, 'inputUsdPerMillion' | 'outputUsdPerMillion'> | undefined {
-  if (provider !== 'openai') return undefined;
-  const normalized = modelName.toLowerCase();
-  if (normalized.startsWith('gpt-4.1-nano')) return { inputUsdPerMillion: 0.1, outputUsdPerMillion: 0.4 };
-  if (normalized.startsWith('gpt-4.1-mini')) return { inputUsdPerMillion: 0.4, outputUsdPerMillion: 1.6 };
-  if (normalized.startsWith('gpt-4.1')) return { inputUsdPerMillion: 2, outputUsdPerMillion: 8 };
-  return undefined;
+function summarizeUnknownTraceUsage(trace: unknown) {
+  const events = Array.isArray(trace) ? trace.filter(isCapabilityEvent) : [];
+  return summarizeUsage(events);
 }
 
 function parseCostEstimate(value: unknown): CostEstimate | undefined {

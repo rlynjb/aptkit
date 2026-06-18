@@ -3,7 +3,7 @@ import type { Anomaly as MonitoringAnomaly } from '@aptkit/agent-anomaly-monitor
 import type { Anomaly as DiagnosticAnomaly, Diagnosis as DiagnosticDiagnosis } from '@aptkit/agent-diagnostic-investigation';
 import type { Intent as QueryIntent } from '@aptkit/agent-query';
 import type { WorkspaceDescriptor } from '@aptkit/context';
-import type { CapabilityEvent, ModelResponse } from '@aptkit/runtime';
+import type { CapabilityEvent, CostEstimate, ModelResponse, TokenUsageSummary } from '@aptkit/runtime';
 import type { ToolDefinition } from '@aptkit/tools';
 
 export type FixtureTool = ToolDefinition & { result: unknown };
@@ -115,22 +115,7 @@ export type QueryReplayMode = 'fixture' | 'openai';
 
 export type ProviderStatus = Record<ReplayMode, { available: boolean; model: string }>;
 
-export type TokenUsageSummary = {
-  inputTokens: number;
-  outputTokens: number;
-  totalTokens: number;
-  modelName?: string;
-};
-
-export type CostEstimate = {
-  currency: 'USD';
-  inputCost: number;
-  outputCost: number;
-  totalCost: number;
-  inputUsdPerMillion: number;
-  outputUsdPerMillion: number;
-  estimated: true;
-};
+export type { CostEstimate, TokenUsageSummary };
 
 export type PromptPackageProvenance = {
   id: string;
