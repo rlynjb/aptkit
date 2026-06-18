@@ -5,8 +5,8 @@ import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const packDir = '/private/tmp/aptkit-packs';
-const npmCache = '/private/tmp/npm-cache';
+const packDir = process.env.APTKIT_PACK_DIR ?? '/private/tmp/aptkit-packs';
+const npmCache = process.env.APTKIT_NPM_CACHE ?? '/private/tmp/npm-cache';
 const packageSpecs = [
   { workspace: '@aptkit/runtime', tarball: 'aptkit-runtime-0.0.0.tgz' },
   { workspace: '@aptkit/tools', tarball: 'aptkit-tools-0.0.0.tgz' },
@@ -40,18 +40,22 @@ const packageJson = JSON.parse(await readFile(join(corePackageDir, 'package.json
 delete packageJson.devDependencies;
 await writeFile(join(stage, 'package.json'), `${JSON.stringify(packageJson, null, 2)}\n`);
 
-run('npm', [
-  '--cache',
-  npmCache,
-  'install',
-  '--no-save',
-  '--omit=dev',
-  ...packageSpecs.map((spec) => join(packDir, spec.tarball)),
-], { cwd: stage });
+for (const spec of packageSpecs) {
+  const packageDir = join(stage, 'node_modules', ...spec.workspace.split('/'));
+  await mkdir(packageDir, { recursive: true });
+  run('tar', [
+    '-xzf',
+    join(packDir, spec.tarball),
+    '-C',
+    packageDir,
+    '--strip-components=1',
+  ]);
+}
 
 run('npm', ['--cache', npmCache, 'pack', '--pack-destination', packDir], { cwd: stage });
 
-console.log(join(packDir, 'aptkit-core-0.0.0.tgz'));
+const packedPackageName = packageJson.name.replace(/^@/, '').replace('/', '-');
+console.log(join(packDir, `${packedPackageName}-${packageJson.version}.tgz`));
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
