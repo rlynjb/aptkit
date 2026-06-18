@@ -28,6 +28,7 @@ import {
   assertCapabilityReplayArtifactShape,
   assertDiagnosticReplayArtifactShape,
   assertMonitoringReplayArtifactShape,
+  assertQueryReplayArtifactShape,
   assertRecommendationShape,
   assertReplayArtifactShape,
 } from '@aptkit/evals';
@@ -107,6 +108,12 @@ type QueryFixture = {
   workspace: QueryWorkspaceDescriptor;
   tools: FixtureTool[];
   modelResponses: ModelResponse[];
+  expectations?: QueryBehaviorExpectations;
+  promotion?: {
+    sourceArtifact?: string;
+    sourceProvider?: { id?: string; model?: string };
+    promotedAt?: string;
+  };
 };
 
 type BehavioralExpectations = {
@@ -125,6 +132,10 @@ type MonitoringBehaviorExpectations = {
 type DiagnosticBehaviorExpectations = {
   requiredEvidenceText?: string[];
   requiredSupportedHypothesisText?: string[];
+};
+
+type QueryBehaviorExpectations = {
+  requiredAnswerText?: string[];
 };
 
 type TokenUsageSummary = {
@@ -231,6 +242,21 @@ export default defineConfig(({ mode }) => {
             }
           });
 
+          server.middlewares.use('/api/promoted-query-fixtures', async (req, res) => {
+            if (req.method !== 'GET') {
+              res.statusCode = 405;
+              sendJson(res, { error: 'method not allowed' });
+              return;
+            }
+
+            try {
+              sendJson(res, { fixtures: await listPromotedQueryFixtureSummaries() });
+            } catch (error) {
+              res.statusCode = 400;
+              sendJson(res, { error: error instanceof Error ? error.message : String(error) });
+            }
+          });
+
           server.middlewares.use('/api/monitoring/replays/promote', async (req, res) => {
             if (req.method !== 'POST') {
               res.statusCode = 405;
@@ -260,6 +286,24 @@ export default defineConfig(({ mode }) => {
               const body = await readJsonBody(req);
               const artifactPath = resolveReplayPath(body.path);
               const result = await promoteDiagnosticReplayArtifact(artifactPath);
+              sendJson(res, result);
+            } catch (error) {
+              res.statusCode = 400;
+              sendJson(res, { error: error instanceof Error ? error.message : String(error) });
+            }
+          });
+
+          server.middlewares.use('/api/query/replays/promote', async (req, res) => {
+            if (req.method !== 'POST') {
+              res.statusCode = 405;
+              sendJson(res, { error: 'method not allowed' });
+              return;
+            }
+
+            try {
+              const body = await readJsonBody(req);
+              const artifactPath = resolveReplayPath(body.path);
+              const result = await promoteQueryReplayArtifact(artifactPath);
               sendJson(res, result);
             } catch (error) {
               res.statusCode = 400;
@@ -839,6 +883,52 @@ async function listPromotedDiagnosticFixtureSummaries() {
   return summaries.sort((left, right) => left.id.localeCompare(right.id) || left.path.localeCompare(right.path));
 }
 
+async function listPromotedQueryFixtureSummaries() {
+  const dir = resolve(workspaceRoot(), 'packages/agents/query/fixtures/promoted');
+  let entries;
+  try {
+    entries = await readdir(dir, { withFileTypes: true });
+  } catch (error) {
+    if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') return [];
+    throw error;
+  }
+
+  const summaries = [];
+  for (const entry of entries) {
+    if (!entry.isFile() || extname(entry.name) !== '.json') continue;
+    const path = join(dir, entry.name);
+    const fixture = JSON.parse(await readFile(path, 'utf8')) as QueryFixture;
+    const replay = await runQueryReplay(fixture, 'fixture');
+    const behavior = assertQueryBehavioralExpectations(replay.answer, fixture.expectations);
+    const usage = summarizeTraceUsage(replay.trace);
+    const costEstimate = estimateCost(
+      fixture.promotion?.sourceProvider?.id ?? 'fixture',
+      usage,
+      fixture.promotion?.sourceProvider?.model ?? '',
+    );
+    summaries.push({
+      path: relativeFromWorkspace(path),
+      id: fixture.id,
+      description: fixture.description,
+      promotion: fixture.promotion,
+      expectations: fixture.expectations,
+      evalOk: replay.eval.ok,
+      behaviorOk: behavior.ok,
+      ok: replay.eval.ok && behavior.ok,
+      issues: [
+        ...replay.eval.issues.map((issue) => ({ ...issue, source: replay.eval.name })),
+        ...behavior.issues.map((issue) => ({ ...issue, source: behavior.name })),
+      ],
+      answerPresent: replay.answer.trim().length > 0,
+      modelTurns: replay.modelTurns,
+      usage,
+      ...(costEstimate ? { costEstimate } : {}),
+    });
+  }
+
+  return summaries.sort((left, right) => left.id.localeCompare(right.id) || left.path.localeCompare(right.path));
+}
+
 function assertBehavioralExpectations(
   recommendations: Recommendation[],
   expectations: BehavioralExpectations | undefined,
@@ -950,6 +1040,23 @@ function assertDiagnosticBehavioralExpectations(
   return { name: 'diagnostic-behavior', ok: issues.length === 0, issues };
 }
 
+function assertQueryBehavioralExpectations(
+  answer: string,
+  expectations: QueryBehaviorExpectations | undefined,
+) {
+  const issues: { path: string; message: string }[] = [];
+  if (!expectations) return { name: 'query-behavior', ok: true, issues };
+
+  const answerText = answer.toLowerCase();
+  for (const text of expectations.requiredAnswerText ?? []) {
+    if (!answerText.includes(text.toLowerCase())) {
+      issues.push({ path: 'expectations.requiredAnswerText', message: `expected answer containing "${text}"` });
+    }
+  }
+
+  return { name: 'query-behavior', ok: issues.length === 0, issues };
+}
+
 function recommendationSearchText(recommendation: Recommendation): string {
   return [
     recommendation.title,
@@ -1007,11 +1114,26 @@ async function promoteDiagnosticReplayArtifact(artifactPath: string) {
   });
 }
 
+async function promoteQueryReplayArtifact(artifactPath: string) {
+  return promoteCapabilityReplayArtifact(artifactPath, {
+    label: 'query',
+    outDir: 'packages/agents/query/fixtures/promoted',
+    validate: assertQueryReplayArtifactShape,
+    output: (artifact) => typeof artifact.answer === 'string' ? artifact.answer : '',
+    responseText: (artifact) => typeof artifact.answer === 'string' ? artifact.answer : '',
+    expectations: (artifact) => queryExpectationsFromAnswer(typeof artifact.answer === 'string' ? artifact.answer : ''),
+    result: (artifact) => ({
+      answerPresent: typeof artifact.answer === 'string' && artifact.answer.trim().length > 0,
+    }),
+  });
+}
+
 type PromotionAdapter = {
   label: string;
   outDir: string;
   validate: (artifact: unknown) => { ok: boolean; issues: { path: string; message: string }[] };
   output: (artifact: Record<string, unknown>) => unknown;
+  responseText?: (artifact: Record<string, unknown>) => string;
   expectations?: (artifact: Record<string, unknown>) => unknown;
   result: (artifact: Record<string, unknown>) => Record<string, unknown>;
 };
@@ -1044,7 +1166,9 @@ async function promoteCapabilityReplayArtifact(artifactPath: string, adapter: Pr
         content: [
           {
             type: 'text',
-            text: `\`\`\`json\n${JSON.stringify(toAscii(adapter.output(artifact)), null, 2)}\n\`\`\``,
+            text: adapter.responseText
+              ? asciiString(adapter.responseText(artifact))
+              : `\`\`\`json\n${JSON.stringify(toAscii(adapter.output(artifact)), null, 2)}\n\`\`\``,
           },
         ],
         usage: {
@@ -1095,6 +1219,20 @@ function diagnosticExpectationsFromDiagnosis(diagnosis: DiagnosticDiagnosis | un
     requiredEvidenceText: evidence.slice(0, 3).map(expectationPhrase).filter(Boolean),
     requiredSupportedHypothesisText: supported ? [expectationPhrase(`${supported.hypothesis} ${supported.reasoning}`)].filter(Boolean) : [],
   };
+}
+
+function queryExpectationsFromAnswer(answer: string): QueryBehaviorExpectations {
+  return {
+    requiredAnswerText: answerExpectationPhrases(answer),
+  };
+}
+
+function answerExpectationPhrases(answer: string): string[] {
+  const candidates = [
+    ...answer.matchAll(/\b[A-Z]{2}\b/g),
+    ...answer.matchAll(/\bBRL\s+[0-9]+(?:,[0-9]{3})*/g),
+  ].map((match) => match[0]);
+  return uniqueStrings(candidates).slice(0, 6);
 }
 
 function expectationPhrase(value: string): string {

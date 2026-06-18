@@ -1,11 +1,11 @@
 import React from 'react';
-import { BadgeCheck, Boxes, BrainCircuit, ChevronDown, CircleDollarSign, FileText, Gauge, KeyRound, MessageSquareText, Play, RefreshCw, Save, Timer } from 'lucide-react';
-import { loadSavedQueryReplays, runServerQueryReplay, saveReplayArtifact } from './api';
+import { BadgeCheck, Boxes, BrainCircuit, ChevronDown, CircleDollarSign, FileCheck, FileText, Gauge, KeyRound, MessageSquareText, Play, RefreshCw, Save, Timer } from 'lucide-react';
+import { loadPromotedQueryFixtures, loadSavedQueryReplays, promoteQueryReplay, runServerQueryReplay, saveReplayArtifact } from './api';
 import { runQueryFixtureReplay } from './agent-runners';
 import { EvalPanel, Metric, Panel, ReplayModeSwitch, TracePanel } from './components';
 import { queryFixtures } from './fixtures';
 import { buildQueryReplayArtifact, estimateCost, formatCost, formatDuration, summarizeUsage } from './replay-artifacts';
-import type { ProviderStatus, QueryReplayMode, QueryReplayState, SavedQueryReplaySummary } from './types';
+import type { PromotedQueryFixtureSummary, ProviderStatus, QueryPromoteResult, QueryReplayMode, QueryReplayState, SavedQueryReplaySummary } from './types';
 
 export function QueryWorkspace({ onHome }: { onHome: () => void }) {
   const [selectedFixtureId, setSelectedFixtureId] = React.useState(queryFixtures[0].id);
@@ -24,6 +24,11 @@ export function QueryWorkspace({ onHome }: { onHome: () => void }) {
   const [savedReplays, setSavedReplays] = React.useState<SavedQueryReplaySummary[]>([]);
   const [historyLoading, setHistoryLoading] = React.useState(false);
   const [historyError, setHistoryError] = React.useState<string | null>(null);
+  const [promotingPath, setPromotingPath] = React.useState<string | null>(null);
+  const [promoteResult, setPromoteResult] = React.useState<QueryPromoteResult | null>(null);
+  const [promotedFixtures, setPromotedFixtures] = React.useState<PromotedQueryFixtureSummary[]>([]);
+  const [promotedLoading, setPromotedLoading] = React.useState(false);
+  const [promotedError, setPromotedError] = React.useState<string | null>(null);
   const runCounter = React.useRef(0);
   const selectedFixtureRef = React.useRef(queryFixtures[0]);
   const modeRef = React.useRef(mode);
@@ -86,6 +91,22 @@ export function QueryWorkspace({ onHome }: { onHome: () => void }) {
     void refreshReplayHistory();
   }, [refreshReplayHistory]);
 
+  const refreshPromotedFixtures = React.useCallback(async () => {
+    setPromotedLoading(true);
+    setPromotedError(null);
+    try {
+      setPromotedFixtures(await loadPromotedQueryFixtures());
+    } catch (caught) {
+      setPromotedError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setPromotedLoading(false);
+    }
+  }, []);
+
+  React.useEffect(() => {
+    void refreshPromotedFixtures();
+  }, [refreshPromotedFixtures]);
+
   function selectFixture(event: React.ChangeEvent<HTMLSelectElement>) {
     setSelectedFixtureId(event.target.value);
     setReplay(null);
@@ -116,9 +137,25 @@ export function QueryWorkspace({ onHome }: { onHome: () => void }) {
     }
   }
 
+  async function promoteSavedReplay(path: string) {
+    setPromotingPath(path);
+    setHistoryError(null);
+    setPromoteResult(null);
+    try {
+      const result = await promoteQueryReplay(path);
+      setPromoteResult(result);
+      await refreshPromotedFixtures();
+    } catch (caught) {
+      setHistoryError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setPromotingPath(null);
+    }
+  }
+
   const usage = summarizeUsage(replay?.trace ?? []);
   const modelName = usage.modelName || providerStatus[mode].model;
   const costEstimate = estimateCost(mode, usage, modelName);
+  const latestReviewPath = replay?.savedPath ?? savedReplays.find((savedReplay) => savedReplay.fixture.id === fixture.id && savedReplay.provider.id === mode)?.path;
 
   return (
     <main className="shell">
@@ -211,6 +248,23 @@ export function QueryWorkspace({ onHome }: { onHome: () => void }) {
                 <code>{replay?.savedPath ?? 'No saved artifact yet'}</code>
                 {saveError ? <p>{saveError}</p> : null}
               </div>
+              <div className="reviewActions">
+                <button
+                  className="primaryAction"
+                  type="button"
+                  onClick={() => latestReviewPath ? void promoteSavedReplay(latestReviewPath) : undefined}
+                  disabled={!latestReviewPath || promotingPath === latestReviewPath}
+                >
+                  <FileCheck size={15} />
+                  <span>{promotingPath === latestReviewPath ? 'Promoting' : 'Promote Replay'}</span>
+                </button>
+              </div>
+              {promoteResult ? (
+                <div className="historySuccess">
+                  <strong>Promoted query fixture</strong>
+                  <code>{promoteResult.path}</code>
+                </div>
+              ) : null}
             </div>
           </Panel>
         </section>
@@ -264,6 +318,48 @@ export function QueryWorkspace({ onHome }: { onHome: () => void }) {
             passedLabel="query-answer-shape passed"
             running={running}
           />
+          <Panel title="Promoted Query" icon={<FileCheck size={17} />}>
+            <div className="historyPanel">
+              <button className="secondaryAction" type="button" onClick={() => void refreshPromotedFixtures()} disabled={promotedLoading}>
+                <RefreshCw size={15} />
+                <span>{promotedLoading ? 'Checking' : 'Check Promoted'}</span>
+              </button>
+              {promotedError ? <div className="errorState compact">{promotedError}</div> : null}
+              {!promotedLoading && promotedFixtures.length === 0 ? <div className="emptyState compact">No promoted query fixtures found.</div> : null}
+              <div className="historyList">
+                {promotedFixtures.map((promotedFixture) => (
+                  <article className="historyItem" key={promotedFixture.path}>
+                    <div className="historyHeader">
+                      <strong>{promotedFixture.id}</strong>
+                      <span className={promotedFixture.ok ? 'statusPill good' : 'statusPill bad'}>{promotedFixture.ok ? 'healthy' : 'failing'}</span>
+                    </div>
+                    <div className="historyMeta">
+                      <span>{promotedFixture.answerPresent ? 'answer present' : 'missing answer'}</span>
+                      <span>{promotedFixture.modelTurns} turns</span>
+                      <span>{promotedFixture.usage.totalTokens.toLocaleString()} tokens</span>
+                      <span>{promotedFixture.behaviorOk ? 'behavior pass' : 'behavior fail'}</span>
+                    </div>
+                    {promotedFixture.expectations ? (
+                      <div className="expectationBlock">
+                        <span>Expectations</span>
+                        <strong>{(promotedFixture.expectations.requiredAnswerText ?? []).join(', ') || 'none'}</strong>
+                      </div>
+                    ) : null}
+                    <code>{promotedFixture.path}</code>
+                    {promotedFixture.issues.length ? (
+                      <ul className="issueList">
+                        {promotedFixture.issues.slice(0, 3).map((issue) => (
+                          <li key={`${promotedFixture.path}-${issue.source}-${issue.path}-${issue.message}`}>
+                            {issue.source} / {issue.path}: {issue.message}
+                          </li>
+                        ))}
+                      </ul>
+                    ) : null}
+                  </article>
+                ))}
+              </div>
+            </div>
+          </Panel>
         </aside>
       </div>
     </main>

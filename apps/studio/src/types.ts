@@ -365,6 +365,13 @@ export type DiagnosticPromoteResult = {
   diagnosisPresent: boolean;
 };
 
+export type QueryPromoteResult = {
+  path: string;
+  id: string;
+  sourceArtifact: string;
+  answerPresent: boolean;
+};
+
 export type PromotedFixtureSummary = {
   path: string;
   id: string;
@@ -436,6 +443,28 @@ export type PromotedDiagnosticFixtureSummary = {
   ok: boolean;
   issues: { path: string; message: string; source: string }[];
   diagnosisPresent: boolean;
+  modelTurns: number;
+  usage: TokenUsageSummary;
+  costEstimate?: CostEstimate;
+};
+
+export type PromotedQueryFixtureSummary = {
+  path: string;
+  id: string;
+  description: string;
+  promotion?: {
+    sourceArtifact?: string;
+    sourceProvider?: { id?: string; model?: string };
+    promotedAt?: string;
+  };
+  expectations?: {
+    requiredAnswerText?: string[];
+  };
+  evalOk: boolean;
+  behaviorOk: boolean;
+  ok: boolean;
+  issues: { path: string; message: string; source: string }[];
+  answerPresent: boolean;
   modelTurns: number;
   usage: TokenUsageSummary;
   costEstimate?: CostEstimate;

@@ -1,0 +1,138 @@
+{
+  "id": "revenue-by-state-query-fixture-promoted",
+  "description": "Promoted deterministic query fixture from fixture replay artifact. Source fixture: revenue-by-state-query. Replay created at: 2026-06-18T19:29:11.225Z.",
+  "question": "What was revenue by state in the last 30 days?",
+  "intent": "monitoring",
+  "workspace": {
+    "projectId": "olist",
+    "projectName": "Olist Brazilian ecommerce fixture",
+    "events": [
+      {
+        "name": "purchase",
+        "properties": [
+          "state",
+          "category",
+          "total_price"
+        ],
+        "eventCount": 50000
+      },
+      {
+        "name": "session_start",
+        "properties": [
+          "utm_source"
+        ],
+        "eventCount": 80000
+      },
+      {
+        "name": "checkout",
+        "properties": [
+          "state"
+        ],
+        "eventCount": 35000
+      },
+      {
+        "name": "view_item",
+        "properties": [
+          "category"
+        ],
+        "eventCount": 120000
+      }
+    ],
+    "customerProperties": [
+      "state",
+      "city"
+    ],
+    "catalogs": [],
+    "totalCustomers": 125000,
+    "totalEvents": 285000,
+    "oldestTimestamp": 1764547200000,
+    "dataHorizon": {
+      "from": "2025-12-01",
+      "to": "2026-06-01",
+      "durationDays": 182
+    }
+  },
+  "tools": [
+    {
+      "name": "get_metric_timeseries",
+      "description": "Return metric timeseries for an optional dimension.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "metric": {
+            "type": "string"
+          },
+          "dimension": {
+            "type": "string"
+          },
+          "time_range": {
+            "type": "object"
+          },
+          "granularity": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "metric",
+          "time_range"
+        ]
+      },
+      "result": {
+        "points": [
+          {
+            "ts": "2026-05-04",
+            "segment": "SP",
+            "value": 28550000
+          },
+          {
+            "ts": "2026-05-04",
+            "segment": "RJ",
+            "value": 12100000
+          },
+          {
+            "ts": "2026-05-04",
+            "segment": "MG",
+            "value": 9800000
+          }
+        ],
+        "totalCount": 4200,
+        "unit": "brl_cents"
+      }
+    }
+  ],
+  "modelResponses": [
+    {
+      "content": [
+        {
+          "type": "text",
+          "text": "For the last 30 days in the populated fixture window, SP had the most revenue at BRL 285,500, followed by RJ at BRL 121,000 and MG at BRL 98,000. The ranking is SP, RJ, then MG, based on the get_metric_timeseries result for revenue by state from 2026-05-04 to 2026-06-01."
+        }
+      ],
+      "usage": {
+        "inputTokens": 1680,
+        "outputTokens": 165,
+        "estimated": true
+      },
+      "model": "promoted-fixture-replay"
+    }
+  ],
+  "expectations": {
+    "requiredAnswerText": [
+      "BRL 121,000",
+      "BRL 285,500",
+      "BRL 98,000",
+      "MG",
+      "RJ",
+      "SP"
+    ]
+  },
+  "promotion": {
+    "sourceArtifact": "artifacts/replays/2026-06-18T19-29-11-225Z-revenue-by-state-query-fixture-studio.json",
+    "sourceProvider": {
+      "id": "fixture",
+      "model": "fixture-model"
+    },
+    "promotedAt": "2026-06-18T19:37:13.692Z",
+    "note": "This fixture captures the final query replay answer deterministically; it does not reconstruct the live provider tool loop."
+  }
+}

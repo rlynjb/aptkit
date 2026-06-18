@@ -1,4 +1,4 @@
-import type { DiagnosticFixture, DiagnosticPromoteResult, DiagnosticReplayArtifact, DiagnosticReplayMode, DiagnosticReplayResult, MonitoringFixture, MonitoringPromoteResult, MonitoringReplayResult, MonitoringReplayMode, MonitoringReplayArtifact, PromoteResult, PromotedDiagnosticFixtureSummary, PromotedFixtureSummary, PromotedMonitoringFixtureSummary, QueryFixture, QueryReplayArtifact, QueryReplayMode, QueryReplayResult, RecommendationFixture, ReplayArtifact, ReplayMode, ReplayResult, SavedDiagnosticReplaySummary, SavedMonitoringReplaySummary, SavedQueryReplaySummary, SavedReplaySummary } from './types';
+import type { DiagnosticFixture, DiagnosticPromoteResult, DiagnosticReplayArtifact, DiagnosticReplayMode, DiagnosticReplayResult, MonitoringFixture, MonitoringPromoteResult, MonitoringReplayResult, MonitoringReplayMode, MonitoringReplayArtifact, PromoteResult, PromotedDiagnosticFixtureSummary, PromotedFixtureSummary, PromotedMonitoringFixtureSummary, PromotedQueryFixtureSummary, QueryFixture, QueryPromoteResult, QueryReplayArtifact, QueryReplayMode, QueryReplayResult, RecommendationFixture, ReplayArtifact, ReplayMode, ReplayResult, SavedDiagnosticReplaySummary, SavedMonitoringReplaySummary, SavedQueryReplaySummary, SavedReplaySummary } from './types';
 
 export async function runServerQueryReplay(
   fixture: QueryFixture,
@@ -181,6 +181,19 @@ export async function promoteDiagnosticReplay(path: string): Promise<DiagnosticP
   return payload;
 }
 
+export async function promoteQueryReplay(path: string): Promise<QueryPromoteResult> {
+  const response = await fetch('/api/query/replays/promote', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ path }),
+  });
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(payload?.error ?? 'promote query replay failed');
+  }
+  return payload;
+}
+
 export async function loadPromotedFixtures(): Promise<PromotedFixtureSummary[]> {
   const response = await fetch('/api/promoted-fixtures');
   const payload = await response.json();
@@ -204,6 +217,15 @@ export async function loadPromotedDiagnosticFixtures(): Promise<PromotedDiagnost
   const payload = await response.json();
   if (!response.ok) {
     throw new Error(payload?.error ?? 'load promoted diagnostic fixtures failed');
+  }
+  return payload.fixtures;
+}
+
+export async function loadPromotedQueryFixtures(): Promise<PromotedQueryFixtureSummary[]> {
+  const response = await fetch('/api/promoted-query-fixtures');
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(payload?.error ?? 'load promoted query fixtures failed');
   }
   return payload.fixtures;
 }
