@@ -9,7 +9,7 @@ import { AnthropicModelProvider } from '@aptkit/provider-anthropic';
 import { OpenAIModelProvider } from '@aptkit/provider-openai';
 import { InMemoryToolRegistry, type ToolDefinition, type ToolHandler } from '@aptkit/tools';
 import type { CapabilityEvent, ModelProvider, ModelResponse } from '@aptkit/runtime';
-import type { Anomaly, Diagnosis, WorkspaceDescriptor } from '@aptkit/agent-recommendation';
+import type { Anomaly, Diagnosis, Recommendation, WorkspaceDescriptor } from '@aptkit/agent-recommendation';
 import electronicsSpikeFixture from '../../packages/agents/recommendation/fixtures/electronics-spike.json';
 import spRevenueDropFixture from '../../packages/agents/recommendation/fixtures/sp-revenue-drop.json';
 import voucherDropoffFixture from '../../packages/agents/recommendation/fixtures/voucher-dropoff.json';
@@ -26,6 +26,17 @@ type RecommendationFixture = {
   diagnosis: Diagnosis;
   tools: FixtureTool[];
   modelResponses: ModelResponse[];
+  expectations?: BehavioralExpectations;
+  promotion?: {
+    sourceArtifact?: string;
+    sourceProvider?: { id?: string; model?: string };
+    promotedAt?: string;
+  };
+};
+
+type BehavioralExpectations = {
+  requiredFeatures?: string[];
+  requiredText?: string[];
 };
 
 const fixtures = [
@@ -57,6 +68,21 @@ export default defineConfig(({ mode }) => {
                 },
               },
             });
+          });
+
+          server.middlewares.use('/api/promoted-fixtures', async (req, res) => {
+            if (req.method !== 'GET') {
+              res.statusCode = 405;
+              sendJson(res, { error: 'method not allowed' });
+              return;
+            }
+
+            try {
+              sendJson(res, { fixtures: await listPromotedFixtureSummaries() });
+            } catch (error) {
+              res.statusCode = 400;
+              sendJson(res, { error: error instanceof Error ? error.message : String(error) });
+            }
           });
 
           server.middlewares.use('/api/replays/promote', async (req, res) => {
@@ -272,6 +298,93 @@ async function listReplaySummaries() {
   }
 
   return summaries.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+}
+
+async function listPromotedFixtureSummaries() {
+  const dir = resolve(workspaceRoot(), 'packages/agents/recommendation/fixtures/promoted');
+  let entries;
+  try {
+    entries = await readdir(dir, { withFileTypes: true });
+  } catch (error) {
+    if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') return [];
+    throw error;
+  }
+
+  const summaries = [];
+  for (const entry of entries) {
+    if (!entry.isFile() || extname(entry.name) !== '.json') continue;
+    const path = join(dir, entry.name);
+    const fixture = JSON.parse(await readFile(path, 'utf8')) as RecommendationFixture;
+    const replay = await runReplay(fixture, 'fixture');
+    const behavior = assertBehavioralExpectations(replay.recommendations, fixture.expectations);
+    summaries.push({
+      path: relativeFromWorkspace(path),
+      id: fixture.id,
+      description: fixture.description,
+      promotion: fixture.promotion,
+      expectations: fixture.expectations,
+      evalOk: replay.eval.ok,
+      behaviorOk: behavior.ok,
+      ok: replay.eval.ok && behavior.ok,
+      issues: [
+        ...replay.eval.issues.map((issue) => ({ ...issue, source: replay.eval.name })),
+        ...behavior.issues.map((issue) => ({ ...issue, source: behavior.name })),
+      ],
+      recommendationCount: replay.recommendations.length,
+      modelTurns: replay.modelTurns,
+      usage: summarizeTraceUsage(replay.trace),
+    });
+  }
+
+  return summaries.sort((left, right) => left.id.localeCompare(right.id) || left.path.localeCompare(right.path));
+}
+
+function assertBehavioralExpectations(
+  recommendations: Recommendation[],
+  expectations: BehavioralExpectations | undefined,
+) {
+  const issues: { path: string; message: string }[] = [];
+  if (!expectations) return { name: 'recommendation-behavior', ok: true, issues };
+
+  for (const feature of expectations.requiredFeatures ?? []) {
+    if (!recommendations.some((recommendation) => recommendation.bloomreachFeature === feature)) {
+      issues.push({
+        path: 'expectations.requiredFeatures',
+        message: `expected at least one recommendation with bloomreachFeature=${feature}`,
+      });
+    }
+  }
+
+  const haystack = recommendations.map(recommendationSearchText).join('\n').toLowerCase();
+  for (const text of expectations.requiredText ?? []) {
+    if (!haystack.includes(text.toLowerCase())) {
+      issues.push({
+        path: 'expectations.requiredText',
+        message: `expected recommendation text to include "${text}"`,
+      });
+    }
+  }
+
+  return { name: 'recommendation-behavior', ok: issues.length === 0, issues };
+}
+
+function recommendationSearchText(recommendation: Recommendation): string {
+  return [
+    recommendation.title,
+    recommendation.rationale,
+    recommendation.bloomreachFeature,
+    ...recommendation.steps,
+    typeof recommendation.estimatedImpact === 'string'
+      ? recommendation.estimatedImpact
+      : [
+          recommendation.estimatedImpact.range,
+          recommendation.estimatedImpact.assumption,
+        ].join(' '),
+    recommendation.successMetric,
+    ...(recommendation.prerequisites ?? []).map((prerequisite) => prerequisite.label),
+  ]
+    .filter((value): value is string => typeof value === 'string')
+    .join(' ');
 }
 
 async function promoteReplayArtifact(artifactPath: string) {

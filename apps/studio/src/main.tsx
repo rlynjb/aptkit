@@ -1,6 +1,6 @@
 import React from 'react';
 import { createRoot } from 'react-dom/client';
-import { Activity, BadgeCheck, Boxes, BrainCircuit, Check, ChevronDown, CircleDollarSign, Clipboard, Cloud, Gauge, History, KeyRound, Play, RefreshCw, Route, Save, ShieldCheck, Timer } from 'lucide-react';
+import { Activity, BadgeCheck, Boxes, BrainCircuit, Check, ChevronDown, CircleDollarSign, Clipboard, Cloud, FileCheck, Gauge, History, KeyRound, Play, RefreshCw, Route, Save, ShieldCheck, Timer } from 'lucide-react';
 import { RecommendationAgent, FixtureModelProvider, type Anomaly, type Diagnosis, type Recommendation, type WorkspaceDescriptor } from '@aptkit/agent-recommendation';
 import { assertRecommendationShape } from '@aptkit/evals';
 import type { CapabilityEvent, ModelResponse } from '@aptkit/runtime';
@@ -86,6 +86,32 @@ type PromoteResult = {
   id: string;
   sourceArtifact: string;
   recommendationCount: number;
+};
+
+type PromotedFixtureSummary = {
+  path: string;
+  id: string;
+  description: string;
+  promotion?: {
+    sourceArtifact?: string;
+    sourceProvider?: { id?: string; model?: string };
+    promotedAt?: string;
+  };
+  expectations?: {
+    requiredFeatures?: string[];
+    requiredText?: string[];
+  };
+  evalOk: boolean;
+  behaviorOk: boolean;
+  ok: boolean;
+  issues: { path: string; message: string; source: string }[];
+  recommendationCount: number;
+  modelTurns: number;
+  usage: {
+    inputTokens: number;
+    outputTokens: number;
+    totalTokens: number;
+  };
 };
 
 const fixtures = [
@@ -187,6 +213,15 @@ async function promoteReplay(path: string): Promise<PromoteResult> {
   return payload;
 }
 
+async function loadPromotedFixtures(): Promise<PromotedFixtureSummary[]> {
+  const response = await fetch('/api/promoted-fixtures');
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(payload?.error ?? 'load promoted fixtures failed');
+  }
+  return payload.fixtures;
+}
+
 function App() {
   const [selectedFixtureId, setSelectedFixtureId] = React.useState(fixtures[0].id);
   const [mode, setMode] = React.useState<ReplayMode>('fixture');
@@ -206,6 +241,9 @@ function App() {
   const [historyError, setHistoryError] = React.useState<string | null>(null);
   const [promotingPath, setPromotingPath] = React.useState<string | null>(null);
   const [promoteResult, setPromoteResult] = React.useState<PromoteResult | null>(null);
+  const [promotedFixtures, setPromotedFixtures] = React.useState<PromotedFixtureSummary[]>([]);
+  const [promotedLoading, setPromotedLoading] = React.useState(false);
+  const [promotedError, setPromotedError] = React.useState<string | null>(null);
   const runCounter = React.useRef(0);
   const selectedFixtureRef = React.useRef(fixtures[0]);
   const fixture = fixtures.find((candidate) => candidate.id === selectedFixtureId) ?? fixtures[0];
@@ -269,6 +307,22 @@ function App() {
     void refreshReplayHistory();
   }, [refreshReplayHistory]);
 
+  const refreshPromotedFixtures = React.useCallback(async () => {
+    setPromotedLoading(true);
+    setPromotedError(null);
+    try {
+      setPromotedFixtures(await loadPromotedFixtures());
+    } catch (caught) {
+      setPromotedError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setPromotedLoading(false);
+    }
+  }, []);
+
+  React.useEffect(() => {
+    void refreshPromotedFixtures();
+  }, [refreshPromotedFixtures]);
+
   function selectFixture(event: React.ChangeEvent<HTMLSelectElement>) {
     setSelectedFixtureId(event.target.value);
     setReplay(null);
@@ -306,6 +360,7 @@ function App() {
     try {
       const result = await promoteReplay(path);
       setPromoteResult(result);
+      await refreshPromotedFixtures();
     } catch (caught) {
       setHistoryError(caught instanceof Error ? caught.message : String(caught));
     } finally {
@@ -478,6 +533,13 @@ function App() {
             promoteResult={promoteResult}
             onRefresh={() => void refreshReplayHistory()}
             onPromote={(path) => void promoteSavedReplay(path)}
+          />
+
+          <PromotedFixturesPanel
+            fixtures={promotedFixtures}
+            loading={promotedLoading}
+            error={promotedError}
+            onRefresh={() => void refreshPromotedFixtures()}
           />
 
           <Panel title="Trace" icon={<BrainCircuit size={17} />}>
@@ -718,6 +780,72 @@ function ReplayHistoryPanel({
                 <Save size={15} />
                 <span>{promotingPath === replay.path ? 'Promoting' : 'Promote'}</span>
               </button>
+            </article>
+          ))}
+        </div>
+      </div>
+    </Panel>
+  );
+}
+
+function PromotedFixturesPanel({
+  fixtures,
+  loading,
+  error,
+  onRefresh,
+}: {
+  fixtures: PromotedFixtureSummary[];
+  loading: boolean;
+  error: string | null;
+  onRefresh: () => void;
+}) {
+  return (
+    <Panel title="Promoted Fixtures" icon={<FileCheck size={17} />}>
+      <div className="historyPanel">
+        <button className="secondaryAction" type="button" onClick={onRefresh} disabled={loading}>
+          <RefreshCw size={15} />
+          <span>{loading ? 'Checking' : 'Check Promoted'}</span>
+        </button>
+        {error ? <div className="errorState compact">{error}</div> : null}
+        {!loading && fixtures.length === 0 ? <div className="emptyState compact">No promoted fixtures found.</div> : null}
+        <div className="historyList">
+          {fixtures.map((fixture) => (
+            <article className="historyItem" key={fixture.path}>
+              <div className="historyHeader">
+                <strong>{fixture.id}</strong>
+                <span className={fixture.ok ? 'statusPill good' : 'statusPill bad'}>{fixture.ok ? 'healthy' : 'failing'}</span>
+              </div>
+              <div className="historyMeta">
+                <span>{fixture.recommendationCount} recs</span>
+                <span>{fixture.modelTurns} turns</span>
+                <span>{fixture.usage.totalTokens.toLocaleString()} tokens</span>
+                <span>{fixture.behaviorOk ? 'behavior pass' : 'behavior fail'}</span>
+              </div>
+              {fixture.promotion?.sourceProvider?.id ? (
+                <div className="expectationBlock">
+                  <span>Source</span>
+                  <strong>{fixture.promotion.sourceProvider.id} / {fixture.promotion.sourceProvider.model ?? 'unknown'}</strong>
+                </div>
+              ) : null}
+              {fixture.expectations ? (
+                <div className="expectationBlock">
+                  <span>Expectations</span>
+                  <strong>{[
+                    ...(fixture.expectations.requiredFeatures ?? []).map((feature) => `feature:${feature}`),
+                    ...(fixture.expectations.requiredText ?? []).map((text) => `text:${text}`),
+                  ].join(', ') || 'none'}</strong>
+                </div>
+              ) : null}
+              <code>{fixture.path}</code>
+              {fixture.issues.length ? (
+                <ul className="issueList">
+                  {fixture.issues.slice(0, 3).map((issue) => (
+                    <li key={`${fixture.path}-${issue.source}-${issue.path}-${issue.message}`}>
+                      {issue.source} / {issue.path}: {issue.message}
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
             </article>
           ))}
         </div>

@@ -488,6 +488,30 @@ h1 {
   font-weight: 700;
 }
 
+.expectationBlock {
+  display: grid;
+  gap: 3px;
+  padding: 8px;
+  border: 1px solid #e2e7e0;
+  border-radius: 6px;
+  background: #ffffff;
+}
+
+.expectationBlock span {
+  color: #66766c;
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.expectationBlock strong {
+  color: #24362e;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
 .commandList {
   display: grid;
   gap: 8px;
