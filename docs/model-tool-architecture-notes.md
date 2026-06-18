@@ -132,6 +132,36 @@ npm run eval:replays
 
 This does not re-run a model. It validates saved artifact JSON files under `artifacts/replays/` so useful live-model runs can be checked consistently before they are promoted into deterministic fixtures or stronger behavioral evals.
 
+A useful replay can be promoted into a deterministic fixture with:
+
+```bash
+npm run promote:replay -- artifacts/replays/<replay>.json
+```
+
+Promotion is a review step. It copies the source fixture inputs and replaces the model response with the replay's final recommendation output, with recommendation ids stripped so the normal fixture run can assign deterministic ids again. This captures the final answer for regression testing, but it does not reconstruct the exact live provider tool loop.
+
+Promoted recommendation fixtures are part of the deterministic package test loop:
+
+```bash
+npm run replay:promoted -w @aptkit/agent-recommendation
+npm test -w @aptkit/agent-recommendation
+```
+
+This means a reviewed live-model output can become a stable regression check without requiring OpenAI or any other live provider during normal tests.
+
+Promoted fixtures can also carry simple behavioral expectations:
+
+```json
+{
+  "expectations": {
+    "requiredFeatures": ["voucher"],
+    "requiredText": ["lapsed voucher users", "experiment"]
+  }
+}
+```
+
+These checks are intentionally small and fixture-specific. They catch cases where the response is structurally valid but no longer addresses the business behavior the fixture is meant to preserve.
+
 ## Why This Matters
 
 This architecture keeps each failure mode isolated:

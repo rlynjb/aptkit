@@ -1,6 +1,6 @@
 import React from 'react';
 import { createRoot } from 'react-dom/client';
-import { Activity, BadgeCheck, Boxes, BrainCircuit, ChevronDown, CircleDollarSign, Cloud, Gauge, KeyRound, Play, Route, ShieldCheck, Wrench } from 'lucide-react';
+import { Activity, BadgeCheck, Boxes, BrainCircuit, Check, ChevronDown, CircleDollarSign, Clipboard, Cloud, Gauge, KeyRound, Play, Route, ShieldCheck, Wrench } from 'lucide-react';
 import { RecommendationAgent, FixtureModelProvider, type Anomaly, type Diagnosis, type Recommendation, type WorkspaceDescriptor } from '@aptkit/agent-recommendation';
 import { assertRecommendationShape } from '@aptkit/evals';
 import type { CapabilityEvent, ModelResponse } from '@aptkit/runtime';
@@ -316,6 +316,8 @@ function App() {
         </section>
 
         <aside className="rightPane">
+          <WorkflowPanel fixtureId={fixture.id} mode={mode} />
+
           <Panel title="Trace" icon={<BrainCircuit size={17} />}>
             {running ? <div className="emptyState compact">Collecting trace events...</div> : null}
             <div className="traceList">
@@ -338,6 +340,73 @@ function App() {
         </aside>
       </div>
     </main>
+  );
+}
+
+function WorkflowPanel({ fixtureId, mode }: { fixtureId: string; mode: ReplayMode }) {
+  const [copied, setCopied] = React.useState<string | null>(null);
+  const commands = [
+    {
+      id: 'live',
+      label: 'Live replay',
+      command: `npm run replay:model -- --provider openai --fixture ${fixtureId}`,
+    },
+    {
+      id: 'eval',
+      label: 'Evaluate replays',
+      command: 'npm run eval:replays',
+    },
+    {
+      id: 'promote',
+      label: 'Promote reviewed replay',
+      command: 'npm run promote:replay -- artifacts/replays/<replay>.json',
+    },
+    {
+      id: 'regression',
+      label: 'Regression replay',
+      command: 'npm run replay:promoted -w @aptkit/agent-recommendation',
+    },
+  ];
+
+  async function copyCommand(id: string, command: string) {
+    await navigator.clipboard.writeText(command);
+    setCopied(id);
+    window.setTimeout(() => setCopied((current) => (current === id ? null : current)), 1300);
+  }
+
+  return (
+    <Panel title="Workflow" icon={<Route size={17} />}>
+      <div className="workflow">
+        <div className="layerCallout">
+          <strong>{mode === 'fixture' ? 'Fake model + fake tools' : 'Real model + fake tools'}</strong>
+          <span>{mode === 'fixture' ? 'Deterministic UI and regression replay.' : 'Live provider reasoning over controlled fixture data.'}</span>
+        </div>
+        <ol className="workflowSteps">
+          <li>Run fixture</li>
+          <li>Run OpenAI</li>
+          <li>Save replay artifact</li>
+          <li>Evaluate replay</li>
+          <li>Promote reviewed replay</li>
+          <li>Regression test promoted fixture</li>
+        </ol>
+        <div className="commandList">
+          {commands.map((item) => (
+            <div className="commandRow" key={item.id}>
+              <span>{item.label}</span>
+              <code>{item.command}</code>
+              <button
+                aria-label={`Copy ${item.label} command`}
+                title={`Copy ${item.label} command`}
+                type="button"
+                onClick={() => void copyCommand(item.id, item.command)}
+              >
+                {copied === item.id ? <Check size={15} /> : <Clipboard size={15} />}
+              </button>
+            </div>
+          ))}
+        </div>
+      </div>
+    </Panel>
   );
 }
 

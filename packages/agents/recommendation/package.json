@@ -12,8 +12,9 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "npm run build && node --test dist/test/*.test.js",
-    "replay:fixture": "npm run build && node dist/scripts/replay-fixture.js"
+    "test": "npm run build && node --test dist/test/*.test.js && node dist/scripts/replay-promoted-fixtures.js",
+    "replay:fixture": "npm run build && node dist/scripts/replay-fixture.js",
+    "replay:promoted": "npm run build && node dist/scripts/replay-promoted-fixtures.js"
   },
   "dependencies": {
     "@aptkit/evals": "0.0.0",

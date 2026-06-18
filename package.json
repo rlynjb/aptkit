@@ -14,6 +14,8 @@
     "dev:studio": "npm run dev -w @aptkit/studio",
     "preeval:replays": "npm run build -w @aptkit/evals",
     "eval:replays": "node scripts/eval-replay-artifacts.mjs",
+    "prepromote:replay": "npm run build -w @aptkit/evals",
+    "promote:replay": "node scripts/promote-replay-to-fixture.mjs",
     "prereplay:model": "npm run build --workspaces --if-present",
     "replay:model": "node scripts/replay-model-recommendation.mjs",
     "prereplay:openai": "npm run build --workspaces --if-present",

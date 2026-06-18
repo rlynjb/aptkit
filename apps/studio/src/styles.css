@@ -298,6 +298,89 @@ h1 {
   margin-top: 8px;
 }
 
+.workflow {
+  display: grid;
+  gap: 12px;
+}
+
+.layerCallout {
+  display: grid;
+  gap: 4px;
+  padding: 10px;
+  border: 1px solid #d8e7dd;
+  border-radius: 6px;
+  background: #f2faf5;
+}
+
+.layerCallout strong {
+  color: #184a35;
+  font-size: 13px;
+}
+
+.layerCallout span {
+  color: #54645a;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.workflowSteps {
+  margin: 0;
+  padding-left: 20px;
+  color: #344239;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.workflowSteps li + li {
+  margin-top: 5px;
+}
+
+.commandList {
+  display: grid;
+  gap: 8px;
+}
+
+.commandRow {
+  display: grid;
+  grid-template-columns: 1fr 34px;
+  gap: 6px 8px;
+  align-items: center;
+  padding: 10px;
+  border: 1px solid #e2e7e0;
+  border-radius: 6px;
+  background: #fafbf9;
+}
+
+.commandRow > span {
+  grid-column: 1 / -1;
+  color: #66766c;
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.commandRow code {
+  min-width: 0;
+  color: #24362e;
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.commandRow button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border: 1px solid #cfd8d1;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #31453b;
+  cursor: pointer;
+}
+
 .recommendations {
   display: grid;
   gap: 12px;

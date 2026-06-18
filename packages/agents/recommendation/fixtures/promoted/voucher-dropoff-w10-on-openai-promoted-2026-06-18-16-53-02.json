@@ -1,0 +1,166 @@
+{
+  "id": "voucher-dropoff-w10-on-openai-promoted",
+  "description": "Promoted deterministic fixture from openai replay artifact. Source fixture: voucher-dropoff-w10-on. Replay created at: 2026-06-18T16:53:02.698Z.",
+  "workspace": {
+    "projectId": "olist",
+    "projectName": "Olist Brazilian ecommerce fixture",
+    "events": [
+      {
+        "name": "order",
+        "properties": [
+          "state",
+          "category",
+          "purchase_ts",
+          "price_brl"
+        ],
+        "eventCount": 0
+      },
+      {
+        "name": "payment",
+        "properties": [
+          "type",
+          "installments",
+          "value_brl"
+        ],
+        "eventCount": 0
+      }
+    ],
+    "customerProperties": [
+      "state",
+      "city"
+    ],
+    "catalogs": [],
+    "totalCustomers": 0,
+    "totalEvents": 0,
+    "oldestTimestamp": null,
+    "dataHorizon": {
+      "from": "2025-12-01",
+      "to": "2026-06-01",
+      "durationDays": 182
+    }
+  },
+  "anomaly": {
+    "metric": "payment_value",
+    "scope": [
+      "payment_type:voucher"
+    ],
+    "change": {
+      "value": 95,
+      "direction": "down",
+      "baseline": "weeks 10-26 vs weeks 1-9 baseline"
+    },
+    "severity": "critical",
+    "evidence": [],
+    "impact": "Voucher payment value collapsed to about 5% of baseline and stayed depressed."
+  },
+  "diagnosis": {
+    "conclusion": "Voucher payment volume collapsed to roughly 5% of baseline starting week 10 and remained depressed through the end of the data horizon. Credit card and boleto did not absorb the lost volume, and order count fell, so this is likely a program-level voucher change rather than clean substitution.",
+    "evidence": [
+      "get_anomaly_context(metric=payment_value, dimension=payment_type, segment=voucher) returned pct_change=-0.95 for weeks 10-26.",
+      "Credit_card and boleto did not rise enough to absorb the lost voucher volume.",
+      "Total order_count was about 8% below baseline after the voucher cliff.",
+      "The drop was uniform across SP, RJ, and MG."
+    ],
+    "hypothesesConsidered": [
+      {
+        "hypothesis": "Voucher volume substituted to credit card or boleto",
+        "supported": false,
+        "reasoning": "Other payment types did not rise and total order count fell."
+      },
+      {
+        "hypothesis": "Program-level voucher change",
+        "supported": true,
+        "reasoning": "The cliff-shaped onset and sustained cross-state impact fit suspension, expiry, or restriction."
+      }
+    ],
+    "affectedCustomers": {
+      "count": 12500,
+      "segmentDescription": "Customers who previously used voucher payment in weeks 1-9"
+    },
+    "confidence": "medium"
+  },
+  "tools": [
+    {
+      "name": "list_voucher_pools",
+      "description": "List voucher pools",
+      "inputSchema": {
+        "type": "object"
+      },
+      "result": {
+        "data": []
+      }
+    },
+    {
+      "name": "list_email_campaigns",
+      "description": "List email campaigns",
+      "inputSchema": {
+        "type": "object"
+      },
+      "result": {
+        "data": [
+          {
+            "name": "inactive customer broadcast"
+          }
+        ]
+      }
+    },
+    {
+      "name": "get_frequency_policies",
+      "description": "List frequency policies",
+      "inputSchema": {
+        "type": "object"
+      },
+      "result": {
+        "data": [
+          {
+            "name": "one marketing message per week"
+          }
+        ]
+      }
+    }
+  ],
+  "modelResponses": [
+    {
+      "content": [
+        {
+          "type": "text",
+          "text": "```json\n[\n  {\n    \"title\": \"Reinstate or Launch New Voucher Incentive for Lapsed Voucher Users\",\n    \"rationale\": \"Since voucher usage has collapsed and was not replaced by other payment types, reinstating a voucher offer can help recover lost order volume from affected customers who previously relied on vouchers. The order count decline suggests many of these users have likely lapsed, representing material lost revenue.\",\n    \"bloomreachFeature\": \"voucher\",\n    \"steps\": [\n      \"Create a new voucher pool or campaign targeting customers who used vouchers in weeks 1-9 but stopped purchasing after week 10.\",\n      \"Design the voucher to be attractive enough to re-engage this audience (e.g., similar or better than previous offers, possibly with a limited-time urgency).\",\n      \"Communicate the voucher via email or SMS to maximize reach and conversion.\"\n    ],\n    \"estimatedImpact\": {\n      \"range\": \"Moderate to High (USD 10,000 - 40,000 regained revenue)\",\n      \"rangeUsd\": {\n        \"low\": 10000,\n        \"high\": 40000\n      },\n      \"assumption\": \"Assumes recapturing 20 - 50% of the estimated $45,000+ in lost voucher-order GMV (baseline $1,500/week x 16 weeks x 12500 customers)\"\n    },\n    \"confidence\": \"high\",\n    \"effort\": \"medium\",\n    \"timeToSetUpMinutes\": 60,\n    \"readResultInDays\": 14,\n    \"prerequisites\": [\n      {\n        \"label\": \"Voucher engine configured\",\n        \"satisfied\": true\n      },\n      {\n        \"label\": \"Segment of lapsed voucher users available\",\n        \"satisfied\": true\n      }\n    ],\n    \"successMetric\": \"Number of recovered orders from targeted lapsed voucher users; baseline: 0/wk, target: +150/wk\"\n  },\n  {\n    \"title\": \"Segment Analysis: Identify and Profile Lapsed Voucher Customers\",\n    \"rationale\": \"A well-defined segment of customers who stopped ordering when voucher incentives ended is critical for targeted recovery and ongoing program design. Understanding their value and response patterns informs further interventions.\",\n    \"bloomreachFeature\": \"segment\",\n    \"steps\": [\n      \"Define a segment encompassing all customers who used voucher payments in weeks 1-9 but placed zero orders in weeks 10-26.\",\n      \"Analyze this segment for order value, category mix, and location to prioritize outreach.\",\n      \"Feed this segment into marketing or win-back initiatives.\"\n    ],\n    \"estimatedImpact\": \"Medium; enables more effective targeting for campaigns and reduces wasted marketing spend.\",\n    \"confidence\": \"high\",\n    \"effort\": \"low\",\n    \"timeToSetUpMinutes\": 30,\n    \"readResultInDays\": 3,\n    \"prerequisites\": [\n      {\n        \"label\": \"Customer order-by-payment-type data available\",\n        \"satisfied\": true\n      }\n    ],\n    \"successMetric\": \"Segment accuracy and percentage overlap with lost voucher revenue group; baseline: n/a, target: >85%\"\n  },\n  {\n    \"title\": \"A/B Test: Voucher Value or Friction Experiment\",\n    \"rationale\": \"Run an experiment restoring voucher value or relaxing criteria (e.g., minimum spend, eligible SKUs) for a sample of lapsed users to validate whether incentive structure - not external factors - caused the drop.\",\n    \"bloomreachFeature\": \"experiment\",\n    \"steps\": [\n      \"Randomly assign lapsed voucher users to test and control groups.\",\n      \"Offer the test group an updated voucher similar to the previous baseline program.\",\n      \"Monitor recovery of orders and compare to control to assess direct causality and incremental lift.\"\n    ],\n    \"estimatedImpact\": \"Medium to high if program-level changes caused the drop; validates full-scale reinstatement potential.\",\n    \"confidence\": \"medium\",\n    \"effort\": \"medium\",\n    \"timeToSetUpMinutes\": 90,\n    \"readResultInDays\": 21,\n    \"prerequisites\": [\n      {\n        \"label\": \"Ability to randomize voucher distribution\",\n        \"satisfied\": true\n      },\n      {\n        \"label\": \"Segment of lapsed voucher users identified\",\n        \"satisfied\": false\n      }\n    ],\n    \"successMetric\": \"Test group uplift over control in new orders; baseline: 0, target: +10% or more\"\n  }\n]\n```"
+        }
+      ],
+      "usage": {
+        "inputTokens": 1052,
+        "outputTokens": 915,
+        "estimated": true
+      },
+      "model": "promoted-openai-replay"
+    }
+  ],
+  "eval": {
+    "requiredFields": [
+      "0.title",
+      "0.rationale",
+      "0.bloomreachFeature",
+      "0.steps",
+      "0.estimatedImpact",
+      "0.confidence"
+    ]
+  },
+  "expectations": {
+    "requiredFeatures": [
+      "voucher"
+    ],
+    "requiredText": [
+      "lapsed voucher users",
+      "experiment"
+    ]
+  },
+  "promotion": {
+    "sourceArtifact": "artifacts/replays/2026-06-18T16-53-02-698Z-voucher-dropoff-w10-on-openai.json",
+    "sourceProvider": {
+      "id": "openai",
+      "model": "gpt-4.1"
+    },
+    "promotedAt": "2026-06-18T17:01:37.868Z",
+    "note": "This fixture captures the final replay answer deterministically; it does not reconstruct the live provider tool loop."
+  }
+}
