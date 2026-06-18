@@ -17,6 +17,7 @@
     "replay:promoted": "npm run build && node ../../../scripts/replay-promoted-fixtures.mjs --count anomalyCount --empty \"no promoted monitoring fixtures found\""
   },
   "dependencies": {
+    "@aptkit/prompts": "0.0.0",
     "@aptkit/runtime": "0.0.0",
     "@aptkit/tools": "0.0.0"
   },

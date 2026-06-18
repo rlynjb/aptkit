@@ -1,6 +1,6 @@
+import { diagnosticPromptPackage, renderPromptTemplate } from '@aptkit/prompts';
 import { buildSynthesisInstruction, runAgentLoop, type CapabilityTraceSink, type ModelProvider, type ToolCallRecord } from '@aptkit/runtime';
 import { filterToolsForPolicy, type ToolRegistry } from '@aptkit/tools';
-import { DIAGNOSTIC_PROMPT } from './diagnostic-prompt.js';
 import { schemaSummary } from './schema-summary.js';
 import type { Anomaly, Diagnosis, WorkspaceDescriptor } from './types.js';
 import { tryParseDiagnosis } from './validate.js';
@@ -47,16 +47,17 @@ export class DiagnosticInvestigationAgent {
   private readonly prompt: string;
 
   constructor(private readonly options: DiagnosticAgentOptions) {
-    this.prompt = options.prompt ?? DIAGNOSTIC_PROMPT;
+    this.prompt = options.prompt ?? diagnosticPromptPackage.system;
   }
 
   async investigate(anomaly: Anomaly, runOptions: DiagnosticRunOptions = {}): Promise<Diagnosis> {
     const allTools = await this.options.tools.listTools();
     const toolSchemas = filterToolsForPolicy(allTools, diagnosticInvestigationToolPolicy);
-    const system = this.prompt
-      .replace('{schema}', schemaSummary(this.options.workspace))
-      .replace(/\{project_id\}/g, this.options.workspace.projectId)
-      .replace('{anomaly}', JSON.stringify(anomaly));
+    const system = renderPromptTemplate(this.prompt, {
+      schema: schemaSummary(this.options.workspace),
+      project_id: this.options.workspace.projectId,
+      anomaly: JSON.stringify(anomaly),
+    });
 
     const { toolCalls, parsed } = await runAgentLoop<Diagnosis>({
       capabilityId: DIAGNOSTIC_INVESTIGATION_CAPABILITY_ID,

@@ -1,3 +1,5 @@
+import type { PromptPackage } from './types.js';
+
 export const MONITORING_PROMPT = `
 You are an anomaly-monitoring agent for an analytics workspace.
 
@@ -27,3 +29,32 @@ Output anomaly fields:
 - impact: one sentence explaining business meaning.
 - evidence: array of { tool, result } objects citing the data used.
 `;
+
+export const monitoringPromptPackage: PromptPackage = {
+  id: 'anomaly-monitoring-agent.default',
+  version: '0.1.0',
+  capabilityId: 'anomaly-monitoring-agent',
+  description: 'Bounded anomaly detection over runnable workspace metric categories.',
+  system: MONITORING_PROMPT,
+  variables: [
+    {
+      name: 'schema',
+      description: 'Workspace schema summary with data horizon and available fields.',
+      required: true,
+    },
+    {
+      name: 'categories',
+      description: 'Runnable anomaly category checklist formatted for the workspace.',
+      required: true,
+    },
+  ],
+  examples: [
+    {
+      name: 'payment-mix-monitoring',
+      input: {
+        categories: ['payment_mix_shift'],
+      },
+      expectedContains: ['category', 'severity'],
+    },
+  ],
+};

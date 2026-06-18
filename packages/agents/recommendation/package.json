@@ -18,6 +18,7 @@
   },
   "dependencies": {
     "@aptkit/evals": "0.0.0",
+    "@aptkit/prompts": "0.0.0",
     "@aptkit/runtime": "0.0.0",
     "@aptkit/tools": "0.0.0"
   },

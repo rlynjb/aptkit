@@ -1,3 +1,5 @@
+import type { PromptPackage } from './types.js';
+
 export const DIAGNOSTIC_PROMPT = `You are a diagnostic investigation agent for an analytics workspace.
 
 Your job is to investigate why one specific anomaly occurred. You generate 2-3 competing hypotheses, query the available tools to test them, and return the best-supported explanation with evidence. You do not propose remediation.
@@ -46,3 +48,41 @@ If you cannot determine a cause, return:
 
 Workspace schema:
 {schema}`;
+
+export const diagnosticPromptPackage: PromptPackage = {
+  id: 'diagnostic-investigation-agent.default',
+  version: '0.1.0',
+  capabilityId: 'diagnostic-investigation-agent',
+  description: 'Root-cause investigation for a supplied workspace anomaly using bounded tool calls.',
+  system: DIAGNOSTIC_PROMPT,
+  variables: [
+    {
+      name: 'schema',
+      description: 'Workspace schema summary with data horizon and available fields.',
+      required: true,
+    },
+    {
+      name: 'project_id',
+      description: 'Host workspace project id for providers that require project context.',
+      required: true,
+    },
+    {
+      name: 'anomaly',
+      description: 'JSON serialized anomaly object to investigate.',
+      required: true,
+    },
+  ],
+  examples: [
+    {
+      name: 'voucher-dropoff-diagnosis',
+      input: {
+        anomaly: {
+          metric: 'orders',
+          category: 'payment_mix_shift',
+          scope: ['payment_type:voucher'],
+        },
+      },
+      expectedContains: ['hypothesesConsidered', 'evidence'],
+    },
+  ],
+};

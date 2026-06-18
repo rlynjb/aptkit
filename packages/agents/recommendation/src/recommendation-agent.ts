@@ -1,6 +1,6 @@
+import { recommendationPromptPackage, renderPromptTemplate } from '@aptkit/prompts';
 import { buildSynthesisInstruction, runAgentLoop, type CapabilityTraceSink, type ModelProvider, type ToolCallRecord } from '@aptkit/runtime';
 import { filterToolsForPolicy, type ToolRegistry } from '@aptkit/tools';
-import { RECOMMENDATION_PROMPT } from './recommendation-prompt.js';
 import { schemaSummary } from './schema-summary.js';
 import {
   DEFAULT_ACTION_TAXONOMY,
@@ -56,7 +56,7 @@ export class RecommendationAgent {
   constructor(private readonly options: RecommendationAgentOptions) {
     this.taxonomy = options.actionTaxonomy ?? DEFAULT_ACTION_TAXONOMY;
     this.idGenerator = options.idGenerator ?? (() => crypto.randomUUID());
-    this.prompt = options.prompt ?? RECOMMENDATION_PROMPT;
+    this.prompt = options.prompt ?? recommendationPromptPackage.system;
   }
 
   async propose(
@@ -66,10 +66,11 @@ export class RecommendationAgent {
   ): Promise<Recommendation[]> {
     const allTools = await this.options.tools.listTools();
     const toolSchemas = filterToolsForPolicy(allTools, recommendationToolPolicy);
-    const system = this.prompt
-      .replace('{schema}', schemaSummary(this.options.workspace))
-      .replace(/\{project_id\}/g, this.options.workspace.projectId)
-      .replace('{diagnosis}', JSON.stringify(diagnosis));
+    const system = renderPromptTemplate(this.prompt, {
+      schema: schemaSummary(this.options.workspace),
+      project_id: this.options.workspace.projectId,
+      diagnosis: JSON.stringify(diagnosis),
+    });
 
     const { parsed } = await runAgentLoop<IdlessRecommendation[]>({
       capabilityId: RECOMMENDATION_CAPABILITY_ID,

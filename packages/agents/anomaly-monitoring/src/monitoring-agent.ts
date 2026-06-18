@@ -1,7 +1,7 @@
+import { monitoringPromptPackage, renderPromptTemplate } from '@aptkit/prompts';
 import { buildSynthesisInstruction, runAgentLoop, type CapabilityTraceSink, type ModelProvider, type ToolCallRecord } from '@aptkit/runtime';
 import { filterToolsForPolicy, type ToolRegistry } from '@aptkit/tools';
 import { ECOMMERCE_ANOMALY_CATEGORIES, runnableCategories, schemaCapabilities } from './categories.js';
-import { MONITORING_PROMPT } from './monitoring-prompt.js';
 import { schemaSummary } from './schema-summary.js';
 import type { Anomaly, AnomalyCategory, WorkspaceDescriptor } from './types.js';
 import { tryParseAnomalies } from './validate.js';
@@ -44,7 +44,7 @@ export class AnomalyMonitoringAgent {
 
   constructor(private readonly options: MonitoringAgentOptions) {
     this.categories = options.categories ?? ECOMMERCE_ANOMALY_CATEGORIES;
-    this.prompt = options.prompt ?? MONITORING_PROMPT;
+    this.prompt = options.prompt ?? monitoringPromptPackage.system;
   }
 
   runnableCategories(): AnomalyCategory[] {
@@ -55,9 +55,10 @@ export class AnomalyMonitoringAgent {
     const allTools = await this.options.tools.listTools();
     const toolSchemas = filterToolsForPolicy(allTools, anomalyMonitoringToolPolicy);
     const categories = this.runnableCategories();
-    const system = this.prompt
-      .replace('{schema}', schemaSummary(this.options.workspace))
-      .replace('{categories}', formatCategoryChecklist(categories));
+    const system = renderPromptTemplate(this.prompt, {
+      schema: schemaSummary(this.options.workspace),
+      categories: formatCategoryChecklist(categories),
+    });
 
     const { parsed } = await runAgentLoop<Anomaly[]>({
       capabilityId: ANOMALY_MONITORING_CAPABILITY_ID,

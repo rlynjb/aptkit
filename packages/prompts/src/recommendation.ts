@@ -1,3 +1,5 @@
+import type { PromptPackage } from './types.js';
+
 export const RECOMMENDATION_PROMPT = `You are a recommendation agent for an ecommerce workspace. You are read-only: you do NOT execute anything. Your recommendations are suggestions for a human to act on.
 
 ## Role
@@ -72,3 +74,40 @@ If you cannot propose grounded actions, return [].
 ## Workspace schema
 
 {schema}`;
+
+export const recommendationPromptPackage: PromptPackage = {
+  id: 'recommendation-agent.default',
+  version: '0.1.0',
+  capabilityId: 'recommendation-agent',
+  description: 'Action recommendation generation from a supported diagnosis and available feature catalog.',
+  system: RECOMMENDATION_PROMPT,
+  variables: [
+    {
+      name: 'schema',
+      description: 'Workspace schema summary with data horizon and available fields.',
+      required: true,
+    },
+    {
+      name: 'project_id',
+      description: 'Host workspace project id for providers that require project context.',
+      required: true,
+    },
+    {
+      name: 'diagnosis',
+      description: 'JSON serialized diagnosis object to act on.',
+      required: true,
+    },
+  ],
+  examples: [
+    {
+      name: 'voucher-dropoff-recommendations',
+      input: {
+        diagnosis: {
+          conclusion: 'Voucher orders declined after a discount pool expired.',
+          evidence: ['voucher orders down 32% versus baseline'],
+        },
+      },
+      expectedContains: ['bloomreachFeature', 'successMetric'],
+    },
+  ],
+};
