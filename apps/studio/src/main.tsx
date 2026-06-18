@@ -41,6 +41,23 @@ type ReplayMode = 'fixture' | 'anthropic' | 'openai';
 
 type ProviderStatus = Record<ReplayMode, { available: boolean; model: string }>;
 
+type TokenUsageSummary = {
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  modelName?: string;
+};
+
+type CostEstimate = {
+  currency: 'USD';
+  inputCost: number;
+  outputCost: number;
+  totalCost: number;
+  inputUsdPerMillion: number;
+  outputUsdPerMillion: number;
+  estimated: true;
+};
+
 type ReplayArtifact = {
   schemaVersion: 1;
   createdAt: string;
@@ -56,6 +73,7 @@ type ReplayArtifact = {
   };
   recommendations: Recommendation[];
   trace: CapabilityEvent[];
+  costEstimate?: CostEstimate;
   eval: {
     name: string;
     ok: boolean;
@@ -79,6 +97,7 @@ type SavedReplaySummary = {
     outputTokens: number;
     totalTokens: number;
   };
+  costEstimate?: CostEstimate;
 };
 
 type PromoteResult = {
@@ -112,6 +131,7 @@ type PromotedFixtureSummary = {
     outputTokens: number;
     totalTokens: number;
   };
+  costEstimate?: CostEstimate;
 };
 
 const fixtures = [
@@ -369,6 +389,8 @@ function App() {
   }
 
   const usage = summarizeUsage(replay?.trace ?? []);
+  const modelName = usage.modelName || providerStatus[mode].model;
+  const costEstimate = estimateCost(mode, usage, modelName);
 
   return (
     <main className="shell">
@@ -421,8 +443,9 @@ function App() {
 
       <section className="metrics" aria-label="Replay summary">
         <Metric icon={<BadgeCheck size={18} />} label="Eval" value={error ? 'Error' : replay?.evalOk ? 'Passing' : running ? 'Running' : 'Pending'} tone={replay?.evalOk ? 'good' : 'neutral'} />
-        <Metric icon={<BrainCircuit size={18} />} label="Model" value={usage.modelName || providerStatus[mode].model} />
+        <Metric icon={<BrainCircuit size={18} />} label="Model" value={modelName} />
         <Metric icon={<Gauge size={18} />} label="Tokens" value={usage.totalTokens.toLocaleString()} />
+        <Metric icon={<CircleDollarSign size={18} />} label="Est. Cost" value={formatCost(costEstimate)} />
         <Metric icon={<Timer size={18} />} label="Duration" value={replay ? formatDuration(replay.durationMs) : running ? 'Running' : '0ms'} />
       </section>
 
@@ -444,6 +467,8 @@ function App() {
               <strong>{usage.inputTokens.toLocaleString()} tokens</strong>
               <span>Output</span>
               <strong>{usage.outputTokens.toLocaleString()} tokens</strong>
+              <span>Cost</span>
+              <strong>{formatCost(costEstimate)}</strong>
               <span>Horizon</span>
               <strong>{fixture.workspace.dataHorizon?.from} to {fixture.workspace.dataHorizon?.to}</strong>
             </div>
@@ -574,13 +599,15 @@ function buildReplayArtifact(
   fallbackModel: string,
 ): ReplayArtifact {
   const usage = summarizeUsage(replay.trace);
+  const modelName = usage.modelName || fallbackModel;
+  const costEstimate = estimateCost(mode, usage, modelName);
   return {
     schemaVersion: 1,
     createdAt: new Date().toISOString(),
     durationMs: replay.durationMs,
     provider: {
       id: mode,
-      model: usage.modelName || fallbackModel,
+      model: modelName,
     },
     fixture: {
       id: fixture.id,
@@ -589,6 +616,7 @@ function buildReplayArtifact(
     },
     recommendations: replay.recommendations,
     trace: replay.trace,
+    ...(costEstimate ? { costEstimate } : {}),
     eval: {
       name: 'recommendation-shape',
       ok: replay.evalOk,
@@ -620,6 +648,38 @@ function summarizeUsage(trace: CapabilityEvent[]) {
     },
     { inputTokens: 0, outputTokens: 0, totalTokens: 0, modelName: '' },
   );
+}
+
+function estimateCost(provider: string, usage: TokenUsageSummary, modelName: string): CostEstimate | undefined {
+  const pricing = pricingForModel(provider, modelName);
+  if (!pricing) return undefined;
+  const inputCost = (usage.inputTokens / 1_000_000) * pricing.inputUsdPerMillion;
+  const outputCost = (usage.outputTokens / 1_000_000) * pricing.outputUsdPerMillion;
+  return {
+    currency: 'USD',
+    inputCost,
+    outputCost,
+    totalCost: inputCost + outputCost,
+    inputUsdPerMillion: pricing.inputUsdPerMillion,
+    outputUsdPerMillion: pricing.outputUsdPerMillion,
+    estimated: true,
+  };
+}
+
+function pricingForModel(provider: string, modelName: string): Pick<CostEstimate, 'inputUsdPerMillion' | 'outputUsdPerMillion'> | undefined {
+  if (provider !== 'openai') return undefined;
+  const normalized = modelName.toLowerCase();
+  if (normalized.startsWith('gpt-4.1-nano')) return { inputUsdPerMillion: 0.1, outputUsdPerMillion: 0.4 };
+  if (normalized.startsWith('gpt-4.1-mini')) return { inputUsdPerMillion: 0.4, outputUsdPerMillion: 1.6 };
+  if (normalized.startsWith('gpt-4.1')) return { inputUsdPerMillion: 2, outputUsdPerMillion: 8 };
+  return undefined;
+}
+
+function formatCost(costEstimate: CostEstimate | undefined): string {
+  if (!costEstimate) return 'n/a';
+  if (costEstimate.totalCost === 0) return '$0.00';
+  if (costEstimate.totalCost < 0.01) return `$${costEstimate.totalCost.toFixed(4)}`;
+  return `$${costEstimate.totalCost.toFixed(2)}`;
 }
 
 function formatDuration(durationMs: number): string {
@@ -761,6 +821,7 @@ function ReplayHistoryPanel({
                 <span>{replay.provider.id} / {replay.provider.model}</span>
                 <span>{replay.recommendationCount} recs</span>
                 <span>{replay.usage.totalTokens.toLocaleString()} tokens</span>
+                <span>{formatCost(replay.costEstimate)}</span>
                 <span>{formatDuration(replay.durationMs)}</span>
               </div>
               <code>{replay.path}</code>
@@ -819,6 +880,7 @@ function PromotedFixturesPanel({
                 <span>{fixture.recommendationCount} recs</span>
                 <span>{fixture.modelTurns} turns</span>
                 <span>{fixture.usage.totalTokens.toLocaleString()} tokens</span>
+                <span>{formatCost(fixture.costEstimate)}</span>
                 <span>{fixture.behaviorOk ? 'behavior pass' : 'behavior fail'}</span>
               </div>
               {fixture.promotion?.sourceProvider?.id ? (

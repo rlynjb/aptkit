@@ -39,6 +39,22 @@ type BehavioralExpectations = {
   requiredText?: string[];
 };
 
+type TokenUsageSummary = {
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+};
+
+type CostEstimate = {
+  currency: 'USD';
+  inputCost: number;
+  outputCost: number;
+  totalCost: number;
+  inputUsdPerMillion: number;
+  outputUsdPerMillion: number;
+  estimated: true;
+};
+
 const fixtures = [
   spRevenueDropFixture,
   electronicsSpikeFixture,
@@ -283,6 +299,8 @@ async function listReplaySummaries() {
     const artifact = JSON.parse(await readFile(path, 'utf8'));
     const evaluation = assertReplayArtifactShape(artifact);
     const usage = summarizeTraceUsage(artifact.trace);
+    const costEstimate = parseCostEstimate(artifact.costEstimate)
+      ?? estimateCost(String(artifact.provider?.id ?? ''), usage, String(artifact.provider?.model ?? ''));
     summaries.push({
       path: relativeFromWorkspace(path),
       createdAt: typeof artifact.createdAt === 'string' ? artifact.createdAt : '',
@@ -294,6 +312,7 @@ async function listReplaySummaries() {
       durationMs: typeof artifact.durationMs === 'number' ? artifact.durationMs : 0,
       modelTurns: typeof artifact.modelTurns === 'number' ? artifact.modelTurns : 0,
       usage,
+      ...(costEstimate ? { costEstimate } : {}),
     });
   }
 
@@ -317,6 +336,12 @@ async function listPromotedFixtureSummaries() {
     const fixture = JSON.parse(await readFile(path, 'utf8')) as RecommendationFixture;
     const replay = await runReplay(fixture, 'fixture');
     const behavior = assertBehavioralExpectations(replay.recommendations, fixture.expectations);
+    const usage = summarizeTraceUsage(replay.trace);
+    const costEstimate = estimateCost(
+      fixture.promotion?.sourceProvider?.id ?? 'fixture',
+      usage,
+      fixture.promotion?.sourceProvider?.model ?? '',
+    );
     summaries.push({
       path: relativeFromWorkspace(path),
       id: fixture.id,
@@ -332,7 +357,8 @@ async function listPromotedFixtureSummaries() {
       ],
       recommendationCount: replay.recommendations.length,
       modelTurns: replay.modelTurns,
-      usage: summarizeTraceUsage(replay.trace),
+      usage,
+      ...(costEstimate ? { costEstimate } : {}),
     });
   }
 
@@ -497,6 +523,46 @@ function summarizeTraceUsage(trace: unknown) {
     },
     { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
   );
+}
+
+function estimateCost(provider: string, usage: TokenUsageSummary, modelName: string): CostEstimate | undefined {
+  const pricing = pricingForModel(provider, modelName);
+  if (!pricing) return undefined;
+  const inputCost = (usage.inputTokens / 1_000_000) * pricing.inputUsdPerMillion;
+  const outputCost = (usage.outputTokens / 1_000_000) * pricing.outputUsdPerMillion;
+  return {
+    currency: 'USD',
+    inputCost,
+    outputCost,
+    totalCost: inputCost + outputCost,
+    inputUsdPerMillion: pricing.inputUsdPerMillion,
+    outputUsdPerMillion: pricing.outputUsdPerMillion,
+    estimated: true,
+  };
+}
+
+function pricingForModel(provider: string, modelName: string): Pick<CostEstimate, 'inputUsdPerMillion' | 'outputUsdPerMillion'> | undefined {
+  if (provider !== 'openai') return undefined;
+  const normalized = modelName.toLowerCase();
+  if (normalized.startsWith('gpt-4.1-nano')) return { inputUsdPerMillion: 0.1, outputUsdPerMillion: 0.4 };
+  if (normalized.startsWith('gpt-4.1-mini')) return { inputUsdPerMillion: 0.4, outputUsdPerMillion: 1.6 };
+  if (normalized.startsWith('gpt-4.1')) return { inputUsdPerMillion: 2, outputUsdPerMillion: 8 };
+  return undefined;
+}
+
+function parseCostEstimate(value: unknown): CostEstimate | undefined {
+  if (!isRecord(value)) return undefined;
+  if (value.currency !== 'USD' || value.estimated !== true) return undefined;
+  if (
+    typeof value.inputCost !== 'number'
+    || typeof value.outputCost !== 'number'
+    || typeof value.totalCost !== 'number'
+    || typeof value.inputUsdPerMillion !== 'number'
+    || typeof value.outputUsdPerMillion !== 'number'
+  ) {
+    return undefined;
+  }
+  return value as CostEstimate;
 }
 
 function normalizeReplayArtifact(value: unknown): Record<string, unknown> & {
