@@ -1,6 +1,7 @@
 import React from 'react';
 import { BadgeCheck, Boxes, BrainCircuit, ChevronDown, CircleDollarSign, FileCheck, FileText, Gauge, KeyRound, MessageSquareText, Play, RefreshCw, Save, Timer } from 'lucide-react';
-import { queryPromptPackage } from '@aptkit/prompts';
+import { queryPromptPackage, renderPromptTemplate } from '@aptkit/prompts';
+import { schemaSummary as querySchemaSummary } from '@aptkit/agent-query';
 import { loadPromotedQueryFixtures, loadSavedQueryReplays, promoteQueryReplay, runServerQueryReplay, saveReplayArtifact } from './api';
 import { runQueryFixtureReplay } from './agent-runners';
 import { EvalPanel, Metric, Panel, PromptPackagePanel, ReplayModeSwitch, TracePanel } from './components';
@@ -157,6 +158,11 @@ export function QueryWorkspace({ onHome }: { onHome: () => void }) {
   const modelName = usage.modelName || providerStatus[mode].model;
   const costEstimate = estimateCost(mode, usage, modelName);
   const latestReviewPath = replay?.savedPath ?? savedReplays.find((savedReplay) => savedReplay.fixture.id === fixture.id && savedReplay.provider.id === mode)?.path;
+  const renderedPrompt = renderPromptTemplate(queryPromptPackage.system, {
+    schema: querySchemaSummary(fixture.workspace),
+    project_id: fixture.workspace.projectId,
+    intent: fixture.intent,
+  });
 
   return (
     <main className="shell">
@@ -311,7 +317,10 @@ export function QueryWorkspace({ onHome }: { onHome: () => void }) {
         </section>
 
         <aside className="rightPane">
-          <PromptPackagePanel promptPackage={queryPromptPackage} />
+          <PromptPackagePanel
+            promptPackage={queryPromptPackage}
+            renderedPrompt={{ label: 'Rendered for fixture', prompt: renderedPrompt }}
+          />
 
           <TracePanel running={running} trace={replay?.trace ?? []} />
           <EvalPanel

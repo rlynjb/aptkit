@@ -1,7 +1,7 @@
 import React from 'react';
 import { Activity, BadgeCheck, Boxes, BrainCircuit, ChevronDown, CircleDollarSign, Clipboard, FileCheck, Gauge, History, KeyRound, Play, Route, Save, Timer } from 'lucide-react';
-import { ECOMMERCE_ANOMALY_CATEGORIES, coverageReport, schemaCapabilities } from '@aptkit/agent-anomaly-monitoring';
-import { monitoringPromptPackage } from '@aptkit/prompts';
+import { ECOMMERCE_ANOMALY_CATEGORIES, coverageReport, formatCategoryChecklist, runnableCategories, schemaCapabilities, schemaSummary as monitoringSchemaSummary } from '@aptkit/agent-anomaly-monitoring';
+import { monitoringPromptPackage, renderPromptTemplate } from '@aptkit/prompts';
 import { monitoringFixtures } from './fixtures';
 import { loadPromotedMonitoringFixtures, loadSavedMonitoringReplays, promoteMonitoringReplay, runServerMonitoringReplay, saveReplayArtifact } from './api';
 import { runMonitoringFixtureReplay } from './agent-runners';
@@ -214,6 +214,10 @@ export function MonitoringWorkspace({ onHome }: { onHome: () => void }) {
   const costEstimate = estimateCost(mode, usage, modelName);
   const reviewReplay = findMonitoringReviewReplay(savedReplays, selectedReviewPath, replay?.savedPath, fixture.id, mode);
   const comparisonView = comparisonForMonitoringFixture(comparison, savedReplays, fixture.id);
+  const renderedPrompt = renderPromptTemplate(monitoringPromptPackage.system, {
+    schema: monitoringSchemaSummary(fixture.workspace),
+    categories: formatCategoryChecklist(runnableCategories(ECOMMERCE_ANOMALY_CATEGORIES, schemaCapabilities(fixture.workspace))),
+  });
 
   return (
     <main className="shell">
@@ -368,7 +372,10 @@ export function MonitoringWorkspace({ onHome }: { onHome: () => void }) {
         </section>
 
         <aside className="rightPane">
-          <PromptPackagePanel promptPackage={monitoringPromptPackage} />
+          <PromptPackagePanel
+            promptPackage={monitoringPromptPackage}
+            renderedPrompt={{ label: 'Rendered for fixture', prompt: renderedPrompt }}
+          />
 
           <TracePanel running={running} trace={replay?.trace ?? []} />
 

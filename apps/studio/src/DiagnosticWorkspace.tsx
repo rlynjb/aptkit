@@ -1,6 +1,7 @@
 import React from 'react';
 import { Activity, BadgeCheck, Boxes, BrainCircuit, ChevronDown, CircleDollarSign, FileCheck, Gauge, History, KeyRound, Play, RefreshCw, Route, Save, SearchCheck, Timer } from 'lucide-react';
-import { diagnosticPromptPackage } from '@aptkit/prompts';
+import { diagnosticPromptPackage, renderPromptTemplate } from '@aptkit/prompts';
+import { schemaSummary as diagnosticSchemaSummary } from '@aptkit/agent-diagnostic-investigation';
 import { loadPromotedDiagnosticFixtures, loadSavedDiagnosticReplays, promoteDiagnosticReplay, runServerDiagnosticReplay, saveReplayArtifact } from './api';
 import { runDiagnosticFixtureReplay } from './agent-runners';
 import { EvalPanel, Metric, Panel, PromptPackagePanel, ReplayModeSwitch, TracePanel } from './components';
@@ -158,6 +159,11 @@ export function DiagnosticWorkspace({ onHome }: { onHome: () => void }) {
   const costEstimate = estimateCost(mode, usage, modelName);
   const diagnosis = replay?.diagnosis;
   const latestReviewPath = replay?.savedPath ?? savedReplays.find((savedReplay) => savedReplay.fixture.id === fixture.id && savedReplay.provider.id === mode)?.path;
+  const renderedPrompt = renderPromptTemplate(diagnosticPromptPackage.system, {
+    schema: diagnosticSchemaSummary(fixture.workspace),
+    project_id: fixture.workspace.projectId,
+    anomaly: JSON.stringify(fixture.anomaly),
+  });
 
   return (
     <main className="shell">
@@ -294,7 +300,10 @@ export function DiagnosticWorkspace({ onHome }: { onHome: () => void }) {
         </section>
 
         <aside className="rightPane">
-          <PromptPackagePanel promptPackage={diagnosticPromptPackage} />
+          <PromptPackagePanel
+            promptPackage={diagnosticPromptPackage}
+            renderedPrompt={{ label: 'Rendered for fixture', prompt: renderedPrompt }}
+          />
 
           <TracePanel running={running} trace={replay?.trace ?? []} />
 

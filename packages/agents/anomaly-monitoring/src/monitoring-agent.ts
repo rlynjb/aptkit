@@ -86,7 +86,7 @@ export class AnomalyMonitoringAgent {
   }
 }
 
-function formatCategoryChecklist(categories: readonly AnomalyCategory[]): string {
+export function formatCategoryChecklist(categories: readonly AnomalyCategory[]): string {
   if (categories.length === 0) return '(no runnable checklist categories; scan core metrics broadly)';
   return categories
     .map(

@@ -1,6 +1,7 @@
 import React from 'react';
 import { Activity, BadgeCheck, Boxes, BrainCircuit, ChevronDown, CircleDollarSign, Cloud, Gauge, KeyRound, Play, Route, Timer } from 'lucide-react';
-import { recommendationPromptPackage } from '@aptkit/prompts';
+import { recommendationPromptPackage, renderPromptTemplate } from '@aptkit/prompts';
+import { schemaSummary as recommendationSchemaSummary } from '@aptkit/agent-recommendation';
 import { fixtures } from './fixtures';
 import { loadPromotedFixtures, loadSavedReplays, promoteReplay, runServerReplay, saveReplayArtifact } from './api';
 import { runFixtureReplay } from './agent-runners';
@@ -211,6 +212,11 @@ export function RecommendationWorkspace({ onHome }: { onHome: () => void }) {
   const costEstimate = estimateCost(mode, usage, modelName);
   const reviewReplay = findReviewReplay(savedReplays, selectedReviewPath, replay?.savedPath, fixture.id, mode);
   const comparisonView = comparisonForFixture(comparison, savedReplays, fixture.id);
+  const renderedPrompt = renderPromptTemplate(recommendationPromptPackage.system, {
+    schema: recommendationSchemaSummary(fixture.workspace),
+    project_id: fixture.workspace.projectId,
+    diagnosis: JSON.stringify(fixture.diagnosis),
+  });
 
   return (
     <main className="shell">
@@ -361,7 +367,10 @@ export function RecommendationWorkspace({ onHome }: { onHome: () => void }) {
         </section>
 
         <aside className="rightPane">
-          <PromptPackagePanel promptPackage={recommendationPromptPackage} />
+          <PromptPackagePanel
+            promptPackage={recommendationPromptPackage}
+            renderedPrompt={{ label: 'Rendered for fixture', prompt: renderedPrompt }}
+          />
 
           <WorkflowPanel
             fixtureId={fixture.id}

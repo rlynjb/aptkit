@@ -805,6 +805,11 @@ h1 {
   white-space: pre-wrap;
 }
 
+.promptPreview.rendered {
+  border-color: #cfe6d7;
+  background: #f2faf5;
+}
+
 .expectationBlock {
   display: grid;
   gap: 3px;

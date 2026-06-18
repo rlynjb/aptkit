@@ -115,9 +115,16 @@ export function EvalPanel({
   );
 }
 
-export function PromptPackagePanel({ promptPackage }: { promptPackage: PromptPackage }) {
+export function PromptPackagePanel({
+  promptPackage,
+  renderedPrompt,
+}: {
+  promptPackage: PromptPackage;
+  renderedPrompt?: { label: string; prompt: string };
+}) {
   const lineCount = promptPackage.system.split('\n').length;
   const characterCount = promptPackage.system.length;
+  const renderedLineCount = renderedPrompt?.prompt.split('\n').length ?? 0;
 
   return (
     <Panel title="Prompt Package" icon={<FileText size={17} />}>
@@ -151,6 +158,12 @@ export function PromptPackagePanel({ promptPackage }: { promptPackage: PromptPac
           <summary>System prompt</summary>
           <pre>{promptPackage.system}</pre>
         </details>
+        {renderedPrompt ? (
+          <details className="promptPreview rendered">
+            <summary>{renderedPrompt.label} ({renderedLineCount} lines)</summary>
+            <pre>{renderedPrompt.prompt}</pre>
+          </details>
+        ) : null}
       </div>
     </Panel>
   );
