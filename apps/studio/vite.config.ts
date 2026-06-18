@@ -308,6 +308,7 @@ async function listReplaySummaries() {
       fixture: artifact.fixture,
       evalOk: evaluation.ok,
       issues: evaluation.issues,
+      recommendations: Array.isArray(artifact.recommendations) ? artifact.recommendations : [],
       recommendationCount: Array.isArray(artifact.recommendations) ? artifact.recommendations.length : 0,
       durationMs: typeof artifact.durationMs === 'number' ? artifact.durationMs : 0,
       modelTurns: typeof artifact.modelTurns === 'number' ? artifact.modelTurns : 0,

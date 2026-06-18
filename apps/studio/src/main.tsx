@@ -89,6 +89,7 @@ type SavedReplaySummary = {
   fixture: { id: string; description?: string; path?: string };
   evalOk: boolean;
   issues: { path: string; message: string }[];
+  recommendations: Recommendation[];
   recommendationCount: number;
   durationMs: number;
   modelTurns: number;
@@ -98,6 +99,27 @@ type SavedReplaySummary = {
     totalTokens: number;
   };
   costEstimate?: CostEstimate;
+};
+
+type ComparableReplay = {
+  path?: string;
+  createdAt: string;
+  provider: { id: string; model: string };
+  fixture: { id: string; description?: string; path?: string };
+  evalOk: boolean;
+  issues: { path: string; message: string }[];
+  recommendations: Recommendation[];
+  recommendationCount: number;
+  durationMs: number;
+  modelTurns: number;
+  usage: TokenUsageSummary;
+  costEstimate?: CostEstimate;
+};
+
+type ComparisonState = {
+  fixture?: ComparableReplay;
+  openai?: ComparableReplay;
+  completedAt: string;
 };
 
 type PromoteResult = {
@@ -259,6 +281,10 @@ function App() {
   const [savedReplays, setSavedReplays] = React.useState<SavedReplaySummary[]>([]);
   const [historyLoading, setHistoryLoading] = React.useState(false);
   const [historyError, setHistoryError] = React.useState<string | null>(null);
+  const [selectedReviewPath, setSelectedReviewPath] = React.useState<string | null>(null);
+  const [comparison, setComparison] = React.useState<ComparisonState | null>(null);
+  const [comparisonRunning, setComparisonRunning] = React.useState(false);
+  const [comparisonError, setComparisonError] = React.useState<string | null>(null);
   const [promotingPath, setPromotingPath] = React.useState<string | null>(null);
   const [promoteResult, setPromoteResult] = React.useState<PromoteResult | null>(null);
   const [promotedFixtures, setPromotedFixtures] = React.useState<PromotedFixtureSummary[]>([]);
@@ -348,6 +374,8 @@ function App() {
     setReplay(null);
     setError(null);
     setSaveError(null);
+    setComparison(null);
+    setComparisonError(null);
   }
 
   function selectMode(nextMode: ReplayMode) {
@@ -355,6 +383,7 @@ function App() {
     setReplay(null);
     setError(null);
     setSaveError(null);
+    setComparisonError(null);
   }
 
   async function saveCurrentReplay() {
@@ -365,6 +394,7 @@ function App() {
       const artifact = buildReplayArtifact(fixture, replay, mode, providerStatus[mode].model);
       const savedPath = await saveReplayArtifact(artifact);
       setReplay((current) => current ? { ...current, savedPath } : current);
+      setSelectedReviewPath(savedPath);
       await refreshReplayHistory();
     } catch (caught) {
       setSaveError(caught instanceof Error ? caught.message : String(caught));
@@ -388,9 +418,54 @@ function App() {
     }
   }
 
+  async function runComparison() {
+    const fixtureToRun = selectedFixtureRef.current;
+    setComparisonRunning(true);
+    setComparisonError(null);
+    setError(null);
+    setSaveError(null);
+    setPromoteResult(null);
+    try {
+      const fixtureRunId = runCounter.current + 1;
+      runCounter.current = fixtureRunId;
+      const fixtureResult = await runFixtureReplay(fixtureToRun);
+      const fixtureState = toReplayState(fixtureResult, fixtureRunId);
+      const fixtureArtifact = buildReplayArtifact(fixtureToRun, fixtureState, 'fixture', providerStatus.fixture.model);
+      const fixturePath = await saveReplayArtifact(fixtureArtifact);
+
+      const openaiRunId = runCounter.current + 1;
+      runCounter.current = openaiRunId;
+      const openaiResult = await runServerReplay(fixtureToRun, 'openai');
+      const openaiState = {
+        ...toReplayState(openaiResult, openaiRunId),
+        savedPath: '',
+      };
+      const openaiArtifact = buildReplayArtifact(fixtureToRun, openaiState, 'openai', providerStatus.openai.model);
+      const openaiPath = await saveReplayArtifact(openaiArtifact);
+      const completedAt = new Date().toLocaleTimeString();
+
+      setMode('openai');
+      setRunId(openaiRunId);
+      setReplay({ ...openaiState, savedPath: openaiPath, completedAt });
+      setSelectedReviewPath(openaiPath);
+      setComparison({
+        fixture: comparableFromArtifact(fixtureArtifact, fixturePath),
+        openai: comparableFromArtifact(openaiArtifact, openaiPath),
+        completedAt,
+      });
+      await refreshReplayHistory();
+    } catch (caught) {
+      setComparisonError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setComparisonRunning(false);
+    }
+  }
+
   const usage = summarizeUsage(replay?.trace ?? []);
   const modelName = usage.modelName || providerStatus[mode].model;
   const costEstimate = estimateCost(mode, usage, modelName);
+  const reviewReplay = findReviewReplay(savedReplays, selectedReviewPath, replay?.savedPath, fixture.id, mode);
+  const comparisonView = comparisonForFixture(comparison, savedReplays, fixture.id);
 
   return (
     <main className="shell">
@@ -538,6 +613,15 @@ function App() {
               ))}
             </div>
           </Panel>
+
+          <ComparisonPanel
+            comparison={comparisonView}
+            fixtureId={fixture.id}
+            openaiAvailable={providerStatus.openai.available}
+            running={comparisonRunning}
+            error={comparisonError}
+            onRun={() => void runComparison()}
+          />
         </section>
 
         <aside className="rightPane">
@@ -550,14 +634,30 @@ function App() {
             onSave={() => void saveCurrentReplay()}
           />
 
+          <ReviewPanel
+            fixture={fixture}
+            mode={mode}
+            modelName={modelName}
+            replay={replay}
+            savedReplay={reviewReplay}
+            usage={usage}
+            costEstimate={costEstimate}
+            saving={saving}
+            saveError={saveError}
+            error={historyError}
+            promotingPath={promotingPath}
+            promoteResult={promoteResult}
+            onSave={() => void saveCurrentReplay()}
+            onPromote={(path) => void promoteSavedReplay(path)}
+          />
+
           <ReplayHistoryPanel
             replays={savedReplays}
             loading={historyLoading}
             error={historyError}
-            promotingPath={promotingPath}
-            promoteResult={promoteResult}
+            selectedPath={reviewReplay?.path ?? selectedReviewPath}
             onRefresh={() => void refreshReplayHistory()}
-            onPromote={(path) => void promoteSavedReplay(path)}
+            onReview={setSelectedReviewPath}
           />
 
           <PromotedFixturesPanel
@@ -687,6 +787,324 @@ function formatDuration(durationMs: number): string {
   return `${(durationMs / 1000).toFixed(1)}s`;
 }
 
+function toReplayState(result: ReplayResult, runId: number): ReplayState {
+  return {
+    ...result,
+    runId,
+    completedAt: new Date().toLocaleTimeString(),
+  };
+}
+
+function comparableFromArtifact(artifact: ReplayArtifact, path: string): ComparableReplay {
+  const usage = summarizeUsage(artifact.trace);
+  return {
+    path,
+    createdAt: artifact.createdAt,
+    provider: artifact.provider,
+    fixture: artifact.fixture,
+    evalOk: artifact.eval.ok,
+    issues: artifact.eval.issues,
+    recommendations: artifact.recommendations,
+    recommendationCount: artifact.recommendations.length,
+    durationMs: artifact.durationMs,
+    modelTurns: artifact.modelTurns,
+    usage,
+    costEstimate: artifact.costEstimate,
+  };
+}
+
+function comparisonForFixture(
+  comparison: ComparisonState | null,
+  replays: SavedReplaySummary[],
+  fixtureId: string,
+): ComparisonState {
+  if (comparison?.fixture?.fixture.id === fixtureId || comparison?.openai?.fixture.id === fixtureId) {
+    return comparison;
+  }
+  return {
+    fixture: latestReplayFor(replays, fixtureId, 'fixture'),
+    openai: latestReplayFor(replays, fixtureId, 'openai'),
+    completedAt: '',
+  };
+}
+
+function latestReplayFor(replays: SavedReplaySummary[], fixtureId: string, providerId: string): ComparableReplay | undefined {
+  const replay = replays.find((candidate) => candidate.fixture.id === fixtureId && candidate.provider.id === providerId);
+  return replay ? { ...replay } : undefined;
+}
+
+function featureSet(replay: ComparableReplay | undefined): Set<string> {
+  return new Set((replay?.recommendations ?? []).map((recommendation) => recommendation.bloomreachFeature));
+}
+
+function formatDelta(value: number, formatter: (value: number) => string = (next) => next.toLocaleString()): string {
+  if (value === 0) return 'same';
+  return `${value > 0 ? '+' : ''}${formatter(value)}`;
+}
+
+function formatCostDelta(value: number): string {
+  if (value === 0) return 'same';
+  return `${value > 0 ? '+' : '-'}${formatCost({ currency: 'USD', inputCost: 0, outputCost: 0, totalCost: Math.abs(value), inputUsdPerMillion: 0, outputUsdPerMillion: 0, estimated: true })}`;
+}
+
+function ComparisonPanel({
+  comparison,
+  fixtureId,
+  openaiAvailable,
+  running,
+  error,
+  onRun,
+}: {
+  comparison: ComparisonState;
+  fixtureId: string;
+  openaiAvailable: boolean;
+  running: boolean;
+  error: string | null;
+  onRun: () => void;
+}) {
+  const fixtureReplay = comparison.fixture;
+  const openaiReplay = comparison.openai;
+  const fixtureFeatures = featureSet(fixtureReplay);
+  const openaiFeatures = featureSet(openaiReplay);
+  const sharedFeatures = [...openaiFeatures].filter((feature) => fixtureFeatures.has(feature));
+  const openaiOnlyFeatures = [...openaiFeatures].filter((feature) => !fixtureFeatures.has(feature));
+  const fixtureOnlyFeatures = [...fixtureFeatures].filter((feature) => !openaiFeatures.has(feature));
+  const tokenDelta = (openaiReplay?.usage.totalTokens ?? 0) - (fixtureReplay?.usage.totalTokens ?? 0);
+  const costDelta = (openaiReplay?.costEstimate?.totalCost ?? 0) - (fixtureReplay?.costEstimate?.totalCost ?? 0);
+  const maxRecommendations = Math.max(fixtureReplay?.recommendations.length ?? 0, openaiReplay?.recommendations.length ?? 0);
+
+  return (
+    <Panel title="Fixture vs OpenAI" icon={<Route size={17} />} wide>
+      <div className="comparisonPanel">
+        <div className="comparisonToolbar">
+          <div>
+            <strong>{fixtureId}</strong>
+            <span>{comparison.completedAt ? `Comparison completed at ${comparison.completedAt}` : 'Latest saved fixture/OpenAI pair'}</span>
+          </div>
+          <button className="primaryAction" type="button" onClick={onRun} disabled={running || !openaiAvailable}>
+            <Play size={15} />
+            <span>{running ? 'Running' : 'Run Comparison'}</span>
+          </button>
+        </div>
+        {!openaiAvailable ? <div className="errorState compact">Set OPENAI_API_KEY and restart Studio to enable comparison runs.</div> : null}
+        {error ? <div className="errorState compact">{error}</div> : null}
+        {!fixtureReplay || !openaiReplay ? (
+          <div className="emptyState compact">Run comparison or save both fixture and OpenAI replays for this fixture.</div>
+        ) : null}
+        <div className="comparisonSummary">
+          <ComparisonMetric label="Fixture Eval" value={fixtureReplay ? (fixtureReplay.evalOk ? 'pass' : 'fail') : 'missing'} tone={fixtureReplay?.evalOk ? 'good' : 'neutral'} />
+          <ComparisonMetric label="OpenAI Eval" value={openaiReplay ? (openaiReplay.evalOk ? 'pass' : 'fail') : 'missing'} tone={openaiReplay?.evalOk ? 'good' : 'neutral'} />
+          <ComparisonMetric label="Recommendations" value={formatDelta((openaiReplay?.recommendationCount ?? 0) - (fixtureReplay?.recommendationCount ?? 0))} />
+          <ComparisonMetric label="Tokens" value={formatDelta(tokenDelta)} />
+          <ComparisonMetric label="Est. Cost" value={formatCostDelta(costDelta)} />
+          <ComparisonMetric label="Shared Features" value={`${sharedFeatures.length}`} />
+        </div>
+        <div className="featureDiff">
+          <div>
+            <span>Shared</span>
+            <strong>{sharedFeatures.join(', ') || 'none'}</strong>
+          </div>
+          <div>
+            <span>Fixture only</span>
+            <strong>{fixtureOnlyFeatures.join(', ') || 'none'}</strong>
+          </div>
+          <div>
+            <span>OpenAI only</span>
+            <strong>{openaiOnlyFeatures.join(', ') || 'none'}</strong>
+          </div>
+        </div>
+        <div className="comparisonColumns">
+          <ComparisonColumn title="Fixture" replay={fixtureReplay} />
+          <ComparisonColumn title="OpenAI" replay={openaiReplay} />
+        </div>
+        {maxRecommendations > 0 ? (
+          <div className="pairedRecommendations">
+            {Array.from({ length: maxRecommendations }, (_, index) => (
+              <div className="pairedRecommendation" key={`pair-${index}`}>
+                <RecommendationPreview label={`Fixture ${index + 1}`} recommendation={fixtureReplay?.recommendations[index]} />
+                <RecommendationPreview label={`OpenAI ${index + 1}`} recommendation={openaiReplay?.recommendations[index]} />
+              </div>
+            ))}
+          </div>
+        ) : null}
+      </div>
+    </Panel>
+  );
+}
+
+function ComparisonMetric({ label, value, tone = 'neutral' }: { label: string; value: string; tone?: 'neutral' | 'good' }) {
+  return (
+    <div className={`comparisonMetric ${tone}`}>
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </div>
+  );
+}
+
+function ComparisonColumn({ title, replay }: { title: string; replay: ComparableReplay | undefined }) {
+  return (
+    <div className="comparisonColumn">
+      <div className="comparisonColumnHeader">
+        <strong>{title}</strong>
+        <span>{replay ? `${replay.provider.id} / ${replay.provider.model}` : 'missing'}</span>
+      </div>
+      <div className="historyMeta">
+        <span>{replay?.recommendationCount ?? 0} recs</span>
+        <span>{replay?.usage.totalTokens.toLocaleString() ?? '0'} tokens</span>
+        <span>{formatCost(replay?.costEstimate)}</span>
+        <span>{replay ? formatDuration(replay.durationMs) : '0ms'}</span>
+      </div>
+      {replay?.path ? <code>{replay.path}</code> : null}
+    </div>
+  );
+}
+
+function RecommendationPreview({ label, recommendation }: { label: string; recommendation: Recommendation | undefined }) {
+  return (
+    <article className="recommendationPreview">
+      <span>{label}</span>
+      {recommendation ? (
+        <>
+          <strong>{recommendation.title}</strong>
+          <em>{recommendation.bloomreachFeature} / {recommendation.confidence}</em>
+          <p>{recommendation.rationale}</p>
+        </>
+      ) : (
+        <strong>missing</strong>
+      )}
+    </article>
+  );
+}
+
+function findReviewReplay(
+  replays: SavedReplaySummary[],
+  selectedPath: string | null,
+  currentSavedPath: string | undefined,
+  fixtureId: string,
+  mode: ReplayMode,
+): SavedReplaySummary | undefined {
+  if (selectedPath) {
+    const selected = replays.find((replay) => replay.path === selectedPath);
+    if (selected) return selected;
+  }
+  if (currentSavedPath) {
+    const current = replays.find((replay) => replay.path === currentSavedPath);
+    if (current) return current;
+  }
+  return replays.find((replay) => replay.fixture.id === fixtureId && replay.provider.id === mode);
+}
+
+function ReviewPanel({
+  fixture,
+  mode,
+  modelName,
+  replay,
+  savedReplay,
+  usage,
+  costEstimate,
+  saving,
+  saveError,
+  error,
+  promotingPath,
+  promoteResult,
+  onSave,
+  onPromote,
+}: {
+  fixture: RecommendationFixture;
+  mode: ReplayMode;
+  modelName: string;
+  replay: ReplayState | null;
+  savedReplay: SavedReplaySummary | undefined;
+  usage: TokenUsageSummary;
+  costEstimate: CostEstimate | undefined;
+  saving: boolean;
+  saveError: string | null;
+  error: string | null;
+  promotingPath: string | null;
+  promoteResult: PromoteResult | null;
+  onSave: () => void;
+  onPromote: (path: string) => void;
+}) {
+  const reviewPath = savedReplay?.path ?? replay?.savedPath;
+  const evalOk = savedReplay?.evalOk ?? replay?.evalOk ?? false;
+  const issues = savedReplay?.issues ?? replay?.evalIssueDetails ?? [];
+  const reviewUsage = savedReplay?.usage ?? usage;
+  const reviewCost = savedReplay?.costEstimate ?? costEstimate;
+  const provider = savedReplay?.provider
+    ? `${savedReplay.provider.id} / ${savedReplay.provider.model}`
+    : `${mode} / ${modelName}`;
+  const recommendationCount = savedReplay?.recommendationCount ?? replay?.recommendations.length ?? 0;
+  const modelTurns = savedReplay?.modelTurns ?? replay?.modelTurns ?? 0;
+  const canPromote = Boolean(reviewPath && evalOk);
+
+  return (
+    <Panel title="Replay Review" icon={<FileCheck size={17} />}>
+      <div className="reviewPanel">
+        <div className={canPromote ? 'reviewBanner ready' : 'reviewBanner pending'}>
+          <strong>{canPromote ? 'Ready to promote' : reviewPath ? 'Needs passing eval' : 'Save before promotion'}</strong>
+          <span>{reviewPath ?? 'No saved artifact selected'}</span>
+        </div>
+        <div className="reviewGrid">
+          <div>
+            <span>Fixture</span>
+            <strong>{savedReplay?.fixture.id ?? fixture.id}</strong>
+          </div>
+          <div>
+            <span>Provider</span>
+            <strong>{provider}</strong>
+          </div>
+          <div>
+            <span>Shape Eval</span>
+            <strong>{evalOk ? 'passing' : 'not passing'}</strong>
+          </div>
+          <div>
+            <span>Behavior</span>
+            <strong>{canPromote ? 'check after promotion' : 'pending'}</strong>
+          </div>
+          <div>
+            <span>Output</span>
+            <strong>{recommendationCount} recs / {modelTurns} turns</strong>
+          </div>
+          <div>
+            <span>Spend</span>
+            <strong>{reviewUsage.totalTokens.toLocaleString()} tokens / {formatCost(reviewCost)}</strong>
+          </div>
+        </div>
+        {issues.length ? (
+          <ul className="issueList">
+            {issues.slice(0, 3).map((issue) => (
+              <li key={`${issue.path}-${issue.message}`}>{issue.path}: {issue.message}</li>
+            ))}
+          </ul>
+        ) : null}
+        {promoteResult ? (
+          <div className="historySuccess">
+            <strong>Promoted fixture</strong>
+            <code>{promoteResult.path}</code>
+          </div>
+        ) : null}
+        {error ? <div className="errorState compact">{error}</div> : null}
+        {saveError ? <div className="errorState compact">{saveError}</div> : null}
+        <div className="reviewActions">
+          <button className="secondaryAction" type="button" onClick={onSave} disabled={!replay || saving}>
+            <Save size={15} />
+            <span>{saving ? 'Saving' : replay?.savedPath ? 'Saved Current' : 'Save Current'}</span>
+          </button>
+          <button
+            className="primaryAction"
+            type="button"
+            onClick={() => reviewPath ? onPromote(reviewPath) : undefined}
+            disabled={!canPromote || promotingPath === reviewPath}
+          >
+            <FileCheck size={15} />
+            <span>{promotingPath === reviewPath ? 'Promoting' : 'Promote Reviewed'}</span>
+          </button>
+        </div>
+      </div>
+    </Panel>
+  );
+}
+
 function WorkflowPanel({
   fixtureId,
   mode,
@@ -781,18 +1199,16 @@ function ReplayHistoryPanel({
   replays,
   loading,
   error,
-  promotingPath,
-  promoteResult,
+  selectedPath,
   onRefresh,
-  onPromote,
+  onReview,
 }: {
   replays: SavedReplaySummary[];
   loading: boolean;
   error: string | null;
-  promotingPath: string | null;
-  promoteResult: PromoteResult | null;
+  selectedPath: string | null | undefined;
   onRefresh: () => void;
-  onPromote: (path: string) => void;
+  onReview: (path: string) => void;
 }) {
   const visibleReplays = replays.slice(0, 5);
   return (
@@ -803,16 +1219,10 @@ function ReplayHistoryPanel({
           <span>{loading ? 'Evaluating' : 'Evaluate Replays'}</span>
         </button>
         {error ? <div className="errorState compact">{error}</div> : null}
-        {promoteResult ? (
-          <div className="historySuccess">
-            <strong>Promoted</strong>
-            <code>{promoteResult.path}</code>
-          </div>
-        ) : null}
         {!loading && visibleReplays.length === 0 ? <div className="emptyState compact">No saved replays found.</div> : null}
         <div className="historyList">
           {visibleReplays.map((replay) => (
-            <article className="historyItem" key={replay.path}>
+            <article className={selectedPath === replay.path ? 'historyItem selected' : 'historyItem'} key={replay.path}>
               <div className="historyHeader">
                 <strong>{replay.fixture.id}</strong>
                 <span className={replay.evalOk ? 'statusPill good' : 'statusPill bad'}>{replay.evalOk ? 'pass' : 'fail'}</span>
@@ -835,11 +1245,10 @@ function ReplayHistoryPanel({
               <button
                 className="secondaryAction"
                 type="button"
-                onClick={() => onPromote(replay.path)}
-                disabled={!replay.evalOk || promotingPath === replay.path}
+                onClick={() => onReview(replay.path)}
               >
-                <Save size={15} />
-                <span>{promotingPath === replay.path ? 'Promoting' : 'Promote'}</span>
+                <FileCheck size={15} />
+                <span>{selectedPath === replay.path ? 'Reviewing' : 'Review'}</span>
               </button>
             </article>
           ))}
