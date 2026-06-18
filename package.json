@@ -11,6 +11,8 @@
   ],
   "scripts": {
     "build": "npm run build --workspaces --if-present",
+    "build:core:deps": "npm run build -w @aptkit/runtime && npm run build -w @aptkit/tools && npm run build -w @aptkit/context && npm run build -w @aptkit/prompts && npm run build -w @aptkit/evals && npm run build -w @aptkit/agent-anomaly-monitoring && npm run build -w @aptkit/agent-diagnostic-investigation && npm run build -w @aptkit/agent-query && npm run build -w @aptkit/agent-recommendation",
+    "build:core": "npm run build:core:deps && npm run build -w @rlynjb/aptkit-core",
     "dev:studio": "npm run dev -w @aptkit/studio",
     "preeval:replays": "npm run build -w @aptkit/evals",
     "eval:replays": "node scripts/eval-replay-artifacts.mjs",
@@ -22,7 +24,7 @@
     "prereplay:openai": "npm run build --workspaces --if-present",
     "replay:openai": "node scripts/replay-model-recommendation.mjs --provider openai",
     "test": "npm run test --workspaces --if-present",
-    "prepublish:core:github": "npm run build --workspaces --if-present && npm run pack:core",
+    "prepublish:core:github": "npm run build:core && npm run pack:core",
     "publish:core:github": "npm publish /private/tmp/aptkit-packs/rlynjb-aptkit-core-0.1.0.tgz --registry=https://npm.pkg.github.com",
     "replay:recommendation": "npm run replay:fixture -w @aptkit/agent-recommendation",
     "replay:monitoring": "npm run replay:fixture -w @aptkit/agent-anomaly-monitoring",
