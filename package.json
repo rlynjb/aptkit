@@ -23,7 +23,8 @@
     "test": "npm run test --workspaces --if-present",
     "replay:recommendation": "npm run replay:fixture -w @aptkit/agent-recommendation",
     "replay:monitoring": "npm run replay:fixture -w @aptkit/agent-anomaly-monitoring",
-    "replay:monitoring:promoted": "npm run replay:promoted -w @aptkit/agent-anomaly-monitoring"
+    "replay:monitoring:promoted": "npm run replay:promoted -w @aptkit/agent-anomaly-monitoring",
+    "replay:diagnostic": "npm run replay:fixture -w @aptkit/agent-diagnostic-investigation"
   },
   "devDependencies": {
     "typescript": "^5.5.0"
