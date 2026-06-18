@@ -1,0 +1,84 @@
+{
+  "id": "electronics-spike-w2",
+  "description": "Fixture derived from Blooming Insights recommendation regression case 07-recommendation-electronics.",
+  "workspace": {
+    "projectId": "olist",
+    "projectName": "Olist Brazilian ecommerce fixture",
+    "events": [
+      { "name": "order", "properties": ["state", "category", "purchase_ts", "price_brl"], "eventCount": 0 },
+      { "name": "payment", "properties": ["type", "installments", "value_brl"], "eventCount": 0 }
+    ],
+    "customerProperties": ["state", "city"],
+    "catalogs": [{ "id": "products", "name": "Products" }],
+    "totalCustomers": 0,
+    "totalEvents": 0,
+    "oldestTimestamp": null,
+    "dataHorizon": { "from": "2025-12-01", "to": "2026-06-01", "durationDays": 182 }
+  },
+  "anomaly": {
+    "metric": "order_count",
+    "scope": ["category:electronics"],
+    "change": {
+      "value": 150,
+      "direction": "up",
+      "baseline": "week 2 (2025-12-08 to 2025-12-15) vs 12-week baseline"
+    },
+    "severity": "positive",
+    "evidence": [],
+    "impact": "Electronics order count spiked about 2.5x across multiple states."
+  },
+  "diagnosis": {
+    "conclusion": "Electronics order count spiked about 2.5x in week 2 versus baseline. The spike is broad across states, revenue scaled with order count, and AOV stayed stable, so this appears to be a real demand surge rather than a single large-buyer artifact.",
+    "evidence": [
+      "get_anomaly_context(metric=order_count, dimension=category, segment=electronics) returned pct_change=+1.50 for week 2.",
+      "SP, RJ, MG, RS, and PR were all up 100-200% in week 2.",
+      "Revenue scaled with order count, with AOV roughly flat.",
+      "No other category moved with electronics that week."
+    ],
+    "hypothesesConsidered": [
+      {
+        "hypothesis": "Single large buyer distorted the metric",
+        "supported": false,
+        "reasoning": "The spike was distributed across states and many customers."
+      },
+      {
+        "hypothesis": "Electronics-specific promotional or seasonal pull",
+        "supported": true,
+        "reasoning": "The category moved broadly while other categories did not."
+      }
+    ],
+    "affectedCustomers": {
+      "count": 8800,
+      "segmentDescription": "Electronics buyers across BR states in week 2"
+    },
+    "confidence": "medium"
+  },
+  "tools": [
+    { "name": "list_segmentations", "description": "List existing segments", "inputSchema": { "type": "object" }, "result": { "data": [{ "name": "electronics buyers" }, { "name": "recent accessory buyers" }] } },
+    { "name": "list_email_campaigns", "description": "List email campaigns", "inputSchema": { "type": "object" }, "result": { "data": [{ "name": "holiday electronics promo" }] } },
+    { "name": "list_recommendations", "description": "List recommendation models", "inputSchema": { "type": "object" }, "result": { "data": [{ "name": "accessory cross-sell" }] } }
+  ],
+  "modelResponses": [
+    {
+      "content": [
+        { "type": "tool_use", "id": "tool-1", "name": "list_segmentations", "input": { "project_id": "olist" } },
+        { "type": "tool_use", "id": "tool-2", "name": "list_recommendations", "input": { "project_id": "olist" } }
+      ],
+      "usage": { "inputTokens": 910, "outputTokens": 80 },
+      "model": "fixture-model"
+    },
+    {
+      "content": [
+        {
+          "type": "text",
+          "text": "```json\n[{\"title\":\"Cross-sell accessories to week-2 electronics buyers\",\"rationale\":\"The diagnosis shows a real electronics demand surge with stable AOV. A follow-on campaign can turn one-time electronics purchases into higher LTV by promoting complementary accessories while purchase recency is high.\",\"bloomreachFeature\":\"campaign\",\"steps\":[\"Build a segment of customers who bought electronics in week 2.\",\"Send a 3-week accessory campaign featuring cables, cases, warranties, and setup bundles.\",\"Exclude customers who already bought accessories after the electronics order.\"],\"estimatedImpact\":{\"range\":\"+$70k - $140k incremental revenue over 21 days\",\"rangeUsd\":{\"low\":70000,\"high\":140000},\"assumption\":\"Assumes 5-10% accessory attach rate on 8800 electronics buyers at about $160 accessory order value.\"},\"effort\":\"medium\",\"timeToSetUpMinutes\":120,\"readResultInDays\":21,\"prerequisites\":[{\"label\":\"electronics buyer segment available\",\"satisfied\":true},{\"label\":\"accessory recommendation model available\",\"satisfied\":true}],\"successMetric\":\"Accessory attach rate rises from about 3% baseline to 5-10% over 21 days.\",\"confidence\":\"medium\"},{\"title\":\"Identify top electronics SKUs behind the spike\",\"rationale\":\"The spike looks real, but the reusable playbook depends on whether a few SKUs or the whole category drove it. A segment analysis gates whether to rerun a promotion or build a seasonal calendar trigger.\",\"bloomreachFeature\":\"segment\",\"steps\":[\"Create a week-2 electronics order segment.\",\"Rank SKUs by order count and compare their share to baseline.\",\"Classify the spike as concentrated promotion or broad seasonal pull.\"],\"estimatedImpact\":{\"range\":\"Diagnostic: gates repeat-promo investment\",\"assumption\":\"No direct lift; prevents scaling the wrong electronics playbook.\"},\"effort\":\"low\",\"timeToSetUpMinutes\":30,\"readResultInDays\":2,\"prerequisites\":[{\"label\":\"SKU-level order data accessible\",\"satisfied\":true}],\"successMetric\":\"Top-10 SKU share classified as concentrated above 50% or broad below 30%.\",\"confidence\":\"high\"}]\n```"
+        }
+      ],
+      "usage": { "inputTokens": 1350, "outputTokens": 610 },
+      "model": "fixture-model"
+    }
+  ],
+  "eval": {
+    "requiredFields": ["0.title", "0.rationale", "0.bloomreachFeature", "0.steps", "0.estimatedImpact", "0.confidence"]
+  }
+}

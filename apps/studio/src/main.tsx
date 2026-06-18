@@ -1,11 +1,13 @@
 import React from 'react';
 import { createRoot } from 'react-dom/client';
-import { Activity, BadgeCheck, Boxes, BrainCircuit, CircleDollarSign, Gauge, Play, Route, ShieldCheck, Wrench } from 'lucide-react';
+import { Activity, BadgeCheck, Boxes, BrainCircuit, ChevronDown, CircleDollarSign, Cloud, Gauge, KeyRound, Play, Route, ShieldCheck, Wrench } from 'lucide-react';
 import { RecommendationAgent, FixtureModelProvider, type Anomaly, type Diagnosis, type Recommendation, type WorkspaceDescriptor } from '@aptkit/agent-recommendation';
 import { assertRecommendationShape } from '@aptkit/evals';
 import type { CapabilityEvent, ModelResponse } from '@aptkit/runtime';
 import { InMemoryToolRegistry, type ToolDefinition, type ToolHandler } from '@aptkit/tools';
-import fixtureData from '../../../packages/agents/recommendation/fixtures/sp-revenue-drop.json';
+import electronicsSpikeFixture from '../../../packages/agents/recommendation/fixtures/electronics-spike.json';
+import spRevenueDropFixture from '../../../packages/agents/recommendation/fixtures/sp-revenue-drop.json';
+import voucherDropoffFixture from '../../../packages/agents/recommendation/fixtures/voucher-dropoff.json';
 import './styles.css';
 
 type FixtureTool = ToolDefinition & { result: unknown };
@@ -32,9 +34,17 @@ type ReplayState = {
 
 type ReplayResult = Omit<ReplayState, 'completedAt' | 'runId'>;
 
-const fixture = fixtureData as RecommendationFixture;
+type ReplayMode = 'fixture' | 'anthropic' | 'openai';
 
-function runFixtureReplay(): Promise<ReplayResult> {
+type ProviderStatus = Record<ReplayMode, { available: boolean; model: string }>;
+
+const fixtures = [
+  spRevenueDropFixture,
+  electronicsSpikeFixture,
+  voucherDropoffFixture,
+] as RecommendationFixture[];
+
+function runFixtureReplay(fixture: RecommendationFixture): Promise<ReplayResult> {
   const handlers: Record<string, ToolHandler> = {};
   for (const tool of fixture.tools) {
     handlers[tool.name] = () => tool.result;
@@ -68,14 +78,48 @@ function runFixtureReplay(): Promise<ReplayResult> {
   });
 }
 
+async function runServerReplay(fixture: RecommendationFixture, mode: Exclude<ReplayMode, 'fixture'>): Promise<ReplayResult> {
+  const response = await fetch('/api/replay', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ fixtureId: fixture.id, mode }),
+  });
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(payload?.error ?? 'live replay failed');
+  }
+  return {
+    recommendations: payload.recommendations,
+    trace: payload.trace,
+    evalOk: payload.eval.ok,
+    evalIssues: payload.eval.issues.map((issue: { path: string; message: string }) => `${issue.path}: ${issue.message}`),
+    modelTurns: payload.modelTurns,
+  };
+}
+
 function App() {
+  const [selectedFixtureId, setSelectedFixtureId] = React.useState(fixtures[0].id);
+  const [mode, setMode] = React.useState<ReplayMode>('fixture');
+  const [providerStatus, setProviderStatus] = React.useState<ProviderStatus>({
+    fixture: { available: true, model: 'fixture-model' },
+    anthropic: { available: false, model: 'claude-sonnet-4-6' },
+    openai: { available: false, model: 'gpt-4.1' },
+  });
   const [replay, setReplay] = React.useState<ReplayState | null>(null);
   const [running, setRunning] = React.useState(false);
   const [runId, setRunId] = React.useState(0);
   const [error, setError] = React.useState<string | null>(null);
   const runCounter = React.useRef(0);
+  const selectedFixtureRef = React.useRef(fixtures[0]);
+  const fixture = fixtures.find((candidate) => candidate.id === selectedFixtureId) ?? fixtures[0];
+
+  selectedFixtureRef.current = fixture;
+  const modeRef = React.useRef(mode);
+  modeRef.current = mode;
 
   const startReplay = React.useCallback(async () => {
+    const fixtureToRun = selectedFixtureRef.current;
+    const modeToRun = modeRef.current;
     const nextRunId = runCounter.current + 1;
     runCounter.current = nextRunId;
     setRunId(nextRunId);
@@ -83,7 +127,9 @@ function App() {
     setError(null);
     setReplay(null);
     try {
-      const result = await runFixtureReplay();
+      const result = modeToRun === 'fixture'
+        ? await runFixtureReplay(fixtureToRun)
+        : await runServerReplay(fixtureToRun, modeToRun);
       setReplay({
         ...result,
         runId: nextRunId,
@@ -100,6 +146,27 @@ function App() {
     void startReplay();
   }, [startReplay]);
 
+  React.useEffect(() => {
+    fetch('/api/model-status')
+      .then((response) => response.json())
+      .then((payload) => setProviderStatus(payload.providers))
+      .catch(() => {
+        setProviderStatus((current) => current);
+      });
+  }, []);
+
+  function selectFixture(event: React.ChangeEvent<HTMLSelectElement>) {
+    setSelectedFixtureId(event.target.value);
+    setReplay(null);
+    setError(null);
+  }
+
+  function selectMode(nextMode: ReplayMode) {
+    setMode(nextMode);
+    setReplay(null);
+    setError(null);
+  }
+
   const totalTokens = replay?.trace.reduce((sum, event) => {
     if (event.type !== 'model_usage') return sum;
     return sum + (event.inputTokens ?? 0) + (event.outputTokens ?? 0);
@@ -112,10 +179,46 @@ function App() {
           <p className="eyebrow">AptKit Studio</p>
           <h1>Recommendation Agent Replay</h1>
         </div>
-        <button className="runButton" onClick={startReplay} disabled={running}>
-          <Play size={17} aria-hidden="true" />
-          <span>{running ? 'Running' : 'Run Fixture'}</span>
-        </button>
+        <div className="topbarActions">
+          <div className="modeSwitch" aria-label="Replay mode">
+            <ModeButton
+              active={mode === 'fixture'}
+              available
+              icon={<Boxes size={15} />}
+              label="Fixture"
+              onClick={() => selectMode('fixture')}
+            />
+            <ModeButton
+              active={mode === 'anthropic'}
+              available={providerStatus.anthropic.available}
+              icon={<Cloud size={15} />}
+              label="Anthropic"
+              onClick={() => selectMode('anthropic')}
+            />
+            <ModeButton
+              active={mode === 'openai'}
+              available={providerStatus.openai.available}
+              icon={<KeyRound size={15} />}
+              label="OpenAI"
+              onClick={() => selectMode('openai')}
+            />
+          </div>
+          <label className="fixtureSelect">
+            <span>Fixture</span>
+            <ChevronDown size={16} aria-hidden="true" />
+            <select value={selectedFixtureId} onChange={selectFixture} disabled={running}>
+              {fixtures.map((candidate) => (
+                <option key={candidate.id} value={candidate.id}>
+                  {candidate.id}
+                </option>
+              ))}
+            </select>
+          </label>
+          <button className="runButton" onClick={startReplay} disabled={running || !providerStatus[mode].available}>
+            <Play size={17} aria-hidden="true" />
+            <span>{running ? 'Running' : mode === 'fixture' ? 'Run Fixture' : 'Run Live'}</span>
+          </button>
+        </div>
       </header>
 
       <section className="metrics" aria-label="Replay summary">
@@ -131,8 +234,12 @@ function App() {
             <div className="kv">
               <span>ID</span>
               <strong>{fixture.id}</strong>
+              <span>Case</span>
+              <strong>{fixture.description}</strong>
               <span>Status</span>
               <strong>{error ? 'error' : running ? 'running' : replay ? `completed at ${replay.completedAt}` : 'not run'}</strong>
+              <span>Mode</span>
+              <strong>{mode} / {providerStatus[mode].model}{providerStatus[mode].available ? '' : ' unavailable'}</strong>
               <span>Workspace</span>
               <strong>{fixture.workspace.projectName}</strong>
               <span>Tokens</span>
@@ -176,7 +283,8 @@ function App() {
 
         <section className="mainPane">
           <Panel title="Recommendations" icon={<CircleDollarSign size={17} />} wide>
-            {running ? <div className="emptyState">Running fixture replay...</div> : null}
+            {running ? <div className="emptyState">Running {mode === 'fixture' ? 'fixture replay' : `${mode} live replay`}...</div> : null}
+            {!providerStatus[mode].available ? <div className="errorState">Set {mode === 'anthropic' ? 'ANTHROPIC_API_KEY' : 'OPENAI_API_KEY'} and restart Studio to enable this mode.</div> : null}
             {error ? <div className="errorState">{error}</div> : null}
             {!running && !error && !replay ? <div className="emptyState">No replay output yet.</div> : null}
             <div className="recommendations">
@@ -243,6 +351,27 @@ function Metric({ icon, label, value, tone = 'neutral' }: { icon: React.ReactNod
   );
 }
 
+function ModeButton({
+  active,
+  available,
+  icon,
+  label,
+  onClick,
+}: {
+  active: boolean;
+  available: boolean;
+  icon: React.ReactNode;
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <button className={active ? 'modeButton active' : 'modeButton'} disabled={!available} onClick={onClick} type="button">
+      {icon}
+      <span>{label}</span>
+    </button>
+  );
+}
+
 function Panel({ title, icon, children, wide = false }: { title: string; icon: React.ReactNode; children: React.ReactNode; wide?: boolean }) {
   return (
     <section className={wide ? 'panel wide' : 'panel'}>
@@ -278,4 +407,6 @@ function TraceItem({ event, index }: { event: CapabilityEvent; index: number }) 
   );
 }
 
-createRoot(document.getElementById('root')!).render(<App />);
+const rootHost = window as Window & { __aptkitStudioRoot?: ReturnType<typeof createRoot> };
+rootHost.__aptkitStudioRoot ??= createRoot(document.getElementById('root')!);
+rootHost.__aptkitStudioRoot.render(<App />);

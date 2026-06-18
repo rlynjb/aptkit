@@ -35,6 +35,97 @@ button {
   margin-bottom: 18px;
 }
 
+.topbarActions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.modeSwitch {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(86px, 1fr));
+  gap: 4px;
+  min-height: 48px;
+  padding: 4px;
+  border: 1px solid #cfd8d1;
+  border-radius: 8px;
+  background: #edf2ee;
+}
+
+.modeButton {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-width: 0;
+  min-height: 38px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #526258;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.modeButton.active {
+  background: #ffffff;
+  color: #1d2420;
+  box-shadow: 0 1px 2px rgba(34, 47, 39, 0.12);
+}
+
+.modeButton:disabled {
+  color: #9ba79f;
+  cursor: not-allowed;
+}
+
+.fixtureSelect {
+  position: relative;
+  display: grid;
+  grid-template-columns: auto 18px;
+  grid-template-rows: auto auto;
+  align-items: center;
+  min-width: 238px;
+  min-height: 48px;
+  padding: 6px 10px;
+  border: 1px solid #cfd8d1;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.fixtureSelect span {
+  grid-column: 1 / -1;
+  color: #66766c;
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.fixtureSelect svg {
+  grid-column: 2;
+  grid-row: 2;
+  color: #5f6d64;
+  pointer-events: none;
+}
+
+.fixtureSelect select {
+  grid-column: 1 / -1;
+  grid-row: 2;
+  width: 100%;
+  min-height: 24px;
+  padding: 0 24px 0 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: #1d2420;
+  font: inherit;
+  font-size: 14px;
+  font-weight: 750;
+  appearance: none;
+  cursor: pointer;
+}
+
 .eyebrow {
   margin: 0 0 4px;
   color: #66766c;
@@ -408,6 +499,19 @@ h1 {
   .topbar {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .topbarActions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .modeSwitch {
+    grid-template-columns: 1fr;
+  }
+
+  .fixtureSelect {
+    min-width: 0;
   }
 
   h1 {

@@ -1,0 +1,84 @@
+{
+  "id": "voucher-dropoff-w10-on",
+  "description": "Fixture derived from Blooming Insights recommendation regression case 08-recommendation-voucher.",
+  "workspace": {
+    "projectId": "olist",
+    "projectName": "Olist Brazilian ecommerce fixture",
+    "events": [
+      { "name": "order", "properties": ["state", "category", "purchase_ts", "price_brl"], "eventCount": 0 },
+      { "name": "payment", "properties": ["type", "installments", "value_brl"], "eventCount": 0 }
+    ],
+    "customerProperties": ["state", "city"],
+    "catalogs": [],
+    "totalCustomers": 0,
+    "totalEvents": 0,
+    "oldestTimestamp": null,
+    "dataHorizon": { "from": "2025-12-01", "to": "2026-06-01", "durationDays": 182 }
+  },
+  "anomaly": {
+    "metric": "payment_value",
+    "scope": ["payment_type:voucher"],
+    "change": {
+      "value": 95,
+      "direction": "down",
+      "baseline": "weeks 10-26 vs weeks 1-9 baseline"
+    },
+    "severity": "critical",
+    "evidence": [],
+    "impact": "Voucher payment value collapsed to about 5% of baseline and stayed depressed."
+  },
+  "diagnosis": {
+    "conclusion": "Voucher payment volume collapsed to roughly 5% of baseline starting week 10 and remained depressed through the end of the data horizon. Credit card and boleto did not absorb the lost volume, and order count fell, so this is likely a program-level voucher change rather than clean substitution.",
+    "evidence": [
+      "get_anomaly_context(metric=payment_value, dimension=payment_type, segment=voucher) returned pct_change=-0.95 for weeks 10-26.",
+      "Credit_card and boleto did not rise enough to absorb the lost voucher volume.",
+      "Total order_count was about 8% below baseline after the voucher cliff.",
+      "The drop was uniform across SP, RJ, and MG."
+    ],
+    "hypothesesConsidered": [
+      {
+        "hypothesis": "Voucher volume substituted to credit card or boleto",
+        "supported": false,
+        "reasoning": "Other payment types did not rise and total order count fell."
+      },
+      {
+        "hypothesis": "Program-level voucher change",
+        "supported": true,
+        "reasoning": "The cliff-shaped onset and sustained cross-state impact fit suspension, expiry, or restriction."
+      }
+    ],
+    "affectedCustomers": {
+      "count": 12500,
+      "segmentDescription": "Customers who previously used voucher payment in weeks 1-9"
+    },
+    "confidence": "medium"
+  },
+  "tools": [
+    { "name": "list_voucher_pools", "description": "List voucher pools", "inputSchema": { "type": "object" }, "result": { "data": [] } },
+    { "name": "list_email_campaigns", "description": "List email campaigns", "inputSchema": { "type": "object" }, "result": { "data": [{ "name": "inactive customer broadcast" }] } },
+    { "name": "get_frequency_policies", "description": "List frequency policies", "inputSchema": { "type": "object" }, "result": { "data": [{ "name": "one marketing message per week" }] } }
+  ],
+  "modelResponses": [
+    {
+      "content": [
+        { "type": "tool_use", "id": "tool-1", "name": "list_voucher_pools", "input": { "project_id": "olist" } },
+        { "type": "tool_use", "id": "tool-2", "name": "get_frequency_policies", "input": { "project_id": "olist" } }
+      ],
+      "usage": { "inputTokens": 940, "outputTokens": 75 },
+      "model": "fixture-model"
+    },
+    {
+      "content": [
+        {
+          "type": "text",
+          "text": "```json\n[{\"title\":\"Launch replacement incentive campaign for prior voucher users\",\"rationale\":\"The voucher program appears blocked and part of the former voucher cohort stopped ordering. A replacement incentive on boleto or credit card gives the merchant a fast retention path while the voucher root cause is resolved.\",\"bloomreachFeature\":\"campaign\",\"steps\":[\"Build a segment of customers who used voucher payment in weeks 1-9 and have not ordered since week 10.\",\"Create a 5% replacement incentive valid on boleto or credit card.\",\"Send a broadcast with a 10% holdout to measure incremental recovery.\"],\"estimatedImpact\":{\"range\":\"+$140k - $280k recovered over 28 days\",\"rangeUsd\":{\"low\":140000,\"high\":280000},\"assumption\":\"Assumes 10-20% reactivation of 12500 affected customers at the historical AOV.\"},\"effort\":\"medium\",\"timeToSetUpMinutes\":90,\"readResultInDays\":28,\"prerequisites\":[{\"label\":\"new voucher or discount pool exists\",\"satisfied\":false},{\"label\":\"email campaign channel available\",\"satisfied\":true}],\"successMetric\":\"Dormant voucher cohort reactivation reaches 10-20% within 28 days.\",\"confidence\":\"medium\"},{\"title\":\"Escalate voucher-program root cause with a status scenario\",\"rationale\":\"No marketing message fixes a program-level voucher outage. A structured escalation and customer-status segment makes the operational fix trackable and prevents the agent from treating policy failure as a campaign-only problem.\",\"bloomreachFeature\":\"scenario\",\"steps\":[\"Create a segment of customers affected by the voucher cliff.\",\"Route the week-10 cliff evidence to the voucher program owner.\",\"If voucher pools are restored, trigger a relaunch message to affected customers.\"],\"estimatedImpact\":{\"range\":\"Up to full voucher-channel recovery if the program is restored\",\"assumption\":\"Bounds the upside against pre-week-10 voucher payment value.\"},\"effort\":\"high\",\"timeToSetUpMinutes\":240,\"readResultInDays\":7,\"prerequisites\":[{\"label\":\"voucher program owner identified\",\"satisfied\":false},{\"label\":\"frequency policy available\",\"satisfied\":true}],\"successMetric\":\"Program status confirmed within 7 days with re-enable date or replacement-program decision.\",\"confidence\":\"high\"}]\n```"
+        }
+      ],
+      "usage": { "inputTokens": 1420, "outputTokens": 590 },
+      "model": "fixture-model"
+    }
+  ],
+  "eval": {
+    "requiredFields": ["0.title", "0.rationale", "0.bloomreachFeature", "0.steps", "0.estimatedImpact", "0.confidence"]
+  }
+}

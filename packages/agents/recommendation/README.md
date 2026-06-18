@@ -21,6 +21,18 @@ npm run replay:fixture -w @aptkit/agent-recommendation
 
 The default fixture is `fixtures/sp-revenue-drop.json`, derived from the Blooming Insights `06-recommendation-sp` regression case.
 
+Additional fixtures:
+
+- `fixtures/electronics-spike.json`
+- `fixtures/voucher-dropoff.json`
+
+Run a specific fixture:
+
+```sh
+npm run replay:fixture -w @aptkit/agent-recommendation -- fixtures/electronics-spike.json
+npm run replay:fixture -w @aptkit/agent-recommendation -- fixtures/voucher-dropoff.json
+```
+
 ## Basic Usage
 
 ```ts
@@ -54,6 +66,24 @@ const agent = new RecommendationAgent({ model, tools, workspace });
 ```
 
 Live provider tests should stay opt-in and must not run in CI without explicit credentials.
+
+## Live OpenAI Usage
+
+Use `@aptkit/provider-openai` at the app boundary:
+
+```ts
+import { OpenAIModelProvider } from '@aptkit/provider-openai';
+import { RecommendationAgent } from '@aptkit/agent-recommendation';
+
+const model = new OpenAIModelProvider({
+  apiKey: process.env.OPENAI_API_KEY,
+  model: process.env.OPENAI_MODEL ?? 'gpt-4.1',
+});
+
+const agent = new RecommendationAgent({ model, tools, workspace });
+```
+
+The OpenAI adapter uses Chat Completions function tools because AptKit's current runtime contract is chat/tool-loop shaped. A Responses API adapter can be added later if AptKit needs OpenAI-native response state, richer built-in tools, or streaming event parity.
 
 ## Contract
 
