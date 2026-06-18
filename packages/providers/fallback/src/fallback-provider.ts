@@ -78,7 +78,7 @@ export class FallbackModelProvider implements ModelProvider {
           this.trace?.emit({
             type: 'warning',
             capabilityId: this.capabilityId,
-            message: `Provider ${provider.id} failed; trying fallback provider.`,
+            message: `Provider ${provider.id} failed (${attempt.error}); trying fallback provider.`,
             timestamp: timestamp(),
           });
         }

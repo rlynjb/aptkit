@@ -36,6 +36,7 @@ import {
   type StructuralDiffRule,
 } from '@aptkit/evals';
 import { AnthropicModelProvider } from '@aptkit/provider-anthropic';
+import { FallbackModelProvider } from '@aptkit/provider-fallback';
 import { OpenAIModelProvider } from '@aptkit/provider-openai';
 import { InMemoryToolRegistry, type ToolDefinition, type ToolHandler } from '@aptkit/tools';
 import { encodeNdjsonRecord, estimateCost, isCapabilityEvent, modelTurnCount, summarizeUsage } from '@aptkit/runtime';
@@ -497,9 +498,15 @@ async function runReplay(fixture: RecommendationFixture, mode: ReplayMode, optio
     handlers[tool.name] = () => tool.result;
   }
 
-  const model = createModelProvider(fixture, mode);
-  const tools = new InMemoryToolRegistry(fixture.tools, handlers);
   const trace: CapabilityEvent[] = [];
+  const traceSink = {
+    emit: (event: CapabilityEvent) => {
+      trace.push(event);
+      options.onEvent?.(event);
+    },
+  };
+  const model = createModelProvider(fixture, mode, traceSink);
+  const tools = new InMemoryToolRegistry(fixture.tools, handlers);
   const agent = new RecommendationAgent({
     model,
     tools,
@@ -508,12 +515,7 @@ async function runReplay(fixture: RecommendationFixture, mode: ReplayMode, optio
       let index = 0;
       return () => `${fixture.id}-${mode}-${++index}`;
     })(),
-    trace: {
-      emit: (event) => {
-        trace.push(event);
-        options.onEvent?.(event);
-      },
-    },
+    trace: traceSink,
   });
 
   const recommendations = await agent.propose(fixture.anomaly, fixture.diagnosis);
@@ -538,19 +540,20 @@ async function runMonitoringReplay(fixture: MonitoringFixture, mode: MonitoringR
     handlers[tool.name] = () => tool.result;
   }
 
-  const model = createMonitoringModelProvider(fixture, mode);
-  const tools = new InMemoryToolRegistry(fixture.tools, handlers);
   const trace: CapabilityEvent[] = [];
+  const traceSink = {
+    emit: (event: CapabilityEvent) => {
+      trace.push(event);
+      options.onEvent?.(event);
+    },
+  };
+  const model = createMonitoringModelProvider(fixture, mode, traceSink);
+  const tools = new InMemoryToolRegistry(fixture.tools, handlers);
   const agent = new AnomalyMonitoringAgent({
     model,
     tools,
     workspace: fixture.workspace,
-    trace: {
-      emit: (event) => {
-        trace.push(event);
-        options.onEvent?.(event);
-      },
-    },
+    trace: traceSink,
   });
 
   const anomalies = await agent.scan();
@@ -580,19 +583,20 @@ async function runDiagnosticReplay(fixture: DiagnosticFixture, mode: DiagnosticR
     handlers[tool.name] = () => tool.result;
   }
 
-  const model = createDiagnosticModelProvider(fixture, mode);
-  const tools = new InMemoryToolRegistry(fixture.tools, handlers);
   const trace: CapabilityEvent[] = [];
+  const traceSink = {
+    emit: (event: CapabilityEvent) => {
+      trace.push(event);
+      options.onEvent?.(event);
+    },
+  };
+  const model = createDiagnosticModelProvider(fixture, mode, traceSink);
+  const tools = new InMemoryToolRegistry(fixture.tools, handlers);
   const agent = new DiagnosticInvestigationAgent({
     model,
     tools,
     workspace: fixture.workspace,
-    trace: {
-      emit: (event) => {
-        trace.push(event);
-        options.onEvent?.(event);
-      },
-    },
+    trace: traceSink,
   });
 
   const diagnosis = await agent.investigate(fixture.anomaly) as DiagnosticDiagnosis;
@@ -622,19 +626,20 @@ async function runQueryReplay(fixture: QueryFixture, mode: QueryReplayMode, opti
     handlers[tool.name] = () => tool.result;
   }
 
-  const model = createQueryModelProvider(fixture, mode);
-  const tools = new InMemoryToolRegistry(fixture.tools, handlers);
   const trace: CapabilityEvent[] = [];
+  const traceSink = {
+    emit: (event: CapabilityEvent) => {
+      trace.push(event);
+      options.onEvent?.(event);
+    },
+  };
+  const model = createQueryModelProvider(fixture, mode, traceSink);
+  const tools = new InMemoryToolRegistry(fixture.tools, handlers);
   const agent = new QueryAgent({
     model,
     tools,
     workspace: fixture.workspace,
-    trace: {
-      emit: (event) => {
-        trace.push(event);
-        options.onEvent?.(event);
-      },
-    },
+    trace: traceSink,
   });
 
   const answer = await agent.answer(fixture.question, { intent: fixture.intent });
@@ -659,37 +664,74 @@ async function runQueryReplay(fixture: QueryFixture, mode: QueryReplayMode, opti
   };
 }
 
-function createModelProvider(fixture: RecommendationFixture, mode: ReplayMode): ModelProvider {
+function createModelProvider(
+  fixture: RecommendationFixture,
+  mode: ReplayMode,
+  trace: { emit(event: CapabilityEvent): void },
+): ModelProvider {
   if (mode === 'fixture') return new FixtureModelProvider(fixture.modelResponses);
   if (mode === 'anthropic') {
-    const apiKey = process.env.ANTHROPIC_API_KEY;
-    if (!apiKey) throw new Error('ANTHROPIC_API_KEY is not configured');
-    return new AnthropicModelProvider({ apiKey, model: process.env.ANTHROPIC_MODEL });
+    return providerWithConfiguredFallback(requireAnthropicProvider(), [configuredOpenAIProvider()], 'recommendation-agent', trace);
   }
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) throw new Error('OPENAI_API_KEY is not configured');
-  return new OpenAIModelProvider({ apiKey, model: process.env.OPENAI_MODEL });
+  return providerWithConfiguredFallback(requireOpenAIProvider(), [configuredAnthropicProvider()], 'recommendation-agent', trace);
 }
 
-function createMonitoringModelProvider(fixture: MonitoringFixture, mode: MonitoringReplayMode): ModelProvider {
+function createMonitoringModelProvider(
+  fixture: MonitoringFixture,
+  mode: MonitoringReplayMode,
+  trace: { emit(event: CapabilityEvent): void },
+): ModelProvider {
   if (mode === 'fixture') return new MonitoringFixtureModelProvider(fixture.modelResponses);
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) throw new Error('OPENAI_API_KEY is not configured');
-  return new OpenAIModelProvider({ apiKey, model: process.env.OPENAI_MODEL });
+  return providerWithConfiguredFallback(requireOpenAIProvider(), [configuredAnthropicProvider()], 'anomaly-monitoring-agent', trace);
 }
 
-function createDiagnosticModelProvider(fixture: DiagnosticFixture, mode: DiagnosticReplayMode): ModelProvider {
+function createDiagnosticModelProvider(
+  fixture: DiagnosticFixture,
+  mode: DiagnosticReplayMode,
+  trace: { emit(event: CapabilityEvent): void },
+): ModelProvider {
   if (mode === 'fixture') return new DiagnosticFixtureModelProvider(fixture.modelResponses);
+  return providerWithConfiguredFallback(requireOpenAIProvider(), [configuredAnthropicProvider()], 'diagnostic-investigation-agent', trace);
+}
+
+function createQueryModelProvider(
+  fixture: QueryFixture,
+  mode: QueryReplayMode,
+  trace: { emit(event: CapabilityEvent): void },
+): ModelProvider {
+  if (mode === 'fixture') return new QueryFixtureModelProvider(fixture.modelResponses);
+  return providerWithConfiguredFallback(requireOpenAIProvider(), [configuredAnthropicProvider()], 'query-agent', trace);
+}
+
+function requireOpenAIProvider(): ModelProvider {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) throw new Error('OPENAI_API_KEY is not configured');
   return new OpenAIModelProvider({ apiKey, model: process.env.OPENAI_MODEL });
 }
 
-function createQueryModelProvider(fixture: QueryFixture, mode: QueryReplayMode): ModelProvider {
-  if (mode === 'fixture') return new QueryFixtureModelProvider(fixture.modelResponses);
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) throw new Error('OPENAI_API_KEY is not configured');
-  return new OpenAIModelProvider({ apiKey, model: process.env.OPENAI_MODEL });
+function requireAnthropicProvider(): ModelProvider {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) throw new Error('ANTHROPIC_API_KEY is not configured');
+  return new AnthropicModelProvider({ apiKey, model: process.env.ANTHROPIC_MODEL });
+}
+
+function configuredOpenAIProvider(): ModelProvider | undefined {
+  return process.env.OPENAI_API_KEY ? new OpenAIModelProvider({ apiKey: process.env.OPENAI_API_KEY, model: process.env.OPENAI_MODEL }) : undefined;
+}
+
+function configuredAnthropicProvider(): ModelProvider | undefined {
+  return process.env.ANTHROPIC_API_KEY ? new AnthropicModelProvider({ apiKey: process.env.ANTHROPIC_API_KEY, model: process.env.ANTHROPIC_MODEL }) : undefined;
+}
+
+function providerWithConfiguredFallback(
+  primary: ModelProvider,
+  candidates: readonly (ModelProvider | undefined)[],
+  capabilityId: string,
+  trace: { emit(event: CapabilityEvent): void },
+): ModelProvider {
+  const providers = [primary, ...candidates.filter((provider): provider is ModelProvider => Boolean(provider) && provider.id !== primary.id)];
+  if (providers.length === 1) return primary;
+  return new FallbackModelProvider({ providers, capabilityId, trace });
 }
 
 function loadStudioEnv(mode: string): NodeJS.ProcessEnv {
