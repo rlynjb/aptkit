@@ -6,14 +6,17 @@ The package is built from `packages/core`, but it is packed as a standalone tarb
 
 ## Publish
 
-Publish with GitHub Actions after adding an `NPM_TOKEN` repository secret:
+Publish `0.1.0` with GitHub Actions after adding an `NPM_TOKEN` repository secret:
+
+1. Open the `Publish AptKit Core` workflow from the GitHub Actions tab.
+2. Run the workflow manually from `main`.
+
+For later versions, bump `packages/core/package.json` and publish with a version tag:
 
 ```sh
-git tag aptkit-core-v0.1.0
-git push origin aptkit-core-v0.1.0
+git tag aptkit-core-v0.1.1
+git push origin aptkit-core-v0.1.1
 ```
-
-The `Publish AptKit Core` workflow can also be run manually from the GitHub Actions tab.
 
 Publish locally only when your shell is logged in to npm or has `NODE_AUTH_TOKEN` set:
 
