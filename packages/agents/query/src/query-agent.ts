@@ -6,6 +6,7 @@ import type { Intent, WorkspaceDescriptor } from './types.js';
 
 export const QUERY_CAPABILITY_ID = 'query-agent';
 
+/** Least-privilege tool grant for answering free-form workspace questions. */
 export const queryToolPolicy = {
   capabilityId: QUERY_CAPABILITY_ID,
   allowedTools: [
@@ -70,6 +71,7 @@ export class QueryAgent {
     this.prompt = options.prompt ?? queryPromptPackage.system;
   }
 
+  /** Answers a natural-language question by using only the supplied model and allowed tools. */
   async answer(question: string, runOptions: QueryRunOptions = {}): Promise<string> {
     const allTools = await this.options.tools.listTools();
     const toolSchemas = filterToolsForPolicy(allTools, queryToolPolicy);

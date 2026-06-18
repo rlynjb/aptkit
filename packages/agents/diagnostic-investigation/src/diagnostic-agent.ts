@@ -7,6 +7,7 @@ import { tryParseDiagnosis } from './validate.js';
 
 export const DIAGNOSTIC_INVESTIGATION_CAPABILITY_ID = 'diagnostic-investigation-agent';
 
+/** Least-privilege tool grant for evidence-gathering during diagnostic investigation. */
 export const diagnosticInvestigationToolPolicy = {
   capabilityId: DIAGNOSTIC_INVESTIGATION_CAPABILITY_ID,
   allowedTools: [
@@ -50,6 +51,7 @@ export class DiagnosticInvestigationAgent {
     this.prompt = options.prompt ?? diagnosticPromptPackage.system;
   }
 
+  /** Investigates one anomaly and returns a validated diagnosis with evidence and confidence. */
   async investigate(anomaly: Anomaly, runOptions: DiagnosticRunOptions = {}): Promise<Diagnosis> {
     const allTools = await this.options.tools.listTools();
     const toolSchemas = filterToolsForPolicy(allTools, diagnosticInvestigationToolPolicy);

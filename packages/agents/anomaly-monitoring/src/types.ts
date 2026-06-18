@@ -1,24 +1,20 @@
 export type { WorkspaceDescriptor } from '@aptkit/context';
+export type {
+  CoverageLevel as CategoryCoverage,
+  CoverageReportItem as CategoryCoverageItem,
+  CoverageRequirement,
+} from '@aptkit/tools';
 
 export type Severity = 'critical' | 'warning' | 'info' | 'positive';
-
-export type CategoryCoverage = 'full' | 'limited' | 'unavailable';
 
 export type AnomalyCategory = {
   id: string;
   label: string;
-  requires: string[];
-  enriches?: string[];
+  requires: readonly string[];
+  enriches?: readonly string[];
   whyItMatters: string;
   queryRecipe: string;
   thresholds: { critical: number; warning: number };
-};
-
-export type CategoryCoverageItem = {
-  category: string;
-  label: string;
-  coverage: CategoryCoverage;
-  missing?: string[];
 };
 
 export type Anomaly = {

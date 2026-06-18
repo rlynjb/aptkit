@@ -15,6 +15,7 @@ import { tryParseRecommendations } from './validate.js';
 
 export const RECOMMENDATION_CAPABILITY_ID = 'recommendation-agent';
 
+/** Least-privilege tool grant for read-only recommendation generation. */
 export const recommendationToolPolicy = {
   capabilityId: RECOMMENDATION_CAPABILITY_ID,
   allowedTools: [
@@ -59,6 +60,7 @@ export class RecommendationAgent {
     this.prompt = options.prompt ?? recommendationPromptPackage.system;
   }
 
+  /** Produces validated, id-assigned recommendations grounded in an anomaly diagnosis. */
   async propose(
     anomaly: Anomaly,
     diagnosis: Diagnosis,

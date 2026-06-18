@@ -1,7 +1,17 @@
-import type { AnomalyCategory, CategoryCoverage, CategoryCoverageItem, WorkspaceDescriptor } from './types.js';
+import {
+  coverageReport as baseCoverageReport,
+  missingCapabilities,
+  requirementCoverage,
+  runnableRequirements,
+  schemaCapabilities,
+} from '@aptkit/tools';
+import type { AnomalyCategory, CategoryCoverage, CategoryCoverageItem } from './types.js';
+
+export { missingCapabilities, schemaCapabilities };
 
 const windowText = 'in last 90 days';
 
+/** Ecommerce-specific anomaly checks used by the monitoring agent's default category pack. */
 export const ECOMMERCE_ANOMALY_CATEGORIES: AnomalyCategory[] = [
   {
     id: 'conversion_drop',
@@ -87,49 +97,23 @@ export const ECOMMERCE_ANOMALY_CATEGORIES: AnomalyCategory[] = [
   },
 ];
 
-export function schemaCapabilities(workspace: Pick<WorkspaceDescriptor, 'events' | 'catalogs'>): Set<string> {
-  const capabilities = new Set<string>();
-  for (const event of workspace.events ?? []) {
-    capabilities.add(event.name);
-    for (const property of event.properties ?? []) {
-      capabilities.add(`${event.name}.${property}`);
-    }
-  }
-  for (const catalog of workspace.catalogs ?? []) {
-    capabilities.add(`catalog:${catalog.name}`);
-  }
-  return capabilities;
-}
-
+/** Compatibility wrapper for generic coverage classification from @aptkit/tools. */
 export function categoryCoverage(category: AnomalyCategory, capabilities: Set<string>): CategoryCoverage {
-  if (!category.requires.every((dependency) => capabilities.has(dependency))) return 'unavailable';
-  if (category.enriches?.length && !category.enriches.every((dependency) => capabilities.has(dependency))) return 'limited';
-  return 'full';
+  return requirementCoverage(category, capabilities);
 }
 
-export function missingCapabilities(category: AnomalyCategory, capabilities: Set<string>): string[] {
-  return [...category.requires, ...(category.enriches ?? [])].filter((dependency) => !capabilities.has(dependency));
-}
-
+/** Reports which ecommerce anomaly categories are runnable for the supplied workspace capabilities. */
 export function coverageReport(
   categories: readonly AnomalyCategory[],
   capabilities: Set<string>,
 ): CategoryCoverageItem[] {
-  return categories.map((category) => {
-    const coverage = categoryCoverage(category, capabilities);
-    const missing = missingCapabilities(category, capabilities);
-    return {
-      category: category.id,
-      label: category.label,
-      coverage,
-      ...(coverage !== 'full' && missing.length ? { missing } : {}),
-    };
-  });
+  return baseCoverageReport(categories, capabilities);
 }
 
+/** Filters the default or supplied categories before the monitoring agent calls a model. */
 export function runnableCategories(
   categories: readonly AnomalyCategory[],
   capabilities: Set<string>,
 ): AnomalyCategory[] {
-  return categories.filter((category) => categoryCoverage(category, capabilities) !== 'unavailable');
+  return runnableRequirements(categories, capabilities);
 }

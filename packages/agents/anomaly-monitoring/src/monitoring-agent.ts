@@ -8,6 +8,7 @@ import { tryParseAnomalies } from './validate.js';
 
 export const ANOMALY_MONITORING_CAPABILITY_ID = 'anomaly-monitoring-agent';
 
+/** Least-privilege tool grant for anomaly scanning. Provider adapters only see these tools. */
 export const anomalyMonitoringToolPolicy = {
   capabilityId: ANOMALY_MONITORING_CAPABILITY_ID,
   allowedTools: [
@@ -47,10 +48,12 @@ export class AnomalyMonitoringAgent {
     this.prompt = options.prompt ?? monitoringPromptPackage.system;
   }
 
+  /** Returns categories this workspace can scan without asking the model to guess unsupported work. */
   runnableCategories(): AnomalyCategory[] {
     return runnableCategories(this.categories, schemaCapabilities(this.options.workspace));
   }
 
+  /** Runs a bounded anomaly scan and returns validated, severity-sorted anomaly objects. */
   async scan(runOptions: MonitoringRunOptions = {}): Promise<Anomaly[]> {
     const allTools = await this.options.tools.listTools();
     const toolSchemas = filterToolsForPolicy(allTools, anomalyMonitoringToolPolicy);
@@ -86,6 +89,7 @@ export class AnomalyMonitoringAgent {
   }
 }
 
+/** Formats runnable categories for the system prompt shown to the model. */
 export function formatCategoryChecklist(categories: readonly AnomalyCategory[]): string {
   if (categories.length === 0) return '(no runnable checklist categories; scan core metrics broadly)';
   return categories

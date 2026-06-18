@@ -2,15 +2,18 @@ import type { ModelTool } from '@aptkit/runtime';
 
 export type ToolDefinition = ModelTool;
 
+/** Per-call controls passed from an agent loop into a tool implementation. */
 export type ToolCallOptions = {
   signal?: AbortSignal;
 };
 
+/** Normalized result envelope for any model-callable tool. */
 export type ToolCallResult = {
   result: unknown;
   durationMs: number;
 };
 
+/** Provider-neutral registry that lists callable tools and executes them by name. */
 export type ToolRegistry = {
   listTools(): Promise<ToolDefinition[]> | ToolDefinition[];
   callTool(
@@ -20,11 +23,13 @@ export type ToolRegistry = {
   ): Promise<ToolCallResult>;
 };
 
+/** Function backing one tool in an in-memory or adapter-backed registry. */
 export type ToolHandler = (
   args: Record<string, unknown>,
   options?: ToolCallOptions,
 ) => Promise<unknown> | unknown;
 
+/** Test/demo registry that serves fixed tool definitions with injected handlers. */
 export class InMemoryToolRegistry implements ToolRegistry {
   private readonly handlers = new Map<string, ToolHandler>();
 
@@ -41,6 +46,7 @@ export class InMemoryToolRegistry implements ToolRegistry {
     return this.definitions;
   }
 
+  /** Executes a named handler and records wall-clock duration for traces. */
   async callTool(
     name: string,
     args: Record<string, unknown>,
