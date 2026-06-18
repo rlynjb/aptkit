@@ -38,6 +38,11 @@ import {
 import { AnthropicModelProvider } from '@aptkit/provider-anthropic';
 import { FallbackModelProvider } from '@aptkit/provider-fallback';
 import { OpenAIModelProvider } from '@aptkit/provider-openai';
+import {
+  FixtureSyntheticEcommerceDataSource,
+  OpenAISyntheticEcommerceDataSource,
+  SyntheticEcommerceToolRegistry,
+} from '@aptkit/provider-synthetic';
 import { InMemoryToolRegistry, type ToolDefinition, type ToolHandler } from '@aptkit/tools';
 import { encodeNdjsonRecord, estimateCost, isCapabilityEvent, modelTurnCount, summarizeUsage } from '@aptkit/runtime';
 import type { CapabilityEvent, CostEstimate, ModelProvider, ModelResponse } from '@aptkit/runtime';
@@ -57,6 +62,8 @@ type MonitoringReplayMode = 'fixture' | 'openai';
 type DiagnosticReplayMode = 'fixture' | 'openai';
 
 type QueryReplayMode = 'fixture' | 'openai';
+
+type SyntheticReplayMode = 'fixture' | 'openai';
 
 type FixtureTool = ToolDefinition & { result: unknown };
 
@@ -352,6 +359,27 @@ export default defineConfig(({ mode }) => {
               const path = join(outDir, `${formatTimestamp(new Date(artifact.createdAt))}-${slugify(artifact.fixture.id)}-${slugify(artifact.provider.id)}-studio.json`);
               await writeFile(path, `${JSON.stringify(artifact, null, 2)}\n`, 'utf8');
               sendJson(res, { path: relativeFromWorkspace(path) });
+            } catch (error) {
+              res.statusCode = 400;
+              sendJson(res, { error: error instanceof Error ? error.message : String(error) });
+            }
+          });
+
+          server.middlewares.use('/api/synthetic/tool', async (req, res) => {
+            if (req.method !== 'POST') {
+              res.statusCode = 405;
+              sendJson(res, { error: 'method not allowed' });
+              return;
+            }
+
+            try {
+              const body = await readJsonBody(req);
+              const result = await runSyntheticTool(
+                stringBodyField(body.toolName, 'toolName'),
+                recordBodyField(body.args, 'args'),
+                parseSyntheticMode(body.mode),
+              );
+              sendJson(res, result);
             } catch (error) {
               res.statusCode = 400;
               sendJson(res, { error: error instanceof Error ? error.message : String(error) });
@@ -664,6 +692,28 @@ async function runQueryReplay(fixture: QueryFixture, mode: QueryReplayMode, opti
   };
 }
 
+async function runSyntheticTool(toolName: string, args: Record<string, unknown>, mode: SyntheticReplayMode) {
+  const startedAt = Date.now();
+  const dataSource = mode === 'openai'
+    ? new OpenAISyntheticEcommerceDataSource({ model: requireOpenAIProvider() })
+    : new FixtureSyntheticEcommerceDataSource();
+  const registry = new SyntheticEcommerceToolRegistry({ dataSource });
+  const result = await registry.callTool(toolName, args);
+
+  return {
+    mode,
+    toolName,
+    args,
+    result: result.result,
+    durationMs: Date.now() - startedAt,
+    toolDurationMs: result.durationMs,
+    provider: {
+      id: mode,
+      model: mode === 'openai' ? openAIModelName() : 'fixture-model',
+    },
+  };
+}
+
 function createModelProvider(
   fixture: RecommendationFixture,
   mode: ReplayMode,
@@ -707,6 +757,10 @@ function requireOpenAIProvider(): ModelProvider {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) throw new Error('OPENAI_API_KEY is not configured');
   return new OpenAIModelProvider({ apiKey, model: process.env.OPENAI_MODEL });
+}
+
+function openAIModelName(): string {
+  return process.env.OPENAI_MODEL ?? 'gpt-4.1';
 }
 
 function requireAnthropicProvider(): ModelProvider {
@@ -781,6 +835,11 @@ function parseQueryMode(value: unknown): QueryReplayMode {
   return 'fixture';
 }
 
+function parseSyntheticMode(value: unknown): SyntheticReplayMode {
+  if (value === 'openai') return 'openai';
+  return 'fixture';
+}
+
 function sendJson(res: { setHeader(name: string, value: string): void; end(body: string): void }, body: unknown) {
   res.setHeader('content-type', 'application/json');
   res.end(JSON.stringify(body));
@@ -819,7 +878,7 @@ async function streamReplayResponse<T>(
   }
 }
 
-function readJsonBody(req: NodeJS.ReadableStream): Promise<{ fixtureId?: string; mode?: unknown; artifact?: unknown; path?: unknown }> {
+function readJsonBody(req: NodeJS.ReadableStream): Promise<Record<string, unknown>> {
   return new Promise((resolve, reject) => {
     let raw = '';
     req.setEncoding('utf8');
@@ -835,6 +894,17 @@ function readJsonBody(req: NodeJS.ReadableStream): Promise<{ fixtureId?: string;
     });
     req.on('error', reject);
   });
+}
+
+function stringBodyField(value: unknown, field: string): string {
+  if (typeof value === 'string' && value.trim()) return value;
+  throw new Error(`${field} must be a non-empty string`);
+}
+
+function recordBodyField(value: unknown, field: string): Record<string, unknown> {
+  if (value === undefined) return {};
+  if (isRecord(value)) return value;
+  throw new Error(`${field} must be an object`);
 }
 
 async function listReplaySummaries() {

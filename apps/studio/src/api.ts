@@ -16,6 +16,35 @@ export async function loadProviderStatus(): Promise<ProviderStatus> {
   return payload.providers;
 }
 
+export type SyntheticToolMode = 'fixture' | 'openai';
+
+export type SyntheticToolRunResult = {
+  mode: SyntheticToolMode;
+  toolName: string;
+  args: Record<string, unknown>;
+  result: unknown;
+  durationMs: number;
+  toolDurationMs: number;
+  provider: { id: SyntheticToolMode; model: string };
+};
+
+export async function runServerSyntheticTool(
+  toolName: string,
+  args: Record<string, unknown>,
+  mode: SyntheticToolMode,
+): Promise<SyntheticToolRunResult> {
+  const response = await fetch('/api/synthetic/tool', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ toolName, args, mode }),
+  });
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(payload?.error ?? 'synthetic provider tool failed');
+  }
+  return payload;
+}
+
 export async function runServerQueryReplay(
   fixture: QueryFixture,
   mode: Exclude<QueryReplayMode, 'fixture'>,

@@ -30,7 +30,7 @@ This lets AptKit test agent behavior with controlled data now while keeping the 
 
 ## Studio
 
-Studio now has a Synthetic Data Provider workspace. It runs the fixture-backed provider tools in the browser and displays:
+Studio now has a Synthetic Data Provider workspace. It can run fixture-backed provider tools in the browser and OpenAI-backed provider tools through the Studio server endpoint. It displays:
 
 - provider metadata
 - tool definitions
@@ -38,4 +38,4 @@ Studio now has a Synthetic Data Provider workspace. It runs the fixture-backed p
 - returned JSON payload
 - fixture vs OpenAI source boundary
 
-The OpenAI-backed data source is implemented at the package layer. Studio currently runs the deterministic fixture source directly in the browser; wiring live OpenAI synthetic generation into Studio should go through a server endpoint so API keys stay off the client.
+The live OpenAI mode calls `/api/synthetic/tool` from Studio. That endpoint constructs `OpenAISyntheticEcommerceDataSource` server-side using `OPENAI_API_KEY`, runs the selected tool through `SyntheticEcommerceToolRegistry`, and returns only the generated provider payload and run metadata to the browser.
