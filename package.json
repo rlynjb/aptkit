@@ -25,7 +25,7 @@
     "replay:openai": "node scripts/replay-model-recommendation.mjs --provider openai",
     "test": "npm run test --workspaces --if-present",
     "prepublish:core:npm": "npm run build:core && npm run pack:core",
-    "publish:core:npm": "npm publish /private/tmp/aptkit-packs/rlynjb-aptkit-core-0.1.0.tgz --access public",
+    "publish:core:npm": "npm publish /private/tmp/aptkit-packs/rlynjb-aptkit-core-0.2.0.tgz --access public",
     "replay:recommendation": "npm run replay:fixture -w @aptkit/agent-recommendation",
     "replay:monitoring": "npm run replay:fixture -w @aptkit/agent-anomaly-monitoring",
     "replay:monitoring:promoted": "npm run replay:promoted -w @aptkit/agent-anomaly-monitoring",

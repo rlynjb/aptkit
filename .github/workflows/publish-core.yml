@@ -30,6 +30,6 @@ jobs:
           APTKIT_PACK_DIR: ${{ runner.temp }}/aptkit-packs
           APTKIT_NPM_CACHE: ${{ runner.temp }}/npm-cache
 
-      - run: npm publish "$RUNNER_TEMP/aptkit-packs/rlynjb-aptkit-core-0.1.0.tgz" --access public
+      - run: npm publish "$RUNNER_TEMP/aptkit-packs/rlynjb-aptkit-core-0.2.0.tgz" --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

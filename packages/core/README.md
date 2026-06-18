@@ -13,7 +13,7 @@ The package is published to npmjs as `@rlynjb/aptkit-core`.
 Blooming keeps its existing imports by installing this package through an npm alias:
 
 ```sh
-npm install @aptkit/core@npm:@rlynjb/aptkit-core@0.1.0
+npm install @aptkit/core@npm:@rlynjb/aptkit-core@0.2.0
 ```
 
 Because the package is public on npmjs, consumers do not need a package registry token.
