@@ -1,9 +1,10 @@
 import React from 'react';
 import { Activity, BadgeCheck, Boxes, BrainCircuit, ChevronDown, CircleDollarSign, Cloud, Gauge, KeyRound, Play, Route, Timer } from 'lucide-react';
+import { recommendationPromptPackage } from '@aptkit/prompts';
 import { fixtures } from './fixtures';
 import { loadPromotedFixtures, loadSavedReplays, promoteReplay, runServerReplay, saveReplayArtifact } from './api';
 import { runFixtureReplay } from './agent-runners';
-import { EvalPanel, Metric, Panel, ReplayModeSwitch, TracePanel } from './components';
+import { EvalPanel, Metric, Panel, PromptPackagePanel, ReplayModeSwitch, TracePanel } from './components';
 import { buildReplayArtifact, comparableFromArtifact, comparisonForFixture, estimateCost, findReviewReplay, formatCost, formatDuration, summarizeUsage, toReplayState } from './replay-artifacts';
 import { ComparisonPanel, PromotedFixturesPanel, ReplayHistoryPanel, ReviewPanel, WorkflowPanel } from './recommendation-panels';
 import type { ComparisonState, PromoteResult, PromotedFixtureSummary, ProviderStatus, ReplayMode, ReplayState, SavedReplaySummary } from './types';
@@ -360,6 +361,8 @@ export function RecommendationWorkspace({ onHome }: { onHome: () => void }) {
         </section>
 
         <aside className="rightPane">
+          <PromptPackagePanel promptPackage={recommendationPromptPackage} />
+
           <WorkflowPanel
             fixtureId={fixture.id}
             mode={mode}

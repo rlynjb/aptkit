@@ -1,10 +1,11 @@
 import React from 'react';
 import { Activity, BadgeCheck, Boxes, BrainCircuit, ChevronDown, CircleDollarSign, Clipboard, FileCheck, Gauge, History, KeyRound, Play, Route, Save, Timer } from 'lucide-react';
 import { ECOMMERCE_ANOMALY_CATEGORIES, coverageReport, schemaCapabilities } from '@aptkit/agent-anomaly-monitoring';
+import { monitoringPromptPackage } from '@aptkit/prompts';
 import { monitoringFixtures } from './fixtures';
 import { loadPromotedMonitoringFixtures, loadSavedMonitoringReplays, promoteMonitoringReplay, runServerMonitoringReplay, saveReplayArtifact } from './api';
 import { runMonitoringFixtureReplay } from './agent-runners';
-import { EvalPanel, Metric, Panel, ReplayModeSwitch, TracePanel } from './components';
+import { EvalPanel, Metric, Panel, PromptPackagePanel, ReplayModeSwitch, TracePanel } from './components';
 import { CoverageItem, MonitoringAnomalyCard, MonitoringComparisonPanel, MonitoringReplayHistoryPanel, MonitoringReviewPanel, PromotedMonitoringFixturesPanel } from './monitoring-panels';
 import { buildMonitoringReplayArtifact, comparableMonitoringFromArtifact, comparisonForMonitoringFixture, estimateCost, findMonitoringReviewReplay, formatCost, formatDuration, summarizeUsage, toMonitoringReplayState } from './replay-artifacts';
 import type { MonitoringComparisonState, MonitoringPromoteResult, MonitoringReplayMode, MonitoringReplayState, PromotedMonitoringFixtureSummary, ProviderStatus, SavedMonitoringReplaySummary } from './types';
@@ -367,6 +368,8 @@ export function MonitoringWorkspace({ onHome }: { onHome: () => void }) {
         </section>
 
         <aside className="rightPane">
+          <PromptPackagePanel promptPackage={monitoringPromptPackage} />
+
           <TracePanel running={running} trace={replay?.trace ?? []} />
 
           <EvalPanel

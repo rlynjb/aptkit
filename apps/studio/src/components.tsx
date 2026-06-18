@@ -1,5 +1,6 @@
 import React from 'react';
-import { BrainCircuit, ShieldCheck } from 'lucide-react';
+import { BrainCircuit, FileText, ShieldCheck } from 'lucide-react';
+import type { PromptPackage } from '@aptkit/prompts';
 import type { CapabilityEvent } from '@aptkit/runtime';
 
 export function Metric({ icon, label, value, tone = 'neutral' }: { icon: React.ReactNode; label: string; value: string; tone?: 'neutral' | 'good' }) {
@@ -110,6 +111,47 @@ export function EvalPanel({
           {issues.map((issue) => <li key={issue}>{issue}</li>)}
         </ul>
       ) : null}
+    </Panel>
+  );
+}
+
+export function PromptPackagePanel({ promptPackage }: { promptPackage: PromptPackage }) {
+  const lineCount = promptPackage.system.split('\n').length;
+  const characterCount = promptPackage.system.length;
+
+  return (
+    <Panel title="Prompt Package" icon={<FileText size={17} />}>
+      <div className="promptPackage">
+        <div className="promptPackageHeader">
+          <div>
+            <strong>{promptPackage.id}</strong>
+            <span>{promptPackage.description}</span>
+          </div>
+          <em>v{promptPackage.version}</em>
+        </div>
+        <div className="promptStats">
+          <div>
+            <span>Capability</span>
+            <strong>{promptPackage.capabilityId}</strong>
+          </div>
+          <div>
+            <span>Template</span>
+            <strong>{lineCount} lines / {characterCount.toLocaleString()} chars</strong>
+          </div>
+        </div>
+        <div className="promptVariables">
+          <span>Variables</span>
+          <div>
+            {promptPackage.variables.map((variable) => (
+              <code key={variable.name}>{variable.name}</code>
+            ))}
+          </div>
+        </div>
+        <details className="promptPreview">
+          <summary>System prompt</summary>
+          <pre>{promptPackage.system}</pre>
+        </details>
+      </div>
     </Panel>
   );
 }

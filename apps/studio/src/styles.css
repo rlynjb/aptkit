@@ -686,6 +686,125 @@ h1 {
   grid-template-columns: 1fr;
 }
 
+.promptPackage {
+  display: grid;
+  gap: 10px;
+}
+
+.promptPackageHeader {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 10px;
+  align-items: start;
+  padding: 10px;
+  border: 1px solid #d8e7dd;
+  border-radius: 6px;
+  background: #f2faf5;
+}
+
+.promptPackageHeader div {
+  display: grid;
+  gap: 4px;
+}
+
+.promptPackageHeader strong {
+  color: #184a35;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.promptPackageHeader span {
+  color: #54645a;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.promptPackageHeader em {
+  padding: 4px 7px;
+  border-radius: 999px;
+  background: #ffffff;
+  color: #31453b;
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 800;
+}
+
+.promptStats {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.promptStats div,
+.promptVariables {
+  display: grid;
+  gap: 4px;
+  padding: 8px;
+  border: 1px solid #e2e7e0;
+  border-radius: 6px;
+  background: #fafbf9;
+}
+
+.promptStats span,
+.promptVariables > span {
+  color: #66766c;
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.promptStats strong {
+  color: #24362e;
+  font-size: 12px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.promptVariables div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.promptVariables code {
+  padding: 4px 6px;
+  border-radius: 5px;
+  background: #ffffff;
+  color: #24362e;
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.promptPreview {
+  border: 1px solid #e2e7e0;
+  border-radius: 6px;
+  background: #fafbf9;
+  overflow: hidden;
+}
+
+.promptPreview summary {
+  min-height: 36px;
+  padding: 10px;
+  color: #31453b;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.promptPreview pre {
+  max-height: 280px;
+  margin: 0;
+  padding: 10px;
+  border-top: 1px solid #e2e7e0;
+  overflow: auto;
+  color: #24362e;
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+
 .expectationBlock {
   display: grid;
   gap: 3px;
