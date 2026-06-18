@@ -75,14 +75,56 @@ export function Panel({ title, icon, children, wide = false }: { title: string; 
   );
 }
 
+type TraceFilter = 'all' | 'model' | 'tools' | 'warnings';
+
 export function TracePanel({ running, trace }: { running: boolean; trace: CapabilityEvent[] }) {
+  const [filter, setFilter] = React.useState<TraceFilter>('all');
+  const summary = summarizeTrace(trace);
+  const visibleTrace = trace.filter((event) => traceFilterMatches(event, filter));
+
   return (
     <Panel title="Trace" icon={<BrainCircuit size={17} />}>
       {running ? <div className="emptyState compact">Collecting trace events...</div> : null}
+      <div className="traceSummary" aria-label="Trace summary">
+        <div>
+          <span>Turns</span>
+          <strong>{summary.turns}</strong>
+        </div>
+        <div>
+          <span>Tools</span>
+          <strong>{summary.toolCalls}</strong>
+        </div>
+        <div>
+          <span>Warnings</span>
+          <strong>{summary.warningCount}</strong>
+        </div>
+        <div>
+          <span>Tokens</span>
+          <strong>{summary.tokens.toLocaleString()}</strong>
+        </div>
+        <div>
+          <span>{running ? 'Running' : 'Elapsed'}</span>
+          <strong>{summary.elapsedMs === null ? '0ms' : formatTraceDuration(summary.elapsedMs)}</strong>
+        </div>
+      </div>
+      <div className="traceFilters" aria-label="Trace filters">
+        {(['all', 'model', 'tools', 'warnings'] as TraceFilter[]).map((option) => (
+          <button
+            className={filter === option ? 'active' : ''}
+            key={option}
+            onClick={() => setFilter(option)}
+            type="button"
+          >
+            {option}
+          </button>
+        ))}
+      </div>
+      {!running && trace.length ? <div className="traceComplete">Final replay result received</div> : null}
       <div className="traceList">
-        {trace.map((event, index) => (
+        {visibleTrace.map((event, index) => (
           <TraceItem event={event} index={index} key={`${event.type}-${index}`} />
         ))}
+        {!visibleTrace.length ? <div className="emptyState compact">No events for this filter.</div> : null}
       </div>
     </Panel>
   );
@@ -180,14 +222,74 @@ export function TraceItem({ event, index }: { event: CapabilityEvent; index: num
           : event.type === 'step'
             ? event.content.slice(0, 120)
             : 'message' in event ? event.message : '';
+  const payload = tracePayload(event);
 
   return (
-    <div className="traceItem">
+    <div className={`traceItem ${traceTone(event)}`}>
       <span>{String(index + 1).padStart(2, '0')}</span>
       <div>
         <strong>{event.type}</strong>
         <p>{detail}</p>
+        {payload ? (
+          <details className="tracePayload">
+            <summary>{payload.label}</summary>
+            <pre>{payload.value}</pre>
+          </details>
+        ) : null}
       </div>
     </div>
   );
+}
+
+function summarizeTrace(trace: CapabilityEvent[]) {
+  const usageEvents = trace.filter((event): event is Extract<CapabilityEvent, { type: 'model_usage' }> => event.type === 'model_usage');
+  const timestamps = trace
+    .map((event) => Date.parse(event.timestamp))
+    .filter((time) => Number.isFinite(time));
+  const startedAt = timestamps.length ? Math.min(...timestamps) : null;
+  const endedAt = timestamps.length ? Math.max(...timestamps) : null;
+
+  return {
+    turns: usageEvents.length,
+    toolCalls: trace.filter((event) => event.type === 'tool_call_start').length,
+    warningCount: trace.filter((event) => event.type === 'warning' || event.type === 'error').length,
+    tokens: usageEvents.reduce((sum, event) => sum + (event.inputTokens ?? 0) + (event.outputTokens ?? 0), 0),
+    elapsedMs: startedAt === null || endedAt === null ? null : Math.max(0, endedAt - startedAt),
+  };
+}
+
+function traceFilterMatches(event: CapabilityEvent, filter: TraceFilter): boolean {
+  if (filter === 'all') return true;
+  if (filter === 'model') return event.type === 'model_usage' || event.type === 'step';
+  if (filter === 'tools') return event.type === 'tool_call_start' || event.type === 'tool_call_end';
+  return event.type === 'warning' || event.type === 'error';
+}
+
+function tracePayload(event: CapabilityEvent): { label: string; value: string } | null {
+  if (event.type === 'tool_call_start') return { label: 'Arguments', value: formatPayload(event.args) };
+  if (event.type === 'tool_call_end' && event.result !== undefined) return { label: 'Result', value: formatPayload(event.result) };
+  if (event.type === 'tool_call_end' && event.error) return { label: 'Error', value: event.error };
+  if (event.type === 'step' && event.content.length > 120) return { label: 'Full step', value: event.content };
+  return null;
+}
+
+function traceTone(event: CapabilityEvent): string {
+  if (event.type === 'error') return 'error';
+  if (event.type === 'warning') return 'warning';
+  if (event.type === 'tool_call_end') return event.error ? 'error' : 'success';
+  return '';
+}
+
+function formatPayload(value: unknown): string {
+  if (typeof value === 'string') return value;
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function formatTraceDuration(durationMs: number): string {
+  if (durationMs < 1000) return `${durationMs}ms`;
+  return `${(durationMs / 1000).toFixed(1)}s`;
 }

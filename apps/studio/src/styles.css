@@ -1353,6 +1353,76 @@ h1 {
   gap: 8px;
 }
 
+.traceSummary {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.traceSummary > div {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+  padding: 8px;
+  border: 1px solid #e2e7e0;
+  border-radius: 6px;
+  background: #ffffff;
+}
+
+.traceSummary span {
+  color: #6a786f;
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.traceSummary strong {
+  min-width: 0;
+  color: #1f2923;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.traceFilters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.traceFilters button {
+  min-height: 28px;
+  padding: 0 10px;
+  border: 1px solid #d6ded8;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #46564d;
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: capitalize;
+  cursor: pointer;
+}
+
+.traceFilters button.active {
+  border-color: #4f7d60;
+  background: #e6f1ea;
+  color: #214a31;
+}
+
+.traceComplete {
+  margin-bottom: 10px;
+  padding: 8px 10px;
+  border: 1px solid #bddcc8;
+  border-radius: 6px;
+  background: #eef8f1;
+  color: #1f5a37;
+  font-size: 12px;
+  font-weight: 800;
+}
+
 .traceItem {
   display: grid;
   grid-template-columns: 28px 1fr;
@@ -1361,6 +1431,21 @@ h1 {
   border: 1px solid #e2e7e0;
   border-radius: 6px;
   background: #fafbf9;
+}
+
+.traceItem.warning {
+  border-color: #e4d29a;
+  background: #fffaf0;
+}
+
+.traceItem.error {
+  border-color: #e2b8b2;
+  background: #fff4f2;
+}
+
+.traceItem.success {
+  border-color: #c9decf;
+  background: #f5faf6;
 }
 
 .traceItem > span {
@@ -1387,6 +1472,32 @@ h1 {
   color: #5e6d64;
   font-size: 12px;
   line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.tracePayload {
+  margin-top: 8px;
+}
+
+.tracePayload summary {
+  color: #34483b;
+  font-size: 12px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.tracePayload pre {
+  max-height: 220px;
+  overflow: auto;
+  margin: 8px 0 0;
+  padding: 10px;
+  border: 1px solid #dce4de;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #1e2b24;
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
 

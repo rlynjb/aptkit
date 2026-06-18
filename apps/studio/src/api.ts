@@ -106,7 +106,15 @@ async function runReplayStream<T>(
 
   let finalPayload: any = null;
   for await (const record of decodeNdjsonStream(responseBodyChunks(response.body))) {
-    if (!record.ok) continue;
+    if (!record.ok) {
+      options.onEvent?.({
+        type: 'warning',
+        capabilityId: 'studio-stream',
+        message: `Malformed stream record on line ${record.warning.line}: ${record.warning.error}`,
+        timestamp: new Date().toISOString(),
+      });
+      continue;
+    }
     const value = record.value;
     if (!isRecord(value) || typeof value.type !== 'string') continue;
     if (value.type === 'event' && isCapabilityEventRecord(value.event)) {
