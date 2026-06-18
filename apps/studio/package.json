@@ -19,6 +19,7 @@
     "@aptkit/provider-anthropic": "0.0.0",
     "@aptkit/provider-fallback": "0.0.0",
     "@aptkit/provider-openai": "0.0.0",
+    "@aptkit/provider-synthetic": "0.0.0",
     "@aptkit/runtime": "0.0.0",
     "@aptkit/tools": "0.0.0",
     "lucide-react": "^0.468.0",

@@ -3,6 +3,7 @@ export * from '@aptkit/tools';
 export * from '@aptkit/context';
 export * from '@aptkit/prompts';
 export * from '@aptkit/evals';
+export * from '@aptkit/provider-synthetic';
 export * from '@aptkit/agent-recommendation';
 export {
   ANOMALY_MONITORING_CAPABILITY_ID,

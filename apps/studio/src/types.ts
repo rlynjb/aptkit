@@ -474,4 +474,4 @@ export type PromotedQueryFixtureSummary = {
   costEstimate?: CostEstimate;
 };
 
-export type StudioView = 'home' | 'recommendation' | 'monitoring' | 'diagnostic' | 'query';
+export type StudioView = 'home' | 'recommendation' | 'monitoring' | 'diagnostic' | 'query' | 'synthetic-data';

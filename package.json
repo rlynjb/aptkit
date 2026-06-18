@@ -11,7 +11,7 @@
   ],
   "scripts": {
     "build": "npm run build --workspaces --if-present",
-    "build:core:deps": "npm run build -w @aptkit/runtime && npm run build -w @aptkit/tools && npm run build -w @aptkit/context && npm run build -w @aptkit/prompts && npm run build -w @aptkit/evals && npm run build -w @aptkit/agent-anomaly-monitoring && npm run build -w @aptkit/agent-diagnostic-investigation && npm run build -w @aptkit/agent-query && npm run build -w @aptkit/agent-recommendation",
+    "build:core:deps": "npm run build -w @aptkit/runtime && npm run build -w @aptkit/tools && npm run build -w @aptkit/context && npm run build -w @aptkit/prompts && npm run build -w @aptkit/evals && npm run build -w @aptkit/agent-anomaly-monitoring && npm run build -w @aptkit/agent-diagnostic-investigation && npm run build -w @aptkit/agent-query && npm run build -w @aptkit/agent-recommendation && npm run build -w @aptkit/provider-synthetic",
     "build:core": "npm run build:core:deps && npm run build -w @rlynjb/aptkit-core",
     "dev:studio": "npm run dev -w @aptkit/studio",
     "preeval:replays": "npm run build -w @aptkit/evals",

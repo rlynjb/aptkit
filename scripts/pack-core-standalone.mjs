@@ -17,6 +17,7 @@ const packageSpecs = [
   { workspace: '@aptkit/agent-diagnostic-investigation', tarball: 'aptkit-agent-diagnostic-investigation-0.0.0.tgz' },
   { workspace: '@aptkit/agent-query', tarball: 'aptkit-agent-query-0.0.0.tgz' },
   { workspace: '@aptkit/agent-recommendation', tarball: 'aptkit-agent-recommendation-0.0.0.tgz' },
+  { workspace: '@aptkit/provider-synthetic', tarball: 'aptkit-provider-synthetic-0.0.0.tgz' },
 ];
 
 await mkdir(packDir, { recursive: true });

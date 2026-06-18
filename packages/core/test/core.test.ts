@@ -11,6 +11,7 @@ import {
   QUERY_CAPABILITY_ID,
   QueryAgent,
   RecommendationAgent,
+  SyntheticEcommerceToolRegistry,
   anomalyMonitoringToolPolicy,
   diagnosticInvestigationToolPolicy,
   parseIntent,
@@ -43,5 +44,9 @@ describe('@aptkit/core', () => {
     assert.equal(diagnosticInvestigationToolPolicy.capabilityId, 'diagnostic-investigation-agent');
     assert.equal(queryToolPolicy.capabilityId, 'query-agent');
     assert.equal(parseIntent('recommendation'), 'recommendation');
+  });
+
+  it('re-exports the synthetic ecommerce provider entry points', () => {
+    assert.equal(typeof SyntheticEcommerceToolRegistry, 'function');
   });
 });

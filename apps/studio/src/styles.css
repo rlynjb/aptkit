@@ -300,6 +300,10 @@ h1 {
   align-items: start;
 }
 
+.syntheticLayout {
+  grid-template-columns: minmax(260px, 0.82fr) minmax(400px, 1.35fr) minmax(280px, 0.95fr);
+}
+
 .leftPane,
 .mainPane,
 .rightPane {
@@ -990,6 +994,86 @@ h1 {
   background: #ffffff;
   color: #31453b;
   cursor: pointer;
+}
+
+.jsonViewer {
+  border: 1px solid #e2e7e0;
+  border-radius: 6px;
+  background: #fafbf9;
+  overflow: hidden;
+}
+
+.jsonViewerHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 38px;
+  padding: 0 10px;
+  border-bottom: 1px solid #e2e7e0;
+}
+
+.jsonViewerHeader strong {
+  color: #24362e;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.jsonViewerHeader span {
+  color: #66766c;
+  font-size: 12px;
+  font-weight: 750;
+  white-space: nowrap;
+}
+
+.jsonViewer pre {
+  max-height: 620px;
+  margin: 0;
+  padding: 12px;
+  overflow: auto;
+  color: #24362e;
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.48;
+}
+
+.jsonViewer.compact pre {
+  max-height: 340px;
+  font-size: 11px;
+}
+
+.toolDefinitionList {
+  display: grid;
+  gap: 8px;
+}
+
+.toolDefinition {
+  display: grid;
+  gap: 4px;
+  width: 100%;
+  padding: 10px;
+  border: 1px solid #e2e7e0;
+  border-radius: 6px;
+  background: #fafbf9;
+  color: #24362e;
+  text-align: left;
+  cursor: pointer;
+}
+
+.toolDefinition.active {
+  border-color: #9cc5ad;
+  background: #f2faf5;
+}
+
+.toolDefinition strong {
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.toolDefinition span {
+  color: #5e6d64;
+  font-size: 12px;
+  line-height: 1.4;
 }
 
 .recommendations {

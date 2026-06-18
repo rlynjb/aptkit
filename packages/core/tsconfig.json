@@ -11,6 +11,7 @@
     { "path": "../context" },
     { "path": "../evals" },
     { "path": "../prompts" },
+    { "path": "../providers/synthetic" },
     { "path": "../runtime" },
     { "path": "../tools" }
   ],
