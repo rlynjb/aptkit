@@ -1,7 +1,8 @@
 import React from 'react';
 import { Activity, BadgeCheck, Boxes, BrainCircuit, ChevronDown, CircleDollarSign, Clipboard, FileCheck, Gauge, History, KeyRound, Play, Route, Save, Timer } from 'lucide-react';
-import { ECOMMERCE_ANOMALY_CATEGORIES, coverageReport, formatCategoryChecklist, runnableCategories, schemaCapabilities, schemaSummary as monitoringSchemaSummary } from '@aptkit/agent-anomaly-monitoring';
+import { ECOMMERCE_ANOMALY_CATEGORIES, coverageReport, formatCategoryChecklist, runnableCategories, schemaCapabilities } from '@aptkit/agent-anomaly-monitoring';
 import { monitoringPromptPackage, renderPromptTemplate } from '@aptkit/prompts';
+import { schemaSummary } from '@aptkit/context';
 import { monitoringFixtures } from './fixtures';
 import { loadPromotedMonitoringFixtures, loadSavedMonitoringReplays, promoteMonitoringReplay, runServerMonitoringReplay, saveReplayArtifact } from './api';
 import { runMonitoringFixtureReplay } from './agent-runners';
@@ -215,7 +216,7 @@ export function MonitoringWorkspace({ onHome }: { onHome: () => void }) {
   const reviewReplay = findMonitoringReviewReplay(savedReplays, selectedReviewPath, replay?.savedPath, fixture.id, mode);
   const comparisonView = comparisonForMonitoringFixture(comparison, savedReplays, fixture.id);
   const renderedPrompt = renderPromptTemplate(monitoringPromptPackage.system, {
-    schema: monitoringSchemaSummary(fixture.workspace),
+    schema: schemaSummary(fixture.workspace, { horizonStyle: 'plain', eventHeading: 'Top events:' }),
     categories: formatCategoryChecklist(runnableCategories(ECOMMERCE_ANOMALY_CATEGORIES, schemaCapabilities(fixture.workspace))),
   });
 

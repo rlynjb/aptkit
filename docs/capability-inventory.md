@@ -30,18 +30,18 @@ Maturity follows the plan's Level 0-6 model, where Level 6 means a reusable pack
 
 | Priority | Capability ID | Name | Type | Source | Target Package | Score | Status |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| P0 | `bounded-agent-loop` | Bounded agent tool-use loop | Utility | `blooming_insights` | `packages/runtime` | High | Candidate |
-| P0 | `capability-trace-events` | Agent event trace contract | Utility | `blooming_insights` | `packages/runtime` | High | Candidate |
-| P0 | `tool-registry` | Tool/data-source seam | Tool | `blooming_insights` | `packages/tools` | High | Candidate |
-| P0 | `json-output-extractor` | Structured-output parser and validators | Utility | `blooming_insights`, `dryrun` | `packages/runtime` | High | Candidate |
+| P0 | `bounded-agent-loop` | Bounded agent tool-use loop | Utility | `blooming_insights` | `packages/runtime` | High | Packaged |
+| P0 | `capability-trace-events` | Agent event trace contract | Utility | `blooming_insights` | `packages/runtime` | High | Packaged |
+| P0 | `tool-registry` | Tool/data-source seam | Tool | `blooming_insights` | `packages/tools` | High | Packaged |
+| P0 | `json-output-extractor` | Structured-output parser and validators | Utility | `blooming_insights`, `dryrun` | `packages/runtime` | High | Packaged |
 | P0 | `ndjson-event-streaming` | NDJSON event streaming utility | Utility | `blooming_insights` | `packages/runtime` | High | Candidate |
-| P0 | `recommendation-agent` | Recommendation agent | Agent | `blooming_insights` | `packages/agents/recommendation` | Medium | Candidate |
-| P1 | `anomaly-monitoring-agent` | Monitoring/anomaly detection agent | Agent | `blooming_insights` | `packages/agents/anomaly-monitoring` | Medium | Candidate |
-| P1 | `diagnostic-investigation-agent` | Diagnostic investigation agent | Agent | `blooming_insights` | `packages/agents/diagnostic-investigation` | Medium | Candidate |
-| P1 | `query-over-tools-agent` | Free-form query agent | Agent | `blooming_insights` | `packages/agents/query` | Medium | Candidate |
-| P1 | `prompt-package` | Prompt packages | Prompt | `blooming_insights`, `dryrun` | `packages/prompts` | Medium | Candidate |
-| P1 | `tool-policy-manifest` | Tool allowlist manifests | Tool | `blooming_insights` | `packages/tools` | High | Candidate |
-| P1 | `workspace-descriptor` | Workspace/schema summarizer | Utility | `blooming_insights` | `packages/context` | Medium | Candidate |
+| P0 | `recommendation-agent` | Recommendation agent | Agent | `blooming_insights` | `packages/agents/recommendation` | Medium | Packaged |
+| P1 | `anomaly-monitoring-agent` | Monitoring/anomaly detection agent | Agent | `blooming_insights` | `packages/agents/anomaly-monitoring` | Medium | Packaged |
+| P1 | `diagnostic-investigation-agent` | Diagnostic investigation agent | Agent | `blooming_insights` | `packages/agents/diagnostic-investigation` | Medium | Packaged |
+| P1 | `query-over-tools-agent` | Free-form query agent | Agent | `blooming_insights` | `packages/agents/query` | Medium | Packaged |
+| P1 | `prompt-package` | Prompt packages | Prompt | `blooming_insights`, `dryrun` | `packages/prompts` | Medium | Packaged |
+| P1 | `tool-policy-manifest` | Tool allowlist manifests | Tool | `blooming_insights` | `packages/tools` | High | Packaged |
+| P1 | `workspace-descriptor` | Workspace/schema summarizer | Utility | `blooming_insights` | `packages/context` | Medium | Packaged |
 | P1 | `capability-coverage-gate` | Capability coverage gate | Utility | `blooming_insights` | `packages/tools` | Medium | Candidate |
 | P1 | `provider-fallback-chain` | Provider fallback chain | Provider | `dryrun` | `packages/providers` | High | Candidate |
 | P1 | `usage-ledger` | LLM progress and usage accounting | Utility | `dryrun` | `packages/runtime` or `packages/usage` | Medium | Candidate |

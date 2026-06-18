@@ -1,7 +1,7 @@
 import React from 'react';
 import { Activity, BadgeCheck, Boxes, BrainCircuit, ChevronDown, CircleDollarSign, FileCheck, Gauge, History, KeyRound, Play, RefreshCw, Route, Save, SearchCheck, Timer } from 'lucide-react';
 import { diagnosticPromptPackage, renderPromptTemplate } from '@aptkit/prompts';
-import { schemaSummary as diagnosticSchemaSummary } from '@aptkit/agent-diagnostic-investigation';
+import { schemaSummary } from '@aptkit/context';
 import { loadPromotedDiagnosticFixtures, loadSavedDiagnosticReplays, promoteDiagnosticReplay, runServerDiagnosticReplay, saveReplayArtifact } from './api';
 import { runDiagnosticFixtureReplay } from './agent-runners';
 import { EvalPanel, Metric, Panel, PromptPackagePanel, ReplayModeSwitch, TracePanel } from './components';
@@ -160,7 +160,7 @@ export function DiagnosticWorkspace({ onHome }: { onHome: () => void }) {
   const diagnosis = replay?.diagnosis;
   const latestReviewPath = replay?.savedPath ?? savedReplays.find((savedReplay) => savedReplay.fixture.id === fixture.id && savedReplay.provider.id === mode)?.path;
   const renderedPrompt = renderPromptTemplate(diagnosticPromptPackage.system, {
-    schema: diagnosticSchemaSummary(fixture.workspace),
+    schema: schemaSummary(fixture.workspace),
     project_id: fixture.workspace.projectId,
     anomaly: JSON.stringify(fixture.anomaly),
   });

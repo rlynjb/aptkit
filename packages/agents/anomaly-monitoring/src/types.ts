@@ -1,18 +1,8 @@
+export type { WorkspaceDescriptor } from '@aptkit/context';
+
 export type Severity = 'critical' | 'warning' | 'info' | 'positive';
 
 export type CategoryCoverage = 'full' | 'limited' | 'unavailable';
-
-export type WorkspaceDescriptor = {
-  projectId: string;
-  projectName: string;
-  events: { name: string; properties: string[]; eventCount: number }[];
-  customerProperties: string[];
-  catalogs: { id?: string; name: string }[];
-  totalCustomers: number;
-  totalEvents: number;
-  oldestTimestamp: number | null;
-  dataHorizon?: { from: string; to: string; durationDays: number };
-};
 
 export type AnomalyCategory = {
   id: string;

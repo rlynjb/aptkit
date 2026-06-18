@@ -1,8 +1,6 @@
 import type { CapabilityEvent } from '@aptkit/runtime';
-import { ECOMMERCE_ANOMALY_CATEGORIES, formatCategoryChecklist, runnableCategories, schemaCapabilities, schemaSummary as monitoringSchemaSummary } from '@aptkit/agent-anomaly-monitoring';
-import { schemaSummary as diagnosticSchemaSummary } from '@aptkit/agent-diagnostic-investigation';
-import { schemaSummary as querySchemaSummary } from '@aptkit/agent-query';
-import { schemaSummary as recommendationSchemaSummary } from '@aptkit/agent-recommendation';
+import { ECOMMERCE_ANOMALY_CATEGORIES, formatCategoryChecklist, runnableCategories, schemaCapabilities } from '@aptkit/agent-anomaly-monitoring';
+import { schemaSummary } from '@aptkit/context';
 import { diagnosticPromptPackage, monitoringPromptPackage, queryPromptPackage, recommendationPromptPackage, renderPromptTemplate } from '@aptkit/prompts';
 import type { PromptPackage } from '@aptkit/prompts';
 import monitoringFixture from '../../../packages/agents/anomaly-monitoring/fixtures/sp-revenue-monitoring.json';
@@ -39,7 +37,7 @@ export function buildQueryReplayArtifact(
     promptPackage: promptPackageProvenance(
       queryPromptPackage,
       renderPromptTemplate(queryPromptPackage.system, {
-        schema: querySchemaSummary(fixture.workspace),
+        schema: schemaSummary(fixture.workspace),
         project_id: fixture.workspace.projectId,
         intent: fixture.intent,
       }),
@@ -91,7 +89,7 @@ export function buildDiagnosticReplayArtifact(
     promptPackage: promptPackageProvenance(
       diagnosticPromptPackage,
       renderPromptTemplate(diagnosticPromptPackage.system, {
-        schema: diagnosticSchemaSummary(fixture.workspace),
+        schema: schemaSummary(fixture.workspace),
         project_id: fixture.workspace.projectId,
         anomaly: JSON.stringify(fixture.anomaly),
       }),
@@ -141,7 +139,7 @@ export function buildMonitoringReplayArtifact(
     promptPackage: promptPackageProvenance(
       monitoringPromptPackage,
       renderPromptTemplate(monitoringPromptPackage.system, {
-        schema: monitoringSchemaSummary(fixture.workspace),
+        schema: schemaSummary(fixture.workspace, { horizonStyle: 'plain', eventHeading: 'Top events:' }),
         categories: formatCategoryChecklist(runnableCategories(ECOMMERCE_ANOMALY_CATEGORIES, schemaCapabilities(fixture.workspace))),
       }),
     ),
@@ -189,7 +187,7 @@ export function buildReplayArtifact(
     promptPackage: promptPackageProvenance(
       recommendationPromptPackage,
       renderPromptTemplate(recommendationPromptPackage.system, {
-        schema: recommendationSchemaSummary(fixture.workspace),
+        schema: schemaSummary(fixture.workspace),
         project_id: fixture.workspace.projectId,
         diagnosis: JSON.stringify(fixture.diagnosis),
       }),

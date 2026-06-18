@@ -1,7 +1,7 @@
 import React from 'react';
 import { BadgeCheck, Boxes, BrainCircuit, ChevronDown, CircleDollarSign, FileCheck, FileText, Gauge, KeyRound, MessageSquareText, Play, RefreshCw, Save, Timer } from 'lucide-react';
 import { queryPromptPackage, renderPromptTemplate } from '@aptkit/prompts';
-import { schemaSummary as querySchemaSummary } from '@aptkit/agent-query';
+import { schemaSummary } from '@aptkit/context';
 import { loadPromotedQueryFixtures, loadSavedQueryReplays, promoteQueryReplay, runServerQueryReplay, saveReplayArtifact } from './api';
 import { runQueryFixtureReplay } from './agent-runners';
 import { EvalPanel, Metric, Panel, PromptPackagePanel, ReplayModeSwitch, TracePanel } from './components';
@@ -159,7 +159,7 @@ export function QueryWorkspace({ onHome }: { onHome: () => void }) {
   const costEstimate = estimateCost(mode, usage, modelName);
   const latestReviewPath = replay?.savedPath ?? savedReplays.find((savedReplay) => savedReplay.fixture.id === fixture.id && savedReplay.provider.id === mode)?.path;
   const renderedPrompt = renderPromptTemplate(queryPromptPackage.system, {
-    schema: querySchemaSummary(fixture.workspace),
+    schema: schemaSummary(fixture.workspace),
     project_id: fixture.workspace.projectId,
     intent: fixture.intent,
   });

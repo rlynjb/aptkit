@@ -17,6 +17,7 @@
     "replay:promoted": "npm run build && node ../../../scripts/replay-promoted-fixtures.mjs --count recommendationCount"
   },
   "dependencies": {
+    "@aptkit/context": "0.0.0",
     "@aptkit/evals": "0.0.0",
     "@aptkit/prompts": "0.0.0",
     "@aptkit/runtime": "0.0.0",

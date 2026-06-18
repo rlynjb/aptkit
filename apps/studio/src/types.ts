@@ -1,7 +1,8 @@
-import type { Anomaly, Diagnosis, Recommendation, WorkspaceDescriptor } from '@aptkit/agent-recommendation';
-import type { Anomaly as MonitoringAnomaly, WorkspaceDescriptor as MonitoringWorkspaceDescriptor } from '@aptkit/agent-anomaly-monitoring';
-import type { Anomaly as DiagnosticAnomaly, Diagnosis as DiagnosticDiagnosis, WorkspaceDescriptor as DiagnosticWorkspaceDescriptor } from '@aptkit/agent-diagnostic-investigation';
-import type { Intent as QueryIntent, WorkspaceDescriptor as QueryWorkspaceDescriptor } from '@aptkit/agent-query';
+import type { Anomaly, Diagnosis, Recommendation } from '@aptkit/agent-recommendation';
+import type { Anomaly as MonitoringAnomaly } from '@aptkit/agent-anomaly-monitoring';
+import type { Anomaly as DiagnosticAnomaly, Diagnosis as DiagnosticDiagnosis } from '@aptkit/agent-diagnostic-investigation';
+import type { Intent as QueryIntent } from '@aptkit/agent-query';
+import type { WorkspaceDescriptor } from '@aptkit/context';
 import type { CapabilityEvent, ModelResponse } from '@aptkit/runtime';
 import type { ToolDefinition } from '@aptkit/tools';
 
@@ -20,7 +21,7 @@ export type RecommendationFixture = {
 export type MonitoringFixture = {
   id: string;
   description: string;
-  workspace: MonitoringWorkspaceDescriptor;
+  workspace: WorkspaceDescriptor;
   tools: FixtureTool[];
   modelResponses: ModelResponse[];
 };
@@ -28,7 +29,7 @@ export type MonitoringFixture = {
 export type DiagnosticFixture = {
   id: string;
   description: string;
-  workspace: DiagnosticWorkspaceDescriptor;
+  workspace: WorkspaceDescriptor;
   anomaly: DiagnosticAnomaly;
   tools: FixtureTool[];
   modelResponses: ModelResponse[];
@@ -39,7 +40,7 @@ export type QueryFixture = {
   description: string;
   question: string;
   intent: QueryIntent;
-  workspace: QueryWorkspaceDescriptor;
+  workspace: WorkspaceDescriptor;
   tools: FixtureTool[];
   modelResponses: ModelResponse[];
 };

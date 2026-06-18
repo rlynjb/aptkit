@@ -13,6 +13,7 @@
     "@aptkit/agent-diagnostic-investigation": "0.0.0",
     "@aptkit/agent-query": "0.0.0",
     "@aptkit/agent-recommendation": "0.0.0",
+    "@aptkit/context": "0.0.0",
     "@aptkit/evals": "0.0.0",
     "@aptkit/prompts": "0.0.0",
     "@aptkit/provider-anthropic": "0.0.0",

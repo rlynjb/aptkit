@@ -8,6 +8,7 @@
     "resolveJsonModule": true
   },
   "references": [
+    { "path": "../../context" },
     { "path": "../../runtime" },
     { "path": "../../tools" }
   ],
