@@ -9,6 +9,7 @@ import { EvalPanel, Metric, Panel, PromptPackagePanel, ReplayModeSwitch, TracePa
 import { buildReplayArtifact, comparableFromArtifact, comparisonForFixture, estimateCost, findReviewReplay, formatCost, formatDuration, summarizeUsage, toReplayState } from './replay-artifacts';
 import { ComparisonPanel, PromotedFixturesPanel, ReplayHistoryPanel, ReviewPanel, WorkflowPanel } from './recommendation-panels';
 import type { ComparisonState, PromoteResult, PromotedFixtureSummary, ProviderStatus, ReplayMode, ReplayState, SavedReplaySummary } from './types';
+import type { CapabilityEvent } from '@aptkit/runtime';
 
 export function RecommendationWorkspace({ onHome }: { onHome: () => void }) {
   const [selectedFixtureId, setSelectedFixtureId] = React.useState(fixtures[0].id);
@@ -19,6 +20,7 @@ export function RecommendationWorkspace({ onHome }: { onHome: () => void }) {
     openai: { available: false, model: 'gpt-4.1' },
   });
   const [replay, setReplay] = React.useState<ReplayState | null>(null);
+  const [liveTrace, setLiveTrace] = React.useState<CapabilityEvent[]>([]);
   const [running, setRunning] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
   const [runId, setRunId] = React.useState(0);
@@ -54,10 +56,15 @@ export function RecommendationWorkspace({ onHome }: { onHome: () => void }) {
     setError(null);
     setSaveError(null);
     setReplay(null);
+    setLiveTrace([]);
     try {
+      const onEvent = (event: CapabilityEvent) => {
+        setLiveTrace((current) => runCounter.current === nextRunId ? [...current, event] : current);
+      };
       const result = modeToRun === 'fixture'
         ? await runFixtureReplay(fixtureToRun)
-        : await runServerReplay(fixtureToRun, modeToRun);
+        : await runServerReplay(fixtureToRun, modeToRun, { onEvent });
+      setLiveTrace(result.trace);
       setReplay({
         ...result,
         runId: nextRunId,
@@ -118,6 +125,7 @@ export function RecommendationWorkspace({ onHome }: { onHome: () => void }) {
   function selectFixture(event: React.ChangeEvent<HTMLSelectElement>) {
     setSelectedFixtureId(event.target.value);
     setReplay(null);
+    setLiveTrace([]);
     setError(null);
     setSaveError(null);
     setComparison(null);
@@ -127,6 +135,7 @@ export function RecommendationWorkspace({ onHome }: { onHome: () => void }) {
   function selectMode(nextMode: ReplayMode) {
     setMode(nextMode);
     setReplay(null);
+    setLiveTrace([]);
     setError(null);
     setSaveError(null);
     setComparisonError(null);
@@ -207,7 +216,8 @@ export function RecommendationWorkspace({ onHome }: { onHome: () => void }) {
     }
   }
 
-  const usage = summarizeUsage(replay?.trace ?? []);
+  const visibleTrace = replay?.trace ?? liveTrace;
+  const usage = summarizeUsage(visibleTrace);
   const modelName = usage.modelName || providerStatus[mode].model;
   const costEstimate = estimateCost(mode, usage, modelName);
   const reviewReplay = findReviewReplay(savedReplays, selectedReviewPath, replay?.savedPath, fixture.id, mode);
@@ -414,7 +424,7 @@ export function RecommendationWorkspace({ onHome }: { onHome: () => void }) {
             onRefresh={() => void refreshPromotedFixtures()}
           />
 
-          <TracePanel running={running} trace={replay?.trace ?? []} />
+          <TracePanel running={running} trace={visibleTrace} />
 
           <EvalPanel
             error={error}

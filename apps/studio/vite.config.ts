@@ -35,6 +35,7 @@ import {
 import { AnthropicModelProvider } from '@aptkit/provider-anthropic';
 import { OpenAIModelProvider } from '@aptkit/provider-openai';
 import { InMemoryToolRegistry, type ToolDefinition, type ToolHandler } from '@aptkit/tools';
+import { encodeNdjsonRecord } from '@aptkit/runtime';
 import type { CapabilityEvent, ModelProvider, ModelResponse } from '@aptkit/runtime';
 import type { Anomaly, Diagnosis, Recommendation, WorkspaceDescriptor } from '@aptkit/agent-recommendation';
 import type { Anomaly as MonitoringAnomaly, WorkspaceDescriptor as MonitoringWorkspaceDescriptor } from '@aptkit/agent-anomaly-monitoring';
@@ -136,6 +137,10 @@ type DiagnosticBehaviorExpectations = {
 
 type QueryBehaviorExpectations = {
   requiredAnswerText?: string[];
+};
+
+type TraceRunOptions = {
+  onEvent?: (event: CapabilityEvent) => void;
 };
 
 type TokenUsageSummary = {
@@ -365,6 +370,58 @@ export default defineConfig(({ mode }) => {
             }
           });
 
+          server.middlewares.use('/api/stream/replay', async (req, res) => {
+            if (req.method !== 'POST') {
+              res.statusCode = 405;
+              sendJson(res, { error: 'method not allowed' });
+              return;
+            }
+
+            await streamReplayResponse(req, res, async (body, onEvent) => {
+              const fixture = fixtures.find((candidate) => candidate.id === body.fixtureId) ?? fixtures[0];
+              return runReplay(fixture, parseMode(body.mode), { onEvent });
+            });
+          });
+
+          server.middlewares.use('/api/stream/monitoring/replay', async (req, res) => {
+            if (req.method !== 'POST') {
+              res.statusCode = 405;
+              sendJson(res, { error: 'method not allowed' });
+              return;
+            }
+
+            await streamReplayResponse(req, res, async (body, onEvent) => {
+              const fixture = monitoringFixtures.find((candidate) => candidate.id === body.fixtureId) ?? monitoringFixtures[0];
+              return runMonitoringReplay(fixture, parseMonitoringMode(body.mode), { onEvent });
+            });
+          });
+
+          server.middlewares.use('/api/stream/diagnostic/replay', async (req, res) => {
+            if (req.method !== 'POST') {
+              res.statusCode = 405;
+              sendJson(res, { error: 'method not allowed' });
+              return;
+            }
+
+            await streamReplayResponse(req, res, async (body, onEvent) => {
+              const fixture = diagnosticFixtures.find((candidate) => candidate.id === body.fixtureId) ?? diagnosticFixtures[0];
+              return runDiagnosticReplay(fixture, parseDiagnosticMode(body.mode), { onEvent });
+            });
+          });
+
+          server.middlewares.use('/api/stream/query/replay', async (req, res) => {
+            if (req.method !== 'POST') {
+              res.statusCode = 405;
+              sendJson(res, { error: 'method not allowed' });
+              return;
+            }
+
+            await streamReplayResponse(req, res, async (body, onEvent) => {
+              const fixture = queryFixtures.find((candidate) => candidate.id === body.fixtureId) ?? queryFixtures[0];
+              return runQueryReplay(fixture, parseQueryMode(body.mode), { onEvent });
+            });
+          });
+
           server.middlewares.use('/api/monitoring/replay', async (req, res) => {
             if (req.method !== 'POST') {
               res.statusCode = 405;
@@ -446,7 +503,7 @@ export default defineConfig(({ mode }) => {
   };
 });
 
-async function runReplay(fixture: RecommendationFixture, mode: ReplayMode) {
+async function runReplay(fixture: RecommendationFixture, mode: ReplayMode, options: TraceRunOptions = {}) {
   const startedAt = Date.now();
   const handlers: Record<string, ToolHandler> = {};
   for (const tool of fixture.tools) {
@@ -464,7 +521,12 @@ async function runReplay(fixture: RecommendationFixture, mode: ReplayMode) {
       let index = 0;
       return () => `${fixture.id}-${mode}-${++index}`;
     })(),
-    trace: { emit: (event) => trace.push(event) },
+    trace: {
+      emit: (event) => {
+        trace.push(event);
+        options.onEvent?.(event);
+      },
+    },
   });
 
   const recommendations = await agent.propose(fixture.anomaly, fixture.diagnosis);
@@ -482,7 +544,7 @@ async function runReplay(fixture: RecommendationFixture, mode: ReplayMode) {
   };
 }
 
-async function runMonitoringReplay(fixture: MonitoringFixture, mode: MonitoringReplayMode) {
+async function runMonitoringReplay(fixture: MonitoringFixture, mode: MonitoringReplayMode, options: TraceRunOptions = {}) {
   const startedAt = Date.now();
   const handlers: Record<string, ToolHandler> = {};
   for (const tool of fixture.tools) {
@@ -496,7 +558,12 @@ async function runMonitoringReplay(fixture: MonitoringFixture, mode: MonitoringR
     model,
     tools,
     workspace: fixture.workspace,
-    trace: { emit: (event) => trace.push(event) },
+    trace: {
+      emit: (event) => {
+        trace.push(event);
+        options.onEvent?.(event);
+      },
+    },
   });
 
   const anomalies = await agent.scan();
@@ -519,7 +586,7 @@ async function runMonitoringReplay(fixture: MonitoringFixture, mode: MonitoringR
   };
 }
 
-async function runDiagnosticReplay(fixture: DiagnosticFixture, mode: DiagnosticReplayMode) {
+async function runDiagnosticReplay(fixture: DiagnosticFixture, mode: DiagnosticReplayMode, options: TraceRunOptions = {}) {
   const startedAt = Date.now();
   const handlers: Record<string, ToolHandler> = {};
   for (const tool of fixture.tools) {
@@ -533,7 +600,12 @@ async function runDiagnosticReplay(fixture: DiagnosticFixture, mode: DiagnosticR
     model,
     tools,
     workspace: fixture.workspace,
-    trace: { emit: (event) => trace.push(event) },
+    trace: {
+      emit: (event) => {
+        trace.push(event);
+        options.onEvent?.(event);
+      },
+    },
   });
 
   const diagnosis = await agent.investigate(fixture.anomaly) as DiagnosticDiagnosis;
@@ -556,7 +628,7 @@ async function runDiagnosticReplay(fixture: DiagnosticFixture, mode: DiagnosticR
   };
 }
 
-async function runQueryReplay(fixture: QueryFixture, mode: QueryReplayMode) {
+async function runQueryReplay(fixture: QueryFixture, mode: QueryReplayMode, options: TraceRunOptions = {}) {
   const startedAt = Date.now();
   const handlers: Record<string, ToolHandler> = {};
   for (const tool of fixture.tools) {
@@ -570,7 +642,12 @@ async function runQueryReplay(fixture: QueryFixture, mode: QueryReplayMode) {
     model,
     tools,
     workspace: fixture.workspace,
-    trace: { emit: (event) => trace.push(event) },
+    trace: {
+      emit: (event) => {
+        trace.push(event);
+        options.onEvent?.(event);
+      },
+    },
   });
 
   const answer = await agent.answer(fixture.question, { intent: fixture.intent });
@@ -678,6 +755,39 @@ function parseQueryMode(value: unknown): QueryReplayMode {
 function sendJson(res: { setHeader(name: string, value: string): void; end(body: string): void }, body: unknown) {
   res.setHeader('content-type', 'application/json');
   res.end(JSON.stringify(body));
+}
+
+async function streamReplayResponse<T>(
+  req: NodeJS.ReadableStream,
+  res: {
+    setHeader(name: string, value: string): void;
+    write(chunk: string): void;
+    end(): void;
+  },
+  run: (
+    body: { fixtureId?: string; mode?: unknown; artifact?: unknown; path?: unknown },
+    onEvent: (event: CapabilityEvent) => void,
+  ) => Promise<T>,
+): Promise<void> {
+  // Keep transport concerns in Studio while runtime owns the NDJSON record encoding.
+  res.setHeader('content-type', 'application/x-ndjson; charset=utf-8');
+  res.setHeader('cache-control', 'no-cache');
+  res.setHeader('x-accel-buffering', 'no');
+
+  try {
+    const body = await readJsonBody(req);
+    const result = await run(body, (event) => {
+      res.write(encodeNdjsonRecord({ type: 'event', event }));
+    });
+    res.write(encodeNdjsonRecord({ type: 'result', result }));
+  } catch (error) {
+    res.write(encodeNdjsonRecord({
+      type: 'error',
+      error: error instanceof Error ? error.message : String(error),
+    }));
+  } finally {
+    res.end();
+  }
 }
 
 function readJsonBody(req: NodeJS.ReadableStream): Promise<{ fixtureId?: string; mode?: unknown; artifact?: unknown; path?: unknown }> {

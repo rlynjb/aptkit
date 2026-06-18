@@ -8,6 +8,7 @@ import { EvalPanel, Metric, Panel, PromptPackagePanel, ReplayModeSwitch, TracePa
 import { queryFixtures } from './fixtures';
 import { buildQueryReplayArtifact, estimateCost, formatCost, formatDuration, summarizeUsage } from './replay-artifacts';
 import type { PromotedQueryFixtureSummary, ProviderStatus, QueryPromoteResult, QueryReplayMode, QueryReplayState, SavedQueryReplaySummary } from './types';
+import type { CapabilityEvent } from '@aptkit/runtime';
 
 export function QueryWorkspace({ onHome }: { onHome: () => void }) {
   const [selectedFixtureId, setSelectedFixtureId] = React.useState(queryFixtures[0].id);
@@ -18,6 +19,7 @@ export function QueryWorkspace({ onHome }: { onHome: () => void }) {
     openai: { available: false, model: 'gpt-4.1' },
   });
   const [replay, setReplay] = React.useState<QueryReplayState | null>(null);
+  const [liveTrace, setLiveTrace] = React.useState<CapabilityEvent[]>([]);
   const [running, setRunning] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
   const [runId, setRunId] = React.useState(0);
@@ -48,10 +50,15 @@ export function QueryWorkspace({ onHome }: { onHome: () => void }) {
     setError(null);
     setSaveError(null);
     setReplay(null);
+    setLiveTrace([]);
     try {
+      const onEvent = (event: CapabilityEvent) => {
+        setLiveTrace((current) => runCounter.current === nextRunId ? [...current, event] : current);
+      };
       const result = modeToRun === 'fixture'
         ? await runQueryFixtureReplay(fixtureToRun)
-        : await runServerQueryReplay(fixtureToRun, modeToRun);
+        : await runServerQueryReplay(fixtureToRun, modeToRun, { onEvent });
+      setLiveTrace(result.trace);
       setReplay({
         ...result,
         runId: nextRunId,
@@ -112,6 +119,7 @@ export function QueryWorkspace({ onHome }: { onHome: () => void }) {
   function selectFixture(event: React.ChangeEvent<HTMLSelectElement>) {
     setSelectedFixtureId(event.target.value);
     setReplay(null);
+    setLiveTrace([]);
     setError(null);
     setSaveError(null);
   }
@@ -119,6 +127,7 @@ export function QueryWorkspace({ onHome }: { onHome: () => void }) {
   function selectMode(nextMode: QueryReplayMode) {
     setMode(nextMode);
     setReplay(null);
+    setLiveTrace([]);
     setError(null);
     setSaveError(null);
   }
@@ -154,7 +163,8 @@ export function QueryWorkspace({ onHome }: { onHome: () => void }) {
     }
   }
 
-  const usage = summarizeUsage(replay?.trace ?? []);
+  const visibleTrace = replay?.trace ?? liveTrace;
+  const usage = summarizeUsage(visibleTrace);
   const modelName = usage.modelName || providerStatus[mode].model;
   const costEstimate = estimateCost(mode, usage, modelName);
   const latestReviewPath = replay?.savedPath ?? savedReplays.find((savedReplay) => savedReplay.fixture.id === fixture.id && savedReplay.provider.id === mode)?.path;
@@ -322,7 +332,7 @@ export function QueryWorkspace({ onHome }: { onHome: () => void }) {
             renderedPrompt={{ label: 'Rendered for fixture', prompt: renderedPrompt }}
           />
 
-          <TracePanel running={running} trace={replay?.trace ?? []} />
+          <TracePanel running={running} trace={visibleTrace} />
           <EvalPanel
             error={error}
             evalOk={replay?.evalOk}

@@ -1,18 +1,44 @@
+import { decodeNdjsonStream } from '@aptkit/runtime';
+import type { CapabilityEvent } from '@aptkit/runtime';
 import type { DiagnosticFixture, DiagnosticPromoteResult, DiagnosticReplayArtifact, DiagnosticReplayMode, DiagnosticReplayResult, MonitoringFixture, MonitoringPromoteResult, MonitoringReplayResult, MonitoringReplayMode, MonitoringReplayArtifact, PromoteResult, PromotedDiagnosticFixtureSummary, PromotedFixtureSummary, PromotedMonitoringFixtureSummary, PromotedQueryFixtureSummary, QueryFixture, QueryPromoteResult, QueryReplayArtifact, QueryReplayMode, QueryReplayResult, RecommendationFixture, ReplayArtifact, ReplayMode, ReplayResult, SavedDiagnosticReplaySummary, SavedMonitoringReplaySummary, SavedQueryReplaySummary, SavedReplaySummary } from './types';
+
+type StreamReplayOptions = {
+  onEvent?: (event: CapabilityEvent) => void;
+};
 
 export async function runServerQueryReplay(
   fixture: QueryFixture,
   mode: Exclude<QueryReplayMode, 'fixture'>,
+  options: StreamReplayOptions = {},
 ): Promise<QueryReplayResult> {
-  const response = await fetch('/api/query/replay', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ fixtureId: fixture.id, mode }),
-  });
-  const payload = await response.json();
-  if (!response.ok) {
-    throw new Error(payload?.error ?? 'query replay failed');
-  }
+  return runReplayStream('/api/stream/query/replay', fixture.id, mode, toQueryReplayResult, options);
+}
+
+export async function runServerDiagnosticReplay(
+  fixture: DiagnosticFixture,
+  mode: Exclude<DiagnosticReplayMode, 'fixture'>,
+  options: StreamReplayOptions = {},
+): Promise<DiagnosticReplayResult> {
+  return runReplayStream('/api/stream/diagnostic/replay', fixture.id, mode, toDiagnosticReplayResult, options);
+}
+
+export async function runServerMonitoringReplay(
+  fixture: MonitoringFixture,
+  mode: Exclude<MonitoringReplayMode, 'fixture'>,
+  options: StreamReplayOptions = {},
+): Promise<MonitoringReplayResult> {
+  return runReplayStream('/api/stream/monitoring/replay', fixture.id, mode, toMonitoringReplayResult, options);
+}
+
+export async function runServerReplay(
+  fixture: RecommendationFixture,
+  mode: Exclude<ReplayMode, 'fixture'>,
+  options: StreamReplayOptions = {},
+): Promise<ReplayResult> {
+  return runReplayStream('/api/stream/replay', fixture.id, mode, toReplayResult, options);
+}
+
+function toQueryReplayResult(payload: any): QueryReplayResult {
   return {
     answer: payload.answer,
     trace: payload.trace,
@@ -24,19 +50,7 @@ export async function runServerQueryReplay(
   };
 }
 
-export async function runServerDiagnosticReplay(
-  fixture: DiagnosticFixture,
-  mode: Exclude<DiagnosticReplayMode, 'fixture'>,
-): Promise<DiagnosticReplayResult> {
-  const response = await fetch('/api/diagnostic/replay', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ fixtureId: fixture.id, mode }),
-  });
-  const payload = await response.json();
-  if (!response.ok) {
-    throw new Error(payload?.error ?? 'diagnostic replay failed');
-  }
+function toDiagnosticReplayResult(payload: any): DiagnosticReplayResult {
   return {
     diagnosis: payload.diagnosis,
     trace: payload.trace,
@@ -48,19 +62,7 @@ export async function runServerDiagnosticReplay(
   };
 }
 
-export async function runServerMonitoringReplay(
-  fixture: MonitoringFixture,
-  mode: Exclude<MonitoringReplayMode, 'fixture'>,
-): Promise<MonitoringReplayResult> {
-  const response = await fetch('/api/monitoring/replay', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ fixtureId: fixture.id, mode }),
-  });
-  const payload = await response.json();
-  if (!response.ok) {
-    throw new Error(payload?.error ?? 'monitoring replay failed');
-  }
+function toMonitoringReplayResult(payload: any): MonitoringReplayResult {
   return {
     anomalies: payload.anomalies,
     trace: payload.trace,
@@ -72,16 +74,7 @@ export async function runServerMonitoringReplay(
   };
 }
 
-export async function runServerReplay(fixture: RecommendationFixture, mode: Exclude<ReplayMode, 'fixture'>): Promise<ReplayResult> {
-  const response = await fetch('/api/replay', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ fixtureId: fixture.id, mode }),
-  });
-  const payload = await response.json();
-  if (!response.ok) {
-    throw new Error(payload?.error ?? 'live replay failed');
-  }
+function toReplayResult(payload: any): ReplayResult {
   return {
     recommendations: payload.recommendations,
     trace: payload.trace,
@@ -91,6 +84,72 @@ export async function runServerReplay(fixture: RecommendationFixture, mode: Excl
     modelTurns: payload.modelTurns,
     durationMs: payload.durationMs,
   };
+}
+
+async function runReplayStream<T>(
+  endpoint: string,
+  fixtureId: string,
+  mode: string,
+  mapResult: (payload: any) => T,
+  options: StreamReplayOptions,
+): Promise<T> {
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ fixtureId, mode }),
+  });
+
+  if (!response.body) {
+    const payload = await response.json().catch(() => null);
+    throw new Error(payload?.error ?? 'streaming replay failed');
+  }
+
+  let finalPayload: any = null;
+  for await (const record of decodeNdjsonStream(responseBodyChunks(response.body))) {
+    if (!record.ok) continue;
+    const value = record.value;
+    if (!isRecord(value) || typeof value.type !== 'string') continue;
+    if (value.type === 'event' && isCapabilityEventRecord(value.event)) {
+      options.onEvent?.(value.event);
+      continue;
+    }
+    if (value.type === 'result') {
+      finalPayload = value.result;
+      continue;
+    }
+    if (value.type === 'error') {
+      throw new Error(typeof value.error === 'string' ? value.error : 'streaming replay failed');
+    }
+  }
+
+  if (!response.ok) throw new Error('streaming replay failed');
+  if (!finalPayload) throw new Error('streaming replay ended without a result');
+  return mapResult(finalPayload);
+}
+
+/** Adapts browser ReadableStream chunks to the runtime NDJSON decoder's async-iterable input. */
+async function* responseBodyChunks(body: ReadableStream<Uint8Array>): AsyncGenerator<Uint8Array> {
+  const reader = body.getReader();
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) return;
+      if (value) yield value;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+function isCapabilityEventRecord(value: unknown): value is CapabilityEvent {
+  return isRecord(value)
+    && typeof value.type === 'string'
+    && typeof value.capabilityId === 'string'
+    && typeof value.timestamp === 'string';
+}
+
+function isRecord(value: unknown): value is Record<string, any> {
+  return typeof value === 'object' && value !== null;
 }
 
 export async function saveReplayArtifact(artifact: ReplayArtifact | MonitoringReplayArtifact | DiagnosticReplayArtifact | QueryReplayArtifact): Promise<string> {

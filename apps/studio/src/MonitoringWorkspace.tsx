@@ -10,6 +10,7 @@ import { EvalPanel, Metric, Panel, PromptPackagePanel, ReplayModeSwitch, TracePa
 import { CoverageItem, MonitoringAnomalyCard, MonitoringComparisonPanel, MonitoringReplayHistoryPanel, MonitoringReviewPanel, PromotedMonitoringFixturesPanel } from './monitoring-panels';
 import { buildMonitoringReplayArtifact, comparableMonitoringFromArtifact, comparisonForMonitoringFixture, estimateCost, findMonitoringReviewReplay, formatCost, formatDuration, summarizeUsage, toMonitoringReplayState } from './replay-artifacts';
 import type { MonitoringComparisonState, MonitoringPromoteResult, MonitoringReplayMode, MonitoringReplayState, PromotedMonitoringFixtureSummary, ProviderStatus, SavedMonitoringReplaySummary } from './types';
+import type { CapabilityEvent } from '@aptkit/runtime';
 
 export function MonitoringWorkspace({ onHome }: { onHome: () => void }) {
   const [selectedFixtureId, setSelectedFixtureId] = React.useState(monitoringFixtures[0].id);
@@ -20,6 +21,7 @@ export function MonitoringWorkspace({ onHome }: { onHome: () => void }) {
     openai: { available: false, model: 'gpt-4.1' },
   });
   const [replay, setReplay] = React.useState<MonitoringReplayState | null>(null);
+  const [liveTrace, setLiveTrace] = React.useState<CapabilityEvent[]>([]);
   const [running, setRunning] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
   const [runId, setRunId] = React.useState(0);
@@ -58,10 +60,15 @@ export function MonitoringWorkspace({ onHome }: { onHome: () => void }) {
     setError(null);
     setSaveError(null);
     setReplay(null);
+    setLiveTrace([]);
     try {
+      const onEvent = (event: CapabilityEvent) => {
+        setLiveTrace((current) => runCounter.current === nextRunId ? [...current, event] : current);
+      };
       const result = modeToRun === 'fixture'
         ? await runMonitoringFixtureReplay(fixtureToRun)
-        : await runServerMonitoringReplay(fixtureToRun, modeToRun);
+        : await runServerMonitoringReplay(fixtureToRun, modeToRun, { onEvent });
+      setLiveTrace(result.trace);
       setReplay({
         ...result,
         runId: nextRunId,
@@ -90,6 +97,7 @@ export function MonitoringWorkspace({ onHome }: { onHome: () => void }) {
   function selectFixture(event: React.ChangeEvent<HTMLSelectElement>) {
     setSelectedFixtureId(event.target.value);
     setReplay(null);
+    setLiveTrace([]);
     setError(null);
     setSaveError(null);
     setComparison(null);
@@ -99,6 +107,7 @@ export function MonitoringWorkspace({ onHome }: { onHome: () => void }) {
   function selectMode(nextMode: MonitoringReplayMode) {
     setMode(nextMode);
     setReplay(null);
+    setLiveTrace([]);
     setError(null);
     setSaveError(null);
     setComparisonError(null);
@@ -210,7 +219,8 @@ export function MonitoringWorkspace({ onHome }: { onHome: () => void }) {
     }
   }
 
-  const usage = summarizeUsage(replay?.trace ?? []);
+  const visibleTrace = replay?.trace ?? liveTrace;
+  const usage = summarizeUsage(visibleTrace);
   const modelName = usage.modelName || providerStatus[mode].model;
   const costEstimate = estimateCost(mode, usage, modelName);
   const reviewReplay = findMonitoringReviewReplay(savedReplays, selectedReviewPath, replay?.savedPath, fixture.id, mode);
@@ -378,7 +388,7 @@ export function MonitoringWorkspace({ onHome }: { onHome: () => void }) {
             renderedPrompt={{ label: 'Rendered for fixture', prompt: renderedPrompt }}
           />
 
-          <TracePanel running={running} trace={replay?.trace ?? []} />
+          <TracePanel running={running} trace={visibleTrace} />
 
           <EvalPanel
             error={error}
