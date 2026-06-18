@@ -1,8 +1,7 @@
-import { readdir, readFile } from 'node:fs/promises';
-import { dirname, extname, join, resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
-import { assertCapabilityReplayArtifactShape } from '@aptkit/evals';
+import { evaluateReplayArtifactFiles, listReplayArtifacts } from '@aptkit/evals/replay-runner';
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDir, '..');
@@ -23,60 +22,12 @@ if (args.values.help) {
 const paths = args.positionals.length
   ? args.positionals.map((path) => resolve(process.cwd(), path))
   : await listReplayArtifacts(resolve(repoRoot, args.values.dir ?? 'artifacts/replays'));
+const report = await evaluateReplayArtifactFiles(paths, { cwd: repoRoot });
 
-if (paths.length === 0) {
-  console.log(JSON.stringify({ ok: true, checked: 0, message: 'no replay artifacts found' }, null, 2));
-  process.exit(0);
-}
+console.log(JSON.stringify(report, null, 2));
 
-const results = [];
-for (const path of paths) {
-  const raw = await readFile(path, 'utf8');
-  const artifact = JSON.parse(raw);
-  const result = assertCapabilityReplayArtifactShape(artifact);
-  results.push({
-    path: relativeFromRoot(path),
-    ok: result.ok,
-    issues: result.issues,
-    capabilityId: artifact?.capabilityId ?? 'recommendation-agent',
-    provider: artifact?.provider,
-    fixture: artifact?.fixture?.id,
-    recommendationCount: Array.isArray(artifact?.recommendations) ? artifact.recommendations.length : null,
-    anomalyCount: Array.isArray(artifact?.anomalies) ? artifact.anomalies.length : null,
-    diagnosisPresent: artifact?.diagnosis && typeof artifact.diagnosis === 'object' ? true : null,
-    answerPresent: typeof artifact?.answer === 'string' ? artifact.answer.trim().length > 0 : null,
-  });
-}
-
-const failed = results.filter((result) => !result.ok);
-console.log(JSON.stringify({
-  ok: failed.length === 0,
-  checked: results.length,
-  failed: failed.length,
-  results,
-}, null, 2));
-
-if (failed.length > 0) {
+if (!report.ok) {
   process.exitCode = 1;
-}
-
-async function listReplayArtifacts(dir) {
-  let entries;
-  try {
-    entries = await readdir(dir, { withFileTypes: true });
-  } catch (error) {
-    if (error?.code === 'ENOENT') return [];
-    throw error;
-  }
-
-  return entries
-    .filter((entry) => entry.isFile() && extname(entry.name) === '.json')
-    .map((entry) => join(dir, entry.name))
-    .sort();
-}
-
-function relativeFromRoot(path) {
-  return path.startsWith(repoRoot) ? path.slice(repoRoot.length + 1) : path;
 }
 
 function printHelp() {
