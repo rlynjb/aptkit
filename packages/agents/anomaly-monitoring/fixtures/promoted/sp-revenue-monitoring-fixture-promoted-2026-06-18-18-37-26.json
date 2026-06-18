@@ -1,0 +1,229 @@
+{
+  "id": "sp-revenue-monitoring-fixture-promoted",
+  "description": "Promoted deterministic monitoring fixture from fixture replay artifact. Source fixture: sp-revenue-monitoring. Replay created at: 2026-06-18T18:37:26.958Z.",
+  "workspace": {
+    "projectId": "olist",
+    "projectName": "Olist Brazilian ecommerce fixture",
+    "events": [
+      {
+        "name": "purchase",
+        "properties": [
+          "state",
+          "category",
+          "total_price"
+        ],
+        "eventCount": 50000
+      },
+      {
+        "name": "session_start",
+        "properties": [
+          "utm_source"
+        ],
+        "eventCount": 80000
+      },
+      {
+        "name": "checkout",
+        "properties": [
+          "state"
+        ],
+        "eventCount": 35000
+      },
+      {
+        "name": "view_item",
+        "properties": [
+          "category"
+        ],
+        "eventCount": 120000
+      }
+    ],
+    "customerProperties": [
+      "state",
+      "city"
+    ],
+    "catalogs": [],
+    "totalCustomers": 125000,
+    "totalEvents": 285000,
+    "oldestTimestamp": 1764547200000,
+    "dataHorizon": {
+      "from": "2025-12-01",
+      "to": "2026-06-01",
+      "durationDays": 182
+    }
+  },
+  "tools": [
+    {
+      "name": "get_metric_timeseries",
+      "description": "Return metric timeseries for an optional dimension.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "metric": {
+            "type": "string"
+          },
+          "dimension": {
+            "type": "string"
+          },
+          "time_range": {
+            "type": "object"
+          },
+          "granularity": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "metric",
+          "time_range"
+        ]
+      },
+      "result": {
+        "periodComparison": {
+          "metric": "revenue",
+          "dimension": "state",
+          "segment": "SP",
+          "recentWindow": {
+            "from": "2026-05-04",
+            "to": "2026-06-01"
+          },
+          "baselineWindow": {
+            "from": "2026-02-09",
+            "to": "2026-05-04"
+          },
+          "recentValue": 28550000,
+          "baselineAverage": 40800000,
+          "pctChange": -0.300245,
+          "relatedSegments": [
+            {
+              "name": "RJ",
+              "pctChange": -0.02
+            },
+            {
+              "name": "MG",
+              "pctChange": 0.01
+            }
+          ]
+        },
+        "points": [
+          {
+            "ts": "2026-05-04",
+            "segment": "SP",
+            "value": 7400000
+          },
+          {
+            "ts": "2026-05-11",
+            "segment": "SP",
+            "value": 7200000
+          },
+          {
+            "ts": "2026-05-18",
+            "segment": "SP",
+            "value": 7050000
+          },
+          {
+            "ts": "2026-05-25",
+            "segment": "SP",
+            "value": 6900000
+          },
+          {
+            "ts": "2026-05-04",
+            "segment": "RJ",
+            "value": 4300000
+          },
+          {
+            "ts": "2026-05-11",
+            "segment": "RJ",
+            "value": 4350000
+          }
+        ],
+        "totalCount": 4200
+      }
+    },
+    {
+      "name": "get_anomaly_context",
+      "description": "Return context for a selected anomaly window and baseline.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "metric": {
+            "type": "string"
+          },
+          "dimension": {
+            "type": "string"
+          },
+          "segment": {
+            "type": "string"
+          },
+          "anomaly_window": {
+            "type": "object"
+          },
+          "baseline_window": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "metric",
+          "dimension",
+          "segment"
+        ]
+      },
+      "result": {
+        "anomaly_summary": {
+          "metric": "revenue",
+          "segment": "SP",
+          "anomaly_value": 28550000,
+          "baseline_avg": 40800000,
+          "pct_change": -0.300245
+        },
+        "related_segments": [
+          {
+            "name": "RJ",
+            "pct_change": -0.02
+          },
+          {
+            "name": "MG",
+            "pct_change": 0.01
+          }
+        ]
+      }
+    }
+  ],
+  "modelResponses": [
+    {
+      "content": [
+        {
+          "type": "text",
+          "text": "```json\n[\n  {\n    \"metric\": \"revenue\",\n    \"category\": \"revenue_drop\",\n    \"scope\": [\n      \"state:SP\"\n    ],\n    \"change\": {\n      \"value\": 30,\n      \"direction\": \"down\",\n      \"baseline\": \"recent 4w vs prior 12w\"\n    },\n    \"severity\": \"critical\",\n    \"impact\": \"Sao Paulo revenue is down about 30% while nearby states are stable, putting the largest regional topline segment at risk if the trend continues.\",\n    \"evidence\": [\n      {\n        \"tool\": \"get_anomaly_context\",\n        \"result\": {\n          \"segment\": \"SP\",\n          \"pct_change\": -0.300245,\n          \"anomaly_value\": 28550000,\n          \"baseline_avg\": 40800000\n        }\n      }\n    ]\n  }\n]\n```"
+        }
+      ],
+      "usage": {
+        "inputTokens": 2680,
+        "outputTokens": 365,
+        "estimated": true
+      },
+      "model": "promoted-fixture-replay"
+    }
+  ],
+  "expectations": {
+    "minAnomalyCount": 1,
+    "requiredCategories": [
+      "revenue_drop"
+    ],
+    "requiredMetrics": [
+      "revenue"
+    ],
+    "requiredScopes": [
+      "state:SP"
+    ],
+    "requiredSeverities": [
+      "critical"
+    ]
+  },
+  "promotion": {
+    "sourceArtifact": "artifacts/replays/2026-06-18T18-37-26-958Z-sp-revenue-monitoring-fixture-studio.json",
+    "sourceProvider": {
+      "id": "fixture",
+      "model": "fixture-model"
+    },
+    "promotedAt": "2026-06-18T18:37:26.963Z",
+    "note": "This fixture captures the final monitoring replay answer deterministically; it does not reconstruct the live provider tool loop."
+  }
+}

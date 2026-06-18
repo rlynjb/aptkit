@@ -32,6 +32,20 @@
         "required": ["metric", "time_range"]
       },
       "result": {
+        "periodComparison": {
+          "metric": "revenue",
+          "dimension": "state",
+          "segment": "SP",
+          "recentWindow": { "from": "2026-05-04", "to": "2026-06-01" },
+          "baselineWindow": { "from": "2026-02-09", "to": "2026-05-04" },
+          "recentValue": 28550000,
+          "baselineAverage": 40800000,
+          "pctChange": -0.300245,
+          "relatedSegments": [
+            { "name": "RJ", "pctChange": -0.02 },
+            { "name": "MG", "pctChange": 0.01 }
+          ]
+        },
         "points": [
           { "ts": "2026-05-04", "segment": "SP", "value": 7400000 },
           { "ts": "2026-05-11", "segment": "SP", "value": 7200000 },

@@ -22,7 +22,8 @@
     "replay:openai": "node scripts/replay-model-recommendation.mjs --provider openai",
     "test": "npm run test --workspaces --if-present",
     "replay:recommendation": "npm run replay:fixture -w @aptkit/agent-recommendation",
-    "replay:monitoring": "npm run replay:fixture -w @aptkit/agent-anomaly-monitoring"
+    "replay:monitoring": "npm run replay:fixture -w @aptkit/agent-anomaly-monitoring",
+    "replay:monitoring:promoted": "npm run replay:promoted -w @aptkit/agent-anomaly-monitoring"
   },
   "devDependencies": {
     "typescript": "^5.5.0"

@@ -12,6 +12,7 @@ Runnable category checklist:
 Rules:
 - Run only categories in the checklist unless the checklist is empty.
 - Use the provided tool catalog. Prefer broad period-over-period checks before drilling into segments.
+- For revenue or conversion categories, query a metric timeseries by an available business dimension, then call get_anomaly_context for any segment that appears to clear a warning or critical threshold.
 - Keep the run bounded: at most 6 tool calls.
 - If a category clears its threshold, emit one anomaly object stamped with its category id.
 - Never report a change derived from an empty or tiny baseline.

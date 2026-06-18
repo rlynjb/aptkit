@@ -3,18 +3,32 @@ import { dirname, extname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { defineConfig, loadEnv } from 'vite';
 import react from '@vitejs/plugin-react';
+import {
+  AnomalyMonitoringAgent,
+  FixtureModelProvider as MonitoringFixtureModelProvider,
+  validateAnomalies,
+} from '@aptkit/agent-anomaly-monitoring';
 import { RecommendationAgent, FixtureModelProvider } from '@aptkit/agent-recommendation';
-import { assertRecommendationShape, assertReplayArtifactShape } from '@aptkit/evals';
+import {
+  assertCapabilityReplayArtifactShape,
+  assertMonitoringReplayArtifactShape,
+  assertRecommendationShape,
+  assertReplayArtifactShape,
+} from '@aptkit/evals';
 import { AnthropicModelProvider } from '@aptkit/provider-anthropic';
 import { OpenAIModelProvider } from '@aptkit/provider-openai';
 import { InMemoryToolRegistry, type ToolDefinition, type ToolHandler } from '@aptkit/tools';
 import type { CapabilityEvent, ModelProvider, ModelResponse } from '@aptkit/runtime';
 import type { Anomaly, Diagnosis, Recommendation, WorkspaceDescriptor } from '@aptkit/agent-recommendation';
+import type { Anomaly as MonitoringAnomaly, WorkspaceDescriptor as MonitoringWorkspaceDescriptor } from '@aptkit/agent-anomaly-monitoring';
+import monitoringFixture from '../../packages/agents/anomaly-monitoring/fixtures/sp-revenue-monitoring.json';
 import electronicsSpikeFixture from '../../packages/agents/recommendation/fixtures/electronics-spike.json';
 import spRevenueDropFixture from '../../packages/agents/recommendation/fixtures/sp-revenue-drop.json';
 import voucherDropoffFixture from '../../packages/agents/recommendation/fixtures/voucher-dropoff.json';
 
 type ReplayMode = 'fixture' | 'anthropic' | 'openai';
+
+type MonitoringReplayMode = 'fixture' | 'openai';
 
 type FixtureTool = ToolDefinition & { result: unknown };
 
@@ -34,9 +48,31 @@ type RecommendationFixture = {
   };
 };
 
+type MonitoringFixture = {
+  id: string;
+  description: string;
+  workspace: MonitoringWorkspaceDescriptor;
+  tools: FixtureTool[];
+  modelResponses: ModelResponse[];
+  expectations?: MonitoringBehaviorExpectations;
+  promotion?: {
+    sourceArtifact?: string;
+    sourceProvider?: { id?: string; model?: string };
+    promotedAt?: string;
+  };
+};
+
 type BehavioralExpectations = {
   requiredFeatures?: string[];
   requiredText?: string[];
+};
+
+type MonitoringBehaviorExpectations = {
+  minAnomalyCount?: number;
+  requiredCategories?: string[];
+  requiredMetrics?: string[];
+  requiredScopes?: string[];
+  requiredSeverities?: string[];
 };
 
 type TokenUsageSummary = {
@@ -60,6 +96,10 @@ const fixtures = [
   electronicsSpikeFixture,
   voucherDropoffFixture,
 ] as RecommendationFixture[];
+
+const monitoringFixtures = [
+  monitoringFixture,
+] as MonitoringFixture[];
 
 export default defineConfig(({ mode }) => {
   const env = loadStudioEnv(mode);
@@ -95,6 +135,39 @@ export default defineConfig(({ mode }) => {
 
             try {
               sendJson(res, { fixtures: await listPromotedFixtureSummaries() });
+            } catch (error) {
+              res.statusCode = 400;
+              sendJson(res, { error: error instanceof Error ? error.message : String(error) });
+            }
+          });
+
+          server.middlewares.use('/api/promoted-monitoring-fixtures', async (req, res) => {
+            if (req.method !== 'GET') {
+              res.statusCode = 405;
+              sendJson(res, { error: 'method not allowed' });
+              return;
+            }
+
+            try {
+              sendJson(res, { fixtures: await listPromotedMonitoringFixtureSummaries() });
+            } catch (error) {
+              res.statusCode = 400;
+              sendJson(res, { error: error instanceof Error ? error.message : String(error) });
+            }
+          });
+
+          server.middlewares.use('/api/monitoring/replays/promote', async (req, res) => {
+            if (req.method !== 'POST') {
+              res.statusCode = 405;
+              sendJson(res, { error: 'method not allowed' });
+              return;
+            }
+
+            try {
+              const body = await readJsonBody(req);
+              const artifactPath = resolveReplayPath(body.path);
+              const result = await promoteMonitoringReplayArtifact(artifactPath);
+              sendJson(res, result);
             } catch (error) {
               res.statusCode = 400;
               sendJson(res, { error: error instanceof Error ? error.message : String(error) });
@@ -149,6 +222,25 @@ export default defineConfig(({ mode }) => {
               const path = join(outDir, `${formatTimestamp(new Date(artifact.createdAt))}-${slugify(artifact.fixture.id)}-${slugify(artifact.provider.id)}-studio.json`);
               await writeFile(path, `${JSON.stringify(artifact, null, 2)}\n`, 'utf8');
               sendJson(res, { path: relativeFromWorkspace(path) });
+            } catch (error) {
+              res.statusCode = 400;
+              sendJson(res, { error: error instanceof Error ? error.message : String(error) });
+            }
+          });
+
+          server.middlewares.use('/api/monitoring/replay', async (req, res) => {
+            if (req.method !== 'POST') {
+              res.statusCode = 405;
+              sendJson(res, { error: 'method not allowed' });
+              return;
+            }
+
+            try {
+              const body = await readJsonBody(req);
+              const fixture = monitoringFixtures.find((candidate) => candidate.id === body.fixtureId) ?? monitoringFixtures[0];
+              const mode = parseMonitoringMode(body.mode);
+              const result = await runMonitoringReplay(fixture, mode);
+              sendJson(res, result);
             } catch (error) {
               res.statusCode = 400;
               sendJson(res, { error: error instanceof Error ? error.message : String(error) });
@@ -215,6 +307,43 @@ async function runReplay(fixture: RecommendationFixture, mode: ReplayMode) {
   };
 }
 
+async function runMonitoringReplay(fixture: MonitoringFixture, mode: MonitoringReplayMode) {
+  const startedAt = Date.now();
+  const handlers: Record<string, ToolHandler> = {};
+  for (const tool of fixture.tools) {
+    handlers[tool.name] = () => tool.result;
+  }
+
+  const model = createMonitoringModelProvider(fixture, mode);
+  const tools = new InMemoryToolRegistry(fixture.tools, handlers);
+  const trace: CapabilityEvent[] = [];
+  const agent = new AnomalyMonitoringAgent({
+    model,
+    tools,
+    workspace: fixture.workspace,
+    trace: { emit: (event) => trace.push(event) },
+  });
+
+  const anomalies = await agent.scan();
+  const validation = validateAnomalies(anomalies);
+  const issues = validation.ok ? [] : [{ path: 'anomalies', message: validation.error }];
+
+  return {
+    fixture: fixture.id,
+    fixtureDescription: fixture.description,
+    mode,
+    anomalies: anomalies as MonitoringAnomaly[],
+    trace,
+    eval: {
+      name: 'anomaly-shape',
+      ok: validation.ok,
+      issues,
+    },
+    modelTurns: trace.filter((event) => event.type === 'model_usage').length,
+    durationMs: Date.now() - startedAt,
+  };
+}
+
 function createModelProvider(fixture: RecommendationFixture, mode: ReplayMode): ModelProvider {
   if (mode === 'fixture') return new FixtureModelProvider(fixture.modelResponses);
   if (mode === 'anthropic') {
@@ -222,6 +351,13 @@ function createModelProvider(fixture: RecommendationFixture, mode: ReplayMode): 
     if (!apiKey) throw new Error('ANTHROPIC_API_KEY is not configured');
     return new AnthropicModelProvider({ apiKey, model: process.env.ANTHROPIC_MODEL });
   }
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) throw new Error('OPENAI_API_KEY is not configured');
+  return new OpenAIModelProvider({ apiKey, model: process.env.OPENAI_MODEL });
+}
+
+function createMonitoringModelProvider(fixture: MonitoringFixture, mode: MonitoringReplayMode): ModelProvider {
+  if (mode === 'fixture') return new MonitoringFixtureModelProvider(fixture.modelResponses);
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) throw new Error('OPENAI_API_KEY is not configured');
   return new OpenAIModelProvider({ apiKey, model: process.env.OPENAI_MODEL });
@@ -256,6 +392,11 @@ function setProcessEnv(name: string, value: string | undefined) {
 
 function parseMode(value: unknown): ReplayMode {
   if (value === 'fixture' || value === 'anthropic' || value === 'openai') return value;
+  return 'fixture';
+}
+
+function parseMonitoringMode(value: unknown): MonitoringReplayMode {
+  if (value === 'openai') return 'openai';
   return 'fixture';
 }
 
@@ -297,12 +438,13 @@ async function listReplaySummaries() {
     if (!entry.isFile() || extname(entry.name) !== '.json') continue;
     const path = join(dir, entry.name);
     const artifact = JSON.parse(await readFile(path, 'utf8'));
-    const evaluation = assertReplayArtifactShape(artifact);
+    const evaluation = assertCapabilityReplayArtifactShape(artifact);
     const usage = summarizeTraceUsage(artifact.trace);
     const costEstimate = parseCostEstimate(artifact.costEstimate)
       ?? estimateCost(String(artifact.provider?.id ?? ''), usage, String(artifact.provider?.model ?? ''));
     summaries.push({
       path: relativeFromWorkspace(path),
+      capabilityId: typeof artifact.capabilityId === 'string' ? artifact.capabilityId : 'recommendation-agent',
       createdAt: typeof artifact.createdAt === 'string' ? artifact.createdAt : '',
       provider: artifact.provider,
       fixture: artifact.fixture,
@@ -310,6 +452,8 @@ async function listReplaySummaries() {
       issues: evaluation.issues,
       recommendations: Array.isArray(artifact.recommendations) ? artifact.recommendations : [],
       recommendationCount: Array.isArray(artifact.recommendations) ? artifact.recommendations.length : 0,
+      anomalies: Array.isArray(artifact.anomalies) ? artifact.anomalies : [],
+      anomalyCount: Array.isArray(artifact.anomalies) ? artifact.anomalies.length : 0,
       durationMs: typeof artifact.durationMs === 'number' ? artifact.durationMs : 0,
       modelTurns: typeof artifact.modelTurns === 'number' ? artifact.modelTurns : 0,
       usage,
@@ -366,6 +510,52 @@ async function listPromotedFixtureSummaries() {
   return summaries.sort((left, right) => left.id.localeCompare(right.id) || left.path.localeCompare(right.path));
 }
 
+async function listPromotedMonitoringFixtureSummaries() {
+  const dir = resolve(workspaceRoot(), 'packages/agents/anomaly-monitoring/fixtures/promoted');
+  let entries;
+  try {
+    entries = await readdir(dir, { withFileTypes: true });
+  } catch (error) {
+    if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') return [];
+    throw error;
+  }
+
+  const summaries = [];
+  for (const entry of entries) {
+    if (!entry.isFile() || extname(entry.name) !== '.json') continue;
+    const path = join(dir, entry.name);
+    const fixture = JSON.parse(await readFile(path, 'utf8')) as MonitoringFixture;
+    const replay = await runMonitoringReplay(fixture, 'fixture');
+    const behavior = assertMonitoringBehavioralExpectations(replay.anomalies, fixture.expectations);
+    const usage = summarizeTraceUsage(replay.trace);
+    const costEstimate = estimateCost(
+      fixture.promotion?.sourceProvider?.id ?? 'fixture',
+      usage,
+      fixture.promotion?.sourceProvider?.model ?? '',
+    );
+    summaries.push({
+      path: relativeFromWorkspace(path),
+      id: fixture.id,
+      description: fixture.description,
+      promotion: fixture.promotion,
+      expectations: fixture.expectations,
+      evalOk: replay.eval.ok,
+      behaviorOk: behavior.ok,
+      ok: replay.eval.ok && behavior.ok,
+      issues: [
+        ...replay.eval.issues.map((issue) => ({ ...issue, source: replay.eval.name })),
+        ...behavior.issues.map((issue) => ({ ...issue, source: behavior.name })),
+      ],
+      anomalyCount: replay.anomalies.length,
+      modelTurns: replay.modelTurns,
+      usage,
+      ...(costEstimate ? { costEstimate } : {}),
+    });
+  }
+
+  return summaries.sort((left, right) => left.id.localeCompare(right.id) || left.path.localeCompare(right.path));
+}
+
 function assertBehavioralExpectations(
   recommendations: Recommendation[],
   expectations: BehavioralExpectations | undefined,
@@ -393,6 +583,60 @@ function assertBehavioralExpectations(
   }
 
   return { name: 'recommendation-behavior', ok: issues.length === 0, issues };
+}
+
+function assertMonitoringBehavioralExpectations(
+  anomalies: MonitoringAnomaly[],
+  expectations: MonitoringBehaviorExpectations | undefined,
+) {
+  const issues: { path: string; message: string }[] = [];
+  if (!expectations) return { name: 'monitoring-behavior', ok: true, issues };
+
+  const minAnomalyCount = expectations.minAnomalyCount ?? 0;
+  if (anomalies.length < minAnomalyCount) {
+    issues.push({
+      path: 'expectations.minAnomalyCount',
+      message: `expected at least ${minAnomalyCount} anomalies, got ${anomalies.length}`,
+    });
+  }
+
+  for (const category of expectations.requiredCategories ?? []) {
+    if (!anomalies.some((anomaly) => anomaly.category === category)) {
+      issues.push({
+        path: 'expectations.requiredCategories',
+        message: `expected category=${category}`,
+      });
+    }
+  }
+
+  for (const metric of expectations.requiredMetrics ?? []) {
+    if (!anomalies.some((anomaly) => anomaly.metric === metric)) {
+      issues.push({
+        path: 'expectations.requiredMetrics',
+        message: `expected metric=${metric}`,
+      });
+    }
+  }
+
+  for (const scope of expectations.requiredScopes ?? []) {
+    if (!anomalies.some((anomaly) => anomaly.scope.includes(scope))) {
+      issues.push({
+        path: 'expectations.requiredScopes',
+        message: `expected scope=${scope}`,
+      });
+    }
+  }
+
+  for (const severity of expectations.requiredSeverities ?? []) {
+    if (!anomalies.some((anomaly) => anomaly.severity === severity)) {
+      issues.push({
+        path: 'expectations.requiredSeverities',
+        message: `expected severity=${severity}`,
+      });
+    }
+  }
+
+  return { name: 'monitoring-behavior', ok: issues.length === 0, issues };
 }
 
 function recommendationSearchText(recommendation: Recommendation): string {
@@ -469,6 +713,79 @@ async function promoteReplayArtifact(artifactPath: string) {
     sourceArtifact: promoted.promotion.sourceArtifact,
     recommendationCount: Array.isArray(artifact.recommendations) ? artifact.recommendations.length : 0,
   };
+}
+
+async function promoteMonitoringReplayArtifact(artifactPath: string) {
+  const artifact = JSON.parse(await readFile(artifactPath, 'utf8'));
+  const evaluation = assertMonitoringReplayArtifactShape(artifact);
+  if (!evaluation.ok) {
+    throw new Error(`monitoring replay artifact is not promotable: ${evaluation.issues.map((issue) => `${issue.path}: ${issue.message}`).join('; ')}`);
+  }
+
+  const sourceFixturePath = resolve(workspaceRoot(), artifact.fixture.path);
+  const sourceFixture = JSON.parse(await readFile(sourceFixturePath, 'utf8'));
+  const providerId = artifact.provider.id;
+  const promotedId = `${artifact.fixture.id}-${providerId}-promoted`;
+  const anomalies = Array.isArray(artifact.anomalies) ? artifact.anomalies : [];
+  const promoted = {
+    ...sourceFixture,
+    id: promotedId,
+    description: [
+      `Promoted deterministic monitoring fixture from ${providerId} replay artifact.`,
+      `Source fixture: ${artifact.fixture.id}.`,
+      `Replay created at: ${artifact.createdAt}.`,
+    ].join(' '),
+    modelResponses: [
+      {
+        content: [
+          {
+            type: 'text',
+            text: `\`\`\`json\n${JSON.stringify(toAscii(anomalies), null, 2)}\n\`\`\``,
+          },
+        ],
+        usage: {
+          inputTokens: summarizeTraceUsage(artifact.trace).inputTokens,
+          outputTokens: summarizeTraceUsage(artifact.trace).outputTokens,
+          estimated: true,
+        },
+        model: `promoted-${providerId}-replay`,
+      },
+    ],
+    expectations: monitoringExpectationsFromAnomalies(anomalies),
+    promotion: {
+      sourceArtifact: relativeFromWorkspace(artifactPath),
+      sourceProvider: artifact.provider,
+      promotedAt: new Date().toISOString(),
+      note: 'This fixture captures the final monitoring replay answer deterministically; it does not reconstruct the live provider tool loop.',
+    },
+  };
+
+  const artifactDate = new Date(artifact.createdAt);
+  const outDir = resolve(workspaceRoot(), 'packages/agents/anomaly-monitoring/fixtures/promoted');
+  await mkdir(outDir, { recursive: true });
+  const outPath = join(outDir, `${slugify(promotedId)}-${formatDateForFilename(artifactDate)}.json`);
+  await writeFile(outPath, `${JSON.stringify(promoted, null, 2)}\n`, 'utf8');
+
+  return {
+    path: relativeFromWorkspace(outPath),
+    id: promoted.id,
+    sourceArtifact: promoted.promotion.sourceArtifact,
+    anomalyCount: anomalies.length,
+  };
+}
+
+function monitoringExpectationsFromAnomalies(anomalies: MonitoringAnomaly[]): MonitoringBehaviorExpectations {
+  return {
+    minAnomalyCount: anomalies.length,
+    requiredCategories: uniqueStrings(anomalies.map((anomaly) => anomaly.category).filter((value): value is string => Boolean(value))),
+    requiredMetrics: uniqueStrings(anomalies.map((anomaly) => anomaly.metric)),
+    requiredScopes: uniqueStrings(anomalies.flatMap((anomaly) => anomaly.scope)),
+    requiredSeverities: uniqueStrings(anomalies.map((anomaly) => anomaly.severity)),
+  };
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return [...new Set(values)].sort();
 }
 
 function resolveReplayPath(value: unknown): string {
@@ -576,7 +893,9 @@ function normalizeReplayArtifact(value: unknown): Record<string, unknown> & {
   if (typeof value.createdAt !== 'string') throw new Error('artifact createdAt must be a string');
   if (!isRecord(value.fixture) || typeof value.fixture.id !== 'string') throw new Error('artifact fixture.id must be a string');
   if (!isRecord(value.provider) || typeof value.provider.id !== 'string') throw new Error('artifact provider.id must be a string');
-  if (!Array.isArray(value.recommendations)) throw new Error('artifact recommendations must be an array');
+  if (!Array.isArray(value.recommendations) && !Array.isArray(value.anomalies)) {
+    throw new Error('artifact must include recommendations or anomalies array');
+  }
   if (!Array.isArray(value.trace)) throw new Error('artifact trace must be an array');
   return value as ReturnType<typeof normalizeReplayArtifact>;
 }

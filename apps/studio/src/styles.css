@@ -52,6 +52,10 @@ button {
   background: #edf2ee;
 }
 
+.monitoringModeSwitch {
+  grid-template-columns: repeat(2, minmax(86px, 1fr));
+}
+
 .modeButton {
   display: inline-flex;
   align-items: center;
@@ -165,6 +169,87 @@ h1 {
   grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 10px;
   margin-bottom: 16px;
+}
+
+.capabilityGrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(280px, 1fr));
+  gap: 16px;
+  max-width: 1080px;
+}
+
+.capabilityCard {
+  display: grid;
+  gap: 16px;
+  align-content: start;
+  min-height: 300px;
+  padding: 18px;
+  border: 1px solid #d9dfd7;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.capabilityCardHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.capabilityIcon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 42px;
+  height: 42px;
+  border: 1px solid #d8e7dd;
+  border-radius: 8px;
+  background: #f2faf5;
+  color: #184a35;
+}
+
+.capabilityCardHeader span {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 0 8px;
+  border-radius: 999px;
+  background: #e3f3ea;
+  color: #184a35;
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.capabilityCard h2 {
+  margin: 0;
+  color: #1d2420;
+  font-size: 22px;
+  line-height: 1.2;
+  letter-spacing: 0;
+}
+
+.capabilityCard p {
+  margin: 0;
+  color: #344239;
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.capabilityStats {
+  display: grid;
+  gap: 8px;
+}
+
+.capabilityStats strong {
+  min-height: 38px;
+  padding: 10px;
+  border: 1px solid #e2e7e0;
+  border-radius: 6px;
+  background: #fafbf9;
+  color: #31453b;
+  font-size: 13px;
+  font-weight: 750;
 }
 
 .metric {
@@ -385,6 +470,11 @@ h1 {
   gap: 10px;
 }
 
+.topbarHome {
+  min-height: 40px;
+  padding: 0 12px;
+}
+
 .secondaryAction {
   display: inline-flex;
   align-items: center;
@@ -584,6 +674,10 @@ h1 {
   gap: 8px;
 }
 
+.reviewActions.single {
+  grid-template-columns: 1fr;
+}
+
 .expectationBlock {
   display: grid;
   gap: 3px;
@@ -771,6 +865,193 @@ h1 {
 
 .recommendation li + li {
   margin-top: 6px;
+}
+
+.coverageSummary {
+  display: grid;
+  gap: 4px;
+  margin-bottom: 12px;
+  padding: 10px;
+  border: 1px solid #d8e7dd;
+  border-radius: 6px;
+  background: #f2faf5;
+}
+
+.coverageSummary strong {
+  color: #184a35;
+  font-size: 14px;
+}
+
+.coverageSummary span {
+  color: #54645a;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.coverageGrid,
+.anomalyCards {
+  display: grid;
+  gap: 10px;
+}
+
+.coverageItem {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid #e2e7e0;
+  border-radius: 6px;
+  background: #fafbf9;
+}
+
+.coverageItem.full {
+  border-color: #cfe6d7;
+  background: #f2faf5;
+}
+
+.coverageItem.limited {
+  border-color: #ece2c8;
+  background: #fbf6e7;
+}
+
+.coverageItem.unavailable {
+  background: #f1f4f0;
+}
+
+.coverageItem div {
+  display: grid;
+  gap: 3px;
+}
+
+.coverageItem strong {
+  color: #1d2420;
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.coverageItem span,
+.coverageItem p,
+.evidencePreview span,
+.anomalyMeta span {
+  color: #66766c;
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.coverageItem em {
+  align-self: start;
+  padding: 4px 7px;
+  border-radius: 999px;
+  background: #ffffff;
+  color: #31453b;
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.coverageItem p {
+  grid-column: 1 / -1;
+  margin: 0;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.monitoringAnomaly {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid #dde4dc;
+  border-radius: 8px;
+  background: #fbfcfb;
+}
+
+.monitoringAnomaly h2 {
+  margin: 8px 0 0;
+  font-size: 18px;
+  line-height: 1.25;
+  letter-spacing: 0;
+}
+
+.monitoringAnomaly p {
+  margin: 0;
+  color: #35443a;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.severityPill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 0 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.severityPill.critical {
+  color: #842d24;
+  background: #fae7e4;
+}
+
+.severityPill.warning {
+  color: #504116;
+  background: #fff0ba;
+}
+
+.severityPill.info {
+  color: #24483a;
+  background: #e7efe9;
+}
+
+.severityPill.positive {
+  color: #145438;
+  background: #e3f3ea;
+}
+
+.anomalyMeta {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.anomalyMeta div {
+  display: grid;
+  gap: 3px;
+  min-height: 54px;
+  padding: 8px;
+  border: 1px solid #e2e7e0;
+  border-radius: 6px;
+  background: #ffffff;
+}
+
+.anomalyMeta strong {
+  color: #24362e;
+  font-size: 12px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.evidencePreview {
+  display: grid;
+  gap: 6px;
+  padding: 10px;
+  border: 1px solid #e2e7e0;
+  border-radius: 6px;
+  background: #ffffff;
+}
+
+.evidencePreview code {
+  max-height: 190px;
+  color: #24362e;
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.4;
+  overflow: auto;
+  white-space: pre-wrap;
 }
 
 .comparisonPanel {
@@ -1042,7 +1323,9 @@ h1 {
   }
 
   .metrics,
-  .layout {
+  .layout,
+  .capabilityGrid,
+  .anomalyMeta {
     grid-template-columns: 1fr;
   }
 

@@ -1,10 +1,22 @@
 import React from 'react';
 import { createRoot } from 'react-dom/client';
 import { Activity, BadgeCheck, Boxes, BrainCircuit, Check, ChevronDown, CircleDollarSign, Clipboard, Cloud, FileCheck, Gauge, History, KeyRound, Play, RefreshCw, Route, Save, ShieldCheck, Timer } from 'lucide-react';
+import {
+  AnomalyMonitoringAgent,
+  ECOMMERCE_ANOMALY_CATEGORIES,
+  FixtureModelProvider as MonitoringFixtureModelProvider,
+  coverageReport,
+  schemaCapabilities,
+  validateAnomalies,
+  type Anomaly as MonitoringAnomaly,
+  type CategoryCoverageItem,
+  type WorkspaceDescriptor as MonitoringWorkspaceDescriptor,
+} from '@aptkit/agent-anomaly-monitoring';
 import { RecommendationAgent, FixtureModelProvider, type Anomaly, type Diagnosis, type Recommendation, type WorkspaceDescriptor } from '@aptkit/agent-recommendation';
 import { assertRecommendationShape } from '@aptkit/evals';
 import type { CapabilityEvent, ModelResponse } from '@aptkit/runtime';
 import { InMemoryToolRegistry, type ToolDefinition, type ToolHandler } from '@aptkit/tools';
+import monitoringFixture from '../../../packages/agents/anomaly-monitoring/fixtures/sp-revenue-monitoring.json';
 import electronicsSpikeFixture from '../../../packages/agents/recommendation/fixtures/electronics-spike.json';
 import spRevenueDropFixture from '../../../packages/agents/recommendation/fixtures/sp-revenue-drop.json';
 import voucherDropoffFixture from '../../../packages/agents/recommendation/fixtures/voucher-dropoff.json';
@@ -18,6 +30,14 @@ type RecommendationFixture = {
   workspace: WorkspaceDescriptor;
   anomaly: Anomaly;
   diagnosis: Diagnosis;
+  tools: FixtureTool[];
+  modelResponses: ModelResponse[];
+};
+
+type MonitoringFixture = {
+  id: string;
+  description: string;
+  workspace: MonitoringWorkspaceDescriptor;
   tools: FixtureTool[];
   modelResponses: ModelResponse[];
 };
@@ -37,7 +57,24 @@ type ReplayState = {
 
 type ReplayResult = Omit<ReplayState, 'completedAt' | 'runId'>;
 
+type MonitoringReplayState = {
+  anomalies: MonitoringAnomaly[];
+  trace: CapabilityEvent[];
+  evalOk: boolean;
+  evalIssueDetails: { path: string; message: string }[];
+  evalIssues: string[];
+  modelTurns: number;
+  durationMs: number;
+  completedAt: string;
+  runId: number;
+  savedPath?: string;
+};
+
+type MonitoringReplayResult = Omit<MonitoringReplayState, 'completedAt' | 'runId'>;
+
 type ReplayMode = 'fixture' | 'anthropic' | 'openai';
+
+type MonitoringReplayMode = 'fixture' | 'openai';
 
 type ProviderStatus = Record<ReplayMode, { available: boolean; model: string }>;
 
@@ -82,8 +119,34 @@ type ReplayArtifact = {
   modelTurns: number;
 };
 
+type MonitoringReplayArtifact = {
+  schemaVersion: 1;
+  capabilityId: 'anomaly-monitoring-agent';
+  createdAt: string;
+  durationMs: number;
+  provider: {
+    id: MonitoringReplayMode;
+    model: string;
+  };
+  fixture: {
+    id: string;
+    description: string;
+    path: string;
+  };
+  anomalies: MonitoringAnomaly[];
+  trace: CapabilityEvent[];
+  costEstimate?: CostEstimate;
+  eval: {
+    name: string;
+    ok: boolean;
+    issues: { path: string; message: string }[];
+  };
+  modelTurns: number;
+};
+
 type SavedReplaySummary = {
   path: string;
+  capabilityId?: string;
   createdAt: string;
   provider: { id: string; model: string };
   fixture: { id: string; description?: string; path?: string };
@@ -98,6 +161,22 @@ type SavedReplaySummary = {
     outputTokens: number;
     totalTokens: number;
   };
+  costEstimate?: CostEstimate;
+};
+
+type SavedMonitoringReplaySummary = {
+  path: string;
+  capabilityId: 'anomaly-monitoring-agent';
+  createdAt: string;
+  provider: { id: string; model: string };
+  fixture: { id: string; description?: string; path?: string };
+  evalOk: boolean;
+  issues: { path: string; message: string }[];
+  anomalies: MonitoringAnomaly[];
+  anomalyCount: number;
+  durationMs: number;
+  modelTurns: number;
+  usage: TokenUsageSummary;
   costEstimate?: CostEstimate;
 };
 
@@ -122,11 +201,39 @@ type ComparisonState = {
   completedAt: string;
 };
 
+type ComparableMonitoringReplay = {
+  path?: string;
+  createdAt: string;
+  provider: { id: string; model: string };
+  fixture: { id: string; description?: string; path?: string };
+  evalOk: boolean;
+  issues: { path: string; message: string }[];
+  anomalies: MonitoringAnomaly[];
+  anomalyCount: number;
+  durationMs: number;
+  modelTurns: number;
+  usage: TokenUsageSummary;
+  costEstimate?: CostEstimate;
+};
+
+type MonitoringComparisonState = {
+  fixture?: ComparableMonitoringReplay;
+  openai?: ComparableMonitoringReplay;
+  completedAt: string;
+};
+
 type PromoteResult = {
   path: string;
   id: string;
   sourceArtifact: string;
   recommendationCount: number;
+};
+
+type MonitoringPromoteResult = {
+  path: string;
+  id: string;
+  sourceArtifact: string;
+  anomalyCount: number;
 };
 
 type PromotedFixtureSummary = {
@@ -156,11 +263,41 @@ type PromotedFixtureSummary = {
   costEstimate?: CostEstimate;
 };
 
+type PromotedMonitoringFixtureSummary = {
+  path: string;
+  id: string;
+  description: string;
+  promotion?: {
+    sourceArtifact?: string;
+    sourceProvider?: { id?: string; model?: string };
+    promotedAt?: string;
+  };
+  expectations?: {
+    minAnomalyCount?: number;
+    requiredCategories?: string[];
+    requiredMetrics?: string[];
+    requiredScopes?: string[];
+    requiredSeverities?: string[];
+  };
+  evalOk: boolean;
+  behaviorOk: boolean;
+  ok: boolean;
+  issues: { path: string; message: string; source: string }[];
+  anomalyCount: number;
+  modelTurns: number;
+  usage: TokenUsageSummary;
+  costEstimate?: CostEstimate;
+};
+
 const fixtures = [
   spRevenueDropFixture,
   electronicsSpikeFixture,
   voucherDropoffFixture,
 ] as RecommendationFixture[];
+
+const monitoringFixtures = [
+  monitoringFixture,
+] as MonitoringFixture[];
 
 function runFixtureReplay(fixture: RecommendationFixture): Promise<ReplayResult> {
   const startedAt = performance.now();
@@ -199,6 +336,62 @@ function runFixtureReplay(fixture: RecommendationFixture): Promise<ReplayResult>
   });
 }
 
+function runMonitoringFixtureReplay(fixture: MonitoringFixture): Promise<MonitoringReplayResult> {
+  const startedAt = performance.now();
+  const handlers: Record<string, ToolHandler> = {};
+  for (const tool of fixture.tools) {
+    handlers[tool.name] = () => tool.result;
+  }
+
+  const model = new MonitoringFixtureModelProvider(fixture.modelResponses);
+  const tools = new InMemoryToolRegistry(fixture.tools, handlers);
+  const trace: CapabilityEvent[] = [];
+  const agent = new AnomalyMonitoringAgent({
+    model,
+    tools,
+    workspace: fixture.workspace,
+    trace: { emit: (event) => trace.push(event) },
+  });
+
+  return agent.scan().then((anomalies) => {
+    const evalResult = validateAnomalies(anomalies);
+    const issues = evalResult.ok ? [] : [{ path: 'anomalies', message: evalResult.error }];
+    return {
+      anomalies,
+      trace,
+      evalOk: evalResult.ok,
+      evalIssueDetails: issues,
+      evalIssues: issues.map((issue) => `${issue.path}: ${issue.message}`),
+      modelTurns: model.requests.length,
+      durationMs: Math.round(performance.now() - startedAt),
+    };
+  });
+}
+
+async function runServerMonitoringReplay(
+  fixture: MonitoringFixture,
+  mode: Exclude<MonitoringReplayMode, 'fixture'>,
+): Promise<MonitoringReplayResult> {
+  const response = await fetch('/api/monitoring/replay', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ fixtureId: fixture.id, mode }),
+  });
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(payload?.error ?? 'monitoring replay failed');
+  }
+  return {
+    anomalies: payload.anomalies,
+    trace: payload.trace,
+    evalOk: payload.eval.ok,
+    evalIssueDetails: payload.eval.issues,
+    evalIssues: payload.eval.issues.map((issue: { path: string; message: string }) => `${issue.path}: ${issue.message}`),
+    modelTurns: payload.modelTurns,
+    durationMs: payload.durationMs,
+  };
+}
+
 async function runServerReplay(fixture: RecommendationFixture, mode: Exclude<ReplayMode, 'fixture'>): Promise<ReplayResult> {
   const response = await fetch('/api/replay', {
     method: 'POST',
@@ -220,7 +413,7 @@ async function runServerReplay(fixture: RecommendationFixture, mode: Exclude<Rep
   };
 }
 
-async function saveReplayArtifact(artifact: ReplayArtifact): Promise<string> {
+async function saveReplayArtifact(artifact: ReplayArtifact | MonitoringReplayArtifact): Promise<string> {
   const response = await fetch('/api/replay/save', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -239,7 +432,16 @@ async function loadSavedReplays(): Promise<SavedReplaySummary[]> {
   if (!response.ok) {
     throw new Error(payload?.error ?? 'load replays failed');
   }
-  return payload.replays;
+  return payload.replays.filter((replay: SavedReplaySummary) => !replay.capabilityId || replay.capabilityId === 'recommendation-agent');
+}
+
+async function loadSavedMonitoringReplays(): Promise<SavedMonitoringReplaySummary[]> {
+  const response = await fetch('/api/replays');
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(payload?.error ?? 'load monitoring replays failed');
+  }
+  return payload.replays.filter((replay: SavedMonitoringReplaySummary) => replay.capabilityId === 'anomaly-monitoring-agent');
 }
 
 async function promoteReplay(path: string): Promise<PromoteResult> {
@@ -255,6 +457,19 @@ async function promoteReplay(path: string): Promise<PromoteResult> {
   return payload;
 }
 
+async function promoteMonitoringReplay(path: string): Promise<MonitoringPromoteResult> {
+  const response = await fetch('/api/monitoring/replays/promote', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ path }),
+  });
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(payload?.error ?? 'promote monitoring replay failed');
+  }
+  return payload;
+}
+
 async function loadPromotedFixtures(): Promise<PromotedFixtureSummary[]> {
   const response = await fetch('/api/promoted-fixtures');
   const payload = await response.json();
@@ -264,7 +479,32 @@ async function loadPromotedFixtures(): Promise<PromotedFixtureSummary[]> {
   return payload.fixtures;
 }
 
+async function loadPromotedMonitoringFixtures(): Promise<PromotedMonitoringFixtureSummary[]> {
+  const response = await fetch('/api/promoted-monitoring-fixtures');
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(payload?.error ?? 'load promoted monitoring fixtures failed');
+  }
+  return payload.fixtures;
+}
+
+type StudioView = 'home' | 'recommendation' | 'monitoring';
+
 function App() {
+  const [view, setView] = React.useState<StudioView>('home');
+
+  if (view === 'recommendation') {
+    return <RecommendationWorkspace onHome={() => setView('home')} />;
+  }
+
+  if (view === 'monitoring') {
+    return <MonitoringWorkspace onHome={() => setView('home')} />;
+  }
+
+  return <StudioHome onOpen={setView} />;
+}
+
+function RecommendationWorkspace({ onHome }: { onHome: () => void }) {
   const [selectedFixtureId, setSelectedFixtureId] = React.useState(fixtures[0].id);
   const [mode, setMode] = React.useState<ReplayMode>('fixture');
   const [providerStatus, setProviderStatus] = React.useState<ProviderStatus>({
@@ -475,29 +715,20 @@ function App() {
           <h1>Recommendation Agent Replay</h1>
         </div>
         <div className="topbarActions">
-          <div className="modeSwitch" aria-label="Replay mode">
-            <ModeButton
-              active={mode === 'fixture'}
-              available
-              icon={<Boxes size={15} />}
-              label="Fixture"
-              onClick={() => selectMode('fixture')}
-            />
-            <ModeButton
-              active={mode === 'anthropic'}
-              available={providerStatus.anthropic.available}
-              icon={<Cloud size={15} />}
-              label="Anthropic"
-              onClick={() => selectMode('anthropic')}
-            />
-            <ModeButton
-              active={mode === 'openai'}
-              available={providerStatus.openai.available}
-              icon={<KeyRound size={15} />}
-              label="OpenAI"
-              onClick={() => selectMode('openai')}
-            />
-          </div>
+          <button className="secondaryAction topbarHome" type="button" onClick={onHome}>
+            <Boxes size={15} />
+            <span>Home</span>
+          </button>
+          <ReplayModeSwitch
+            ariaLabel="Replay mode"
+            mode={mode}
+            onSelect={selectMode}
+            options={[
+              { mode: 'fixture', available: true, icon: <Boxes size={15} />, label: 'Fixture' },
+              { mode: 'anthropic', available: providerStatus.anthropic.available, icon: <Cloud size={15} />, label: 'Anthropic' },
+              { mode: 'openai', available: providerStatus.openai.available, icon: <KeyRound size={15} />, label: 'OpenAI' },
+            ]}
+          />
           <label className="fixtureSelect">
             <span>Fixture</span>
             <ChevronDown size={16} aria-hidden="true" />
@@ -667,29 +898,976 @@ function App() {
             onRefresh={() => void refreshPromotedFixtures()}
           />
 
-          <Panel title="Trace" icon={<BrainCircuit size={17} />}>
-            {running ? <div className="emptyState compact">Collecting trace events...</div> : null}
-            <div className="traceList">
-              {(replay?.trace ?? []).map((event, index) => (
-                <TraceItem event={event} index={index} key={`${event.type}-${index}`} />
-              ))}
-            </div>
-          </Panel>
+          <TracePanel running={running} trace={replay?.trace ?? []} />
 
-          <Panel title="Eval" icon={<ShieldCheck size={17} />}>
-            <div className={error ? 'evalError' : replay?.evalOk ? 'evalPass' : 'evalPending'}>
-              {error ? 'replay failed' : replay?.evalOk ? 'recommendation-shape passed' : running ? 'replay running' : 'waiting for replay'}
-            </div>
-            {replay?.evalIssues.length ? (
-              <ul className="issueList">
-                {replay.evalIssues.map((issue) => <li key={issue}>{issue}</li>)}
-              </ul>
-            ) : null}
-          </Panel>
+          <EvalPanel
+            error={error}
+            evalOk={replay?.evalOk}
+            issues={replay?.evalIssues ?? []}
+            passedLabel="recommendation-shape passed"
+            running={running}
+          />
         </aside>
       </div>
     </main>
   );
+}
+
+function StudioHome({ onOpen }: { onOpen: (view: StudioView) => void }) {
+  const monitoringCoverage = coverageReport(
+    ECOMMERCE_ANOMALY_CATEGORIES,
+    schemaCapabilities(monitoringFixtures[0].workspace),
+  );
+  const fullCoverage = monitoringCoverage.filter((item) => item.coverage === 'full').length;
+  const limitedCoverage = monitoringCoverage.filter((item) => item.coverage === 'limited').length;
+
+  return (
+    <main className="shell">
+      <header className="topbar">
+        <div>
+          <p className="eyebrow">AptKit Studio</p>
+          <h1>Capability Gallery</h1>
+        </div>
+      </header>
+
+      <section className="capabilityGrid" aria-label="Available capabilities">
+        <CapabilityCard
+          icon={<CircleDollarSign size={20} />}
+          title="Recommendation Agent"
+          status="Ready"
+          summary="Replay ecommerce recommendations, compare fixture vs OpenAI, save artifacts, and promote fixtures."
+          details={[
+            `${fixtures.length} fixtures`,
+            'Fixture/OpenAI comparison',
+            'Replay promotion workflow',
+          ]}
+          onOpen={() => onOpen('recommendation')}
+        />
+        <CapabilityCard
+          icon={<Activity size={20} />}
+          title="Anomaly Monitoring Agent"
+          status="Fixture ready"
+          summary="Scan ecommerce workspace data for seeded anomaly categories with trace and coverage review."
+          details={[
+            `${monitoringFixtures.length} fixture`,
+            `${fullCoverage} full / ${limitedCoverage} limited categories`,
+            'Deterministic monitoring replay',
+          ]}
+          onOpen={() => onOpen('monitoring')}
+        />
+      </section>
+    </main>
+  );
+}
+
+function CapabilityCard({
+  icon,
+  title,
+  status,
+  summary,
+  details,
+  onOpen,
+}: {
+  icon: React.ReactNode;
+  title: string;
+  status: string;
+  summary: string;
+  details: string[];
+  onOpen: () => void;
+}) {
+  return (
+    <article className="capabilityCard">
+      <div className="capabilityCardHeader">
+        <div className="capabilityIcon">{icon}</div>
+        <span>{status}</span>
+      </div>
+      <h2>{title}</h2>
+      <p>{summary}</p>
+      <div className="capabilityStats">
+        {details.map((detail) => (
+          <strong key={detail}>{detail}</strong>
+        ))}
+      </div>
+      <button className="primaryAction" type="button" onClick={onOpen}>
+        <Play size={15} />
+        <span>Open</span>
+      </button>
+    </article>
+  );
+}
+
+function MonitoringWorkspace({ onHome }: { onHome: () => void }) {
+  const [selectedFixtureId, setSelectedFixtureId] = React.useState(monitoringFixtures[0].id);
+  const [mode, setMode] = React.useState<MonitoringReplayMode>('fixture');
+  const [providerStatus, setProviderStatus] = React.useState<ProviderStatus>({
+    fixture: { available: true, model: 'fixture-model' },
+    anthropic: { available: false, model: 'claude-sonnet-4-6' },
+    openai: { available: false, model: 'gpt-4.1' },
+  });
+  const [replay, setReplay] = React.useState<MonitoringReplayState | null>(null);
+  const [running, setRunning] = React.useState(false);
+  const [saving, setSaving] = React.useState(false);
+  const [runId, setRunId] = React.useState(0);
+  const [error, setError] = React.useState<string | null>(null);
+  const [saveError, setSaveError] = React.useState<string | null>(null);
+  const [savedReplays, setSavedReplays] = React.useState<SavedMonitoringReplaySummary[]>([]);
+  const [historyLoading, setHistoryLoading] = React.useState(false);
+  const [historyError, setHistoryError] = React.useState<string | null>(null);
+  const [selectedReviewPath, setSelectedReviewPath] = React.useState<string | null>(null);
+  const [comparison, setComparison] = React.useState<MonitoringComparisonState | null>(null);
+  const [comparisonRunning, setComparisonRunning] = React.useState(false);
+  const [comparisonError, setComparisonError] = React.useState<string | null>(null);
+  const [promotingPath, setPromotingPath] = React.useState<string | null>(null);
+  const [promoteResult, setPromoteResult] = React.useState<MonitoringPromoteResult | null>(null);
+  const [promotedFixtures, setPromotedFixtures] = React.useState<PromotedMonitoringFixtureSummary[]>([]);
+  const [promotedLoading, setPromotedLoading] = React.useState(false);
+  const [promotedError, setPromotedError] = React.useState<string | null>(null);
+  const runCounter = React.useRef(0);
+  const selectedFixtureRef = React.useRef(monitoringFixtures[0]);
+  const modeRef = React.useRef(mode);
+  const fixture = monitoringFixtures.find((candidate) => candidate.id === selectedFixtureId) ?? monitoringFixtures[0];
+  const coverage = coverageReport(ECOMMERCE_ANOMALY_CATEGORIES, schemaCapabilities(fixture.workspace));
+  const fullCoverage = coverage.filter((item) => item.coverage === 'full').length;
+  const runnableCoverage = coverage.filter((item) => item.coverage !== 'unavailable').length;
+
+  selectedFixtureRef.current = fixture;
+  modeRef.current = mode;
+
+  const startReplay = React.useCallback(async () => {
+    const fixtureToRun = selectedFixtureRef.current;
+    const modeToRun = modeRef.current;
+    const nextRunId = runCounter.current + 1;
+    runCounter.current = nextRunId;
+    setRunId(nextRunId);
+    setRunning(true);
+    setError(null);
+    setSaveError(null);
+    setReplay(null);
+    try {
+      const result = modeToRun === 'fixture'
+        ? await runMonitoringFixtureReplay(fixtureToRun)
+        : await runServerMonitoringReplay(fixtureToRun, modeToRun);
+      setReplay({
+        ...result,
+        runId: nextRunId,
+        completedAt: new Date().toLocaleTimeString(),
+      });
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setRunning(false);
+    }
+  }, []);
+
+  React.useEffect(() => {
+    void startReplay();
+  }, [startReplay]);
+
+  React.useEffect(() => {
+    fetch('/api/model-status')
+      .then((response) => response.json())
+      .then((payload) => setProviderStatus(payload.providers))
+      .catch(() => {
+        setProviderStatus((current) => current);
+      });
+  }, []);
+
+  function selectFixture(event: React.ChangeEvent<HTMLSelectElement>) {
+    setSelectedFixtureId(event.target.value);
+    setReplay(null);
+    setError(null);
+    setSaveError(null);
+    setComparison(null);
+    setComparisonError(null);
+  }
+
+  function selectMode(nextMode: MonitoringReplayMode) {
+    setMode(nextMode);
+    setReplay(null);
+    setError(null);
+    setSaveError(null);
+    setComparisonError(null);
+  }
+
+  const refreshReplayHistory = React.useCallback(async () => {
+    setHistoryLoading(true);
+    setHistoryError(null);
+    try {
+      setSavedReplays(await loadSavedMonitoringReplays());
+    } catch (caught) {
+      setHistoryError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setHistoryLoading(false);
+    }
+  }, []);
+
+  React.useEffect(() => {
+    void refreshReplayHistory();
+  }, [refreshReplayHistory]);
+
+  const refreshPromotedFixtures = React.useCallback(async () => {
+    setPromotedLoading(true);
+    setPromotedError(null);
+    try {
+      setPromotedFixtures(await loadPromotedMonitoringFixtures());
+    } catch (caught) {
+      setPromotedError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setPromotedLoading(false);
+    }
+  }, []);
+
+  React.useEffect(() => {
+    void refreshPromotedFixtures();
+  }, [refreshPromotedFixtures]);
+
+  async function saveCurrentReplay() {
+    if (!replay) return;
+    setSaving(true);
+    setSaveError(null);
+    try {
+      const artifact = buildMonitoringReplayArtifact(fixture, replay, mode, providerStatus[mode].model);
+      const savedPath = await saveReplayArtifact(artifact);
+      setReplay((current) => current ? { ...current, savedPath } : current);
+      setSelectedReviewPath(savedPath);
+      await refreshReplayHistory();
+    } catch (caught) {
+      setSaveError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function promoteSavedReplay(path: string) {
+    setPromotingPath(path);
+    setHistoryError(null);
+    setPromoteResult(null);
+    try {
+      const result = await promoteMonitoringReplay(path);
+      setPromoteResult(result);
+      await refreshPromotedFixtures();
+    } catch (caught) {
+      setHistoryError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setPromotingPath(null);
+    }
+  }
+
+  async function runComparison() {
+    const fixtureToRun = selectedFixtureRef.current;
+    setComparisonRunning(true);
+    setComparisonError(null);
+    setError(null);
+    setSaveError(null);
+    try {
+      const fixtureRunId = runCounter.current + 1;
+      runCounter.current = fixtureRunId;
+      const fixtureResult = await runMonitoringFixtureReplay(fixtureToRun);
+      const fixtureState = toMonitoringReplayState(fixtureResult, fixtureRunId);
+      const fixtureArtifact = buildMonitoringReplayArtifact(fixtureToRun, fixtureState, 'fixture', providerStatus.fixture.model);
+      const fixturePath = await saveReplayArtifact(fixtureArtifact);
+
+      const openaiRunId = runCounter.current + 1;
+      runCounter.current = openaiRunId;
+      const openaiResult = await runServerMonitoringReplay(fixtureToRun, 'openai');
+      const openaiState = {
+        ...toMonitoringReplayState(openaiResult, openaiRunId),
+        savedPath: '',
+      };
+      const openaiArtifact = buildMonitoringReplayArtifact(fixtureToRun, openaiState, 'openai', providerStatus.openai.model);
+      const openaiPath = await saveReplayArtifact(openaiArtifact);
+      const completedAt = new Date().toLocaleTimeString();
+
+      setMode('openai');
+      setRunId(openaiRunId);
+      setReplay({ ...openaiState, savedPath: openaiPath, completedAt });
+      setSelectedReviewPath(openaiPath);
+      setComparison({
+        fixture: comparableMonitoringFromArtifact(fixtureArtifact, fixturePath),
+        openai: comparableMonitoringFromArtifact(openaiArtifact, openaiPath),
+        completedAt,
+      });
+      await refreshReplayHistory();
+    } catch (caught) {
+      setComparisonError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setComparisonRunning(false);
+    }
+  }
+
+  const usage = summarizeUsage(replay?.trace ?? []);
+  const modelName = usage.modelName || providerStatus[mode].model;
+  const costEstimate = estimateCost(mode, usage, modelName);
+  const reviewReplay = findMonitoringReviewReplay(savedReplays, selectedReviewPath, replay?.savedPath, fixture.id, mode);
+  const comparisonView = comparisonForMonitoringFixture(comparison, savedReplays, fixture.id);
+
+  return (
+    <main className="shell">
+      <header className="topbar">
+        <div>
+          <p className="eyebrow">AptKit Studio</p>
+          <h1>Anomaly Monitoring Replay</h1>
+        </div>
+        <div className="topbarActions">
+          <button className="secondaryAction topbarHome" type="button" onClick={onHome}>
+            <Boxes size={15} />
+            <span>Home</span>
+          </button>
+          <ReplayModeSwitch
+            ariaLabel="Monitoring replay mode"
+            className="monitoringModeSwitch"
+            mode={mode}
+            onSelect={selectMode}
+            options={[
+              { mode: 'fixture', available: true, icon: <Boxes size={15} />, label: 'Fixture' },
+              { mode: 'openai', available: providerStatus.openai.available, icon: <KeyRound size={15} />, label: 'OpenAI' },
+            ]}
+          />
+          <label className="fixtureSelect">
+            <span>Fixture</span>
+            <ChevronDown size={16} aria-hidden="true" />
+            <select value={selectedFixtureId} onChange={selectFixture} disabled={running}>
+              {monitoringFixtures.map((candidate) => (
+                <option key={candidate.id} value={candidate.id}>
+                  {candidate.id}
+                </option>
+              ))}
+            </select>
+          </label>
+          <button className="runButton" onClick={startReplay} disabled={running || !providerStatus[mode].available}>
+            <Play size={17} aria-hidden="true" />
+            <span>{running ? 'Running' : mode === 'fixture' ? 'Run Fixture' : 'Run OpenAI'}</span>
+          </button>
+        </div>
+      </header>
+
+      <section className="metrics" aria-label="Monitoring replay summary">
+        <Metric icon={<BadgeCheck size={18} />} label="Eval" value={error ? 'Error' : replay?.evalOk ? 'Passing' : running ? 'Running' : 'Pending'} tone={replay?.evalOk ? 'good' : 'neutral'} />
+        <Metric icon={<BrainCircuit size={18} />} label="Model" value={modelName} />
+        <Metric icon={<Gauge size={18} />} label="Tokens" value={usage.totalTokens.toLocaleString()} />
+        <Metric icon={<CircleDollarSign size={18} />} label="Est. Cost" value={formatCost(costEstimate)} />
+        <Metric icon={<Timer size={18} />} label="Duration" value={replay ? formatDuration(replay.durationMs) : running ? 'Running' : '0ms'} />
+      </section>
+
+      <div className="layout">
+        <section className="leftPane">
+          <Panel title="Fixture" icon={<Boxes size={17} />}>
+            <div className="kv">
+              <span>ID</span>
+              <strong>{fixture.id}</strong>
+              <span>Case</span>
+              <strong>{fixture.description}</strong>
+              <span>Status</span>
+              <strong>{error ? 'error' : running ? 'running' : replay ? `completed at ${replay.completedAt}` : 'not run'}</strong>
+              <span>Mode</span>
+              <strong>{mode} / {providerStatus[mode].model}{providerStatus[mode].available ? '' : ' unavailable'}</strong>
+              <span>Workspace</span>
+              <strong>{fixture.workspace.projectName}</strong>
+              <span>Input</span>
+              <strong>{usage.inputTokens.toLocaleString()} tokens</strong>
+              <span>Output</span>
+              <strong>{usage.outputTokens.toLocaleString()} tokens</strong>
+              <span>Cost</span>
+              <strong>{formatCost(costEstimate)}</strong>
+              <span>Events</span>
+              <strong>{fixture.workspace.totalEvents.toLocaleString()}</strong>
+              <span>Customers</span>
+              <strong>{fixture.workspace.totalCustomers.toLocaleString()}</strong>
+              <span>Horizon</span>
+              <strong>{fixture.workspace.dataHorizon?.from} to {fixture.workspace.dataHorizon?.to}</strong>
+            </div>
+          </Panel>
+
+          <Panel title="Coverage" icon={<FileCheck size={17} />}>
+            <div className="coverageSummary">
+              <strong>{fullCoverage} full</strong>
+              <span>{runnableCoverage} runnable categories out of {coverage.length}</span>
+            </div>
+            <div className="coverageGrid">
+              {coverage.map((item) => (
+                <CoverageItem item={item} key={item.category} />
+              ))}
+            </div>
+          </Panel>
+        </section>
+
+        <section className="mainPane">
+          <Panel title="Detected Anomalies" icon={<Activity size={17} />} wide>
+            {running ? <div className="emptyState">Running {mode === 'fixture' ? 'fixture' : 'OpenAI'} monitoring replay...</div> : null}
+            {!providerStatus[mode].available ? <div className="errorState">Set OPENAI_API_KEY and restart Studio to enable OpenAI monitoring.</div> : null}
+            {error ? <div className="errorState">{error}</div> : null}
+            {!running && !error && !replay ? <div className="emptyState">No monitoring output yet.</div> : null}
+            {!running && replay && replay.anomalies.length === 0 ? <div className="emptyState">No meaningful anomaly found.</div> : null}
+            <div className="anomalyCards">
+              {(replay?.anomalies ?? []).map((anomaly, index) => (
+                <MonitoringAnomalyCard anomaly={anomaly} index={index} key={`${anomaly.metric}-${anomaly.scope.join('-')}-${index}`} />
+              ))}
+            </div>
+          </Panel>
+
+          <MonitoringComparisonPanel
+            comparison={comparisonView}
+            fixtureId={fixture.id}
+            openaiAvailable={providerStatus.openai.available}
+            running={comparisonRunning}
+            error={comparisonError}
+            onRun={() => void runComparison()}
+          />
+
+          <Panel title="Workflow" icon={<Route size={17} />} wide>
+            <div className="workflow">
+              <div className="layerCallout">
+                <strong>{mode === 'fixture' ? 'Fake model + fake tools' : 'Real model + fake tools'}</strong>
+                <span>{mode === 'fixture' ? 'Deterministic monitoring replay for UI validation and regression checks.' : 'OpenAI reasons over controlled fixture data; no live customer data is sent.'}</span>
+              </div>
+              <ol className="workflowSteps">
+                <li>Load ecommerce workspace descriptor</li>
+                <li>Calculate runnable anomaly categories</li>
+                <li>Replay fixture model tool calls</li>
+                <li>Validate anomaly JSON</li>
+                <li>Review trace and coverage in Studio</li>
+              </ol>
+              <div className="saveReplay">
+                <button type="button" onClick={() => void saveCurrentReplay()} disabled={!replay || saving}>
+                  <Save size={15} />
+                  <span>{saving ? 'Saving' : replay?.savedPath ? 'Saved' : 'Save Replay'}</span>
+                </button>
+                <code>{replay?.savedPath ?? 'No saved artifact yet'}</code>
+                {saveError ? <p>{saveError}</p> : null}
+              </div>
+              <div className="commandList">
+                <div className="commandRow">
+                  <span>{mode === 'fixture' ? 'CLI replay' : 'Live shape'}</span>
+                  <code>{mode === 'fixture' ? 'npm run replay:monitoring' : 'OpenAI monitoring runs through Studio API'}</code>
+                  <button
+                    aria-label="Copy monitoring replay command"
+                    title="Copy monitoring replay command"
+                    type="button"
+                    onClick={() => void navigator.clipboard.writeText(mode === 'fixture' ? 'npm run replay:monitoring' : 'OpenAI monitoring runs through Studio API')}
+                  >
+                    <Clipboard size={15} />
+                  </button>
+                </div>
+              </div>
+            </div>
+          </Panel>
+        </section>
+
+        <aside className="rightPane">
+          <TracePanel running={running} trace={replay?.trace ?? []} />
+
+          <EvalPanel
+            error={error}
+            evalOk={replay?.evalOk}
+            issues={replay?.evalIssues ?? []}
+            passedLabel="anomaly-shape passed"
+            running={running}
+          />
+
+          <MonitoringReviewPanel
+            fixture={fixture}
+            mode={mode}
+            modelName={modelName}
+            replay={replay}
+            savedReplay={reviewReplay}
+            usage={usage}
+            costEstimate={costEstimate}
+            saving={saving}
+            saveError={saveError}
+            error={historyError}
+            promotingPath={promotingPath}
+            promoteResult={promoteResult}
+            onSave={() => void saveCurrentReplay()}
+            onPromote={(path) => void promoteSavedReplay(path)}
+          />
+
+          <Panel title="Run" icon={<History size={17} />}>
+            <div className="kv">
+              <span>Run</span>
+              <strong>{runId || replay?.runId || 0}</strong>
+              <span>Turns</span>
+              <strong>{replay?.modelTurns ?? 0}</strong>
+              <span>Input</span>
+              <strong>{usage.inputTokens.toLocaleString()} tokens</strong>
+              <span>Output</span>
+              <strong>{usage.outputTokens.toLocaleString()} tokens</strong>
+            </div>
+          </Panel>
+
+          <MonitoringReplayHistoryPanel
+            replays={savedReplays}
+            loading={historyLoading}
+            error={historyError}
+            selectedPath={reviewReplay?.path ?? selectedReviewPath}
+            onRefresh={() => void refreshReplayHistory()}
+            onReview={setSelectedReviewPath}
+          />
+
+          <PromotedMonitoringFixturesPanel
+            fixtures={promotedFixtures}
+            loading={promotedLoading}
+            error={promotedError}
+            onRefresh={() => void refreshPromotedFixtures()}
+          />
+        </aside>
+      </div>
+    </main>
+  );
+}
+
+function CoverageItem({ item }: { item: CategoryCoverageItem }) {
+  return (
+    <div className={`coverageItem ${item.coverage}`}>
+      <div>
+        <strong>{item.label}</strong>
+        <span>{item.category}</span>
+      </div>
+      <em>{item.coverage}</em>
+      {item.missing?.length ? <p>Missing {item.missing.join(', ')}</p> : null}
+    </div>
+  );
+}
+
+function MonitoringAnomalyCard({ anomaly, index }: { anomaly: MonitoringAnomaly; index: number }) {
+  return (
+    <article className="monitoringAnomaly">
+      <div className="recHeader">
+        <div>
+          <span className="feature">{anomaly.category ?? 'uncategorized'}</span>
+          <h2>{anomaly.metric}</h2>
+        </div>
+        <span className={`severityPill ${anomaly.severity}`}>{anomaly.severity}</span>
+      </div>
+      <div className="anomalyMeta">
+        <div>
+          <span>Scope</span>
+          <strong>{anomaly.scope.join(', ') || 'workspace'}</strong>
+        </div>
+        <div>
+          <span>Change</span>
+          <strong>{anomaly.change.direction} {anomaly.change.value}%</strong>
+        </div>
+        <div>
+          <span>Baseline</span>
+          <strong>{anomaly.change.baseline}</strong>
+        </div>
+        <div>
+          <span>Evidence</span>
+          <strong>{anomaly.evidence?.length ?? 0} item{anomaly.evidence?.length === 1 ? '' : 's'}</strong>
+        </div>
+      </div>
+      {anomaly.impact ? <p>{anomaly.impact}</p> : null}
+      <div className="evidencePreview">
+        <span>Evidence {index + 1}</span>
+        <code>{JSON.stringify(anomaly.evidence?.[0]?.result ?? anomaly.evidence?.[0] ?? {}, null, 2)}</code>
+      </div>
+    </article>
+  );
+}
+
+function MonitoringComparisonPanel({
+  comparison,
+  fixtureId,
+  openaiAvailable,
+  running,
+  error,
+  onRun,
+}: {
+  comparison: MonitoringComparisonState;
+  fixtureId: string;
+  openaiAvailable: boolean;
+  running: boolean;
+  error: string | null;
+  onRun: () => void;
+}) {
+  const fixtureReplay = comparison.fixture;
+  const openaiReplay = comparison.openai;
+  const fixtureCategories = monitoringCategorySet(fixtureReplay);
+  const openaiCategories = monitoringCategorySet(openaiReplay);
+  const sharedCategories = [...openaiCategories].filter((category) => fixtureCategories.has(category));
+  const openaiOnlyCategories = [...openaiCategories].filter((category) => !fixtureCategories.has(category));
+  const fixtureOnlyCategories = [...fixtureCategories].filter((category) => !openaiCategories.has(category));
+  const tokenDelta = (openaiReplay?.usage.totalTokens ?? 0) - (fixtureReplay?.usage.totalTokens ?? 0);
+  const costDelta = (openaiReplay?.costEstimate?.totalCost ?? 0) - (fixtureReplay?.costEstimate?.totalCost ?? 0);
+  const maxAnomalies = Math.max(fixtureReplay?.anomalies.length ?? 0, openaiReplay?.anomalies.length ?? 0);
+
+  return (
+    <Panel title="Fixture vs OpenAI" icon={<Route size={17} />} wide>
+      <div className="comparisonPanel">
+        <div className="comparisonToolbar">
+          <div>
+            <strong>{fixtureId}</strong>
+            <span>{comparison.completedAt ? `Comparison completed at ${comparison.completedAt}` : 'Latest saved fixture/OpenAI monitoring pair'}</span>
+          </div>
+          <button className="primaryAction" type="button" onClick={onRun} disabled={running || !openaiAvailable}>
+            <Play size={15} />
+            <span>{running ? 'Running' : 'Run Comparison'}</span>
+          </button>
+        </div>
+        {!openaiAvailable ? <div className="errorState compact">Set OPENAI_API_KEY and restart Studio to enable comparison runs.</div> : null}
+        {error ? <div className="errorState compact">{error}</div> : null}
+        {!fixtureReplay || !openaiReplay ? (
+          <div className="emptyState compact">Run comparison or save both fixture and OpenAI monitoring replays for this fixture.</div>
+        ) : null}
+        <div className="comparisonSummary">
+          <ComparisonMetric label="Fixture Eval" value={fixtureReplay ? (fixtureReplay.evalOk ? 'pass' : 'fail') : 'missing'} tone={fixtureReplay?.evalOk ? 'good' : 'neutral'} />
+          <ComparisonMetric label="OpenAI Eval" value={openaiReplay ? (openaiReplay.evalOk ? 'pass' : 'fail') : 'missing'} tone={openaiReplay?.evalOk ? 'good' : 'neutral'} />
+          <ComparisonMetric label="Anomalies" value={formatDelta((openaiReplay?.anomalyCount ?? 0) - (fixtureReplay?.anomalyCount ?? 0))} />
+          <ComparisonMetric label="Tokens" value={formatDelta(tokenDelta)} />
+          <ComparisonMetric label="Est. Cost" value={formatCostDelta(costDelta)} />
+          <ComparisonMetric label="Shared Categories" value={`${sharedCategories.length}`} />
+        </div>
+        <div className="featureDiff">
+          <div>
+            <span>Shared</span>
+            <strong>{sharedCategories.join(', ') || 'none'}</strong>
+          </div>
+          <div>
+            <span>Fixture only</span>
+            <strong>{fixtureOnlyCategories.join(', ') || 'none'}</strong>
+          </div>
+          <div>
+            <span>OpenAI only</span>
+            <strong>{openaiOnlyCategories.join(', ') || 'none'}</strong>
+          </div>
+        </div>
+        <div className="comparisonColumns">
+          <MonitoringComparisonColumn title="Fixture" replay={fixtureReplay} />
+          <MonitoringComparisonColumn title="OpenAI" replay={openaiReplay} />
+        </div>
+        {maxAnomalies > 0 ? (
+          <div className="pairedRecommendations">
+            {Array.from({ length: maxAnomalies }, (_, index) => (
+              <div className="pairedRecommendation" key={`monitoring-pair-${index}`}>
+                <MonitoringAnomalyPreview label={`Fixture ${index + 1}`} anomaly={fixtureReplay?.anomalies[index]} />
+                <MonitoringAnomalyPreview label={`OpenAI ${index + 1}`} anomaly={openaiReplay?.anomalies[index]} />
+              </div>
+            ))}
+          </div>
+        ) : null}
+      </div>
+    </Panel>
+  );
+}
+
+function MonitoringComparisonColumn({ title, replay }: { title: string; replay: ComparableMonitoringReplay | undefined }) {
+  return (
+    <div className="comparisonColumn">
+      <div className="comparisonColumnHeader">
+        <strong>{title}</strong>
+        <span>{replay ? `${replay.provider.id} / ${replay.provider.model}` : 'missing'}</span>
+      </div>
+      <div className="historyMeta">
+        <span>{replay?.anomalyCount ?? 0} anomalies</span>
+        <span>{replay?.usage.totalTokens.toLocaleString() ?? '0'} tokens</span>
+        <span>{formatCost(replay?.costEstimate)}</span>
+        <span>{replay ? formatDuration(replay.durationMs) : '0ms'}</span>
+      </div>
+      {replay?.path ? <code>{replay.path}</code> : null}
+    </div>
+  );
+}
+
+function MonitoringAnomalyPreview({ label, anomaly }: { label: string; anomaly: MonitoringAnomaly | undefined }) {
+  return (
+    <article className="recommendationPreview">
+      <span>{label}</span>
+      {anomaly ? (
+        <>
+          <strong>{anomaly.metric}</strong>
+          <em>{anomaly.category ?? 'uncategorized'} / {anomaly.severity}</em>
+          <p>{anomaly.scope.join(', ')} - {anomaly.change.direction} {anomaly.change.value}% vs {anomaly.change.baseline}</p>
+        </>
+      ) : (
+        <strong>missing</strong>
+      )}
+    </article>
+  );
+}
+
+function MonitoringReviewPanel({
+  fixture,
+  mode,
+  modelName,
+  replay,
+  savedReplay,
+  usage,
+  costEstimate,
+  saving,
+  saveError,
+  error,
+  promotingPath,
+  promoteResult,
+  onSave,
+  onPromote,
+}: {
+  fixture: MonitoringFixture;
+  mode: MonitoringReplayMode;
+  modelName: string;
+  replay: MonitoringReplayState | null;
+  savedReplay: SavedMonitoringReplaySummary | undefined;
+  usage: TokenUsageSummary;
+  costEstimate: CostEstimate | undefined;
+  saving: boolean;
+  saveError: string | null;
+  error: string | null;
+  promotingPath: string | null;
+  promoteResult: MonitoringPromoteResult | null;
+  onSave: () => void;
+  onPromote: (path: string) => void;
+}) {
+  const reviewPath = savedReplay?.path ?? replay?.savedPath;
+  const evalOk = savedReplay?.evalOk ?? replay?.evalOk ?? false;
+  const issues = savedReplay?.issues ?? replay?.evalIssueDetails ?? [];
+  const reviewUsage = savedReplay?.usage ?? usage;
+  const reviewCost = savedReplay?.costEstimate ?? costEstimate;
+  const provider = savedReplay?.provider
+    ? `${savedReplay.provider.id} / ${savedReplay.provider.model}`
+    : `${mode} / ${modelName}`;
+  const anomalyCount = savedReplay?.anomalyCount ?? replay?.anomalies.length ?? 0;
+  const modelTurns = savedReplay?.modelTurns ?? replay?.modelTurns ?? 0;
+  const canReview = Boolean(reviewPath && evalOk);
+
+  return (
+    <Panel title="Replay Review" icon={<FileCheck size={17} />}>
+      <div className="reviewPanel">
+        <div className={canReview ? 'reviewBanner ready' : 'reviewBanner pending'}>
+          <strong>{canReview ? 'Ready for comparison' : reviewPath ? 'Needs passing eval' : 'Save before review'}</strong>
+          <span>{reviewPath ?? 'No saved monitoring artifact selected'}</span>
+        </div>
+        <div className="reviewGrid">
+          <div>
+            <span>Fixture</span>
+            <strong>{savedReplay?.fixture.id ?? fixture.id}</strong>
+          </div>
+          <div>
+            <span>Provider</span>
+            <strong>{provider}</strong>
+          </div>
+          <div>
+            <span>Shape Eval</span>
+            <strong>{evalOk ? 'passing' : 'not passing'}</strong>
+          </div>
+          <div>
+            <span>Output</span>
+            <strong>{anomalyCount} anomalies / {modelTurns} turns</strong>
+          </div>
+          <div>
+            <span>Spend</span>
+            <strong>{reviewUsage.totalTokens.toLocaleString()} tokens / {formatCost(reviewCost)}</strong>
+          </div>
+          <div>
+            <span>Next</span>
+            <strong>{canReview ? 'compare fixture/OpenAI' : 'save passing replay'}</strong>
+          </div>
+        </div>
+        {issues.length ? (
+          <ul className="issueList">
+            {issues.slice(0, 3).map((issue) => (
+              <li key={`${issue.path}-${issue.message}`}>{issue.path}: {issue.message}</li>
+            ))}
+          </ul>
+        ) : null}
+        {error ? <div className="errorState compact">{error}</div> : null}
+        {saveError ? <div className="errorState compact">{saveError}</div> : null}
+        {promoteResult ? (
+          <div className="historySuccess">
+            <strong>Promoted monitoring fixture</strong>
+            <code>{promoteResult.path}</code>
+          </div>
+        ) : null}
+        <div className="reviewActions">
+          <button className="secondaryAction" type="button" onClick={onSave} disabled={!replay || saving}>
+            <Save size={15} />
+            <span>{saving ? 'Saving' : replay?.savedPath ? 'Saved Current' : 'Save Current'}</span>
+          </button>
+          <button
+            className="primaryAction"
+            type="button"
+            onClick={() => reviewPath ? onPromote(reviewPath) : undefined}
+            disabled={!canReview || promotingPath === reviewPath}
+          >
+            <FileCheck size={15} />
+            <span>{promotingPath === reviewPath ? 'Promoting' : 'Promote Reviewed'}</span>
+          </button>
+        </div>
+      </div>
+    </Panel>
+  );
+}
+
+function MonitoringReplayHistoryPanel({
+  replays,
+  loading,
+  error,
+  selectedPath,
+  onRefresh,
+  onReview,
+}: {
+  replays: SavedMonitoringReplaySummary[];
+  loading: boolean;
+  error: string | null;
+  selectedPath: string | null | undefined;
+  onRefresh: () => void;
+  onReview: (path: string) => void;
+}) {
+  const visibleReplays = replays.slice(0, 5);
+  return (
+    <Panel title="Monitoring History" icon={<History size={17} />}>
+      <div className="historyPanel">
+        <button className="secondaryAction" type="button" onClick={onRefresh} disabled={loading}>
+          <RefreshCw size={15} />
+          <span>{loading ? 'Checking' : 'Refresh History'}</span>
+        </button>
+        {error ? <div className="errorState compact">{error}</div> : null}
+        {!loading && visibleReplays.length === 0 ? <div className="emptyState compact">No saved monitoring replays found.</div> : null}
+        <div className="historyList">
+          {visibleReplays.map((replay) => (
+            <article className={selectedPath === replay.path ? 'historyItem selected' : 'historyItem'} key={replay.path}>
+              <div className="historyHeader">
+                <strong>{replay.fixture.id}</strong>
+                <span className={replay.evalOk ? 'statusPill good' : 'statusPill bad'}>{replay.evalOk ? 'pass' : 'fail'}</span>
+              </div>
+              <div className="historyMeta">
+                <span>{replay.provider.id} / {replay.provider.model}</span>
+                <span>{replay.anomalyCount} anomalies</span>
+                <span>{replay.usage.totalTokens.toLocaleString()} tokens</span>
+                <span>{formatDuration(replay.durationMs)}</span>
+              </div>
+              <code>{replay.path}</code>
+              {replay.issues.length ? (
+                <ul className="issueList">
+                  {replay.issues.slice(0, 2).map((issue) => (
+                    <li key={`${replay.path}-${issue.path}-${issue.message}`}>{issue.path}: {issue.message}</li>
+                  ))}
+                </ul>
+              ) : null}
+              <button
+                className="secondaryAction"
+                type="button"
+                onClick={() => onReview(replay.path)}
+              >
+                <FileCheck size={15} />
+                <span>{selectedPath === replay.path ? 'Reviewing' : 'Review'}</span>
+              </button>
+            </article>
+          ))}
+        </div>
+      </div>
+    </Panel>
+  );
+}
+
+function PromotedMonitoringFixturesPanel({
+  fixtures,
+  loading,
+  error,
+  onRefresh,
+}: {
+  fixtures: PromotedMonitoringFixtureSummary[];
+  loading: boolean;
+  error: string | null;
+  onRefresh: () => void;
+}) {
+  return (
+    <Panel title="Promoted Monitoring" icon={<FileCheck size={17} />}>
+      <div className="historyPanel">
+        <button className="secondaryAction" type="button" onClick={onRefresh} disabled={loading}>
+          <RefreshCw size={15} />
+          <span>{loading ? 'Checking' : 'Check Promoted'}</span>
+        </button>
+        {error ? <div className="errorState compact">{error}</div> : null}
+        {!loading && fixtures.length === 0 ? <div className="emptyState compact">No promoted monitoring fixtures found.</div> : null}
+        <div className="historyList">
+          {fixtures.map((fixture) => (
+            <article className="historyItem" key={fixture.path}>
+              <div className="historyHeader">
+                <strong>{fixture.id}</strong>
+                <span className={fixture.ok ? 'statusPill good' : 'statusPill bad'}>{fixture.ok ? 'healthy' : 'failing'}</span>
+              </div>
+              <div className="historyMeta">
+                <span>{fixture.anomalyCount} anomalies</span>
+                <span>{fixture.modelTurns} turns</span>
+                <span>{fixture.usage.totalTokens.toLocaleString()} tokens</span>
+                <span>{formatCost(fixture.costEstimate)}</span>
+                <span>{fixture.behaviorOk ? 'behavior pass' : 'behavior fail'}</span>
+              </div>
+              {fixture.promotion?.sourceProvider?.id ? (
+                <div className="expectationBlock">
+                  <span>Source</span>
+                  <strong>{fixture.promotion.sourceProvider.id} / {fixture.promotion.sourceProvider.model ?? 'unknown'}</strong>
+                </div>
+              ) : null}
+              {fixture.expectations ? (
+                <div className="expectationBlock">
+                  <span>Expectations</span>
+                  <strong>{[
+                    ...(fixture.expectations.requiredCategories ?? []).map((category) => `category:${category}`),
+                    ...(fixture.expectations.requiredMetrics ?? []).map((metric) => `metric:${metric}`),
+                    ...(fixture.expectations.requiredScopes ?? []).map((scope) => `scope:${scope}`),
+                    ...(fixture.expectations.requiredSeverities ?? []).map((severity) => `severity:${severity}`),
+                    fixture.expectations.minAnomalyCount !== undefined ? `min:${fixture.expectations.minAnomalyCount}` : '',
+                  ].filter(Boolean).join(', ') || 'none'}</strong>
+                </div>
+              ) : null}
+              <code>{fixture.path}</code>
+              {fixture.issues.length ? (
+                <ul className="issueList">
+                  {fixture.issues.slice(0, 3).map((issue) => (
+                    <li key={`${fixture.path}-${issue.source}-${issue.path}-${issue.message}`}>
+                      {issue.source} / {issue.path}: {issue.message}
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
+            </article>
+          ))}
+        </div>
+      </div>
+    </Panel>
+  );
+}
+
+function buildMonitoringReplayArtifact(
+  fixture: MonitoringFixture,
+  replay: MonitoringReplayState,
+  mode: MonitoringReplayMode,
+  fallbackModel: string,
+): MonitoringReplayArtifact {
+  const usage = summarizeUsage(replay.trace);
+  const modelName = usage.modelName || fallbackModel;
+  const costEstimate = estimateCost(mode, usage, modelName);
+  return {
+    schemaVersion: 1,
+    capabilityId: 'anomaly-monitoring-agent',
+    createdAt: new Date().toISOString(),
+    durationMs: replay.durationMs,
+    provider: {
+      id: mode,
+      model: modelName,
+    },
+    fixture: {
+      id: fixture.id,
+      description: fixture.description,
+      path: monitoringFixturePath(fixture.id),
+    },
+    anomalies: replay.anomalies,
+    trace: replay.trace,
+    ...(costEstimate ? { costEstimate } : {}),
+    eval: {
+      name: 'anomaly-shape',
+      ok: replay.evalOk,
+      issues: replay.evalIssueDetails,
+    },
+    modelTurns: replay.modelTurns,
+  };
+}
+
+function monitoringFixturePath(fixtureId: string): string {
+  const knownPaths: Record<string, string> = {
+    [monitoringFixture.id]: 'packages/agents/anomaly-monitoring/fixtures/sp-revenue-monitoring.json',
+  };
+  return knownPaths[fixtureId] ?? `packages/agents/anomaly-monitoring/fixtures/${fixtureId}.json`;
 }
 
 function buildReplayArtifact(
@@ -795,6 +1973,14 @@ function toReplayState(result: ReplayResult, runId: number): ReplayState {
   };
 }
 
+function toMonitoringReplayState(result: MonitoringReplayResult, runId: number): MonitoringReplayState {
+  return {
+    ...result,
+    runId,
+    completedAt: new Date().toLocaleTimeString(),
+  };
+}
+
 function comparableFromArtifact(artifact: ReplayArtifact, path: string): ComparableReplay {
   const usage = summarizeUsage(artifact.trace);
   return {
@@ -806,6 +1992,24 @@ function comparableFromArtifact(artifact: ReplayArtifact, path: string): Compara
     issues: artifact.eval.issues,
     recommendations: artifact.recommendations,
     recommendationCount: artifact.recommendations.length,
+    durationMs: artifact.durationMs,
+    modelTurns: artifact.modelTurns,
+    usage,
+    costEstimate: artifact.costEstimate,
+  };
+}
+
+function comparableMonitoringFromArtifact(artifact: MonitoringReplayArtifact, path: string): ComparableMonitoringReplay {
+  const usage = summarizeUsage(artifact.trace);
+  return {
+    path,
+    createdAt: artifact.createdAt,
+    provider: artifact.provider,
+    fixture: artifact.fixture,
+    evalOk: artifact.eval.ok,
+    issues: artifact.eval.issues,
+    anomalies: artifact.anomalies,
+    anomalyCount: artifact.anomalies.length,
     durationMs: artifact.durationMs,
     modelTurns: artifact.modelTurns,
     usage,
@@ -828,13 +2032,41 @@ function comparisonForFixture(
   };
 }
 
+function comparisonForMonitoringFixture(
+  comparison: MonitoringComparisonState | null,
+  replays: SavedMonitoringReplaySummary[],
+  fixtureId: string,
+): MonitoringComparisonState {
+  if (comparison?.fixture?.fixture.id === fixtureId || comparison?.openai?.fixture.id === fixtureId) {
+    return comparison;
+  }
+  return {
+    fixture: latestMonitoringReplayFor(replays, fixtureId, 'fixture'),
+    openai: latestMonitoringReplayFor(replays, fixtureId, 'openai'),
+    completedAt: '',
+  };
+}
+
 function latestReplayFor(replays: SavedReplaySummary[], fixtureId: string, providerId: string): ComparableReplay | undefined {
+  const replay = replays.find((candidate) => candidate.fixture.id === fixtureId && candidate.provider.id === providerId);
+  return replay ? { ...replay } : undefined;
+}
+
+function latestMonitoringReplayFor(
+  replays: SavedMonitoringReplaySummary[],
+  fixtureId: string,
+  providerId: string,
+): ComparableMonitoringReplay | undefined {
   const replay = replays.find((candidate) => candidate.fixture.id === fixtureId && candidate.provider.id === providerId);
   return replay ? { ...replay } : undefined;
 }
 
 function featureSet(replay: ComparableReplay | undefined): Set<string> {
   return new Set((replay?.recommendations ?? []).map((recommendation) => recommendation.bloomreachFeature));
+}
+
+function monitoringCategorySet(replay: ComparableMonitoringReplay | undefined): Set<string> {
+  return new Set((replay?.anomalies ?? []).map((anomaly) => anomaly.category ?? 'uncategorized'));
 }
 
 function formatDelta(value: number, formatter: (value: number) => string = (next) => next.toLocaleString()): string {
@@ -983,6 +2215,24 @@ function findReviewReplay(
   fixtureId: string,
   mode: ReplayMode,
 ): SavedReplaySummary | undefined {
+  if (selectedPath) {
+    const selected = replays.find((replay) => replay.path === selectedPath);
+    if (selected) return selected;
+  }
+  if (currentSavedPath) {
+    const current = replays.find((replay) => replay.path === currentSavedPath);
+    if (current) return current;
+  }
+  return replays.find((replay) => replay.fixture.id === fixtureId && replay.provider.id === mode);
+}
+
+function findMonitoringReviewReplay(
+  replays: SavedMonitoringReplaySummary[],
+  selectedPath: string | null,
+  currentSavedPath: string | undefined,
+  fixtureId: string,
+  mode: MonitoringReplayMode,
+): SavedMonitoringReplaySummary | undefined {
   if (selectedPath) {
     const selected = replays.find((replay) => replay.path === selectedPath);
     if (selected) return selected;
@@ -1356,6 +2606,35 @@ function ModeButton({
   );
 }
 
+function ReplayModeSwitch<M extends string>({
+  ariaLabel,
+  className = '',
+  mode,
+  options,
+  onSelect,
+}: {
+  ariaLabel: string;
+  className?: string;
+  mode: M;
+  options: { mode: M; available: boolean; icon: React.ReactNode; label: string }[];
+  onSelect: (mode: M) => void;
+}) {
+  return (
+    <div className={`modeSwitch ${className}`.trim()} aria-label={ariaLabel}>
+      {options.map((option) => (
+        <ModeButton
+          active={mode === option.mode}
+          available={option.available}
+          icon={option.icon}
+          key={option.mode}
+          label={option.label}
+          onClick={() => onSelect(option.mode)}
+        />
+      ))}
+    </div>
+  );
+}
+
 function Panel({ title, icon, children, wide = false }: { title: string; icon: React.ReactNode; children: React.ReactNode; wide?: boolean }) {
   return (
     <section className={wide ? 'panel wide' : 'panel'}>
@@ -1365,6 +2644,46 @@ function Panel({ title, icon, children, wide = false }: { title: string; icon: R
       </header>
       {children}
     </section>
+  );
+}
+
+function TracePanel({ running, trace }: { running: boolean; trace: CapabilityEvent[] }) {
+  return (
+    <Panel title="Trace" icon={<BrainCircuit size={17} />}>
+      {running ? <div className="emptyState compact">Collecting trace events...</div> : null}
+      <div className="traceList">
+        {trace.map((event, index) => (
+          <TraceItem event={event} index={index} key={`${event.type}-${index}`} />
+        ))}
+      </div>
+    </Panel>
+  );
+}
+
+function EvalPanel({
+  error,
+  evalOk,
+  issues,
+  passedLabel,
+  running,
+}: {
+  error: string | null;
+  evalOk: boolean | undefined;
+  issues: string[];
+  passedLabel: string;
+  running: boolean;
+}) {
+  return (
+    <Panel title="Eval" icon={<ShieldCheck size={17} />}>
+      <div className={error ? 'evalError' : evalOk ? 'evalPass' : 'evalPending'}>
+        {error ? 'replay failed' : evalOk ? passedLabel : running ? 'replay running' : 'waiting for replay'}
+      </div>
+      {issues.length ? (
+        <ul className="issueList">
+          {issues.map((issue) => <li key={issue}>{issue}</li>)}
+        </ul>
+      ) : null}
+    </Panel>
   );
 }
 

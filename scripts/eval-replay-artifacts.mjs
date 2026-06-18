@@ -2,7 +2,7 @@ import { readdir, readFile } from 'node:fs/promises';
 import { dirname, extname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
-import { assertReplayArtifactShape } from '@aptkit/evals';
+import { assertCapabilityReplayArtifactShape } from '@aptkit/evals';
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDir, '..');
@@ -33,14 +33,16 @@ const results = [];
 for (const path of paths) {
   const raw = await readFile(path, 'utf8');
   const artifact = JSON.parse(raw);
-  const result = assertReplayArtifactShape(artifact);
+  const result = assertCapabilityReplayArtifactShape(artifact);
   results.push({
     path: relativeFromRoot(path),
     ok: result.ok,
     issues: result.issues,
+    capabilityId: artifact?.capabilityId ?? 'recommendation-agent',
     provider: artifact?.provider,
     fixture: artifact?.fixture?.id,
     recommendationCount: Array.isArray(artifact?.recommendations) ? artifact.recommendations.length : null,
+    anomalyCount: Array.isArray(artifact?.anomalies) ? artifact.anomalies.length : null,
   });
 }
 
