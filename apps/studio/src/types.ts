@@ -1,6 +1,7 @@
 import type { Anomaly, Diagnosis, Recommendation, WorkspaceDescriptor } from '@aptkit/agent-recommendation';
 import type { Anomaly as MonitoringAnomaly, WorkspaceDescriptor as MonitoringWorkspaceDescriptor } from '@aptkit/agent-anomaly-monitoring';
 import type { Anomaly as DiagnosticAnomaly, Diagnosis as DiagnosticDiagnosis, WorkspaceDescriptor as DiagnosticWorkspaceDescriptor } from '@aptkit/agent-diagnostic-investigation';
+import type { Intent as QueryIntent, WorkspaceDescriptor as QueryWorkspaceDescriptor } from '@aptkit/agent-query';
 import type { CapabilityEvent, ModelResponse } from '@aptkit/runtime';
 import type { ToolDefinition } from '@aptkit/tools';
 
@@ -29,6 +30,16 @@ export type DiagnosticFixture = {
   description: string;
   workspace: DiagnosticWorkspaceDescriptor;
   anomaly: DiagnosticAnomaly;
+  tools: FixtureTool[];
+  modelResponses: ModelResponse[];
+};
+
+export type QueryFixture = {
+  id: string;
+  description: string;
+  question: string;
+  intent: QueryIntent;
+  workspace: QueryWorkspaceDescriptor;
   tools: FixtureTool[];
   modelResponses: ModelResponse[];
 };
@@ -78,11 +89,28 @@ export type DiagnosticReplayState = {
 
 export type DiagnosticReplayResult = Omit<DiagnosticReplayState, 'completedAt' | 'runId'>;
 
+export type QueryReplayState = {
+  answer: string;
+  trace: CapabilityEvent[];
+  evalOk: boolean;
+  evalIssueDetails: { path: string; message: string }[];
+  evalIssues: string[];
+  modelTurns: number;
+  durationMs: number;
+  completedAt: string;
+  runId: number;
+  savedPath?: string;
+};
+
+export type QueryReplayResult = Omit<QueryReplayState, 'completedAt' | 'runId'>;
+
 export type ReplayMode = 'fixture' | 'anthropic' | 'openai';
 
 export type MonitoringReplayMode = 'fixture' | 'openai';
 
 export type DiagnosticReplayMode = 'fixture' | 'openai';
+
+export type QueryReplayMode = 'fixture' | 'openai';
 
 export type ProviderStatus = Record<ReplayMode, { available: boolean; model: string }>;
 
@@ -177,6 +205,33 @@ export type DiagnosticReplayArtifact = {
   modelTurns: number;
 };
 
+export type QueryReplayArtifact = {
+  schemaVersion: 1;
+  capabilityId: 'query-agent';
+  createdAt: string;
+  durationMs: number;
+  provider: {
+    id: QueryReplayMode;
+    model: string;
+  };
+  fixture: {
+    id: string;
+    description: string;
+    path: string;
+  };
+  question: string;
+  intent: QueryIntent;
+  answer: string;
+  trace: CapabilityEvent[];
+  costEstimate?: CostEstimate;
+  eval: {
+    name: string;
+    ok: boolean;
+    issues: { path: string; message: string }[];
+  };
+  modelTurns: number;
+};
+
 export type SavedReplaySummary = {
   path: string;
   capabilityId?: string;
@@ -223,6 +278,24 @@ export type SavedDiagnosticReplaySummary = {
   issues: { path: string; message: string }[];
   diagnosis: DiagnosticDiagnosis;
   diagnosisPresent: boolean;
+  durationMs: number;
+  modelTurns: number;
+  usage: TokenUsageSummary;
+  costEstimate?: CostEstimate;
+};
+
+export type SavedQueryReplaySummary = {
+  path: string;
+  capabilityId: 'query-agent';
+  createdAt: string;
+  provider: { id: string; model: string };
+  fixture: { id: string; description?: string; path?: string };
+  evalOk: boolean;
+  issues: { path: string; message: string }[];
+  question?: string;
+  intent?: QueryIntent;
+  answer: string;
+  answerPresent: boolean;
   durationMs: number;
   modelTurns: number;
   usage: TokenUsageSummary;
@@ -368,4 +441,4 @@ export type PromotedDiagnosticFixtureSummary = {
   costEstimate?: CostEstimate;
 };
 
-export type StudioView = 'home' | 'recommendation' | 'monitoring' | 'diagnostic';
+export type StudioView = 'home' | 'recommendation' | 'monitoring' | 'diagnostic' | 'query';

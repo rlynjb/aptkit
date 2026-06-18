@@ -145,6 +145,14 @@ h1 {
   letter-spacing: 0;
 }
 
+.answerText {
+  margin: 0;
+  max-width: 76ch;
+  color: #27342d;
+  font-size: 16px;
+  line-height: 1.65;
+}
+
 .runButton {
   display: inline-flex;
   align-items: center;

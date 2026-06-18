@@ -1,10 +1,55 @@
 import type { CapabilityEvent } from '@aptkit/runtime';
 import monitoringFixture from '../../../packages/agents/anomaly-monitoring/fixtures/sp-revenue-monitoring.json';
 import diagnosticFixture from '../../../packages/agents/diagnostic-investigation/fixtures/sp-revenue-diagnostic.json';
+import queryFixture from '../../../packages/agents/query/fixtures/revenue-by-state-query.json';
 import electronicsSpikeFixture from '../../../packages/agents/recommendation/fixtures/electronics-spike.json';
 import spRevenueDropFixture from '../../../packages/agents/recommendation/fixtures/sp-revenue-drop.json';
 import voucherDropoffFixture from '../../../packages/agents/recommendation/fixtures/voucher-dropoff.json';
-import type { ComparableMonitoringReplay, ComparableReplay, ComparisonState, CostEstimate, DiagnosticFixture, DiagnosticReplayArtifact, DiagnosticReplayMode, DiagnosticReplayState, MonitoringComparisonState, MonitoringFixture, MonitoringReplayMode, MonitoringReplayArtifact, MonitoringReplayResult, MonitoringReplayState, RecommendationFixture, ReplayArtifact, ReplayMode, ReplayResult, ReplayState, SavedMonitoringReplaySummary, SavedReplaySummary, TokenUsageSummary } from './types';
+import type { ComparableMonitoringReplay, ComparableReplay, ComparisonState, CostEstimate, DiagnosticFixture, DiagnosticReplayArtifact, DiagnosticReplayMode, DiagnosticReplayState, MonitoringComparisonState, MonitoringFixture, MonitoringReplayMode, MonitoringReplayArtifact, MonitoringReplayResult, MonitoringReplayState, QueryFixture, QueryReplayArtifact, QueryReplayMode, QueryReplayState, RecommendationFixture, ReplayArtifact, ReplayMode, ReplayResult, ReplayState, SavedMonitoringReplaySummary, SavedReplaySummary, TokenUsageSummary } from './types';
+
+export function buildQueryReplayArtifact(
+  fixture: QueryFixture,
+  replay: QueryReplayState,
+  mode: QueryReplayMode,
+  fallbackModel: string,
+): QueryReplayArtifact {
+  const usage = summarizeUsage(replay.trace);
+  const modelName = usage.modelName || fallbackModel;
+  const costEstimate = estimateCost(mode, usage, modelName);
+  return {
+    schemaVersion: 1,
+    capabilityId: 'query-agent',
+    createdAt: new Date().toISOString(),
+    durationMs: replay.durationMs,
+    provider: {
+      id: mode,
+      model: modelName,
+    },
+    fixture: {
+      id: fixture.id,
+      description: fixture.description,
+      path: queryFixturePath(fixture.id),
+    },
+    question: fixture.question,
+    intent: fixture.intent,
+    answer: replay.answer,
+    trace: replay.trace,
+    ...(costEstimate ? { costEstimate } : {}),
+    eval: {
+      name: 'query-answer-shape',
+      ok: replay.evalOk,
+      issues: replay.evalIssueDetails,
+    },
+    modelTurns: replay.modelTurns,
+  };
+}
+
+export function queryFixturePath(fixtureId: string): string {
+  const knownPaths: Record<string, string> = {
+    [queryFixture.id]: 'packages/agents/query/fixtures/revenue-by-state-query.json',
+  };
+  return knownPaths[fixtureId] ?? `packages/agents/query/fixtures/${fixtureId}.json`;
+}
 
 export function buildDiagnosticReplayArtifact(
   fixture: DiagnosticFixture,

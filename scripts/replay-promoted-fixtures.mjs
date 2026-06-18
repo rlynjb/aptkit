@@ -50,6 +50,7 @@ function outputCount(result, field) {
   if (field === 'recommendationCount') return Array.isArray(result.recommendations) ? result.recommendations.length : 0;
   if (field === 'anomalyCount') return Array.isArray(result.anomalies) ? result.anomalies.length : 0;
   if (field === 'diagnosisPresent') return result.diagnosis && typeof result.diagnosis === 'object';
+  if (field === 'answerPresent') return typeof result.answer === 'string' && result.answer.trim().length > 0;
   return 0;
 }
 

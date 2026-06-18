@@ -3,6 +3,7 @@ import { createRoot } from 'react-dom/client';
 import { RecommendationWorkspace } from './RecommendationWorkspace';
 import { MonitoringWorkspace } from './MonitoringWorkspace';
 import { DiagnosticWorkspace } from './DiagnosticWorkspace';
+import { QueryWorkspace } from './QueryWorkspace';
 import { StudioHome } from './StudioHome';
 import type { StudioView } from './types';
 import './styles.css';
@@ -20,6 +21,10 @@ function App() {
 
   if (view === 'diagnostic') {
     return <DiagnosticWorkspace onHome={() => setView('home')} />;
+  }
+
+  if (view === 'query') {
+    return <QueryWorkspace onHome={() => setView('home')} />;
   }
 
   return <StudioHome onOpen={setView} />;

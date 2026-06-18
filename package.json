@@ -25,7 +25,9 @@
     "replay:monitoring": "npm run replay:fixture -w @aptkit/agent-anomaly-monitoring",
     "replay:monitoring:promoted": "npm run replay:promoted -w @aptkit/agent-anomaly-monitoring",
     "replay:diagnostic": "npm run replay:fixture -w @aptkit/agent-diagnostic-investigation",
-    "replay:diagnostic:promoted": "npm run replay:promoted -w @aptkit/agent-diagnostic-investigation"
+    "replay:diagnostic:promoted": "npm run replay:promoted -w @aptkit/agent-diagnostic-investigation",
+    "replay:query": "npm run replay:fixture -w @aptkit/agent-query",
+    "replay:query:promoted": "npm run replay:promoted -w @aptkit/agent-query"
   },
   "devDependencies": {
     "typescript": "^5.5.0"

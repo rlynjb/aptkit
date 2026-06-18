@@ -1,10 +1,11 @@
 import { AnomalyMonitoringAgent, FixtureModelProvider as MonitoringFixtureModelProvider, validateAnomalies } from '@aptkit/agent-anomaly-monitoring';
 import { DiagnosticInvestigationAgent, FixtureModelProvider as DiagnosticFixtureModelProvider, validateDiagnosis } from '@aptkit/agent-diagnostic-investigation';
+import { FixtureModelProvider as QueryFixtureModelProvider, QueryAgent, validateQueryAnswer } from '@aptkit/agent-query';
 import { RecommendationAgent, FixtureModelProvider } from '@aptkit/agent-recommendation';
 import { assertRecommendationShape } from '@aptkit/evals';
 import type { CapabilityEvent } from '@aptkit/runtime';
 import { InMemoryToolRegistry, type ToolHandler } from '@aptkit/tools';
-import type { DiagnosticFixture, DiagnosticReplayResult, MonitoringFixture, MonitoringReplayResult, RecommendationFixture, ReplayResult } from './types';
+import type { DiagnosticFixture, DiagnosticReplayResult, MonitoringFixture, MonitoringReplayResult, QueryFixture, QueryReplayResult, RecommendationFixture, ReplayResult } from './types';
 
 export function runFixtureReplay(fixture: RecommendationFixture): Promise<ReplayResult> {
   const startedAt = performance.now();
@@ -97,6 +98,38 @@ export function runDiagnosticFixtureReplay(fixture: DiagnosticFixture): Promise<
     const issues = evalResult.ok ? [] : [{ path: 'diagnosis', message: evalResult.error }];
     return {
       diagnosis,
+      trace,
+      evalOk: evalResult.ok,
+      evalIssueDetails: issues,
+      evalIssues: issues.map((issue) => `${issue.path}: ${issue.message}`),
+      modelTurns: model.requests.length,
+      durationMs: Math.round(performance.now() - startedAt),
+    };
+  });
+}
+
+export function runQueryFixtureReplay(fixture: QueryFixture): Promise<QueryReplayResult> {
+  const startedAt = performance.now();
+  const handlers: Record<string, ToolHandler> = {};
+  for (const tool of fixture.tools) {
+    handlers[tool.name] = () => tool.result;
+  }
+
+  const model = new QueryFixtureModelProvider(fixture.modelResponses);
+  const tools = new InMemoryToolRegistry(fixture.tools, handlers);
+  const trace: CapabilityEvent[] = [];
+  const agent = new QueryAgent({
+    model,
+    tools,
+    workspace: fixture.workspace,
+    trace: { emit: (event) => trace.push(event) },
+  });
+
+  return agent.answer(fixture.question, { intent: fixture.intent }).then((answer) => {
+    const evalResult = validateQueryAnswer(answer);
+    const issues = evalResult.ok ? [] : [{ path: 'answer', message: evalResult.error }];
+    return {
+      answer,
       trace,
       evalOk: evalResult.ok,
       evalIssueDetails: issues,

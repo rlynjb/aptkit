@@ -1,4 +1,28 @@
-import type { DiagnosticFixture, DiagnosticPromoteResult, DiagnosticReplayArtifact, DiagnosticReplayMode, DiagnosticReplayResult, MonitoringFixture, MonitoringPromoteResult, MonitoringReplayResult, MonitoringReplayMode, MonitoringReplayArtifact, PromoteResult, PromotedDiagnosticFixtureSummary, PromotedFixtureSummary, PromotedMonitoringFixtureSummary, RecommendationFixture, ReplayArtifact, ReplayMode, ReplayResult, SavedDiagnosticReplaySummary, SavedMonitoringReplaySummary, SavedReplaySummary } from './types';
+import type { DiagnosticFixture, DiagnosticPromoteResult, DiagnosticReplayArtifact, DiagnosticReplayMode, DiagnosticReplayResult, MonitoringFixture, MonitoringPromoteResult, MonitoringReplayResult, MonitoringReplayMode, MonitoringReplayArtifact, PromoteResult, PromotedDiagnosticFixtureSummary, PromotedFixtureSummary, PromotedMonitoringFixtureSummary, QueryFixture, QueryReplayArtifact, QueryReplayMode, QueryReplayResult, RecommendationFixture, ReplayArtifact, ReplayMode, ReplayResult, SavedDiagnosticReplaySummary, SavedMonitoringReplaySummary, SavedQueryReplaySummary, SavedReplaySummary } from './types';
+
+export async function runServerQueryReplay(
+  fixture: QueryFixture,
+  mode: Exclude<QueryReplayMode, 'fixture'>,
+): Promise<QueryReplayResult> {
+  const response = await fetch('/api/query/replay', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ fixtureId: fixture.id, mode }),
+  });
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(payload?.error ?? 'query replay failed');
+  }
+  return {
+    answer: payload.answer,
+    trace: payload.trace,
+    evalOk: payload.eval.ok,
+    evalIssueDetails: payload.eval.issues,
+    evalIssues: payload.eval.issues.map((issue: { path: string; message: string }) => `${issue.path}: ${issue.message}`),
+    modelTurns: payload.modelTurns,
+    durationMs: payload.durationMs,
+  };
+}
 
 export async function runServerDiagnosticReplay(
   fixture: DiagnosticFixture,
@@ -69,7 +93,7 @@ export async function runServerReplay(fixture: RecommendationFixture, mode: Excl
   };
 }
 
-export async function saveReplayArtifact(artifact: ReplayArtifact | MonitoringReplayArtifact | DiagnosticReplayArtifact): Promise<string> {
+export async function saveReplayArtifact(artifact: ReplayArtifact | MonitoringReplayArtifact | DiagnosticReplayArtifact | QueryReplayArtifact): Promise<string> {
   const response = await fetch('/api/replay/save', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -107,6 +131,15 @@ export async function loadSavedDiagnosticReplays(): Promise<SavedDiagnosticRepla
     throw new Error(payload?.error ?? 'load diagnostic replays failed');
   }
   return payload.replays.filter((replay: SavedDiagnosticReplaySummary) => replay.capabilityId === 'diagnostic-investigation-agent');
+}
+
+export async function loadSavedQueryReplays(): Promise<SavedQueryReplaySummary[]> {
+  const response = await fetch('/api/replays');
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(payload?.error ?? 'load query replays failed');
+  }
+  return payload.replays.filter((replay: SavedQueryReplaySummary) => replay.capabilityId === 'query-agent');
 }
 
 export async function promoteReplay(path: string): Promise<PromoteResult> {

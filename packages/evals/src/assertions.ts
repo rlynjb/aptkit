@@ -33,6 +33,9 @@ export function assertAnomalyShape(output: unknown): EvalAssertionResult {
 }
 
 export function assertCapabilityReplayArtifactShape(output: unknown): EvalAssertionResult {
+  if (isRecord(output) && (output.capabilityId === 'query-agent' || typeof output.answer === 'string')) {
+    return assertQueryReplayArtifactShape(output);
+  }
   if (isRecord(output) && (output.capabilityId === 'diagnostic-investigation-agent' || isRecord(output.diagnosis))) {
     return assertDiagnosticReplayArtifactShape(output);
   }
@@ -40,6 +43,16 @@ export function assertCapabilityReplayArtifactShape(output: unknown): EvalAssert
     return assertMonitoringReplayArtifactShape(output);
   }
   return assertReplayArtifactShape(output);
+}
+
+export function assertQueryAnswerShape(output: unknown): EvalAssertionResult {
+  const issues: { path: string; message: string }[] = [];
+  if (typeof output !== 'string') {
+    issues.push({ path: '', message: 'answer must be a string' });
+  } else if (output.trim().length < 20) {
+    issues.push({ path: '', message: 'answer is too short to be useful' });
+  }
+  return { name: 'query-answer-shape', ok: issues.length === 0, issues };
 }
 
 export function assertReplayArtifactShape(output: unknown): EvalAssertionResult {
@@ -276,6 +289,74 @@ export function assertDiagnosticReplayArtifactShape(output: unknown): EvalAssert
   }
 
   return { name: 'diagnostic-replay-artifact-shape', ok: issues.length === 0, issues };
+}
+
+export function assertQueryReplayArtifactShape(output: unknown): EvalAssertionResult {
+  const result = assertRequiredPaths(output, [
+    'schemaVersion',
+    'capabilityId',
+    'createdAt',
+    'durationMs',
+    'provider.id',
+    'provider.model',
+    'fixture.id',
+    'fixture.path',
+    'answer',
+    'trace',
+    'eval.name',
+    'eval.ok',
+    'modelTurns',
+  ]);
+  const issues = [...result.issues];
+
+  if (!isRecord(output)) {
+    return {
+      name: 'query-replay-artifact-shape',
+      ok: false,
+      issues: [{ path: '', message: 'artifact must be an object' }, ...issues],
+    };
+  }
+
+  if (output.schemaVersion !== 1) {
+    issues.push({ path: 'schemaVersion', message: 'expected schemaVersion 1' });
+  }
+
+  if (output.capabilityId !== 'query-agent') {
+    issues.push({ path: 'capabilityId', message: 'expected query-agent' });
+  }
+
+  if (typeof output.createdAt !== 'string' || Number.isNaN(Date.parse(output.createdAt))) {
+    issues.push({ path: 'createdAt', message: 'expected an ISO timestamp string' });
+  }
+
+  if (typeof output.durationMs !== 'number' || output.durationMs < 0) {
+    issues.push({ path: 'durationMs', message: 'expected a non-negative number' });
+  }
+
+  if (typeof output.modelTurns !== 'number' || output.modelTurns < 0) {
+    issues.push({ path: 'modelTurns', message: 'expected a non-negative number' });
+  }
+
+  if (!Array.isArray(output.trace)) {
+    issues.push({ path: 'trace', message: 'expected an array' });
+  }
+
+  const answerResult = assertQueryAnswerShape(output.answer);
+  for (const issue of answerResult.issues) {
+    issues.push({ path: `answer.${issue.path}`, message: issue.message });
+  }
+
+  const replayEval = output.eval;
+  if (!isRecord(replayEval) || replayEval.ok !== true) {
+    issues.push({ path: 'eval.ok', message: 'expected embedded replay eval to pass' });
+  }
+
+  const secretIssue = findSecretLikeString(output);
+  if (secretIssue) {
+    issues.push(secretIssue);
+  }
+
+  return { name: 'query-replay-artifact-shape', ok: issues.length === 0, issues };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

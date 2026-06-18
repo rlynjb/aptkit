@@ -16,6 +16,13 @@ import {
   type Diagnosis as DiagnosticDiagnosis,
   type WorkspaceDescriptor as DiagnosticWorkspaceDescriptor,
 } from '@aptkit/agent-diagnostic-investigation';
+import {
+  FixtureModelProvider as QueryFixtureModelProvider,
+  QueryAgent,
+  validateQueryAnswer,
+  type Intent as QueryIntent,
+  type WorkspaceDescriptor as QueryWorkspaceDescriptor,
+} from '@aptkit/agent-query';
 import { RecommendationAgent, FixtureModelProvider } from '@aptkit/agent-recommendation';
 import {
   assertCapabilityReplayArtifactShape,
@@ -32,6 +39,7 @@ import type { Anomaly, Diagnosis, Recommendation, WorkspaceDescriptor } from '@a
 import type { Anomaly as MonitoringAnomaly, WorkspaceDescriptor as MonitoringWorkspaceDescriptor } from '@aptkit/agent-anomaly-monitoring';
 import monitoringFixture from '../../packages/agents/anomaly-monitoring/fixtures/sp-revenue-monitoring.json';
 import diagnosticFixture from '../../packages/agents/diagnostic-investigation/fixtures/sp-revenue-diagnostic.json';
+import queryFixture from '../../packages/agents/query/fixtures/revenue-by-state-query.json';
 import electronicsSpikeFixture from '../../packages/agents/recommendation/fixtures/electronics-spike.json';
 import spRevenueDropFixture from '../../packages/agents/recommendation/fixtures/sp-revenue-drop.json';
 import voucherDropoffFixture from '../../packages/agents/recommendation/fixtures/voucher-dropoff.json';
@@ -41,6 +49,8 @@ type ReplayMode = 'fixture' | 'anthropic' | 'openai';
 type MonitoringReplayMode = 'fixture' | 'openai';
 
 type DiagnosticReplayMode = 'fixture' | 'openai';
+
+type QueryReplayMode = 'fixture' | 'openai';
 
 type FixtureTool = ToolDefinition & { result: unknown };
 
@@ -87,6 +97,16 @@ type DiagnosticFixture = {
     sourceProvider?: { id?: string; model?: string };
     promotedAt?: string;
   };
+};
+
+type QueryFixture = {
+  id: string;
+  description: string;
+  question: string;
+  intent: QueryIntent;
+  workspace: QueryWorkspaceDescriptor;
+  tools: FixtureTool[];
+  modelResponses: ModelResponse[];
 };
 
 type BehavioralExpectations = {
@@ -136,6 +156,10 @@ const monitoringFixtures = [
 const diagnosticFixtures = [
   diagnosticFixture,
 ] as DiagnosticFixture[];
+
+const queryFixtures = [
+  queryFixture,
+] as QueryFixture[];
 
 export default defineConfig(({ mode }) => {
   const env = loadStudioEnv(mode);
@@ -335,6 +359,25 @@ export default defineConfig(({ mode }) => {
             }
           });
 
+          server.middlewares.use('/api/query/replay', async (req, res) => {
+            if (req.method !== 'POST') {
+              res.statusCode = 405;
+              sendJson(res, { error: 'method not allowed' });
+              return;
+            }
+
+            try {
+              const body = await readJsonBody(req);
+              const fixture = queryFixtures.find((candidate) => candidate.id === body.fixtureId) ?? queryFixtures[0];
+              const mode = parseQueryMode(body.mode);
+              const result = await runQueryReplay(fixture, mode);
+              sendJson(res, result);
+            } catch (error) {
+              res.statusCode = 400;
+              sendJson(res, { error: error instanceof Error ? error.message : String(error) });
+            }
+          });
+
           server.middlewares.use('/api/replay', async (req, res) => {
             if (req.method !== 'POST') {
               res.statusCode = 405;
@@ -469,6 +512,45 @@ async function runDiagnosticReplay(fixture: DiagnosticFixture, mode: DiagnosticR
   };
 }
 
+async function runQueryReplay(fixture: QueryFixture, mode: QueryReplayMode) {
+  const startedAt = Date.now();
+  const handlers: Record<string, ToolHandler> = {};
+  for (const tool of fixture.tools) {
+    handlers[tool.name] = () => tool.result;
+  }
+
+  const model = createQueryModelProvider(fixture, mode);
+  const tools = new InMemoryToolRegistry(fixture.tools, handlers);
+  const trace: CapabilityEvent[] = [];
+  const agent = new QueryAgent({
+    model,
+    tools,
+    workspace: fixture.workspace,
+    trace: { emit: (event) => trace.push(event) },
+  });
+
+  const answer = await agent.answer(fixture.question, { intent: fixture.intent });
+  const validation = validateQueryAnswer(answer);
+  const issues = validation.ok ? [] : [{ path: 'answer', message: validation.error }];
+
+  return {
+    fixture: fixture.id,
+    fixtureDescription: fixture.description,
+    mode,
+    question: fixture.question,
+    intent: fixture.intent,
+    answer,
+    trace,
+    eval: {
+      name: 'query-answer-shape',
+      ok: validation.ok,
+      issues,
+    },
+    modelTurns: trace.filter((event) => event.type === 'model_usage').length,
+    durationMs: Date.now() - startedAt,
+  };
+}
+
 function createModelProvider(fixture: RecommendationFixture, mode: ReplayMode): ModelProvider {
   if (mode === 'fixture') return new FixtureModelProvider(fixture.modelResponses);
   if (mode === 'anthropic') {
@@ -490,6 +572,13 @@ function createMonitoringModelProvider(fixture: MonitoringFixture, mode: Monitor
 
 function createDiagnosticModelProvider(fixture: DiagnosticFixture, mode: DiagnosticReplayMode): ModelProvider {
   if (mode === 'fixture') return new DiagnosticFixtureModelProvider(fixture.modelResponses);
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) throw new Error('OPENAI_API_KEY is not configured');
+  return new OpenAIModelProvider({ apiKey, model: process.env.OPENAI_MODEL });
+}
+
+function createQueryModelProvider(fixture: QueryFixture, mode: QueryReplayMode): ModelProvider {
+  if (mode === 'fixture') return new QueryFixtureModelProvider(fixture.modelResponses);
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) throw new Error('OPENAI_API_KEY is not configured');
   return new OpenAIModelProvider({ apiKey, model: process.env.OPENAI_MODEL });
@@ -533,6 +622,11 @@ function parseMonitoringMode(value: unknown): MonitoringReplayMode {
 }
 
 function parseDiagnosticMode(value: unknown): DiagnosticReplayMode {
+  if (value === 'openai') return 'openai';
+  return 'fixture';
+}
+
+function parseQueryMode(value: unknown): QueryReplayMode {
   if (value === 'openai') return 'openai';
   return 'fixture';
 }
@@ -593,6 +687,10 @@ async function listReplaySummaries() {
       anomalyCount: Array.isArray(artifact.anomalies) ? artifact.anomalies.length : 0,
       diagnosis: isRecord(artifact.diagnosis) ? artifact.diagnosis : undefined,
       diagnosisPresent: isRecord(artifact.diagnosis),
+      question: typeof artifact.question === 'string' ? artifact.question : undefined,
+      intent: typeof artifact.intent === 'string' ? artifact.intent : undefined,
+      answer: typeof artifact.answer === 'string' ? artifact.answer : '',
+      answerPresent: typeof artifact.answer === 'string' && artifact.answer.trim().length > 0,
       durationMs: typeof artifact.durationMs === 'number' ? artifact.durationMs : 0,
       modelTurns: typeof artifact.modelTurns === 'number' ? artifact.modelTurns : 0,
       usage,
@@ -1116,8 +1214,8 @@ function normalizeReplayArtifact(value: unknown): Record<string, unknown> & {
   if (typeof value.createdAt !== 'string') throw new Error('artifact createdAt must be a string');
   if (!isRecord(value.fixture) || typeof value.fixture.id !== 'string') throw new Error('artifact fixture.id must be a string');
   if (!isRecord(value.provider) || typeof value.provider.id !== 'string') throw new Error('artifact provider.id must be a string');
-  if (!Array.isArray(value.recommendations) && !Array.isArray(value.anomalies) && !isRecord(value.diagnosis)) {
-    throw new Error('artifact must include recommendations, anomalies, or diagnosis');
+  if (!Array.isArray(value.recommendations) && !Array.isArray(value.anomalies) && !isRecord(value.diagnosis) && typeof value.answer !== 'string') {
+    throw new Error('artifact must include recommendations, anomalies, diagnosis, or answer');
   }
   if (!Array.isArray(value.trace)) throw new Error('artifact trace must be an array');
   return value as ReturnType<typeof normalizeReplayArtifact>;

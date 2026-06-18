@@ -44,6 +44,7 @@ for (const path of paths) {
     recommendationCount: Array.isArray(artifact?.recommendations) ? artifact.recommendations.length : null,
     anomalyCount: Array.isArray(artifact?.anomalies) ? artifact.anomalies.length : null,
     diagnosisPresent: artifact?.diagnosis && typeof artifact.diagnosis === 'object' ? true : null,
+    answerPresent: typeof artifact?.answer === 'string' ? artifact.answer.trim().length > 0 : null,
   });
 }
 

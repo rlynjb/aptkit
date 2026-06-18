@@ -1,7 +1,7 @@
 import React from 'react';
-import { Activity, CircleDollarSign, Play, SearchCheck } from 'lucide-react';
+import { Activity, CircleDollarSign, MessageSquareText, Play, SearchCheck } from 'lucide-react';
 import { ECOMMERCE_ANOMALY_CATEGORIES, coverageReport, schemaCapabilities } from '@aptkit/agent-anomaly-monitoring';
-import { diagnosticFixtures, fixtures, monitoringFixtures } from './fixtures';
+import { diagnosticFixtures, fixtures, monitoringFixtures, queryFixtures } from './fixtures';
 import type { StudioView } from './types';
 
 export function StudioHome({ onOpen }: { onOpen: (view: StudioView) => void }) {
@@ -57,6 +57,18 @@ export function StudioHome({ onOpen }: { onOpen: (view: StudioView) => void }) {
             'Deterministic diagnostic replay',
           ]}
           onOpen={() => onOpen('diagnostic')}
+        />
+        <CapabilityCard
+          icon={<MessageSquareText size={20} />}
+          title="Query Agent"
+          status="Fixture ready"
+          summary="Ask a free-form workspace question and get a grounded prose answer from allowed tools."
+          details={[
+            `${queryFixtures.length} fixture`,
+            'Natural-language answer',
+            'Fixture/OpenAI replay',
+          ]}
+          onOpen={() => onOpen('query')}
         />
       </section>
     </main>
