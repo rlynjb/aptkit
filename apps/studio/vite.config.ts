@@ -31,6 +31,8 @@ import {
   assertQueryReplayArtifactShape,
   assertRecommendationShape,
   assertReplayArtifactShape,
+  evaluateStructuralDiff,
+  type StructuralDiffRule,
 } from '@aptkit/evals';
 import { AnthropicModelProvider } from '@aptkit/provider-anthropic';
 import { OpenAIModelProvider } from '@aptkit/provider-openai';
@@ -1028,110 +1030,84 @@ function assertBehavioralExpectations(
   recommendations: Recommendation[],
   expectations: BehavioralExpectations | undefined,
 ) {
-  const issues: { path: string; message: string }[] = [];
-  if (!expectations) return { name: 'recommendation-behavior', ok: true, issues };
-
-  for (const feature of expectations.requiredFeatures ?? []) {
-    if (!recommendations.some((recommendation) => recommendation.bloomreachFeature === feature)) {
-      issues.push({
-        path: 'expectations.requiredFeatures',
-        message: `expected at least one recommendation with bloomreachFeature=${feature}`,
-      });
-    }
-  }
-
-  const haystack = recommendations.map(recommendationSearchText).join('\n').toLowerCase();
-  for (const text of expectations.requiredText ?? []) {
-    if (!haystack.includes(text.toLowerCase())) {
-      issues.push({
-        path: 'expectations.requiredText',
-        message: `expected recommendation text to include "${text}"`,
-      });
-    }
-  }
-
-  return { name: 'recommendation-behavior', ok: issues.length === 0, issues };
+  if (!expectations) return { name: 'recommendation-behavior', ok: true, issues: [] };
+  const rules: StructuralDiffRule[] = [
+    ...(expectations.requiredFeatures ?? []).map((feature): StructuralDiffRule => ({
+      type: 'arrayIncludes',
+      path: '',
+      itemPath: 'bloomreachFeature',
+      value: feature,
+      message: `expected at least one recommendation with bloomreachFeature=${feature}`,
+    })),
+    ...(expectations.requiredText ?? []).map((text): StructuralDiffRule => ({
+      type: 'containsText',
+      path: '',
+      text,
+      message: `expected recommendation text to include "${text}"`,
+    })),
+  ];
+  return { name: 'recommendation-behavior', ...evaluateStructuralDiff(recommendations, rules) };
 }
 
 function assertMonitoringBehavioralExpectations(
   anomalies: MonitoringAnomaly[],
   expectations: MonitoringBehaviorExpectations | undefined,
 ) {
-  const issues: { path: string; message: string }[] = [];
-  if (!expectations) return { name: 'monitoring-behavior', ok: true, issues };
-
+  if (!expectations) return { name: 'monitoring-behavior', ok: true, issues: [] };
   const minAnomalyCount = expectations.minAnomalyCount ?? 0;
-  if (anomalies.length < minAnomalyCount) {
-    issues.push({
-      path: 'expectations.minAnomalyCount',
-      message: `expected at least ${minAnomalyCount} anomalies, got ${anomalies.length}`,
-    });
-  }
-
-  for (const category of expectations.requiredCategories ?? []) {
-    if (!anomalies.some((anomaly) => anomaly.category === category)) {
-      issues.push({
-        path: 'expectations.requiredCategories',
-        message: `expected category=${category}`,
-      });
-    }
-  }
-
-  for (const metric of expectations.requiredMetrics ?? []) {
-    if (!anomalies.some((anomaly) => anomaly.metric === metric)) {
-      issues.push({
-        path: 'expectations.requiredMetrics',
-        message: `expected metric=${metric}`,
-      });
-    }
-  }
-
-  for (const scope of expectations.requiredScopes ?? []) {
-    if (!anomalies.some((anomaly) => anomaly.scope.includes(scope))) {
-      issues.push({
-        path: 'expectations.requiredScopes',
-        message: `expected scope=${scope}`,
-      });
-    }
-  }
-
-  for (const severity of expectations.requiredSeverities ?? []) {
-    if (!anomalies.some((anomaly) => anomaly.severity === severity)) {
-      issues.push({
-        path: 'expectations.requiredSeverities',
-        message: `expected severity=${severity}`,
-      });
-    }
-  }
-
-  return { name: 'monitoring-behavior', ok: issues.length === 0, issues };
+  const rules: StructuralDiffRule[] = [
+    { type: 'arrayCount', path: '', min: minAnomalyCount, message: `expected at least ${minAnomalyCount} anomalies, got ${anomalies.length}` },
+    ...(expectations.requiredCategories ?? []).map((category): StructuralDiffRule => ({
+      type: 'arrayIncludes',
+      path: '',
+      itemPath: 'category',
+      value: category,
+      message: `expected category=${category}`,
+    })),
+    ...(expectations.requiredMetrics ?? []).map((metric): StructuralDiffRule => ({
+      type: 'arrayIncludes',
+      path: '',
+      itemPath: 'metric',
+      value: metric,
+      message: `expected metric=${metric}`,
+    })),
+    ...(expectations.requiredScopes ?? []).map((scope): StructuralDiffRule => ({
+      type: 'arrayIncludes',
+      path: '',
+      itemPath: 'scope',
+      value: scope,
+      message: `expected scope=${scope}`,
+    })),
+    ...(expectations.requiredSeverities ?? []).map((severity): StructuralDiffRule => ({
+      type: 'arrayIncludes',
+      path: '',
+      itemPath: 'severity',
+      value: severity,
+      message: `expected severity=${severity}`,
+    })),
+  ];
+  return { name: 'monitoring-behavior', ...evaluateStructuralDiff(anomalies, rules) };
 }
 
 function assertDiagnosticBehavioralExpectations(
   diagnosis: DiagnosticDiagnosis,
   expectations: DiagnosticBehaviorExpectations | undefined,
 ) {
-  const issues: { path: string; message: string }[] = [];
-  if (!expectations) return { name: 'diagnostic-behavior', ok: true, issues };
-
-  const evidenceText = diagnosis.evidence.join('\n').toLowerCase();
-  for (const text of expectations.requiredEvidenceText ?? []) {
-    if (!evidenceText.includes(text.toLowerCase())) {
-      issues.push({ path: 'expectations.requiredEvidenceText', message: `expected evidence containing "${text}"` });
-    }
-  }
-
-  const supportedText = diagnosis.hypothesesConsidered
-    .filter((hypothesis) => hypothesis.supported)
-    .map((hypothesis) => `${hypothesis.hypothesis}\n${hypothesis.reasoning}`)
-    .join('\n')
-    .toLowerCase();
-  for (const text of expectations.requiredSupportedHypothesisText ?? []) {
-    if (!supportedText.includes(text.toLowerCase())) {
-      issues.push({ path: 'expectations.requiredSupportedHypothesisText', message: `expected supported hypothesis containing "${text}"` });
-    }
-  }
-
+  if (!expectations) return { name: 'diagnostic-behavior', ok: true, issues: [] };
+  const supportedHypotheses = diagnosis.hypothesesConsidered.filter((hypothesis) => hypothesis.supported);
+  const evidenceResult = evaluateStructuralDiff(diagnosis, (expectations.requiredEvidenceText ?? []).map((text) => ({
+    type: 'containsText',
+    path: 'evidence',
+    text,
+    message: `expected evidence containing "${text}"`,
+  })));
+  const hypothesisResult = evaluateStructuralDiff(supportedHypotheses, (expectations.requiredSupportedHypothesisText ?? []).map((text) => ({
+    type: 'containsText',
+    path: '',
+    text,
+    message: `expected supported hypothesis containing "${text}"`,
+  })));
+  const issues = [...evidenceResult.issues, ...hypothesisResult.issues];
   return { name: 'diagnostic-behavior', ok: issues.length === 0, issues };
 }
 
@@ -1139,36 +1115,14 @@ function assertQueryBehavioralExpectations(
   answer: string,
   expectations: QueryBehaviorExpectations | undefined,
 ) {
-  const issues: { path: string; message: string }[] = [];
-  if (!expectations) return { name: 'query-behavior', ok: true, issues };
-
-  const answerText = answer.toLowerCase();
-  for (const text of expectations.requiredAnswerText ?? []) {
-    if (!answerText.includes(text.toLowerCase())) {
-      issues.push({ path: 'expectations.requiredAnswerText', message: `expected answer containing "${text}"` });
-    }
-  }
-
-  return { name: 'query-behavior', ok: issues.length === 0, issues };
-}
-
-function recommendationSearchText(recommendation: Recommendation): string {
-  return [
-    recommendation.title,
-    recommendation.rationale,
-    recommendation.bloomreachFeature,
-    ...recommendation.steps,
-    typeof recommendation.estimatedImpact === 'string'
-      ? recommendation.estimatedImpact
-      : [
-          recommendation.estimatedImpact.range,
-          recommendation.estimatedImpact.assumption,
-        ].join(' '),
-    recommendation.successMetric,
-    ...(recommendation.prerequisites ?? []).map((prerequisite) => prerequisite.label),
-  ]
-    .filter((value): value is string => typeof value === 'string')
-    .join(' ');
+  if (!expectations) return { name: 'query-behavior', ok: true, issues: [] };
+  const rules = (expectations.requiredAnswerText ?? []).map((text): StructuralDiffRule => ({
+    type: 'containsText',
+    path: '',
+    text,
+    message: `expected answer containing "${text}"`,
+  }));
+  return { name: 'query-behavior', ...evaluateStructuralDiff(answer, rules) };
 }
 
 async function promoteReplayArtifact(artifactPath: string) {
