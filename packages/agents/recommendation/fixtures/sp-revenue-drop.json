@@ -1,0 +1,83 @@
+{
+  "id": "sp-revenue-drop-w4",
+  "description": "Fixture derived from Blooming Insights recommendation regression case 06-recommendation-sp.",
+  "workspace": {
+    "projectId": "olist",
+    "projectName": "Olist Brazilian ecommerce fixture",
+    "events": [
+      { "name": "order", "properties": ["state", "category", "purchase_ts", "price_brl"], "eventCount": 0 },
+      { "name": "payment", "properties": ["type", "installments", "value_brl"], "eventCount": 0 }
+    ],
+    "customerProperties": ["state", "city"],
+    "catalogs": [],
+    "totalCustomers": 0,
+    "totalEvents": 0,
+    "oldestTimestamp": null,
+    "dataHorizon": { "from": "2025-12-01", "to": "2026-06-01", "durationDays": 182 }
+  },
+  "anomaly": {
+    "metric": "revenue",
+    "scope": ["state:SP"],
+    "change": {
+      "value": 30,
+      "direction": "down",
+      "baseline": "week 4 (2025-12-22 to 2025-12-29) vs 12-week baseline"
+    },
+    "severity": "critical",
+    "evidence": [],
+    "impact": "Revenue for state:SP fell about 30% in a discrete window."
+  },
+  "diagnosis": {
+    "conclusion": "Sao Paulo state revenue fell about 30% in week 4 versus the surrounding baseline. The drop is isolated to SP and broad across categories, consistent with a localized demand or fulfillment factor.",
+    "evidence": [
+      "get_anomaly_context(metric=revenue, dimension=state, segment=SP) returned pct_change=-0.30 for week 4.",
+      "Related states RJ, MG, and PR stayed within normal variance.",
+      "Electronics, fashion, and home_decor were all down in SP week 4.",
+      "Order count fell while AOV stayed roughly flat, so the drop is volume-driven."
+    ],
+    "hypothesesConsidered": [
+      {
+        "hypothesis": "Single-category collapse drove the SP revenue drop",
+        "supported": false,
+        "reasoning": "All examined categories moved together."
+      },
+      {
+        "hypothesis": "Localized SP fulfillment or demand factor",
+        "supported": true,
+        "reasoning": "The issue is isolated to SP and volume-driven across categories."
+      }
+    ],
+    "affectedCustomers": {
+      "count": 4200,
+      "segmentDescription": "SP-state buyers in week 4 of dataset"
+    },
+    "confidence": "medium"
+  },
+  "tools": [
+    { "name": "list_scenarios", "description": "List existing automations", "inputSchema": { "type": "object" }, "result": { "data": [] } },
+    { "name": "list_segmentations", "description": "List existing segments", "inputSchema": { "type": "object" }, "result": { "data": [{ "name": "SP recent buyers" }] } },
+    { "name": "get_frequency_policies", "description": "List frequency policies", "inputSchema": { "type": "object" }, "result": { "data": [{ "name": "global weekly cap" }] } }
+  ],
+  "modelResponses": [
+    {
+      "content": [
+        { "type": "tool_use", "id": "tool-1", "name": "list_scenarios", "input": { "project_id": "olist" } }
+      ],
+      "usage": { "inputTokens": 850, "outputTokens": 45 },
+      "model": "fixture-model"
+    },
+    {
+      "content": [
+        {
+          "type": "text",
+          "text": "```json\n[{\"title\":\"Re-engagement campaign targeting lapsed SP buyers\",\"rationale\":\"Order count in SP fell while AOV held flat, so the fastest recovery lever is to reach full-value SP buyers who went quiet during the drop week.\",\"bloomreachFeature\":\"campaign\",\"steps\":[\"Build a segment of SP customers who purchased in the prior 8 weeks but not during the drop week.\",\"Send a localized re-engagement email with a soft incentive.\",\"Measure SP order count and revenue against the anomaly-week baseline.\"],\"estimatedImpact\":{\"range\":\"+$21k - $43k recovered revenue\",\"rangeUsd\":{\"low\":21000,\"high\":43000},\"assumption\":\"Assumes 10-20% reactivation of 4200 affected SP buyers.\"},\"effort\":\"low\",\"timeToSetUpMinutes\":45,\"readResultInDays\":7,\"prerequisites\":[{\"label\":\"email channel active\",\"satisfied\":true},{\"label\":\"SP customer property available\",\"satisfied\":true}],\"successMetric\":\"SP weekly order count returns to at least 95 orders within 7 days.\",\"confidence\":\"medium\"},{\"title\":\"Automated win-back scenario for SP buyers\",\"rationale\":\"The pattern may recur, so a triggered flow gives durable recovery infrastructure for SP customers who go silent.\",\"bloomreachFeature\":\"scenario\",\"steps\":[\"Trigger when state=SP and no order in 14 days after prior activity.\",\"Send a personalized win-back email.\",\"Escalate to a voucher follow-up if no purchase occurs.\"],\"estimatedImpact\":{\"range\":\"+$18k - $38k recovered revenue per recurrence\",\"rangeUsd\":{\"low\":18000,\"high\":38000},\"assumption\":\"Assumes 8-15% conversion among reachable lapsed SP buyers.\"},\"effort\":\"medium\",\"timeToSetUpMinutes\":90,\"readResultInDays\":14,\"prerequisites\":[{\"label\":\"triggered email channel active\",\"satisfied\":true}],\"successMetric\":\"Scenario conversion rate reaches at least 10% within 14 days.\",\"confidence\":\"medium\"}]\n```"
+        }
+      ],
+      "usage": { "inputTokens": 1200, "outputTokens": 550 },
+      "model": "fixture-model"
+    }
+  ],
+  "eval": {
+    "requiredFields": ["0.title", "0.rationale", "0.bloomreachFeature", "0.steps", "0.estimatedImpact", "0.confidence"]
+  }
+}

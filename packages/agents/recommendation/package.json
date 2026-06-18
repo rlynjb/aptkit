@@ -1,0 +1,26 @@
+{
+  "name": "@aptkit/agent-recommendation",
+  "version": "0.0.0",
+  "type": "module",
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "import": "./dist/src/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test dist/test/*.test.js",
+    "replay:fixture": "npm run build && node dist/scripts/replay-fixture.js"
+  },
+  "dependencies": {
+    "@aptkit/evals": "0.0.0",
+    "@aptkit/runtime": "0.0.0",
+    "@aptkit/tools": "0.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0"
+  }
+}

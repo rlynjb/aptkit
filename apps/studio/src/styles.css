@@ -1,0 +1,434 @@
+:root {
+  color: #1d2420;
+  background: #f5f7f4;
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+button {
+  font: inherit;
+}
+
+.shell {
+  min-height: 100vh;
+  padding: 24px;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 18px;
+}
+
+.eyebrow {
+  margin: 0 0 4px;
+  color: #66766c;
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+h1 {
+  margin: 0;
+  font-size: 30px;
+  line-height: 1.1;
+  letter-spacing: 0;
+}
+
+.runButton {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 40px;
+  padding: 0 14px;
+  border: 1px solid #24483a;
+  border-radius: 6px;
+  background: #24483a;
+  color: #ffffff;
+  cursor: pointer;
+}
+
+.runButton:disabled {
+  cursor: wait;
+  opacity: 0.7;
+}
+
+.metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.metric {
+  display: grid;
+  grid-template-columns: 22px 1fr;
+  grid-template-rows: auto auto;
+  align-items: center;
+  gap: 2px 8px;
+  min-height: 72px;
+  padding: 12px;
+  border: 1px solid #d9dfd7;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.metric svg {
+  grid-row: 1 / span 2;
+  color: #5f6d64;
+}
+
+.metric span {
+  color: #66766c;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.metric strong {
+  font-size: 20px;
+}
+
+.metric.good svg,
+.metric.good strong {
+  color: #1b6b45;
+}
+
+.layout {
+  display: grid;
+  grid-template-columns: minmax(260px, 0.82fr) minmax(360px, 1.45fr) minmax(280px, 0.9fr);
+  gap: 16px;
+  align-items: start;
+}
+
+.leftPane,
+.mainPane,
+.rightPane {
+  display: grid;
+  gap: 16px;
+}
+
+.panel {
+  border: 1px solid #d9dfd7;
+  border-radius: 8px;
+  background: #ffffff;
+  overflow: hidden;
+}
+
+.panel > header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+  padding: 0 14px;
+  border-bottom: 1px solid #e7ebe5;
+  color: #31453b;
+}
+
+.panel > header h2 {
+  margin: 0;
+  font-size: 14px;
+  letter-spacing: 0;
+}
+
+.panel > :not(header) {
+  margin: 14px;
+}
+
+.kv {
+  display: grid;
+  grid-template-columns: 92px 1fr;
+  gap: 10px 12px;
+  font-size: 13px;
+}
+
+.kv span,
+.anomalyGrid span {
+  color: #6f7e74;
+  font-weight: 700;
+}
+
+.kv strong,
+.anomalyGrid strong {
+  color: #1d2420;
+  font-weight: 650;
+  overflow-wrap: anywhere;
+}
+
+.anomalyGrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.anomalyGrid div {
+  display: grid;
+  gap: 4px;
+  min-height: 58px;
+  padding: 10px;
+  border: 1px solid #e1e6df;
+  border-radius: 6px;
+  background: #fafbf9;
+}
+
+.bodyText {
+  color: #344239;
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.evidenceList,
+.issueList {
+  margin: 12px 0 0;
+  padding-left: 18px;
+  color: #344239;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.evidenceList li + li,
+.issueList li + li {
+  margin-top: 8px;
+}
+
+.recommendations {
+  display: grid;
+  gap: 12px;
+}
+
+.emptyState,
+.errorState {
+  min-height: 52px;
+  display: flex;
+  align-items: center;
+  padding: 0 12px;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 750;
+}
+
+.emptyState {
+  color: #59685f;
+  background: #f1f4f0;
+}
+
+.emptyState.compact {
+  min-height: 38px;
+  margin-bottom: 8px;
+  font-size: 13px;
+}
+
+.errorState {
+  color: #842d24;
+  background: #fae7e4;
+}
+
+.recommendation {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid #dde4dc;
+  border-radius: 8px;
+  background: #fbfcfb;
+}
+
+.recHeader {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: start;
+}
+
+.feature,
+.confidence {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 0 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.feature {
+  color: #184a35;
+  background: #e3f3ea;
+}
+
+.confidence {
+  color: #504116;
+  background: #fff0ba;
+}
+
+.recommendation h2 {
+  margin: 8px 0 0;
+  font-size: 18px;
+  line-height: 1.25;
+  letter-spacing: 0;
+}
+
+.recommendation p {
+  margin: 0;
+  color: #35443a;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.impact {
+  display: grid;
+  gap: 4px;
+  padding: 10px;
+  border: 1px solid #d8e7dd;
+  border-radius: 6px;
+  background: #f2faf5;
+}
+
+.impact strong {
+  color: #1b6b45;
+}
+
+.impact span {
+  color: #54645a;
+  font-size: 13px;
+}
+
+.recommendation ol {
+  margin: 0;
+  padding-left: 20px;
+  color: #2d3932;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.recommendation li + li {
+  margin-top: 6px;
+}
+
+.traceList {
+  display: grid;
+  gap: 8px;
+}
+
+.traceItem {
+  display: grid;
+  grid-template-columns: 28px 1fr;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid #e2e7e0;
+  border-radius: 6px;
+  background: #fafbf9;
+}
+
+.traceItem > span {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: #e8eee9;
+  color: #58695f;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.traceItem strong {
+  display: block;
+  margin-bottom: 3px;
+  font-size: 13px;
+}
+
+.traceItem p {
+  margin: 0;
+  color: #5e6d64;
+  font-size: 12px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.evalPass,
+.evalPending,
+.evalError {
+  min-height: 42px;
+  display: flex;
+  align-items: center;
+  padding: 0 12px;
+  border-radius: 6px;
+  font-weight: 800;
+}
+
+.evalPass {
+  color: #145438;
+  background: #e3f3ea;
+}
+
+.evalPending {
+  color: #5f5a49;
+  background: #f0ece1;
+}
+
+.evalError {
+  color: #842d24;
+  background: #fae7e4;
+}
+
+@media (max-width: 1180px) {
+  .layout {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .mainPane {
+    grid-column: 1 / -1;
+    order: 3;
+  }
+}
+
+@media (max-width: 760px) {
+  .shell {
+    padding: 16px;
+  }
+
+  .topbar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  h1 {
+    font-size: 24px;
+  }
+
+  .metrics,
+  .layout {
+    grid-template-columns: 1fr;
+  }
+
+  .mainPane {
+    grid-column: auto;
+    order: 0;
+  }
+
+  .recHeader {
+    flex-direction: column;
+  }
+
+  .anomalyGrid {
+    grid-template-columns: 1fr;
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "name": "aptkit",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "packages/agents/*",
+    "packages/providers/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "dev:studio": "npm run dev -w @aptkit/studio",
+    "test": "npm run test --workspaces --if-present",
+    "replay:recommendation": "npm run replay:fixture -w @aptkit/agent-recommendation"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0"
+  }
+}
