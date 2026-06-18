@@ -1,6 +1,6 @@
 import React from 'react';
 import { createRoot } from 'react-dom/client';
-import { Activity, BadgeCheck, Boxes, BrainCircuit, Check, ChevronDown, CircleDollarSign, Clipboard, Cloud, Gauge, KeyRound, Play, Route, ShieldCheck, Wrench } from 'lucide-react';
+import { Activity, BadgeCheck, Boxes, BrainCircuit, Check, ChevronDown, CircleDollarSign, Clipboard, Cloud, Gauge, History, KeyRound, Play, RefreshCw, Route, Save, ShieldCheck, Timer } from 'lucide-react';
 import { RecommendationAgent, FixtureModelProvider, type Anomaly, type Diagnosis, type Recommendation, type WorkspaceDescriptor } from '@aptkit/agent-recommendation';
 import { assertRecommendationShape } from '@aptkit/evals';
 import type { CapabilityEvent, ModelResponse } from '@aptkit/runtime';
@@ -26,10 +26,13 @@ type ReplayState = {
   recommendations: Recommendation[];
   trace: CapabilityEvent[];
   evalOk: boolean;
+  evalIssueDetails: { path: string; message: string }[];
   evalIssues: string[];
   modelTurns: number;
+  durationMs: number;
   completedAt: string;
   runId: number;
+  savedPath?: string;
 };
 
 type ReplayResult = Omit<ReplayState, 'completedAt' | 'runId'>;
@@ -38,6 +41,53 @@ type ReplayMode = 'fixture' | 'anthropic' | 'openai';
 
 type ProviderStatus = Record<ReplayMode, { available: boolean; model: string }>;
 
+type ReplayArtifact = {
+  schemaVersion: 1;
+  createdAt: string;
+  durationMs: number;
+  provider: {
+    id: ReplayMode;
+    model: string;
+  };
+  fixture: {
+    id: string;
+    description: string;
+    path: string;
+  };
+  recommendations: Recommendation[];
+  trace: CapabilityEvent[];
+  eval: {
+    name: string;
+    ok: boolean;
+    issues: { path: string; message: string }[];
+  };
+  modelTurns: number;
+};
+
+type SavedReplaySummary = {
+  path: string;
+  createdAt: string;
+  provider: { id: string; model: string };
+  fixture: { id: string; description?: string; path?: string };
+  evalOk: boolean;
+  issues: { path: string; message: string }[];
+  recommendationCount: number;
+  durationMs: number;
+  modelTurns: number;
+  usage: {
+    inputTokens: number;
+    outputTokens: number;
+    totalTokens: number;
+  };
+};
+
+type PromoteResult = {
+  path: string;
+  id: string;
+  sourceArtifact: string;
+  recommendationCount: number;
+};
+
 const fixtures = [
   spRevenueDropFixture,
   electronicsSpikeFixture,
@@ -45,6 +95,7 @@ const fixtures = [
 ] as RecommendationFixture[];
 
 function runFixtureReplay(fixture: RecommendationFixture): Promise<ReplayResult> {
+  const startedAt = performance.now();
   const handlers: Record<string, ToolHandler> = {};
   for (const tool of fixture.tools) {
     handlers[tool.name] = () => tool.result;
@@ -72,8 +123,10 @@ function runFixtureReplay(fixture: RecommendationFixture): Promise<ReplayResult>
       recommendations,
       trace,
       evalOk: evalResult.ok,
+      evalIssueDetails: evalResult.issues,
       evalIssues: evalResult.issues.map((issue) => `${issue.path}: ${issue.message}`),
       modelTurns: model.requests.length,
+      durationMs: Math.round(performance.now() - startedAt),
     };
   });
 }
@@ -92,9 +145,46 @@ async function runServerReplay(fixture: RecommendationFixture, mode: Exclude<Rep
     recommendations: payload.recommendations,
     trace: payload.trace,
     evalOk: payload.eval.ok,
+    evalIssueDetails: payload.eval.issues,
     evalIssues: payload.eval.issues.map((issue: { path: string; message: string }) => `${issue.path}: ${issue.message}`),
     modelTurns: payload.modelTurns,
+    durationMs: payload.durationMs,
   };
+}
+
+async function saveReplayArtifact(artifact: ReplayArtifact): Promise<string> {
+  const response = await fetch('/api/replay/save', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ artifact }),
+  });
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(payload?.error ?? 'save replay failed');
+  }
+  return payload.path;
+}
+
+async function loadSavedReplays(): Promise<SavedReplaySummary[]> {
+  const response = await fetch('/api/replays');
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(payload?.error ?? 'load replays failed');
+  }
+  return payload.replays;
+}
+
+async function promoteReplay(path: string): Promise<PromoteResult> {
+  const response = await fetch('/api/replays/promote', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ path }),
+  });
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(payload?.error ?? 'promote replay failed');
+  }
+  return payload;
 }
 
 function App() {
@@ -107,8 +197,15 @@ function App() {
   });
   const [replay, setReplay] = React.useState<ReplayState | null>(null);
   const [running, setRunning] = React.useState(false);
+  const [saving, setSaving] = React.useState(false);
   const [runId, setRunId] = React.useState(0);
   const [error, setError] = React.useState<string | null>(null);
+  const [saveError, setSaveError] = React.useState<string | null>(null);
+  const [savedReplays, setSavedReplays] = React.useState<SavedReplaySummary[]>([]);
+  const [historyLoading, setHistoryLoading] = React.useState(false);
+  const [historyError, setHistoryError] = React.useState<string | null>(null);
+  const [promotingPath, setPromotingPath] = React.useState<string | null>(null);
+  const [promoteResult, setPromoteResult] = React.useState<PromoteResult | null>(null);
   const runCounter = React.useRef(0);
   const selectedFixtureRef = React.useRef(fixtures[0]);
   const fixture = fixtures.find((candidate) => candidate.id === selectedFixtureId) ?? fixtures[0];
@@ -125,6 +222,7 @@ function App() {
     setRunId(nextRunId);
     setRunning(true);
     setError(null);
+    setSaveError(null);
     setReplay(null);
     try {
       const result = modeToRun === 'fixture'
@@ -155,22 +253,67 @@ function App() {
       });
   }, []);
 
+  const refreshReplayHistory = React.useCallback(async () => {
+    setHistoryLoading(true);
+    setHistoryError(null);
+    try {
+      setSavedReplays(await loadSavedReplays());
+    } catch (caught) {
+      setHistoryError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setHistoryLoading(false);
+    }
+  }, []);
+
+  React.useEffect(() => {
+    void refreshReplayHistory();
+  }, [refreshReplayHistory]);
+
   function selectFixture(event: React.ChangeEvent<HTMLSelectElement>) {
     setSelectedFixtureId(event.target.value);
     setReplay(null);
     setError(null);
+    setSaveError(null);
   }
 
   function selectMode(nextMode: ReplayMode) {
     setMode(nextMode);
     setReplay(null);
     setError(null);
+    setSaveError(null);
   }
 
-  const totalTokens = replay?.trace.reduce((sum, event) => {
-    if (event.type !== 'model_usage') return sum;
-    return sum + (event.inputTokens ?? 0) + (event.outputTokens ?? 0);
-  }, 0) ?? 0;
+  async function saveCurrentReplay() {
+    if (!replay) return;
+    setSaving(true);
+    setSaveError(null);
+    try {
+      const artifact = buildReplayArtifact(fixture, replay, mode, providerStatus[mode].model);
+      const savedPath = await saveReplayArtifact(artifact);
+      setReplay((current) => current ? { ...current, savedPath } : current);
+      await refreshReplayHistory();
+    } catch (caught) {
+      setSaveError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function promoteSavedReplay(path: string) {
+    setPromotingPath(path);
+    setHistoryError(null);
+    setPromoteResult(null);
+    try {
+      const result = await promoteReplay(path);
+      setPromoteResult(result);
+    } catch (caught) {
+      setHistoryError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setPromotingPath(null);
+    }
+  }
+
+  const usage = summarizeUsage(replay?.trace ?? []);
 
   return (
     <main className="shell">
@@ -223,9 +366,9 @@ function App() {
 
       <section className="metrics" aria-label="Replay summary">
         <Metric icon={<BadgeCheck size={18} />} label="Eval" value={error ? 'Error' : replay?.evalOk ? 'Passing' : running ? 'Running' : 'Pending'} tone={replay?.evalOk ? 'good' : 'neutral'} />
-        <Metric icon={<BrainCircuit size={18} />} label="Model Turns" value={String(replay?.modelTurns ?? 0)} />
-        <Metric icon={<Wrench size={18} />} label="Tool Calls" value={String(replay?.trace.filter((event) => event.type === 'tool_call_end').length ?? 0)} />
-        <Metric icon={<Gauge size={18} />} label="Run" value={replay ? `#${replay.runId}` : running ? `#${runId}` : '0'} />
+        <Metric icon={<BrainCircuit size={18} />} label="Model" value={usage.modelName || providerStatus[mode].model} />
+        <Metric icon={<Gauge size={18} />} label="Tokens" value={usage.totalTokens.toLocaleString()} />
+        <Metric icon={<Timer size={18} />} label="Duration" value={replay ? formatDuration(replay.durationMs) : running ? 'Running' : '0ms'} />
       </section>
 
       <div className="layout">
@@ -242,8 +385,10 @@ function App() {
               <strong>{mode} / {providerStatus[mode].model}{providerStatus[mode].available ? '' : ' unavailable'}</strong>
               <span>Workspace</span>
               <strong>{fixture.workspace.projectName}</strong>
-              <span>Tokens</span>
-              <strong>{totalTokens.toLocaleString()}</strong>
+              <span>Input</span>
+              <strong>{usage.inputTokens.toLocaleString()} tokens</strong>
+              <span>Output</span>
+              <strong>{usage.outputTokens.toLocaleString()} tokens</strong>
               <span>Horizon</span>
               <strong>{fixture.workspace.dataHorizon?.from} to {fixture.workspace.dataHorizon?.to}</strong>
             </div>
@@ -316,7 +461,24 @@ function App() {
         </section>
 
         <aside className="rightPane">
-          <WorkflowPanel fixtureId={fixture.id} mode={mode} />
+          <WorkflowPanel
+            fixtureId={fixture.id}
+            mode={mode}
+            replay={replay}
+            saving={saving}
+            saveError={saveError}
+            onSave={() => void saveCurrentReplay()}
+          />
+
+          <ReplayHistoryPanel
+            replays={savedReplays}
+            loading={historyLoading}
+            error={historyError}
+            promotingPath={promotingPath}
+            promoteResult={promoteResult}
+            onRefresh={() => void refreshReplayHistory()}
+            onPromote={(path) => void promoteSavedReplay(path)}
+          />
 
           <Panel title="Trace" icon={<BrainCircuit size={17} />}>
             {running ? <div className="emptyState compact">Collecting trace events...</div> : null}
@@ -343,8 +505,83 @@ function App() {
   );
 }
 
-function WorkflowPanel({ fixtureId, mode }: { fixtureId: string; mode: ReplayMode }) {
+function buildReplayArtifact(
+  fixture: RecommendationFixture,
+  replay: ReplayState,
+  mode: ReplayMode,
+  fallbackModel: string,
+): ReplayArtifact {
+  const usage = summarizeUsage(replay.trace);
+  return {
+    schemaVersion: 1,
+    createdAt: new Date().toISOString(),
+    durationMs: replay.durationMs,
+    provider: {
+      id: mode,
+      model: usage.modelName || fallbackModel,
+    },
+    fixture: {
+      id: fixture.id,
+      description: fixture.description,
+      path: fixturePath(fixture.id),
+    },
+    recommendations: replay.recommendations,
+    trace: replay.trace,
+    eval: {
+      name: 'recommendation-shape',
+      ok: replay.evalOk,
+      issues: replay.evalIssueDetails,
+    },
+    modelTurns: replay.modelTurns,
+  };
+}
+
+function fixturePath(fixtureId: string): string {
+  const knownPaths: Record<string, string> = {
+    [spRevenueDropFixture.id]: 'packages/agents/recommendation/fixtures/sp-revenue-drop.json',
+    [electronicsSpikeFixture.id]: 'packages/agents/recommendation/fixtures/electronics-spike.json',
+    [voucherDropoffFixture.id]: 'packages/agents/recommendation/fixtures/voucher-dropoff.json',
+  };
+  return knownPaths[fixtureId] ?? `packages/agents/recommendation/fixtures/${fixtureId}.json`;
+}
+
+function summarizeUsage(trace: CapabilityEvent[]) {
+  return trace.reduce(
+    (summary, event) => {
+      if (event.type !== 'model_usage') return summary;
+      return {
+        inputTokens: summary.inputTokens + (event.inputTokens ?? 0),
+        outputTokens: summary.outputTokens + (event.outputTokens ?? 0),
+        totalTokens: summary.totalTokens + (event.inputTokens ?? 0) + (event.outputTokens ?? 0),
+        modelName: event.model || summary.modelName,
+      };
+    },
+    { inputTokens: 0, outputTokens: 0, totalTokens: 0, modelName: '' },
+  );
+}
+
+function formatDuration(durationMs: number): string {
+  if (durationMs < 1000) return `${durationMs}ms`;
+  return `${(durationMs / 1000).toFixed(1)}s`;
+}
+
+function WorkflowPanel({
+  fixtureId,
+  mode,
+  replay,
+  saving,
+  saveError,
+  onSave,
+}: {
+  fixtureId: string;
+  mode: ReplayMode;
+  replay: ReplayState | null;
+  saving: boolean;
+  saveError: string | null;
+  onSave: () => void;
+}) {
   const [copied, setCopied] = React.useState<string | null>(null);
+  const artifactPath = replay?.savedPath ?? 'artifacts/replays/<replay>.json';
   const commands = [
     {
       id: 'live',
@@ -359,7 +596,7 @@ function WorkflowPanel({ fixtureId, mode }: { fixtureId: string; mode: ReplayMod
     {
       id: 'promote',
       label: 'Promote reviewed replay',
-      command: 'npm run promote:replay -- artifacts/replays/<replay>.json',
+      command: `npm run promote:replay -- ${artifactPath}`,
     },
     {
       id: 'regression',
@@ -389,6 +626,14 @@ function WorkflowPanel({ fixtureId, mode }: { fixtureId: string; mode: ReplayMod
           <li>Promote reviewed replay</li>
           <li>Regression test promoted fixture</li>
         </ol>
+        <div className="saveReplay">
+          <button type="button" onClick={onSave} disabled={!replay || saving}>
+            <Save size={15} />
+            <span>{saving ? 'Saving' : replay?.savedPath ? 'Saved' : 'Save Replay'}</span>
+          </button>
+          <code>{replay?.savedPath ?? 'No saved artifact yet'}</code>
+          {saveError ? <p>{saveError}</p> : null}
+        </div>
         <div className="commandList">
           {commands.map((item) => (
             <div className="commandRow" key={item.id}>
@@ -403,6 +648,77 @@ function WorkflowPanel({ fixtureId, mode }: { fixtureId: string; mode: ReplayMod
                 {copied === item.id ? <Check size={15} /> : <Clipboard size={15} />}
               </button>
             </div>
+          ))}
+        </div>
+      </div>
+    </Panel>
+  );
+}
+
+function ReplayHistoryPanel({
+  replays,
+  loading,
+  error,
+  promotingPath,
+  promoteResult,
+  onRefresh,
+  onPromote,
+}: {
+  replays: SavedReplaySummary[];
+  loading: boolean;
+  error: string | null;
+  promotingPath: string | null;
+  promoteResult: PromoteResult | null;
+  onRefresh: () => void;
+  onPromote: (path: string) => void;
+}) {
+  const visibleReplays = replays.slice(0, 5);
+  return (
+    <Panel title="Replay History" icon={<History size={17} />}>
+      <div className="historyPanel">
+        <button className="secondaryAction" type="button" onClick={onRefresh} disabled={loading}>
+          <RefreshCw size={15} />
+          <span>{loading ? 'Evaluating' : 'Evaluate Replays'}</span>
+        </button>
+        {error ? <div className="errorState compact">{error}</div> : null}
+        {promoteResult ? (
+          <div className="historySuccess">
+            <strong>Promoted</strong>
+            <code>{promoteResult.path}</code>
+          </div>
+        ) : null}
+        {!loading && visibleReplays.length === 0 ? <div className="emptyState compact">No saved replays found.</div> : null}
+        <div className="historyList">
+          {visibleReplays.map((replay) => (
+            <article className="historyItem" key={replay.path}>
+              <div className="historyHeader">
+                <strong>{replay.fixture.id}</strong>
+                <span className={replay.evalOk ? 'statusPill good' : 'statusPill bad'}>{replay.evalOk ? 'pass' : 'fail'}</span>
+              </div>
+              <div className="historyMeta">
+                <span>{replay.provider.id} / {replay.provider.model}</span>
+                <span>{replay.recommendationCount} recs</span>
+                <span>{replay.usage.totalTokens.toLocaleString()} tokens</span>
+                <span>{formatDuration(replay.durationMs)}</span>
+              </div>
+              <code>{replay.path}</code>
+              {replay.issues.length ? (
+                <ul className="issueList">
+                  {replay.issues.slice(0, 2).map((issue) => (
+                    <li key={`${replay.path}-${issue.path}-${issue.message}`}>{issue.path}: {issue.message}</li>
+                  ))}
+                </ul>
+              ) : null}
+              <button
+                className="secondaryAction"
+                type="button"
+                onClick={() => onPromote(replay.path)}
+                disabled={!replay.evalOk || promotingPath === replay.path}
+              >
+                <Save size={15} />
+                <span>{promotingPath === replay.path ? 'Promoting' : 'Promote'}</span>
+              </button>
+            </article>
           ))}
         </div>
       </div>

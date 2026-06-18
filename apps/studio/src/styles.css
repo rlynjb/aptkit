@@ -335,6 +335,159 @@ h1 {
   margin-top: 5px;
 }
 
+.saveReplay {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid #d8e7dd;
+  border-radius: 6px;
+  background: #f2faf5;
+}
+
+.saveReplay button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 34px;
+  border: 1px solid #24483a;
+  border-radius: 6px;
+  background: #24483a;
+  color: #ffffff;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.saveReplay button:disabled {
+  cursor: not-allowed;
+  opacity: 0.68;
+}
+
+.saveReplay code {
+  color: #24362e;
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.saveReplay p {
+  margin: 0;
+  color: #842d24;
+  font-size: 12px;
+  font-weight: 750;
+  line-height: 1.4;
+}
+
+.historyPanel {
+  display: grid;
+  gap: 10px;
+}
+
+.secondaryAction {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 34px;
+  border: 1px solid #cfd8d1;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #31453b;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.secondaryAction:disabled {
+  cursor: not-allowed;
+  opacity: 0.65;
+}
+
+.historySuccess {
+  display: grid;
+  gap: 4px;
+  padding: 10px;
+  border: 1px solid #d8e7dd;
+  border-radius: 6px;
+  background: #f2faf5;
+}
+
+.historySuccess strong {
+  color: #145438;
+  font-size: 13px;
+}
+
+.historySuccess code,
+.historyItem code {
+  color: #24362e;
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.historyList {
+  display: grid;
+  gap: 10px;
+}
+
+.historyItem {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid #e2e7e0;
+  border-radius: 6px;
+  background: #fafbf9;
+}
+
+.historyHeader {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.historyHeader strong {
+  color: #1d2420;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.statusPill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 0 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.statusPill.good {
+  color: #145438;
+  background: #e3f3ea;
+}
+
+.statusPill.bad {
+  color: #842d24;
+  background: #fae7e4;
+}
+
+.historyMeta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.historyMeta span {
+  color: #5e6d64;
+  font-size: 12px;
+  font-weight: 700;
+}
+
 .commandList {
   display: grid;
   gap: 8px;
@@ -405,6 +558,11 @@ h1 {
 .emptyState.compact {
   min-height: 38px;
   margin-bottom: 8px;
+  font-size: 13px;
+}
+
+.errorState.compact {
+  min-height: 38px;
   font-size: 13px;
 }
 

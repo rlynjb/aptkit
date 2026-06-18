@@ -1,0 +1,157 @@
+{
+  "id": "voucher-dropoff-w10-on-openai-promoted",
+  "description": "Promoted deterministic fixture from openai replay artifact. Source fixture: voucher-dropoff-w10-on. Replay created at: 2026-06-18T17:20:55.422Z.",
+  "workspace": {
+    "projectId": "olist",
+    "projectName": "Olist Brazilian ecommerce fixture",
+    "events": [
+      {
+        "name": "order",
+        "properties": [
+          "state",
+          "category",
+          "purchase_ts",
+          "price_brl"
+        ],
+        "eventCount": 0
+      },
+      {
+        "name": "payment",
+        "properties": [
+          "type",
+          "installments",
+          "value_brl"
+        ],
+        "eventCount": 0
+      }
+    ],
+    "customerProperties": [
+      "state",
+      "city"
+    ],
+    "catalogs": [],
+    "totalCustomers": 0,
+    "totalEvents": 0,
+    "oldestTimestamp": null,
+    "dataHorizon": {
+      "from": "2025-12-01",
+      "to": "2026-06-01",
+      "durationDays": 182
+    }
+  },
+  "anomaly": {
+    "metric": "payment_value",
+    "scope": [
+      "payment_type:voucher"
+    ],
+    "change": {
+      "value": 95,
+      "direction": "down",
+      "baseline": "weeks 10-26 vs weeks 1-9 baseline"
+    },
+    "severity": "critical",
+    "evidence": [],
+    "impact": "Voucher payment value collapsed to about 5% of baseline and stayed depressed."
+  },
+  "diagnosis": {
+    "conclusion": "Voucher payment volume collapsed to roughly 5% of baseline starting week 10 and remained depressed through the end of the data horizon. Credit card and boleto did not absorb the lost volume, and order count fell, so this is likely a program-level voucher change rather than clean substitution.",
+    "evidence": [
+      "get_anomaly_context(metric=payment_value, dimension=payment_type, segment=voucher) returned pct_change=-0.95 for weeks 10-26.",
+      "Credit_card and boleto did not rise enough to absorb the lost voucher volume.",
+      "Total order_count was about 8% below baseline after the voucher cliff.",
+      "The drop was uniform across SP, RJ, and MG."
+    ],
+    "hypothesesConsidered": [
+      {
+        "hypothesis": "Voucher volume substituted to credit card or boleto",
+        "supported": false,
+        "reasoning": "Other payment types did not rise and total order count fell."
+      },
+      {
+        "hypothesis": "Program-level voucher change",
+        "supported": true,
+        "reasoning": "The cliff-shaped onset and sustained cross-state impact fit suspension, expiry, or restriction."
+      }
+    ],
+    "affectedCustomers": {
+      "count": 12500,
+      "segmentDescription": "Customers who previously used voucher payment in weeks 1-9"
+    },
+    "confidence": "medium"
+  },
+  "tools": [
+    {
+      "name": "list_voucher_pools",
+      "description": "List voucher pools",
+      "inputSchema": {
+        "type": "object"
+      },
+      "result": {
+        "data": []
+      }
+    },
+    {
+      "name": "list_email_campaigns",
+      "description": "List email campaigns",
+      "inputSchema": {
+        "type": "object"
+      },
+      "result": {
+        "data": [
+          {
+            "name": "inactive customer broadcast"
+          }
+        ]
+      }
+    },
+    {
+      "name": "get_frequency_policies",
+      "description": "List frequency policies",
+      "inputSchema": {
+        "type": "object"
+      },
+      "result": {
+        "data": [
+          {
+            "name": "one marketing message per week"
+          }
+        ]
+      }
+    }
+  ],
+  "modelResponses": [
+    {
+      "content": [
+        {
+          "type": "text",
+          "text": "```json\n[\n  {\n    \"title\": \"Reactivate Voucher Incentives for Lost Voucher Users\",\n    \"rationale\": \"A sudden and sustained drop in voucher usage affected ~12,500 customers and led to an 8% overall order decline. To recover lost conversion, an automated scenario targeting voucher users pre-week 10 should reintroduce vouchers or explain changes.\",\n    \"bloomreachFeature\": \"scenario\",\n    \"steps\": [\n      \"Define a scenario targeting customers who used vouchers in weeks 1-9 but not since week 10.\",\n      \"Trigger personalized emails or SMS with a new time-limited voucher and/or messaging about ongoing incentives.\",\n      \"Monitor reactivation and payment type preferences of re-engaged customers.\"\n    ],\n    \"estimatedImpact\": {\n      \"range\": \"high (potential to recover up to 8% of lost orders)\",\n      \"rangeUsd\": {\n        \"low\": 25000,\n        \"high\": 80000\n      },\n      \"assumption\": \"Assumes recovery of 20-65% of lost voucher user purchase value over the next month; number derived from baseline order drop and typical voucher-driven order value.\"\n    },\n    \"confidence\": \"high\",\n    \"effort\": \"medium\",\n    \"timeToSetUpMinutes\": 120,\n    \"readResultInDays\": 14,\n    \"prerequisites\": [\n      {\n        \"label\": \"Ability to identify customers who used vouchers in weeks 1-9\",\n        \"satisfied\": true\n      },\n      {\n        \"label\": \"Active voucher pool to assign new codes\",\n        \"satisfied\": false\n      },\n      {\n        \"label\": \"Automated messaging channel configured\",\n        \"satisfied\": true\n      }\n    ],\n    \"successMetric\": \"Order count for former voucher users: baseline ~12,500 orders per 9 weeks vs. target recovery of 4,000+ incremental orders in 4 weeks\"\n  },\n  {\n    \"title\": \"Segment and Analyze Voucher-Dependent Customers\",\n    \"rationale\": \"To tailor recovery efforts and long-term programs, cluster and analyze the cohort most affected - voucher users pre-week 10 - to understand their demographics, product categories, and payment alternatives.\",\n    \"bloomreachFeature\": \"segment\",\n    \"steps\": [\n      \"Create a segment of all customers who made a voucher payment in weeks 1-9 and none since week 10.\",\n      \"Analyze their order history, geolocation (SP, RJ, MG), and basket composition.\",\n      \"Surface insights for targeted marketing or product adjustments.\"\n    ],\n    \"estimatedImpact\": \"medium (enables improved targeting, likely indirect financial impact via future campaigns)\",\n    \"confidence\": \"medium\",\n    \"effort\": \"low\",\n    \"timeToSetUpMinutes\": 45,\n    \"readResultInDays\": 3,\n    \"prerequisites\": [\n      {\n        \"label\": \"Access to historical payment and customer data\",\n        \"satisfied\": true\n      }\n    ],\n    \"successMetric\": \"Segment created, >10,000 affected customers accurately identified; subsequent campaign conversion rate >10% above average\"\n  },\n  {\n    \"title\": \"Campaign: Communicate Voucher Program Changes and Alternatives\",\n    \"rationale\": \"Customer confusion over voucher policy changes may have contributed to order drop. A broadcast campaign clarifying changes, new incentives, or alternative payment benefits can ease friction and reduce churn.\",\n    \"bloomreachFeature\": \"campaign\",\n    \"steps\": [\n      \"Draft clear communication explaining reasons for voucher changes or expiry.\",\n      \"Offer incentives for alternative payments (e.g., installment plans, first purchase cashback).\",\n      \"Send campaign to all impacted voucher users and monitor engagement.\"\n    ],\n    \"estimatedImpact\": {\n      \"range\": \"low to moderate (~3-5% win-back of lost orders)\",\n      \"rangeUsd\": {\n        \"low\": 10000,\n        \"high\": 25000\n      },\n      \"assumption\": \"Assumes 25-40% open rate with 5-10% conversion among recipients.\"\n    },\n    \"confidence\": \"medium\",\n    \"effort\": \"low\",\n    \"timeToSetUpMinutes\": 60,\n    \"readResultInDays\": 7,\n    \"prerequisites\": [\n      {\n        \"label\": \"Up-to-date communication list of all affected users\",\n        \"satisfied\": true\n      },\n      {\n        \"label\": \"Clarity on voucher program changes and new offers\",\n        \"satisfied\": false\n      }\n    ],\n    \"successMetric\": \"Open rate > 25%, click-through > 5%, incremental orders attributable to campaign > 400 within two weeks\"\n  }\n]\n```"
+        }
+      ],
+      "usage": {
+        "inputTokens": 1052,
+        "outputTokens": 950,
+        "estimated": true
+      },
+      "model": "promoted-openai-replay"
+    }
+  ],
+  "eval": {
+    "requiredFields": [
+      "0.title",
+      "0.rationale",
+      "0.bloomreachFeature",
+      "0.steps",
+      "0.estimatedImpact",
+      "0.confidence"
+    ]
+  },
+  "promotion": {
+    "sourceArtifact": "artifacts/replays/2026-06-18T17-20-55-422Z-voucher-dropoff-w10-on-openai-studio.json",
+    "sourceProvider": {
+      "id": "openai",
+      "model": "gpt-4.1-2025-04-14"
+    },
+    "promotedAt": "2026-06-18T17:27:18.678Z",
+    "note": "This fixture captures the final replay answer deterministically; it does not reconstruct the live provider tool loop."
+  }
+}
