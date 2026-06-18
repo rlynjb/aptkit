@@ -34,7 +34,7 @@ Maturity follows the plan's Level 0-6 model, where Level 6 means a reusable pack
 | P0 | `capability-trace-events` | Agent event trace contract | Utility | `blooming_insights` | `packages/runtime` | High | Packaged |
 | P0 | `tool-registry` | Tool/data-source seam | Tool | `blooming_insights` | `packages/tools` | High | Packaged |
 | P0 | `json-output-extractor` | Structured-output parser and validators | Utility | `blooming_insights`, `dryrun` | `packages/runtime` | High | Packaged |
-| P0 | `ndjson-event-streaming` | NDJSON event streaming utility | Utility | `blooming_insights` | `packages/runtime` | High | Candidate |
+| P0 | `ndjson-event-streaming` | NDJSON event streaming utility | Utility | `blooming_insights` | `packages/runtime` | High | Packaged |
 | P0 | `recommendation-agent` | Recommendation agent | Agent | `blooming_insights` | `packages/agents/recommendation` | Medium | Packaged |
 | P1 | `anomaly-monitoring-agent` | Monitoring/anomaly detection agent | Agent | `blooming_insights` | `packages/agents/anomaly-monitoring` | Medium | Packaged |
 | P1 | `diagnostic-investigation-agent` | Diagnostic investigation agent | Agent | `blooming_insights` | `packages/agents/diagnostic-investigation` | Medium | Packaged |
