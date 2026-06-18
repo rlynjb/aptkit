@@ -43,7 +43,7 @@ Maturity follows the plan's Level 0-6 model, where Level 6 means a reusable pack
 | P1 | `tool-policy-manifest` | Tool allowlist manifests | Tool | `blooming_insights` | `packages/tools` | High | Packaged |
 | P1 | `workspace-descriptor` | Workspace/schema summarizer | Utility | `blooming_insights` | `packages/context` | Medium | Packaged |
 | P1 | `capability-coverage-gate` | Capability coverage gate | Utility | `blooming_insights` | `packages/tools` | Medium | Packaged |
-| P1 | `provider-fallback-chain` | Provider fallback chain | Provider | `dryrun` | `packages/providers` | High | Candidate |
+| P1 | `provider-fallback-chain` | Provider fallback chain | Provider | `dryrun` | `packages/providers/fallback` | High | Packaged |
 | P1 | `usage-ledger` | LLM progress and usage accounting | Utility | `dryrun` | `packages/runtime` | Medium | Packaged |
 | P1 | `structured-generation` | On-device JSON retry/fallback pipeline | Utility | `dryrun` | `packages/runtime` or `packages/providers/local` | Medium | Candidate |
 | P1 | `local-context-guard` | Local model context-window guard | Provider | `dryrun` | `packages/providers/local` | Medium | Design only |
