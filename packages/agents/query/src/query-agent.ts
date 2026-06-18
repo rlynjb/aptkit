@@ -1,6 +1,6 @@
 import { buildSynthesisInstruction, runAgentLoop, type CapabilityTraceSink, type ModelProvider } from '@aptkit/runtime';
+import { queryPromptPackage, renderPromptTemplate } from '@aptkit/prompts';
 import { filterToolsForPolicy, type ToolRegistry } from '@aptkit/tools';
-import { QUERY_PROMPT } from './query-prompt.js';
 import { schemaSummary } from './schema-summary.js';
 import type { Intent, WorkspaceDescriptor } from './types.js';
 
@@ -67,17 +67,18 @@ export class QueryAgent {
   private readonly prompt: string;
 
   constructor(private readonly options: QueryAgentOptions) {
-    this.prompt = options.prompt ?? QUERY_PROMPT;
+    this.prompt = options.prompt ?? queryPromptPackage.system;
   }
 
   async answer(question: string, runOptions: QueryRunOptions = {}): Promise<string> {
     const allTools = await this.options.tools.listTools();
     const toolSchemas = filterToolsForPolicy(allTools, queryToolPolicy);
     const intent = runOptions.intent ?? 'diagnostic';
-    const system = this.prompt
-      .replace('{schema}', schemaSummary(this.options.workspace))
-      .replace(/\{project_id\}/g, this.options.workspace.projectId)
-      .replace(/\{intent\}/g, intent);
+    const system = renderPromptTemplate(this.prompt, {
+      schema: schemaSummary(this.options.workspace),
+      project_id: this.options.workspace.projectId,
+      intent,
+    });
 
     const { finalText } = await runAgentLoop({
       capabilityId: QUERY_CAPABILITY_ID,

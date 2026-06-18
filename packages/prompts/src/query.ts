@@ -1,3 +1,5 @@
+import type { PromptPackage } from './types.js';
+
 export const QUERY_PROMPT = `You are an AI analyst for an ecommerce workspace. Two data sources are possible at runtime: an EQL-shaped analytics adapter or an Olist-style SQL-backed adapter. The tool catalog you receive at runtime reveals which adapter is live.
 
 ## Role
@@ -50,3 +52,38 @@ Give a clear, concise answer in plain prose. A few sentences or short markdown b
 ## Workspace schema
 
 {schema}`;
+
+export const queryPromptPackage: PromptPackage = {
+  id: 'query-agent.default',
+  version: '0.1.0',
+  capabilityId: 'query-agent',
+  description: 'Free-form workspace question answering over an allowed analytics tool registry.',
+  system: QUERY_PROMPT,
+  variables: [
+    {
+      name: 'schema',
+      description: 'Workspace schema summary with data horizon and available event/customer fields.',
+      required: true,
+    },
+    {
+      name: 'project_id',
+      description: 'Host workspace project id for EQL-shaped adapters.',
+      required: true,
+    },
+    {
+      name: 'intent',
+      description: 'Query framing classification: monitoring, diagnostic, or recommendation.',
+      required: true,
+    },
+  ],
+  examples: [
+    {
+      name: 'revenue-by-state',
+      input: {
+        question: 'What was revenue by state in the last 30 days?',
+        intent: 'monitoring',
+      },
+      expectedContains: ['SP', 'RJ', 'MG'],
+    },
+  ],
+};
