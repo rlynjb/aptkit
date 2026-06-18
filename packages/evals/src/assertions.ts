@@ -33,6 +33,9 @@ export function assertAnomalyShape(output: unknown): EvalAssertionResult {
 }
 
 export function assertCapabilityReplayArtifactShape(output: unknown): EvalAssertionResult {
+  if (isRecord(output) && (output.capabilityId === 'diagnostic-investigation-agent' || isRecord(output.diagnosis))) {
+    return assertDiagnosticReplayArtifactShape(output);
+  }
   if (isRecord(output) && (output.capabilityId === 'anomaly-monitoring-agent' || Array.isArray(output.anomalies))) {
     return assertMonitoringReplayArtifactShape(output);
   }
@@ -178,6 +181,101 @@ export function assertMonitoringReplayArtifactShape(output: unknown): EvalAssert
   }
 
   return { name: 'monitoring-replay-artifact-shape', ok: issues.length === 0, issues };
+}
+
+export function assertDiagnosticShape(output: unknown): EvalAssertionResult {
+  const result = assertRequiredPaths(output, [
+    'conclusion',
+    'evidence',
+    'hypothesesConsidered',
+  ]);
+  const issues = [...result.issues];
+
+  if (!isRecord(output)) {
+    return {
+      name: 'diagnosis-shape',
+      ok: false,
+      issues: [{ path: '', message: 'diagnosis must be an object' }, ...issues],
+    };
+  }
+
+  if (!Array.isArray(output.evidence)) {
+    issues.push({ path: 'evidence', message: 'expected an array' });
+  }
+
+  if (!Array.isArray(output.hypothesesConsidered)) {
+    issues.push({ path: 'hypothesesConsidered', message: 'expected an array' });
+  }
+
+  return { name: 'diagnosis-shape', ok: issues.length === 0, issues };
+}
+
+export function assertDiagnosticReplayArtifactShape(output: unknown): EvalAssertionResult {
+  const result = assertRequiredPaths(output, [
+    'schemaVersion',
+    'capabilityId',
+    'createdAt',
+    'durationMs',
+    'provider.id',
+    'provider.model',
+    'fixture.id',
+    'fixture.path',
+    'diagnosis',
+    'trace',
+    'eval.name',
+    'eval.ok',
+    'modelTurns',
+  ]);
+  const issues = [...result.issues];
+
+  if (!isRecord(output)) {
+    return {
+      name: 'diagnostic-replay-artifact-shape',
+      ok: false,
+      issues: [{ path: '', message: 'artifact must be an object' }, ...issues],
+    };
+  }
+
+  if (output.schemaVersion !== 1) {
+    issues.push({ path: 'schemaVersion', message: 'expected schemaVersion 1' });
+  }
+
+  if (output.capabilityId !== 'diagnostic-investigation-agent') {
+    issues.push({ path: 'capabilityId', message: 'expected diagnostic-investigation-agent' });
+  }
+
+  if (typeof output.createdAt !== 'string' || Number.isNaN(Date.parse(output.createdAt))) {
+    issues.push({ path: 'createdAt', message: 'expected an ISO timestamp string' });
+  }
+
+  if (typeof output.durationMs !== 'number' || output.durationMs < 0) {
+    issues.push({ path: 'durationMs', message: 'expected a non-negative number' });
+  }
+
+  if (typeof output.modelTurns !== 'number' || output.modelTurns < 0) {
+    issues.push({ path: 'modelTurns', message: 'expected a non-negative number' });
+  }
+
+  if (!Array.isArray(output.trace)) {
+    issues.push({ path: 'trace', message: 'expected an array' });
+  }
+
+  const diagnosisResult = assertDiagnosticShape(output.diagnosis);
+  for (const issue of diagnosisResult.issues) {
+    issues.push({ path: `diagnosis.${issue.path}`, message: issue.message });
+  }
+
+  const replayEval = output.eval;
+  if (!isRecord(replayEval) || replayEval.ok !== true) {
+    issues.push({ path: 'eval.ok', message: 'expected embedded replay eval to pass' });
+  }
+
+  const secretIssue = findSecretLikeString(output);
+  if (secretIssue) {
+    issues.push(secretIssue);
+  }
+
+  return { name: 'diagnostic-replay-artifact-shape', ok: issues.length === 0, issues };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

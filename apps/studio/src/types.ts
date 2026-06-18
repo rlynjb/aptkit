@@ -73,6 +73,7 @@ export type DiagnosticReplayState = {
   durationMs: number;
   completedAt: string;
   runId: number;
+  savedPath?: string;
 };
 
 export type DiagnosticReplayResult = Omit<DiagnosticReplayState, 'completedAt' | 'runId'>;
@@ -80,6 +81,8 @@ export type DiagnosticReplayResult = Omit<DiagnosticReplayState, 'completedAt' |
 export type ReplayMode = 'fixture' | 'anthropic' | 'openai';
 
 export type MonitoringReplayMode = 'fixture' | 'openai';
+
+export type DiagnosticReplayMode = 'fixture' | 'openai';
 
 export type ProviderStatus = Record<ReplayMode, { available: boolean; model: string }>;
 
@@ -149,6 +152,31 @@ export type MonitoringReplayArtifact = {
   modelTurns: number;
 };
 
+export type DiagnosticReplayArtifact = {
+  schemaVersion: 1;
+  capabilityId: 'diagnostic-investigation-agent';
+  createdAt: string;
+  durationMs: number;
+  provider: {
+    id: DiagnosticReplayMode;
+    model: string;
+  };
+  fixture: {
+    id: string;
+    description: string;
+    path: string;
+  };
+  diagnosis: DiagnosticDiagnosis;
+  trace: CapabilityEvent[];
+  costEstimate?: CostEstimate;
+  eval: {
+    name: string;
+    ok: boolean;
+    issues: { path: string; message: string }[];
+  };
+  modelTurns: number;
+};
+
 export type SavedReplaySummary = {
   path: string;
   capabilityId?: string;
@@ -179,6 +207,22 @@ export type SavedMonitoringReplaySummary = {
   issues: { path: string; message: string }[];
   anomalies: MonitoringAnomaly[];
   anomalyCount: number;
+  durationMs: number;
+  modelTurns: number;
+  usage: TokenUsageSummary;
+  costEstimate?: CostEstimate;
+};
+
+export type SavedDiagnosticReplaySummary = {
+  path: string;
+  capabilityId: 'diagnostic-investigation-agent';
+  createdAt: string;
+  provider: { id: string; model: string };
+  fixture: { id: string; description?: string; path?: string };
+  evalOk: boolean;
+  issues: { path: string; message: string }[];
+  diagnosis: DiagnosticDiagnosis;
+  diagnosisPresent: boolean;
   durationMs: number;
   modelTurns: number;
   usage: TokenUsageSummary;
@@ -241,6 +285,13 @@ export type MonitoringPromoteResult = {
   anomalyCount: number;
 };
 
+export type DiagnosticPromoteResult = {
+  path: string;
+  id: string;
+  sourceArtifact: string;
+  diagnosisPresent: boolean;
+};
+
 export type PromotedFixtureSummary = {
   path: string;
   id: string;
@@ -289,6 +340,29 @@ export type PromotedMonitoringFixtureSummary = {
   ok: boolean;
   issues: { path: string; message: string; source: string }[];
   anomalyCount: number;
+  modelTurns: number;
+  usage: TokenUsageSummary;
+  costEstimate?: CostEstimate;
+};
+
+export type PromotedDiagnosticFixtureSummary = {
+  path: string;
+  id: string;
+  description: string;
+  promotion?: {
+    sourceArtifact?: string;
+    sourceProvider?: { id?: string; model?: string };
+    promotedAt?: string;
+  };
+  expectations?: {
+    requiredEvidenceText?: string[];
+    requiredSupportedHypothesisText?: string[];
+  };
+  evalOk: boolean;
+  behaviorOk: boolean;
+  ok: boolean;
+  issues: { path: string; message: string; source: string }[];
+  diagnosisPresent: boolean;
   modelTurns: number;
   usage: TokenUsageSummary;
   costEstimate?: CostEstimate;

@@ -1,9 +1,52 @@
 import type { CapabilityEvent } from '@aptkit/runtime';
 import monitoringFixture from '../../../packages/agents/anomaly-monitoring/fixtures/sp-revenue-monitoring.json';
+import diagnosticFixture from '../../../packages/agents/diagnostic-investigation/fixtures/sp-revenue-diagnostic.json';
 import electronicsSpikeFixture from '../../../packages/agents/recommendation/fixtures/electronics-spike.json';
 import spRevenueDropFixture from '../../../packages/agents/recommendation/fixtures/sp-revenue-drop.json';
 import voucherDropoffFixture from '../../../packages/agents/recommendation/fixtures/voucher-dropoff.json';
-import type { ComparableMonitoringReplay, ComparableReplay, ComparisonState, CostEstimate, MonitoringComparisonState, MonitoringFixture, MonitoringReplayMode, MonitoringReplayArtifact, MonitoringReplayResult, MonitoringReplayState, RecommendationFixture, ReplayArtifact, ReplayMode, ReplayResult, ReplayState, SavedMonitoringReplaySummary, SavedReplaySummary, TokenUsageSummary } from './types';
+import type { ComparableMonitoringReplay, ComparableReplay, ComparisonState, CostEstimate, DiagnosticFixture, DiagnosticReplayArtifact, DiagnosticReplayMode, DiagnosticReplayState, MonitoringComparisonState, MonitoringFixture, MonitoringReplayMode, MonitoringReplayArtifact, MonitoringReplayResult, MonitoringReplayState, RecommendationFixture, ReplayArtifact, ReplayMode, ReplayResult, ReplayState, SavedMonitoringReplaySummary, SavedReplaySummary, TokenUsageSummary } from './types';
+
+export function buildDiagnosticReplayArtifact(
+  fixture: DiagnosticFixture,
+  replay: DiagnosticReplayState,
+  mode: DiagnosticReplayMode,
+  fallbackModel: string,
+): DiagnosticReplayArtifact {
+  const usage = summarizeUsage(replay.trace);
+  const modelName = usage.modelName || fallbackModel;
+  const costEstimate = estimateCost(mode, usage, modelName);
+  return {
+    schemaVersion: 1,
+    capabilityId: 'diagnostic-investigation-agent',
+    createdAt: new Date().toISOString(),
+    durationMs: replay.durationMs,
+    provider: {
+      id: mode,
+      model: modelName,
+    },
+    fixture: {
+      id: fixture.id,
+      description: fixture.description,
+      path: diagnosticFixturePath(fixture.id),
+    },
+    diagnosis: replay.diagnosis,
+    trace: replay.trace,
+    ...(costEstimate ? { costEstimate } : {}),
+    eval: {
+      name: 'diagnosis-shape',
+      ok: replay.evalOk,
+      issues: replay.evalIssueDetails,
+    },
+    modelTurns: replay.modelTurns,
+  };
+}
+
+export function diagnosticFixturePath(fixtureId: string): string {
+  const knownPaths: Record<string, string> = {
+    [diagnosticFixture.id]: 'packages/agents/diagnostic-investigation/fixtures/sp-revenue-diagnostic.json',
+  };
+  return knownPaths[fixtureId] ?? `packages/agents/diagnostic-investigation/fixtures/${fixtureId}.json`;
+}
 
 export function buildMonitoringReplayArtifact(
   fixture: MonitoringFixture,

@@ -1,4 +1,28 @@
-import type { MonitoringFixture, MonitoringPromoteResult, MonitoringReplayResult, MonitoringReplayMode, MonitoringReplayArtifact, PromoteResult, PromotedFixtureSummary, PromotedMonitoringFixtureSummary, RecommendationFixture, ReplayArtifact, ReplayMode, ReplayResult, SavedMonitoringReplaySummary, SavedReplaySummary } from './types';
+import type { DiagnosticFixture, DiagnosticPromoteResult, DiagnosticReplayArtifact, DiagnosticReplayMode, DiagnosticReplayResult, MonitoringFixture, MonitoringPromoteResult, MonitoringReplayResult, MonitoringReplayMode, MonitoringReplayArtifact, PromoteResult, PromotedDiagnosticFixtureSummary, PromotedFixtureSummary, PromotedMonitoringFixtureSummary, RecommendationFixture, ReplayArtifact, ReplayMode, ReplayResult, SavedDiagnosticReplaySummary, SavedMonitoringReplaySummary, SavedReplaySummary } from './types';
+
+export async function runServerDiagnosticReplay(
+  fixture: DiagnosticFixture,
+  mode: Exclude<DiagnosticReplayMode, 'fixture'>,
+): Promise<DiagnosticReplayResult> {
+  const response = await fetch('/api/diagnostic/replay', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ fixtureId: fixture.id, mode }),
+  });
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(payload?.error ?? 'diagnostic replay failed');
+  }
+  return {
+    diagnosis: payload.diagnosis,
+    trace: payload.trace,
+    evalOk: payload.eval.ok,
+    evalIssueDetails: payload.eval.issues,
+    evalIssues: payload.eval.issues.map((issue: { path: string; message: string }) => `${issue.path}: ${issue.message}`),
+    modelTurns: payload.modelTurns,
+    durationMs: payload.durationMs,
+  };
+}
 
 export async function runServerMonitoringReplay(
   fixture: MonitoringFixture,
@@ -45,7 +69,7 @@ export async function runServerReplay(fixture: RecommendationFixture, mode: Excl
   };
 }
 
-export async function saveReplayArtifact(artifact: ReplayArtifact | MonitoringReplayArtifact): Promise<string> {
+export async function saveReplayArtifact(artifact: ReplayArtifact | MonitoringReplayArtifact | DiagnosticReplayArtifact): Promise<string> {
   const response = await fetch('/api/replay/save', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -76,6 +100,15 @@ export async function loadSavedMonitoringReplays(): Promise<SavedMonitoringRepla
   return payload.replays.filter((replay: SavedMonitoringReplaySummary) => replay.capabilityId === 'anomaly-monitoring-agent');
 }
 
+export async function loadSavedDiagnosticReplays(): Promise<SavedDiagnosticReplaySummary[]> {
+  const response = await fetch('/api/replays');
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(payload?.error ?? 'load diagnostic replays failed');
+  }
+  return payload.replays.filter((replay: SavedDiagnosticReplaySummary) => replay.capabilityId === 'diagnostic-investigation-agent');
+}
+
 export async function promoteReplay(path: string): Promise<PromoteResult> {
   const response = await fetch('/api/replays/promote', {
     method: 'POST',
@@ -102,6 +135,19 @@ export async function promoteMonitoringReplay(path: string): Promise<MonitoringP
   return payload;
 }
 
+export async function promoteDiagnosticReplay(path: string): Promise<DiagnosticPromoteResult> {
+  const response = await fetch('/api/diagnostic/replays/promote', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ path }),
+  });
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(payload?.error ?? 'promote diagnostic replay failed');
+  }
+  return payload;
+}
+
 export async function loadPromotedFixtures(): Promise<PromotedFixtureSummary[]> {
   const response = await fetch('/api/promoted-fixtures');
   const payload = await response.json();
@@ -116,6 +162,15 @@ export async function loadPromotedMonitoringFixtures(): Promise<PromotedMonitori
   const payload = await response.json();
   if (!response.ok) {
     throw new Error(payload?.error ?? 'load promoted monitoring fixtures failed');
+  }
+  return payload.fixtures;
+}
+
+export async function loadPromotedDiagnosticFixtures(): Promise<PromotedDiagnosticFixtureSummary[]> {
+  const response = await fetch('/api/promoted-diagnostic-fixtures');
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(payload?.error ?? 'load promoted diagnostic fixtures failed');
   }
   return payload.fixtures;
 }

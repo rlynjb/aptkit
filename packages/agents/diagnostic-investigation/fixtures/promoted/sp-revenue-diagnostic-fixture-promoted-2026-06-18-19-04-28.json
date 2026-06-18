@@ -1,0 +1,230 @@
+{
+  "id": "sp-revenue-diagnostic-fixture-promoted",
+  "description": "Promoted deterministic diagnostic fixture from fixture replay artifact. Source fixture: sp-revenue-diagnostic. Replay created at: 2026-06-18T19:04:28.139Z.",
+  "workspace": {
+    "projectId": "olist",
+    "projectName": "Olist Brazilian ecommerce fixture",
+    "events": [
+      {
+        "name": "purchase",
+        "properties": [
+          "state",
+          "category",
+          "total_price"
+        ],
+        "eventCount": 50000
+      },
+      {
+        "name": "session_start",
+        "properties": [
+          "utm_source"
+        ],
+        "eventCount": 80000
+      },
+      {
+        "name": "checkout",
+        "properties": [
+          "state"
+        ],
+        "eventCount": 35000
+      },
+      {
+        "name": "view_item",
+        "properties": [
+          "category"
+        ],
+        "eventCount": 120000
+      }
+    ],
+    "customerProperties": [
+      "state",
+      "city"
+    ],
+    "catalogs": [],
+    "totalCustomers": 125000,
+    "totalEvents": 285000,
+    "oldestTimestamp": 1764547200000,
+    "dataHorizon": {
+      "from": "2025-12-01",
+      "to": "2026-06-01",
+      "durationDays": 182
+    }
+  },
+  "anomaly": {
+    "metric": "revenue",
+    "category": "revenue_drop",
+    "scope": [
+      "state:SP"
+    ],
+    "change": {
+      "value": 30,
+      "direction": "down",
+      "baseline": "recent 4w vs prior 12w"
+    },
+    "severity": "critical",
+    "impact": "Sao Paulo revenue is down about 30% while nearby states are stable.",
+    "evidence": [
+      {
+        "tool": "get_anomaly_context",
+        "result": {
+          "segment": "SP",
+          "pct_change": -0.300245,
+          "anomaly_value": 28550000,
+          "baseline_avg": 40800000
+        }
+      }
+    ]
+  },
+  "tools": [
+    {
+      "name": "get_anomaly_context",
+      "description": "Return context for a selected anomaly window and baseline.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "metric": {
+            "type": "string"
+          },
+          "dimension": {
+            "type": "string"
+          },
+          "segment": {
+            "type": "string"
+          },
+          "anomaly_window": {
+            "type": "object"
+          },
+          "baseline_window": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "metric",
+          "dimension",
+          "segment"
+        ]
+      },
+      "result": {
+        "anomaly_summary": {
+          "metric": "revenue",
+          "segment": "SP",
+          "anomaly_value": 28550000,
+          "baseline_avg": 40800000,
+          "pct_change": -0.300245
+        },
+        "related_segments": [
+          {
+            "name": "RJ",
+            "pct_change": -0.02
+          },
+          {
+            "name": "MG",
+            "pct_change": 0.01
+          }
+        ],
+        "sample_orders": [
+          {
+            "order_id": "sp-101",
+            "purchase_ts": "2026-05-10",
+            "status": "delivered",
+            "price_brl": 42000
+          },
+          {
+            "order_id": "sp-102",
+            "purchase_ts": "2026-05-23",
+            "status": "delivered",
+            "price_brl": 31000
+          }
+        ]
+      }
+    },
+    {
+      "name": "get_metric_timeseries",
+      "description": "Return metric timeseries for an optional dimension.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "metric": {
+            "type": "string"
+          },
+          "dimension": {
+            "type": "string"
+          },
+          "filter": {
+            "type": "object"
+          },
+          "time_range": {
+            "type": "object"
+          },
+          "granularity": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "metric",
+          "time_range"
+        ]
+      },
+      "result": {
+        "points": [
+          {
+            "ts": "2026-05-04",
+            "segment": "SP",
+            "value": 7400000
+          },
+          {
+            "ts": "2026-05-11",
+            "segment": "SP",
+            "value": 7200000
+          },
+          {
+            "ts": "2026-05-18",
+            "segment": "SP",
+            "value": 7050000
+          },
+          {
+            "ts": "2026-05-25",
+            "segment": "SP",
+            "value": 6900000
+          }
+        ],
+        "totalCount": 4200
+      }
+    }
+  ],
+  "modelResponses": [
+    {
+      "content": [
+        {
+          "type": "text",
+          "text": "```json\n{\n  \"conclusion\": \"The SP revenue drop is isolated to Sao Paulo and is best explained by a regional demand or operations issue rather than broad marketplace seasonality. SP revenue fell about 30% versus baseline while RJ and MG were nearly flat, and the weekly series shows a steady slide through May.\",\n  \"evidence\": [\n    \"get_anomaly_context reported SP revenue of 28,550,000 against a 40,800,000 baseline average, a -30.0245% change.\",\n    \"Related segments did not move with SP: RJ was -2% and MG was +1%.\",\n    \"The SP weekly revenue series declined from 7,400,000 to 6,900,000 across the anomaly window.\"\n  ],\n  \"hypothesesConsidered\": [\n    {\n      \"hypothesis\": \"Broad marketplace seasonality\",\n      \"supported\": false,\n      \"reasoning\": \"Related state segments were nearly flat, so the pattern is not broad.\"\n    },\n    {\n      \"hypothesis\": \"Sao Paulo-specific demand or operations issue\",\n      \"supported\": true,\n      \"reasoning\": \"The magnitude is concentrated in SP and persists across the anomaly weeks.\"\n    },\n    {\n      \"hypothesis\": \"One-week reporting gap\",\n      \"supported\": false,\n      \"reasoning\": \"The timeseries shows a gradual weekly slide rather than a sudden zero or missing week.\"\n    }\n  ],\n  \"timeSeries\": [\n    {\n      \"day\": \"w-3\",\n      \"value\": 7400000\n    },\n    {\n      \"day\": \"w-2\",\n      \"value\": 7200000\n    },\n    {\n      \"day\": \"w-1\",\n      \"value\": 7050000\n    },\n    {\n      \"day\": \"this week\",\n      \"value\": 6900000\n    }\n  ],\n  \"confidence\": \"high\"\n}\n```"
+        }
+      ],
+      "usage": {
+        "inputTokens": 2920,
+        "outputTokens": 425,
+        "estimated": true
+      },
+      "model": "promoted-fixture-replay"
+    }
+  ],
+  "expectations": {
+    "requiredEvidenceText": [
+      "get_anomaly_context reported SP revenue of 28",
+      "Related segments did not move with",
+      "The SP weekly revenue series declined"
+    ],
+    "requiredSupportedHypothesisText": [
+      "Sao Paulo-specific demand or operations issue"
+    ]
+  },
+  "promotion": {
+    "sourceArtifact": "artifacts/replays/2026-06-18T19-04-28-139Z-sp-revenue-diagnostic-fixture-studio.json",
+    "sourceProvider": {
+      "id": "fixture",
+      "model": "fixture-model"
+    },
+    "promotedAt": "2026-06-18T19:12:30.863Z",
+    "note": "This fixture captures the final diagnostic replay answer deterministically; it does not reconstruct the live provider tool loop."
+  }
+}

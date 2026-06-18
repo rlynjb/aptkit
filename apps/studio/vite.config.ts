@@ -8,9 +8,18 @@ import {
   FixtureModelProvider as MonitoringFixtureModelProvider,
   validateAnomalies,
 } from '@aptkit/agent-anomaly-monitoring';
+import {
+  DiagnosticInvestigationAgent,
+  FixtureModelProvider as DiagnosticFixtureModelProvider,
+  validateDiagnosis,
+  type Anomaly as DiagnosticAnomaly,
+  type Diagnosis as DiagnosticDiagnosis,
+  type WorkspaceDescriptor as DiagnosticWorkspaceDescriptor,
+} from '@aptkit/agent-diagnostic-investigation';
 import { RecommendationAgent, FixtureModelProvider } from '@aptkit/agent-recommendation';
 import {
   assertCapabilityReplayArtifactShape,
+  assertDiagnosticReplayArtifactShape,
   assertMonitoringReplayArtifactShape,
   assertRecommendationShape,
   assertReplayArtifactShape,
@@ -22,6 +31,7 @@ import type { CapabilityEvent, ModelProvider, ModelResponse } from '@aptkit/runt
 import type { Anomaly, Diagnosis, Recommendation, WorkspaceDescriptor } from '@aptkit/agent-recommendation';
 import type { Anomaly as MonitoringAnomaly, WorkspaceDescriptor as MonitoringWorkspaceDescriptor } from '@aptkit/agent-anomaly-monitoring';
 import monitoringFixture from '../../packages/agents/anomaly-monitoring/fixtures/sp-revenue-monitoring.json';
+import diagnosticFixture from '../../packages/agents/diagnostic-investigation/fixtures/sp-revenue-diagnostic.json';
 import electronicsSpikeFixture from '../../packages/agents/recommendation/fixtures/electronics-spike.json';
 import spRevenueDropFixture from '../../packages/agents/recommendation/fixtures/sp-revenue-drop.json';
 import voucherDropoffFixture from '../../packages/agents/recommendation/fixtures/voucher-dropoff.json';
@@ -29,6 +39,8 @@ import voucherDropoffFixture from '../../packages/agents/recommendation/fixtures
 type ReplayMode = 'fixture' | 'anthropic' | 'openai';
 
 type MonitoringReplayMode = 'fixture' | 'openai';
+
+type DiagnosticReplayMode = 'fixture' | 'openai';
 
 type FixtureTool = ToolDefinition & { result: unknown };
 
@@ -62,6 +74,21 @@ type MonitoringFixture = {
   };
 };
 
+type DiagnosticFixture = {
+  id: string;
+  description: string;
+  workspace: DiagnosticWorkspaceDescriptor;
+  anomaly: DiagnosticAnomaly;
+  tools: FixtureTool[];
+  modelResponses: ModelResponse[];
+  expectations?: DiagnosticBehaviorExpectations;
+  promotion?: {
+    sourceArtifact?: string;
+    sourceProvider?: { id?: string; model?: string };
+    promotedAt?: string;
+  };
+};
+
 type BehavioralExpectations = {
   requiredFeatures?: string[];
   requiredText?: string[];
@@ -73,6 +100,11 @@ type MonitoringBehaviorExpectations = {
   requiredMetrics?: string[];
   requiredScopes?: string[];
   requiredSeverities?: string[];
+};
+
+type DiagnosticBehaviorExpectations = {
+  requiredEvidenceText?: string[];
+  requiredSupportedHypothesisText?: string[];
 };
 
 type TokenUsageSummary = {
@@ -100,6 +132,10 @@ const fixtures = [
 const monitoringFixtures = [
   monitoringFixture,
 ] as MonitoringFixture[];
+
+const diagnosticFixtures = [
+  diagnosticFixture,
+] as DiagnosticFixture[];
 
 export default defineConfig(({ mode }) => {
   const env = loadStudioEnv(mode);
@@ -156,6 +192,21 @@ export default defineConfig(({ mode }) => {
             }
           });
 
+          server.middlewares.use('/api/promoted-diagnostic-fixtures', async (req, res) => {
+            if (req.method !== 'GET') {
+              res.statusCode = 405;
+              sendJson(res, { error: 'method not allowed' });
+              return;
+            }
+
+            try {
+              sendJson(res, { fixtures: await listPromotedDiagnosticFixtureSummaries() });
+            } catch (error) {
+              res.statusCode = 400;
+              sendJson(res, { error: error instanceof Error ? error.message : String(error) });
+            }
+          });
+
           server.middlewares.use('/api/monitoring/replays/promote', async (req, res) => {
             if (req.method !== 'POST') {
               res.statusCode = 405;
@@ -167,6 +218,24 @@ export default defineConfig(({ mode }) => {
               const body = await readJsonBody(req);
               const artifactPath = resolveReplayPath(body.path);
               const result = await promoteMonitoringReplayArtifact(artifactPath);
+              sendJson(res, result);
+            } catch (error) {
+              res.statusCode = 400;
+              sendJson(res, { error: error instanceof Error ? error.message : String(error) });
+            }
+          });
+
+          server.middlewares.use('/api/diagnostic/replays/promote', async (req, res) => {
+            if (req.method !== 'POST') {
+              res.statusCode = 405;
+              sendJson(res, { error: 'method not allowed' });
+              return;
+            }
+
+            try {
+              const body = await readJsonBody(req);
+              const artifactPath = resolveReplayPath(body.path);
+              const result = await promoteDiagnosticReplayArtifact(artifactPath);
               sendJson(res, result);
             } catch (error) {
               res.statusCode = 400;
@@ -240,6 +309,25 @@ export default defineConfig(({ mode }) => {
               const fixture = monitoringFixtures.find((candidate) => candidate.id === body.fixtureId) ?? monitoringFixtures[0];
               const mode = parseMonitoringMode(body.mode);
               const result = await runMonitoringReplay(fixture, mode);
+              sendJson(res, result);
+            } catch (error) {
+              res.statusCode = 400;
+              sendJson(res, { error: error instanceof Error ? error.message : String(error) });
+            }
+          });
+
+          server.middlewares.use('/api/diagnostic/replay', async (req, res) => {
+            if (req.method !== 'POST') {
+              res.statusCode = 405;
+              sendJson(res, { error: 'method not allowed' });
+              return;
+            }
+
+            try {
+              const body = await readJsonBody(req);
+              const fixture = diagnosticFixtures.find((candidate) => candidate.id === body.fixtureId) ?? diagnosticFixtures[0];
+              const mode = parseDiagnosticMode(body.mode);
+              const result = await runDiagnosticReplay(fixture, mode);
               sendJson(res, result);
             } catch (error) {
               res.statusCode = 400;
@@ -344,6 +432,43 @@ async function runMonitoringReplay(fixture: MonitoringFixture, mode: MonitoringR
   };
 }
 
+async function runDiagnosticReplay(fixture: DiagnosticFixture, mode: DiagnosticReplayMode) {
+  const startedAt = Date.now();
+  const handlers: Record<string, ToolHandler> = {};
+  for (const tool of fixture.tools) {
+    handlers[tool.name] = () => tool.result;
+  }
+
+  const model = createDiagnosticModelProvider(fixture, mode);
+  const tools = new InMemoryToolRegistry(fixture.tools, handlers);
+  const trace: CapabilityEvent[] = [];
+  const agent = new DiagnosticInvestigationAgent({
+    model,
+    tools,
+    workspace: fixture.workspace,
+    trace: { emit: (event) => trace.push(event) },
+  });
+
+  const diagnosis = await agent.investigate(fixture.anomaly) as DiagnosticDiagnosis;
+  const validation = validateDiagnosis(diagnosis);
+  const issues = validation.ok ? [] : [{ path: 'diagnosis', message: validation.error }];
+
+  return {
+    fixture: fixture.id,
+    fixtureDescription: fixture.description,
+    mode,
+    diagnosis,
+    trace,
+    eval: {
+      name: 'diagnosis-shape',
+      ok: validation.ok,
+      issues,
+    },
+    modelTurns: trace.filter((event) => event.type === 'model_usage').length,
+    durationMs: Date.now() - startedAt,
+  };
+}
+
 function createModelProvider(fixture: RecommendationFixture, mode: ReplayMode): ModelProvider {
   if (mode === 'fixture') return new FixtureModelProvider(fixture.modelResponses);
   if (mode === 'anthropic') {
@@ -358,6 +483,13 @@ function createModelProvider(fixture: RecommendationFixture, mode: ReplayMode): 
 
 function createMonitoringModelProvider(fixture: MonitoringFixture, mode: MonitoringReplayMode): ModelProvider {
   if (mode === 'fixture') return new MonitoringFixtureModelProvider(fixture.modelResponses);
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) throw new Error('OPENAI_API_KEY is not configured');
+  return new OpenAIModelProvider({ apiKey, model: process.env.OPENAI_MODEL });
+}
+
+function createDiagnosticModelProvider(fixture: DiagnosticFixture, mode: DiagnosticReplayMode): ModelProvider {
+  if (mode === 'fixture') return new DiagnosticFixtureModelProvider(fixture.modelResponses);
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) throw new Error('OPENAI_API_KEY is not configured');
   return new OpenAIModelProvider({ apiKey, model: process.env.OPENAI_MODEL });
@@ -396,6 +528,11 @@ function parseMode(value: unknown): ReplayMode {
 }
 
 function parseMonitoringMode(value: unknown): MonitoringReplayMode {
+  if (value === 'openai') return 'openai';
+  return 'fixture';
+}
+
+function parseDiagnosticMode(value: unknown): DiagnosticReplayMode {
   if (value === 'openai') return 'openai';
   return 'fixture';
 }
@@ -454,6 +591,8 @@ async function listReplaySummaries() {
       recommendationCount: Array.isArray(artifact.recommendations) ? artifact.recommendations.length : 0,
       anomalies: Array.isArray(artifact.anomalies) ? artifact.anomalies : [],
       anomalyCount: Array.isArray(artifact.anomalies) ? artifact.anomalies.length : 0,
+      diagnosis: isRecord(artifact.diagnosis) ? artifact.diagnosis : undefined,
+      diagnosisPresent: isRecord(artifact.diagnosis),
       durationMs: typeof artifact.durationMs === 'number' ? artifact.durationMs : 0,
       modelTurns: typeof artifact.modelTurns === 'number' ? artifact.modelTurns : 0,
       usage,
@@ -556,6 +695,52 @@ async function listPromotedMonitoringFixtureSummaries() {
   return summaries.sort((left, right) => left.id.localeCompare(right.id) || left.path.localeCompare(right.path));
 }
 
+async function listPromotedDiagnosticFixtureSummaries() {
+  const dir = resolve(workspaceRoot(), 'packages/agents/diagnostic-investigation/fixtures/promoted');
+  let entries;
+  try {
+    entries = await readdir(dir, { withFileTypes: true });
+  } catch (error) {
+    if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') return [];
+    throw error;
+  }
+
+  const summaries = [];
+  for (const entry of entries) {
+    if (!entry.isFile() || extname(entry.name) !== '.json') continue;
+    const path = join(dir, entry.name);
+    const fixture = JSON.parse(await readFile(path, 'utf8')) as DiagnosticFixture;
+    const replay = await runDiagnosticReplay(fixture, 'fixture');
+    const behavior = assertDiagnosticBehavioralExpectations(replay.diagnosis, fixture.expectations);
+    const usage = summarizeTraceUsage(replay.trace);
+    const costEstimate = estimateCost(
+      fixture.promotion?.sourceProvider?.id ?? 'fixture',
+      usage,
+      fixture.promotion?.sourceProvider?.model ?? '',
+    );
+    summaries.push({
+      path: relativeFromWorkspace(path),
+      id: fixture.id,
+      description: fixture.description,
+      promotion: fixture.promotion,
+      expectations: fixture.expectations,
+      evalOk: replay.eval.ok,
+      behaviorOk: behavior.ok,
+      ok: replay.eval.ok && behavior.ok,
+      issues: [
+        ...replay.eval.issues.map((issue) => ({ ...issue, source: replay.eval.name })),
+        ...behavior.issues.map((issue) => ({ ...issue, source: behavior.name })),
+      ],
+      diagnosisPresent: Boolean(replay.diagnosis),
+      modelTurns: replay.modelTurns,
+      usage,
+      ...(costEstimate ? { costEstimate } : {}),
+    });
+  }
+
+  return summaries.sort((left, right) => left.id.localeCompare(right.id) || left.path.localeCompare(right.path));
+}
+
 function assertBehavioralExpectations(
   recommendations: Recommendation[],
   expectations: BehavioralExpectations | undefined,
@@ -639,6 +824,34 @@ function assertMonitoringBehavioralExpectations(
   return { name: 'monitoring-behavior', ok: issues.length === 0, issues };
 }
 
+function assertDiagnosticBehavioralExpectations(
+  diagnosis: DiagnosticDiagnosis,
+  expectations: DiagnosticBehaviorExpectations | undefined,
+) {
+  const issues: { path: string; message: string }[] = [];
+  if (!expectations) return { name: 'diagnostic-behavior', ok: true, issues };
+
+  const evidenceText = diagnosis.evidence.join('\n').toLowerCase();
+  for (const text of expectations.requiredEvidenceText ?? []) {
+    if (!evidenceText.includes(text.toLowerCase())) {
+      issues.push({ path: 'expectations.requiredEvidenceText', message: `expected evidence containing "${text}"` });
+    }
+  }
+
+  const supportedText = diagnosis.hypothesesConsidered
+    .filter((hypothesis) => hypothesis.supported)
+    .map((hypothesis) => `${hypothesis.hypothesis}\n${hypothesis.reasoning}`)
+    .join('\n')
+    .toLowerCase();
+  for (const text of expectations.requiredSupportedHypothesisText ?? []) {
+    if (!supportedText.includes(text.toLowerCase())) {
+      issues.push({ path: 'expectations.requiredSupportedHypothesisText', message: `expected supported hypothesis containing "${text}"` });
+    }
+  }
+
+  return { name: 'diagnostic-behavior', ok: issues.length === 0, issues };
+}
+
 function recommendationSearchText(recommendation: Recommendation): string {
   return [
     recommendation.title,
@@ -659,79 +872,72 @@ function recommendationSearchText(recommendation: Recommendation): string {
 }
 
 async function promoteReplayArtifact(artifactPath: string) {
-  const artifact = JSON.parse(await readFile(artifactPath, 'utf8'));
-  const evaluation = assertReplayArtifactShape(artifact);
-  if (!evaluation.ok) {
-    throw new Error(`replay artifact is not promotable: ${evaluation.issues.map((issue) => `${issue.path}: ${issue.message}`).join('; ')}`);
-  }
-
-  const sourceFixturePath = resolve(workspaceRoot(), artifact.fixture.path);
-  const sourceFixture = JSON.parse(await readFile(sourceFixturePath, 'utf8'));
-  const providerId = artifact.provider.id;
-  const promotedId = `${artifact.fixture.id}-${providerId}-promoted`;
-  const promoted = {
-    ...sourceFixture,
-    id: promotedId,
-    description: [
-      `Promoted deterministic fixture from ${providerId} replay artifact.`,
-      `Source fixture: ${artifact.fixture.id}.`,
-      `Replay created at: ${artifact.createdAt}.`,
-    ].join(' '),
-    modelResponses: [
-      {
-        content: [
-          {
-            type: 'text',
-            text: `\`\`\`json\n${JSON.stringify(toAscii(stripRecommendationIds(artifact.recommendations)), null, 2)}\n\`\`\``,
-          },
-        ],
-        usage: {
-          inputTokens: summarizeTraceUsage(artifact.trace).inputTokens,
-          outputTokens: summarizeTraceUsage(artifact.trace).outputTokens,
-          estimated: true,
-        },
-        model: `promoted-${providerId}-replay`,
-      },
-    ],
-    promotion: {
-      sourceArtifact: relativeFromWorkspace(artifactPath),
-      sourceProvider: artifact.provider,
-      promotedAt: new Date().toISOString(),
-      note: 'This fixture captures the final replay answer deterministically; it does not reconstruct the live provider tool loop.',
-    },
-  };
-
-  const artifactDate = new Date(artifact.createdAt);
-  const outDir = resolve(workspaceRoot(), 'packages/agents/recommendation/fixtures/promoted');
-  await mkdir(outDir, { recursive: true });
-  const outPath = join(outDir, `${slugify(promotedId)}-${formatDateForFilename(artifactDate)}.json`);
-  await writeFile(outPath, `${JSON.stringify(promoted, null, 2)}\n`, 'utf8');
-
-  return {
-    path: relativeFromWorkspace(outPath),
-    id: promoted.id,
-    sourceArtifact: promoted.promotion.sourceArtifact,
-    recommendationCount: Array.isArray(artifact.recommendations) ? artifact.recommendations.length : 0,
-  };
+  return promoteCapabilityReplayArtifact(artifactPath, {
+    label: 'recommendation',
+    outDir: 'packages/agents/recommendation/fixtures/promoted',
+    validate: assertReplayArtifactShape,
+    output: (artifact) => stripRecommendationIds(artifact.recommendations),
+    result: (artifact) => ({
+      recommendationCount: Array.isArray(artifact.recommendations) ? artifact.recommendations.length : 0,
+    }),
+  });
 }
 
 async function promoteMonitoringReplayArtifact(artifactPath: string) {
+  return promoteCapabilityReplayArtifact(artifactPath, {
+    label: 'monitoring',
+    outDir: 'packages/agents/anomaly-monitoring/fixtures/promoted',
+    validate: assertMonitoringReplayArtifactShape,
+    output: (artifact) => Array.isArray(artifact.anomalies) ? artifact.anomalies : [],
+    expectations: (artifact) => monitoringExpectationsFromAnomalies(Array.isArray(artifact.anomalies) ? artifact.anomalies : []),
+    result: (artifact) => ({
+      anomalyCount: Array.isArray(artifact.anomalies) ? artifact.anomalies.length : 0,
+    }),
+  });
+}
+
+async function promoteDiagnosticReplayArtifact(artifactPath: string) {
+  return promoteCapabilityReplayArtifact(artifactPath, {
+    label: 'diagnostic',
+    outDir: 'packages/agents/diagnostic-investigation/fixtures/promoted',
+    validate: assertDiagnosticReplayArtifactShape,
+    output: (artifact) => isRecord(artifact.diagnosis) ? artifact.diagnosis : {},
+    expectations: (artifact) => diagnosticExpectationsFromDiagnosis(isRecord(artifact.diagnosis) ? artifact.diagnosis as DiagnosticDiagnosis : undefined),
+    result: (artifact) => ({
+      diagnosisPresent: isRecord(artifact.diagnosis),
+    }),
+  });
+}
+
+type PromotionAdapter = {
+  label: string;
+  outDir: string;
+  validate: (artifact: unknown) => { ok: boolean; issues: { path: string; message: string }[] };
+  output: (artifact: Record<string, unknown>) => unknown;
+  expectations?: (artifact: Record<string, unknown>) => unknown;
+  result: (artifact: Record<string, unknown>) => Record<string, unknown>;
+};
+
+async function promoteCapabilityReplayArtifact(artifactPath: string, adapter: PromotionAdapter) {
   const artifact = JSON.parse(await readFile(artifactPath, 'utf8'));
-  const evaluation = assertMonitoringReplayArtifactShape(artifact);
+  const evaluation = adapter.validate(artifact);
   if (!evaluation.ok) {
-    throw new Error(`monitoring replay artifact is not promotable: ${evaluation.issues.map((issue) => `${issue.path}: ${issue.message}`).join('; ')}`);
+    throw new Error(`${adapter.label} replay artifact is not promotable: ${evaluation.issues.map((issue) => `${issue.path}: ${issue.message}`).join('; ')}`);
+  }
+  if (!isRecord(artifact) || !isRecord(artifact.fixture) || !isRecord(artifact.provider)) {
+    throw new Error(`${adapter.label} replay artifact is malformed`);
   }
 
   const sourceFixturePath = resolve(workspaceRoot(), artifact.fixture.path);
   const sourceFixture = JSON.parse(await readFile(sourceFixturePath, 'utf8'));
   const providerId = artifact.provider.id;
   const promotedId = `${artifact.fixture.id}-${providerId}-promoted`;
-  const anomalies = Array.isArray(artifact.anomalies) ? artifact.anomalies : [];
+  const usage = summarizeTraceUsage(artifact.trace);
   const promoted = {
     ...sourceFixture,
     id: promotedId,
     description: [
-      `Promoted deterministic monitoring fixture from ${providerId} replay artifact.`,
+      `Promoted deterministic ${adapter.label} fixture from ${providerId} replay artifact.`,
       `Source fixture: ${artifact.fixture.id}.`,
       `Replay created at: ${artifact.createdAt}.`,
     ].join(' '),
@@ -740,28 +946,28 @@ async function promoteMonitoringReplayArtifact(artifactPath: string) {
         content: [
           {
             type: 'text',
-            text: `\`\`\`json\n${JSON.stringify(toAscii(anomalies), null, 2)}\n\`\`\``,
+            text: `\`\`\`json\n${JSON.stringify(toAscii(adapter.output(artifact)), null, 2)}\n\`\`\``,
           },
         ],
         usage: {
-          inputTokens: summarizeTraceUsage(artifact.trace).inputTokens,
-          outputTokens: summarizeTraceUsage(artifact.trace).outputTokens,
+          inputTokens: usage.inputTokens,
+          outputTokens: usage.outputTokens,
           estimated: true,
         },
         model: `promoted-${providerId}-replay`,
       },
     ],
-    expectations: monitoringExpectationsFromAnomalies(anomalies),
+    ...(adapter.expectations ? { expectations: adapter.expectations(artifact) } : {}),
     promotion: {
       sourceArtifact: relativeFromWorkspace(artifactPath),
       sourceProvider: artifact.provider,
       promotedAt: new Date().toISOString(),
-      note: 'This fixture captures the final monitoring replay answer deterministically; it does not reconstruct the live provider tool loop.',
+      note: `This fixture captures the final ${adapter.label} replay answer deterministically; it does not reconstruct the live provider tool loop.`,
     },
   };
 
   const artifactDate = new Date(artifact.createdAt);
-  const outDir = resolve(workspaceRoot(), 'packages/agents/anomaly-monitoring/fixtures/promoted');
+  const outDir = resolve(workspaceRoot(), adapter.outDir);
   await mkdir(outDir, { recursive: true });
   const outPath = join(outDir, `${slugify(promotedId)}-${formatDateForFilename(artifactDate)}.json`);
   await writeFile(outPath, `${JSON.stringify(promoted, null, 2)}\n`, 'utf8');
@@ -770,7 +976,7 @@ async function promoteMonitoringReplayArtifact(artifactPath: string) {
     path: relativeFromWorkspace(outPath),
     id: promoted.id,
     sourceArtifact: promoted.promotion.sourceArtifact,
-    anomalyCount: anomalies.length,
+    ...adapter.result(artifact),
   };
 }
 
@@ -782,6 +988,23 @@ function monitoringExpectationsFromAnomalies(anomalies: MonitoringAnomaly[]): Mo
     requiredScopes: uniqueStrings(anomalies.flatMap((anomaly) => anomaly.scope)),
     requiredSeverities: uniqueStrings(anomalies.map((anomaly) => anomaly.severity)),
   };
+}
+
+function diagnosticExpectationsFromDiagnosis(diagnosis: DiagnosticDiagnosis | undefined): DiagnosticBehaviorExpectations {
+  const evidence = diagnosis?.evidence ?? [];
+  const supported = diagnosis?.hypothesesConsidered.find((hypothesis) => hypothesis.supported);
+  return {
+    requiredEvidenceText: evidence.slice(0, 3).map(expectationPhrase).filter(Boolean),
+    requiredSupportedHypothesisText: supported ? [expectationPhrase(`${supported.hypothesis} ${supported.reasoning}`)].filter(Boolean) : [],
+  };
+}
+
+function expectationPhrase(value: string): string {
+  const words = value
+    .replace(/[^\w\s.%+-]/g, ' ')
+    .split(/\s+/)
+    .filter(Boolean);
+  return words.slice(0, 6).join(' ');
 }
 
 function uniqueStrings(values: string[]): string[] {
@@ -893,8 +1116,8 @@ function normalizeReplayArtifact(value: unknown): Record<string, unknown> & {
   if (typeof value.createdAt !== 'string') throw new Error('artifact createdAt must be a string');
   if (!isRecord(value.fixture) || typeof value.fixture.id !== 'string') throw new Error('artifact fixture.id must be a string');
   if (!isRecord(value.provider) || typeof value.provider.id !== 'string') throw new Error('artifact provider.id must be a string');
-  if (!Array.isArray(value.recommendations) && !Array.isArray(value.anomalies)) {
-    throw new Error('artifact must include recommendations or anomalies array');
+  if (!Array.isArray(value.recommendations) && !Array.isArray(value.anomalies) && !isRecord(value.diagnosis)) {
+    throw new Error('artifact must include recommendations, anomalies, or diagnosis');
   }
   if (!Array.isArray(value.trace)) throw new Error('artifact trace must be an array');
   return value as ReturnType<typeof normalizeReplayArtifact>;
