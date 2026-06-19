@@ -9,6 +9,7 @@ import { AgentStatusPanel, EvalPanel, Metric, Panel, PromptPackagePanel, Provide
 import { queryFixtures } from './fixtures';
 import { buildQueryReplayArtifact, formatCost, formatDuration } from './replay-artifacts';
 import { useReplayArtifacts } from './useReplayArtifacts';
+import { STATIC_DEMO, STATIC_DEMO_NOTE } from './env';
 import type { QueryFixture, QueryReplayMode, QueryReplayResult } from './types';
 
 type QueryShellResult = QueryReplayResult & { savedPath?: string };
@@ -132,11 +133,12 @@ function QueryPanels({ context, resetToken }: { context: QueryShellContext; rese
               saving={saving}
             />
             <div className="reviewActions">
+              {STATIC_DEMO ? <div className="errorState compact">{STATIC_DEMO_NOTE}</div> : null}
               <button
                 className="primaryAction"
                 type="button"
                 onClick={() => latestReviewPath ? void promoteSavedReplay(latestReviewPath) : undefined}
-                disabled={!latestReviewPath || promotingPath === latestReviewPath}
+                disabled={!latestReviewPath || promotingPath === latestReviewPath || STATIC_DEMO}
               >
                 <FileCheck size={15} />
                 <span>{promotingPath === latestReviewPath ? 'Promoting' : 'Promote Replay'}</span>
@@ -155,7 +157,7 @@ function QueryPanels({ context, resetToken }: { context: QueryShellContext; rese
       <section className="mainPane">
         <Panel title="Answer" icon={<MessageSquareText size={17} />} wide>
           {running ? <div className="emptyState">Running {mode === 'fixture' ? 'fixture' : 'OpenAI'} query replay...</div> : null}
-          {!providerStatus[mode].available ? <div className="errorState">Set OPENAI_API_KEY and restart Studio to enable OpenAI query replay.</div> : null}
+          {!providerStatus[mode].available ? <div className="errorState">{STATIC_DEMO ? 'Live model replay is available in local dev only — this is a static fixture demo.' : 'Set OPENAI_API_KEY and restart Studio to enable OpenAI query replay.'}</div> : null}
           {error ? <div className="errorState">{error}</div> : null}
           {!running && !error && !replay ? <div className="emptyState">No answer yet.</div> : null}
           {replay?.answer ? <p className="answerText">{replay.answer}</p> : null}
@@ -163,10 +165,11 @@ function QueryPanels({ context, resetToken }: { context: QueryShellContext; rese
 
         <Panel title="Query History" icon={<FileText size={17} />} wide>
           <div className="historyPanel">
-            <button className="secondaryAction" type="button" onClick={() => void refreshReplayHistory()} disabled={historyLoading}>
+            <button className="secondaryAction" type="button" onClick={() => void refreshReplayHistory()} disabled={historyLoading || STATIC_DEMO}>
               <RefreshCw size={15} />
               <span>{historyLoading ? 'Checking' : 'Refresh History'}</span>
             </button>
+            {STATIC_DEMO ? <div className="errorState compact">{STATIC_DEMO_NOTE}</div> : null}
             {historyError ? <div className="errorState compact">{historyError}</div> : null}
             {!historyLoading && savedReplays.length === 0 ? <div className="emptyState compact">No saved query replays found.</div> : null}
             <div className="historyList">
@@ -215,10 +218,11 @@ function QueryPanels({ context, resetToken }: { context: QueryShellContext; rese
         />
         <Panel title="Promoted Query" icon={<FileCheck size={17} />}>
           <div className="historyPanel">
-            <button className="secondaryAction" type="button" onClick={() => void refreshPromotedFixtures()} disabled={promotedLoading}>
+            <button className="secondaryAction" type="button" onClick={() => void refreshPromotedFixtures()} disabled={promotedLoading || STATIC_DEMO}>
               <RefreshCw size={15} />
               <span>{promotedLoading ? 'Checking' : 'Check Promoted'}</span>
             </button>
+            {STATIC_DEMO ? <div className="errorState compact">{STATIC_DEMO_NOTE}</div> : null}
             {promotedError ? <div className="errorState compact">{promotedError}</div> : null}
             {!promotedLoading && promotedFixtures.length === 0 ? <div className="emptyState compact">No promoted query fixtures found.</div> : null}
             <div className="historyList">

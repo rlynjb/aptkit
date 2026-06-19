@@ -193,6 +193,7 @@ export default defineConfig(({ mode }) => {
   const env = loadStudioEnv(mode);
 
   return {
+    base: env.VITE_STATIC_DEMO === '1' ? '/aptkit/' : '/',
     plugins: [
       react(),
       {

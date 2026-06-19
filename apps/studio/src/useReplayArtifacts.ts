@@ -1,4 +1,5 @@
 import React from 'react';
+import { STATIC_DEMO, STATIC_DEMO_NOTE } from './env';
 
 type ReplayWithSavedPath = {
   savedPath?: string;
@@ -73,6 +74,7 @@ export function useReplayArtifacts<
   }, [loadSavedReplays]);
 
   React.useEffect(() => {
+    if (STATIC_DEMO) return;
     void refreshReplayHistory();
   }, [refreshReplayHistory]);
 
@@ -89,11 +91,16 @@ export function useReplayArtifacts<
   }, [loadPromotedFixtures]);
 
   React.useEffect(() => {
+    if (STATIC_DEMO) return;
     void refreshPromotedFixtures();
   }, [refreshPromotedFixtures]);
 
   const saveCurrentReplay = React.useCallback(async () => {
     if (!replay) return;
+    if (STATIC_DEMO) {
+      setSaveError(STATIC_DEMO_NOTE);
+      return;
+    }
     setSaving(true);
     setSaveError(null);
     try {
@@ -110,6 +117,10 @@ export function useReplayArtifacts<
   }, [buildArtifact, fixture, mode, model, refreshReplayHistory, replay, saveArtifact, setReplay]);
 
   const promoteSavedReplay = React.useCallback(async (path: string) => {
+    if (STATIC_DEMO) {
+      setHistoryError(STATIC_DEMO_NOTE);
+      return;
+    }
     setPromotingPath(path);
     setHistoryError(null);
     setPromoteResult(null);

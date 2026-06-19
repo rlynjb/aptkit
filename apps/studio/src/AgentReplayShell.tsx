@@ -3,6 +3,7 @@ import { Boxes, ChevronDown, Cloud, KeyRound, Play } from 'lucide-react';
 import type { CapabilityEvent, CostEstimate, TokenUsageSummary } from '@aptkit/runtime';
 import { loadProviderStatus } from './api';
 import { ReplayModeSwitch } from './components';
+import { STATIC_DEMO } from './env';
 import { estimateCost, summarizeUsage } from './replay-artifacts';
 import type { ProviderStatus } from './types';
 
@@ -135,6 +136,7 @@ export function AgentReplayShell<F, M extends string, R extends ReplayResultBase
   }, [startReplay]);
 
   React.useEffect(() => {
+    if (STATIC_DEMO) return;
     loadProviderStatus()
       .then(setProviderStatus)
       .catch(() => {

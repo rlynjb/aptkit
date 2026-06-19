@@ -2,6 +2,7 @@ import React from 'react';
 import { FileCheck, History, Play, RefreshCw, Route, Save } from 'lucide-react';
 import type { Anomaly as MonitoringAnomaly, CategoryCoverageItem } from '@aptkit/agent-anomaly-monitoring';
 import { Panel } from './components';
+import { STATIC_DEMO, STATIC_DEMO_NOTE } from './env';
 import { ComparisonMetric } from './recommendation-panels';
 import { formatCost, formatCostDelta, formatDelta, formatDuration, monitoringCategorySet } from './replay-artifacts';
 import type {
@@ -101,11 +102,12 @@ export function MonitoringComparisonPanel({
             <strong>{fixtureId}</strong>
             <span>{comparison.completedAt ? `Comparison completed at ${comparison.completedAt}` : 'Latest saved fixture/OpenAI monitoring pair'}</span>
           </div>
-          <button className="primaryAction" type="button" onClick={onRun} disabled={running || !openaiAvailable}>
+          <button className="primaryAction" type="button" onClick={onRun} disabled={running || !openaiAvailable || STATIC_DEMO}>
             <Play size={15} />
             <span>{running ? 'Running' : 'Run Comparison'}</span>
           </button>
         </div>
+        {STATIC_DEMO ? <div className="errorState compact">{STATIC_DEMO_NOTE}</div> : null}
         {!openaiAvailable ? <div className="errorState compact">Set OPENAI_API_KEY and restart Studio to enable comparison runs.</div> : null}
         {error ? <div className="errorState compact">{error}</div> : null}
         {!fixtureReplay || !openaiReplay ? (
@@ -279,7 +281,8 @@ export function MonitoringReviewPanel({
           </div>
         ) : null}
         <div className="reviewActions">
-          <button className="secondaryAction" type="button" onClick={onSave} disabled={!replay || saving}>
+          {STATIC_DEMO ? <div className="errorState compact">{STATIC_DEMO_NOTE}</div> : null}
+          <button className="secondaryAction" type="button" onClick={onSave} disabled={!replay || saving || STATIC_DEMO}>
             <Save size={15} />
             <span>{saving ? 'Saving' : replay?.savedPath ? 'Saved Current' : 'Save Current'}</span>
           </button>
@@ -287,7 +290,7 @@ export function MonitoringReviewPanel({
             className="primaryAction"
             type="button"
             onClick={() => reviewPath ? onPromote(reviewPath) : undefined}
-            disabled={!canReview || promotingPath === reviewPath}
+            disabled={!canReview || promotingPath === reviewPath || STATIC_DEMO}
           >
             <FileCheck size={15} />
             <span>{promotingPath === reviewPath ? 'Promoting' : 'Promote Reviewed'}</span>
@@ -317,10 +320,11 @@ export function MonitoringReplayHistoryPanel({
   return (
     <Panel title="Monitoring History" icon={<History size={17} />}>
       <div className="historyPanel">
-        <button className="secondaryAction" type="button" onClick={onRefresh} disabled={loading}>
+        <button className="secondaryAction" type="button" onClick={onRefresh} disabled={loading || STATIC_DEMO}>
           <RefreshCw size={15} />
           <span>{loading ? 'Checking' : 'Refresh History'}</span>
         </button>
+        {STATIC_DEMO ? <div className="errorState compact">{STATIC_DEMO_NOTE}</div> : null}
         {error ? <div className="errorState compact">{error}</div> : null}
         {!loading && visibleReplays.length === 0 ? <div className="emptyState compact">No saved monitoring replays found.</div> : null}
         <div className="historyList">
@@ -374,10 +378,11 @@ export function PromotedMonitoringFixturesPanel({
   return (
     <Panel title="Promoted Monitoring" icon={<FileCheck size={17} />}>
       <div className="historyPanel">
-        <button className="secondaryAction" type="button" onClick={onRefresh} disabled={loading}>
+        <button className="secondaryAction" type="button" onClick={onRefresh} disabled={loading || STATIC_DEMO}>
           <RefreshCw size={15} />
           <span>{loading ? 'Checking' : 'Check Promoted'}</span>
         </button>
+        {STATIC_DEMO ? <div className="errorState compact">{STATIC_DEMO_NOTE}</div> : null}
         {error ? <div className="errorState compact">{error}</div> : null}
         {!loading && fixtures.length === 0 ? <div className="emptyState compact">No promoted monitoring fixtures found.</div> : null}
         <div className="historyList">

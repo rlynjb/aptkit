@@ -11,6 +11,7 @@ import { monitoringFixtures } from './fixtures';
 import { CoverageItem, MonitoringAnomalyCard, MonitoringComparisonPanel, MonitoringReplayHistoryPanel, MonitoringReviewPanel, PromotedMonitoringFixturesPanel } from './monitoring-panels';
 import { buildMonitoringReplayArtifact, comparableMonitoringFromArtifact, comparisonForMonitoringFixture, findMonitoringReviewReplay, formatCost, formatDuration, toMonitoringReplayState } from './replay-artifacts';
 import { useReplayArtifacts } from './useReplayArtifacts';
+import { STATIC_DEMO } from './env';
 import type { MonitoringComparisonState, MonitoringFixture, MonitoringReplayMode, MonitoringReplayResult } from './types';
 
 type MonitoringShellResult = MonitoringReplayResult & { savedPath?: string };
@@ -190,7 +191,7 @@ function MonitoringPanels({ context, resetToken }: { context: MonitoringShellCon
       <section className="mainPane">
         <Panel title="Detected Anomalies" icon={<Activity size={17} />} wide>
           {running ? <div className="emptyState">Running {mode === 'fixture' ? 'fixture' : 'OpenAI'} monitoring replay...</div> : null}
-          {!providerStatus[mode].available ? <div className="errorState">Set OPENAI_API_KEY and restart Studio to enable OpenAI monitoring.</div> : null}
+          {!providerStatus[mode].available ? <div className="errorState">{STATIC_DEMO ? 'Live model replay is available in local dev only — this is a static fixture demo.' : 'Set OPENAI_API_KEY and restart Studio to enable OpenAI monitoring.'}</div> : null}
           {error ? <div className="errorState">{error}</div> : null}
           {!running && !error && !replay ? <div className="emptyState">No monitoring output yet.</div> : null}
           {!running && replay && replay.anomalies.length === 0 ? <div className="emptyState">No meaningful anomaly found.</div> : null}

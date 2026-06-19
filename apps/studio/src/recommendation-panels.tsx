@@ -2,6 +2,7 @@ import React from 'react';
 import { Check, Clipboard, FileCheck, History, Play, RefreshCw, Route, Save } from 'lucide-react';
 import type { Recommendation } from '@aptkit/agent-recommendation';
 import { Panel, SaveReplayControl } from './components';
+import { STATIC_DEMO, STATIC_DEMO_NOTE } from './env';
 import { featureSet, formatCost, formatCostDelta, formatDelta, formatDuration } from './replay-artifacts';
 import type { ComparableReplay, ComparisonState, CostEstimate, PromoteResult, RecommendationFixture, ReplayMode, ReplayState, SavedReplaySummary, TokenUsageSummary, PromotedFixtureSummary } from './types';
 
@@ -39,11 +40,12 @@ export function ComparisonPanel({
             <strong>{fixtureId}</strong>
             <span>{comparison.completedAt ? `Comparison completed at ${comparison.completedAt}` : 'Latest saved fixture/OpenAI pair'}</span>
           </div>
-          <button className="primaryAction" type="button" onClick={onRun} disabled={running || !openaiAvailable}>
+          <button className="primaryAction" type="button" onClick={onRun} disabled={running || !openaiAvailable || STATIC_DEMO}>
             <Play size={15} />
             <span>{running ? 'Running' : 'Run Comparison'}</span>
           </button>
         </div>
+        {STATIC_DEMO ? <div className="errorState compact">{STATIC_DEMO_NOTE}</div> : null}
         {!openaiAvailable ? <div className="errorState compact">Set OPENAI_API_KEY and restart Studio to enable comparison runs.</div> : null}
         {error ? <div className="errorState compact">{error}</div> : null}
         {!fixtureReplay || !openaiReplay ? (
@@ -226,7 +228,8 @@ export function ReviewPanel({
         {error ? <div className="errorState compact">{error}</div> : null}
         {saveError ? <div className="errorState compact">{saveError}</div> : null}
         <div className="reviewActions">
-          <button className="secondaryAction" type="button" onClick={onSave} disabled={!replay || saving}>
+          {STATIC_DEMO ? <div className="errorState compact">{STATIC_DEMO_NOTE}</div> : null}
+          <button className="secondaryAction" type="button" onClick={onSave} disabled={!replay || saving || STATIC_DEMO}>
             <Save size={15} />
             <span>{saving ? 'Saving' : replay?.savedPath ? 'Saved Current' : 'Save Current'}</span>
           </button>
@@ -234,7 +237,7 @@ export function ReviewPanel({
             className="primaryAction"
             type="button"
             onClick={() => reviewPath ? onPromote(reviewPath) : undefined}
-            disabled={!canPromote || promotingPath === reviewPath}
+            disabled={!canPromote || promotingPath === reviewPath || STATIC_DEMO}
           >
             <FileCheck size={15} />
             <span>{promotingPath === reviewPath ? 'Promoting' : 'Promote Reviewed'}</span>
@@ -353,10 +356,11 @@ export function ReplayHistoryPanel({
   return (
     <Panel title="Replay History" icon={<History size={17} />}>
       <div className="historyPanel">
-        <button className="secondaryAction" type="button" onClick={onRefresh} disabled={loading}>
+        <button className="secondaryAction" type="button" onClick={onRefresh} disabled={loading || STATIC_DEMO}>
           <RefreshCw size={15} />
           <span>{loading ? 'Evaluating' : 'Evaluate Replays'}</span>
         </button>
+        {STATIC_DEMO ? <div className="errorState compact">{STATIC_DEMO_NOTE}</div> : null}
         {error ? <div className="errorState compact">{error}</div> : null}
         {!loading && visibleReplays.length === 0 ? <div className="emptyState compact">No saved replays found.</div> : null}
         <div className="historyList">
@@ -411,10 +415,11 @@ export function PromotedFixturesPanel({
   return (
     <Panel title="Promoted Fixtures" icon={<FileCheck size={17} />}>
       <div className="historyPanel">
-        <button className="secondaryAction" type="button" onClick={onRefresh} disabled={loading}>
+        <button className="secondaryAction" type="button" onClick={onRefresh} disabled={loading || STATIC_DEMO}>
           <RefreshCw size={15} />
           <span>{loading ? 'Checking' : 'Check Promoted'}</span>
         </button>
+        {STATIC_DEMO ? <div className="errorState compact">{STATIC_DEMO_NOTE}</div> : null}
         {error ? <div className="errorState compact">{error}</div> : null}
         {!loading && fixtures.length === 0 ? <div className="emptyState compact">No promoted fixtures found.</div> : null}
         <div className="historyList">

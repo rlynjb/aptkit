@@ -10,6 +10,7 @@ import { AgentStatusPanel, EvalPanel, Metric, Panel, PromptPackagePanel, Provide
 import { buildReplayArtifact, comparableFromArtifact, comparisonForFixture, findReviewReplay, formatCost, formatDuration, toReplayState } from './replay-artifacts';
 import { ComparisonPanel, PromotedFixturesPanel, ReplayHistoryPanel, ReviewPanel, WorkflowPanel } from './recommendation-panels';
 import { useReplayArtifacts } from './useReplayArtifacts';
+import { STATIC_DEMO } from './env';
 import type { ComparisonState, RecommendationFixture, ReplayMode, ReplayResult } from './types';
 
 type RecommendationShellResult = ReplayResult & { savedPath?: string };
@@ -206,7 +207,7 @@ function RecommendationPanels({ context, resetToken }: { context: Recommendation
         <section className="mainPane">
           <Panel title="Recommendations" icon={<CircleDollarSign size={17} />} wide>
             {running ? <div className="emptyState">Running {mode === 'fixture' ? 'fixture replay' : `${mode} live replay`}...</div> : null}
-            {!providerStatus[mode].available ? <div className="errorState">Set {mode === 'anthropic' ? 'ANTHROPIC_API_KEY' : 'OPENAI_API_KEY'} and restart Studio to enable this mode.</div> : null}
+            {!providerStatus[mode].available ? <div className="errorState">{STATIC_DEMO ? 'Live model replay is available in local dev only — this is a static fixture demo.' : `Set ${mode === 'anthropic' ? 'ANTHROPIC_API_KEY' : 'OPENAI_API_KEY'} and restart Studio to enable this mode.`}</div> : null}
             {error ? <div className="errorState">{error}</div> : null}
             {!running && !error && !replay ? <div className="emptyState">No replay output yet.</div> : null}
             <div className="recommendations">

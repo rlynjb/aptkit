@@ -3,6 +3,7 @@ import { Boxes, BrainCircuit, Cloud, FileText, KeyRound, Save, ShieldCheck } fro
 import type { PromptPackage } from '@aptkit/prompts';
 import type { CapabilityEvent } from '@aptkit/runtime';
 import type { ProviderStatus, ReplayMode } from './types';
+import { STATIC_DEMO, STATIC_DEMO_NOTE } from './env';
 
 export function Metric({ icon, label, value, tone = 'neutral' }: { icon: React.ReactNode; label: string; value: string; tone?: 'neutral' | 'good' }) {
   return (
@@ -114,11 +115,12 @@ export function SaveReplayControl({
 }) {
   return (
     <div className="saveReplay">
-      <button type="button" onClick={onSave} disabled={!canSave || saving}>
+      <button type="button" onClick={onSave} disabled={!canSave || saving || STATIC_DEMO}>
         <Save size={15} />
         <span>{saving ? 'Saving' : savedPath ? 'Saved' : 'Save Replay'}</span>
       </button>
       <code>{savedPath ?? 'No saved artifact yet'}</code>
+      {STATIC_DEMO ? <div className="errorState compact">{STATIC_DEMO_NOTE}</div> : null}
       {saveError ? <p>{saveError}</p> : null}
     </div>
   );

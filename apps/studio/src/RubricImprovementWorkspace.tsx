@@ -6,6 +6,7 @@ import { runRubricImprovementFixtureReplay } from './agent-runners';
 import { EvalPanel, Metric, Panel, ProviderStatusPanel, TracePanel } from './components';
 import { rubricImprovementFixtures } from './fixtures';
 import { formatCost, formatDuration } from './replay-artifacts';
+import { STATIC_DEMO } from './env';
 import type { RubricImprovementFixture, RubricImprovementReplayMode, RubricImprovementReplayResult } from './types';
 
 type RubricShellContext = AgentReplayShellContext<
@@ -120,7 +121,7 @@ function rubricPanels(context: RubricShellContext) {
 
         <Panel title="Judgment" icon={<Scale size={17} />}>
           {running ? <div className="emptyState compact">Scoring rubric...</div> : null}
-          {!providerStatus[mode].available ? <div className="errorState">Set OPENAI_API_KEY and restart Studio to enable OpenAI rubric improvement replay.</div> : null}
+          {!providerStatus[mode].available ? <div className="errorState">{STATIC_DEMO ? 'Live model replay is available in local dev only — this is a static fixture demo.' : 'Set OPENAI_API_KEY and restart Studio to enable OpenAI rubric improvement replay.'}</div> : null}
           {error ? <div className="errorState">{error}</div> : null}
           {result ? (
             <div className="rubricJudgment">

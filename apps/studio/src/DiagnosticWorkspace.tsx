@@ -9,6 +9,7 @@ import { AgentStatusPanel, EvalPanel, Metric, Panel, PromptPackagePanel, Provide
 import { diagnosticFixtures } from './fixtures';
 import { buildDiagnosticReplayArtifact, formatCost, formatDuration } from './replay-artifacts';
 import { useReplayArtifacts } from './useReplayArtifacts';
+import { STATIC_DEMO, STATIC_DEMO_NOTE } from './env';
 import type { DiagnosticFixture, DiagnosticReplayMode, DiagnosticReplayResult } from './types';
 
 type DiagnosticShellResult = DiagnosticReplayResult & { savedPath?: string };
@@ -142,7 +143,7 @@ function DiagnosticPanels({ context, resetToken }: { context: DiagnosticShellCon
       <section className="mainPane">
         <Panel title="Diagnosis" icon={<SearchCheck size={17} />} wide>
           {running ? <div className="emptyState">Running {mode === 'fixture' ? 'fixture' : 'OpenAI'} diagnostic replay...</div> : null}
-          {!providerStatus[mode].available ? <div className="errorState">Set OPENAI_API_KEY and restart Studio to enable OpenAI diagnostic replay.</div> : null}
+          {!providerStatus[mode].available ? <div className="errorState">{STATIC_DEMO ? 'Live model replay is available in local dev only — this is a static fixture demo.' : 'Set OPENAI_API_KEY and restart Studio to enable OpenAI diagnostic replay.'}</div> : null}
           {error ? <div className="errorState">{error}</div> : null}
           {!running && !error && !replay ? <div className="emptyState">No diagnostic output yet.</div> : null}
           {diagnosis ? (
@@ -219,11 +220,12 @@ function DiagnosticPanels({ context, resetToken }: { context: DiagnosticShellCon
               saving={saving}
             />
             <div className="reviewActions">
+              {STATIC_DEMO ? <div className="errorState compact">{STATIC_DEMO_NOTE}</div> : null}
               <button
                 className="primaryAction"
                 type="button"
                 onClick={() => latestReviewPath ? void promoteSavedReplay(latestReviewPath) : undefined}
-                disabled={!latestReviewPath || promotingPath === latestReviewPath}
+                disabled={!latestReviewPath || promotingPath === latestReviewPath || STATIC_DEMO}
               >
                 <FileCheck size={15} />
                 <span>{promotingPath === latestReviewPath ? 'Promoting' : 'Promote Replay'}</span>
@@ -240,10 +242,11 @@ function DiagnosticPanels({ context, resetToken }: { context: DiagnosticShellCon
 
         <Panel title="Diagnostic History" icon={<FileCheck size={17} />}>
           <div className="historyPanel">
-            <button className="secondaryAction" type="button" onClick={() => void refreshReplayHistory()} disabled={historyLoading}>
+            <button className="secondaryAction" type="button" onClick={() => void refreshReplayHistory()} disabled={historyLoading || STATIC_DEMO}>
               <RefreshCw size={15} />
               <span>{historyLoading ? 'Checking' : 'Refresh History'}</span>
             </button>
+            {STATIC_DEMO ? <div className="errorState compact">{STATIC_DEMO_NOTE}</div> : null}
             {historyError ? <div className="errorState compact">{historyError}</div> : null}
             {!historyLoading && savedReplays.length === 0 ? <div className="emptyState compact">No saved diagnostic replays found.</div> : null}
             <div className="historyList">
@@ -269,10 +272,11 @@ function DiagnosticPanels({ context, resetToken }: { context: DiagnosticShellCon
 
         <Panel title="Promoted Diagnostic" icon={<FileCheck size={17} />}>
           <div className="historyPanel">
-            <button className="secondaryAction" type="button" onClick={() => void refreshPromotedFixtures()} disabled={promotedLoading}>
+            <button className="secondaryAction" type="button" onClick={() => void refreshPromotedFixtures()} disabled={promotedLoading || STATIC_DEMO}>
               <RefreshCw size={15} />
               <span>{promotedLoading ? 'Checking' : 'Check Promoted'}</span>
             </button>
+            {STATIC_DEMO ? <div className="errorState compact">{STATIC_DEMO_NOTE}</div> : null}
             {promotedError ? <div className="errorState compact">{promotedError}</div> : null}
             {!promotedLoading && promotedFixtures.length === 0 ? <div className="emptyState compact">No promoted diagnostic fixtures found.</div> : null}
             <div className="historyList">
