@@ -54,6 +54,20 @@ test('Rubric improvement fixture run increments the run counter', async ({ page 
   await expect(page.getByRole('heading', { name: 'Next Improvement' })).toBeVisible();
 });
 
+test('Recommendation fixture run increments the run counter', async ({ page }) => {
+  await page.goto('/');
+  await page.getByRole('button', { name: /Recommendation Agent/ }).click();
+  await expect(page.getByRole('heading', { name: 'Recommendation Agent Replay' })).toBeVisible();
+
+  const runMetric = page.locator('.metric').filter({ hasText: 'Run' }).locator('strong');
+  await expect(runMetric).toHaveText(/^#\d+$/);
+  const before = Number((await runMetric.textContent())?.replace('#', '') ?? '0');
+
+  await page.getByRole('button', { name: 'Run Fixture' }).click();
+  await expect.poll(async () => Number((await runMetric.textContent())?.replace('#', '') ?? '0')).toBeGreaterThan(before);
+  await expect(page.getByRole('heading', { name: 'Recommendations' })).toBeVisible();
+});
+
 test('Query fixture run increments the run counter', async ({ page }) => {
   await page.goto('/');
   await page.getByRole('button', { name: /Query Agent/ }).click();
