@@ -10,7 +10,8 @@ import { EvalPanel, Metric, Panel, PromptPackagePanel, ProviderStatusPanel, Trac
 import { monitoringFixtures } from './fixtures';
 import { CoverageItem, MonitoringAnomalyCard, MonitoringComparisonPanel, MonitoringReplayHistoryPanel, MonitoringReviewPanel, PromotedMonitoringFixturesPanel } from './monitoring-panels';
 import { buildMonitoringReplayArtifact, comparableMonitoringFromArtifact, comparisonForMonitoringFixture, findMonitoringReviewReplay, formatCost, formatDuration, toMonitoringReplayState } from './replay-artifacts';
-import type { MonitoringComparisonState, MonitoringFixture, MonitoringPromoteResult, MonitoringReplayMode, MonitoringReplayResult, PromotedMonitoringFixtureSummary, SavedMonitoringReplaySummary } from './types';
+import { useReplayArtifacts } from './useReplayArtifacts';
+import type { MonitoringComparisonState, MonitoringFixture, MonitoringReplayMode, MonitoringReplayResult } from './types';
 
 type MonitoringShellResult = MonitoringReplayResult & { savedPath?: string };
 
@@ -64,92 +65,46 @@ function MonitoringPanels({ context, resetToken }: { context: MonitoringShellCon
   const coverage = coverageReport(ECOMMERCE_ANOMALY_CATEGORIES, schemaCapabilities(fixture.workspace));
   const fullCoverage = coverage.filter((item) => item.coverage === 'full').length;
   const runnableCoverage = coverage.filter((item) => item.coverage !== 'unavailable').length;
-  const [saving, setSaving] = React.useState(false);
-  const [saveError, setSaveError] = React.useState<string | null>(null);
-  const [savedReplays, setSavedReplays] = React.useState<SavedMonitoringReplaySummary[]>([]);
-  const [historyLoading, setHistoryLoading] = React.useState(false);
-  const [historyError, setHistoryError] = React.useState<string | null>(null);
-  const [selectedReviewPath, setSelectedReviewPath] = React.useState<string | null>(null);
   const [comparison, setComparison] = React.useState<MonitoringComparisonState | null>(null);
   const [comparisonRunning, setComparisonRunning] = React.useState(false);
   const [comparisonError, setComparisonError] = React.useState<string | null>(null);
-  const [promotingPath, setPromotingPath] = React.useState<string | null>(null);
-  const [promoteResult, setPromoteResult] = React.useState<MonitoringPromoteResult | null>(null);
-  const [promotedFixtures, setPromotedFixtures] = React.useState<PromotedMonitoringFixtureSummary[]>([]);
-  const [promotedLoading, setPromotedLoading] = React.useState(false);
-  const [promotedError, setPromotedError] = React.useState<string | null>(null);
   const comparisonRunCounter = React.useRef(0);
+  const {
+    historyError,
+    historyLoading,
+    promotedError,
+    promotedFixtures,
+    promotedLoading,
+    promoteResult,
+    promoteSavedReplay,
+    promotingPath,
+    refreshPromotedFixtures,
+    refreshReplayHistory,
+    saveCurrentReplay,
+    saveError,
+    savedReplays,
+    saving,
+    selectedReviewPath,
+    setSaveError,
+    setSelectedReviewPath,
+  } = useReplayArtifacts({
+    buildArtifact: buildMonitoringReplayArtifact,
+    fixture,
+    loadPromotedFixtures: loadPromotedMonitoringFixtures,
+    loadSavedReplays: loadSavedMonitoringReplays,
+    mode,
+    model: providerStatus[mode].model,
+    promoteReplay: promoteMonitoringReplay,
+    replay,
+    resetToken,
+    saveArtifact: saveReplayArtifact,
+    setReplay,
+  });
 
   React.useEffect(() => {
-    setSaveError(null);
     setComparison(null);
     setComparisonError(null);
-    setPromoteResult(null);
   }, [resetToken]);
-
-  const refreshReplayHistory = React.useCallback(async () => {
-    setHistoryLoading(true);
-    setHistoryError(null);
-    try {
-      setSavedReplays(await loadSavedMonitoringReplays());
-    } catch (caught) {
-      setHistoryError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setHistoryLoading(false);
-    }
-  }, []);
-
-  React.useEffect(() => {
-    void refreshReplayHistory();
-  }, [refreshReplayHistory]);
-
-  const refreshPromotedFixtures = React.useCallback(async () => {
-    setPromotedLoading(true);
-    setPromotedError(null);
-    try {
-      setPromotedFixtures(await loadPromotedMonitoringFixtures());
-    } catch (caught) {
-      setPromotedError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setPromotedLoading(false);
-    }
-  }, []);
-
-  React.useEffect(() => {
-    void refreshPromotedFixtures();
-  }, [refreshPromotedFixtures]);
-
-  async function saveCurrentReplay() {
-    if (!replay) return;
-    setSaving(true);
-    setSaveError(null);
-    try {
-      const artifact = buildMonitoringReplayArtifact(fixture, replay, mode, providerStatus[mode].model);
-      const savedPath = await saveReplayArtifact(artifact);
-      setReplay((current) => current ? { ...current, savedPath } : current);
-      setSelectedReviewPath(savedPath);
-      await refreshReplayHistory();
-    } catch (caught) {
-      setSaveError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  async function promoteSavedReplay(path: string) {
-    setPromotingPath(path);
-    setHistoryError(null);
-    setPromoteResult(null);
-    try {
-      const result = await promoteMonitoringReplay(path);
-      setPromoteResult(result);
-      await refreshPromotedFixtures();
-    } catch (caught) {
-      setHistoryError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setPromotingPath(null);
-    }
-  }
 
   async function runComparison() {
     setComparisonRunning(true);

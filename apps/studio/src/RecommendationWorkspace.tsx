@@ -9,7 +9,8 @@ import { runFixtureReplay } from './agent-runners';
 import { EvalPanel, Metric, Panel, PromptPackagePanel, ProviderStatusPanel, TracePanel } from './components';
 import { buildReplayArtifact, comparableFromArtifact, comparisonForFixture, findReviewReplay, formatCost, formatDuration, toReplayState } from './replay-artifacts';
 import { ComparisonPanel, PromotedFixturesPanel, ReplayHistoryPanel, ReviewPanel, WorkflowPanel } from './recommendation-panels';
-import type { ComparisonState, PromoteResult, PromotedFixtureSummary, RecommendationFixture, ReplayMode, ReplayResult, SavedReplaySummary } from './types';
+import { useReplayArtifacts } from './useReplayArtifacts';
+import type { ComparisonState, RecommendationFixture, ReplayMode, ReplayResult } from './types';
 
 type RecommendationShellResult = ReplayResult & { savedPath?: string };
 
@@ -60,92 +61,47 @@ function recommendationMetrics(context: RecommendationShellContext) {
 
 function RecommendationPanels({ context, resetToken }: { context: RecommendationShellContext; resetToken: number }) {
   const { error, fixture, mode, providerStatus, replay, running, setReplay, usage, visibleTrace } = context;
-  const [saving, setSaving] = React.useState(false);
-  const [saveError, setSaveError] = React.useState<string | null>(null);
-  const [savedReplays, setSavedReplays] = React.useState<SavedReplaySummary[]>([]);
-  const [historyLoading, setHistoryLoading] = React.useState(false);
-  const [historyError, setHistoryError] = React.useState<string | null>(null);
-  const [selectedReviewPath, setSelectedReviewPath] = React.useState<string | null>(null);
   const [comparison, setComparison] = React.useState<ComparisonState | null>(null);
   const [comparisonRunning, setComparisonRunning] = React.useState(false);
   const [comparisonError, setComparisonError] = React.useState<string | null>(null);
-  const [promotingPath, setPromotingPath] = React.useState<string | null>(null);
-  const [promoteResult, setPromoteResult] = React.useState<PromoteResult | null>(null);
-  const [promotedFixtures, setPromotedFixtures] = React.useState<PromotedFixtureSummary[]>([]);
-  const [promotedLoading, setPromotedLoading] = React.useState(false);
-  const [promotedError, setPromotedError] = React.useState<string | null>(null);
   const comparisonRunCounter = React.useRef(0);
+  const {
+    historyError,
+    historyLoading,
+    promotedError,
+    promotedFixtures,
+    promotedLoading,
+    promoteResult,
+    promoteSavedReplay,
+    promotingPath,
+    refreshPromotedFixtures,
+    refreshReplayHistory,
+    saveCurrentReplay,
+    saveError,
+    savedReplays,
+    saving,
+    selectedReviewPath,
+    setPromoteResult,
+    setSaveError,
+    setSelectedReviewPath,
+  } = useReplayArtifacts({
+    buildArtifact: buildReplayArtifact,
+    fixture,
+    loadPromotedFixtures,
+    loadSavedReplays,
+    mode,
+    model: providerStatus[mode].model,
+    promoteReplay,
+    replay,
+    resetToken,
+    saveArtifact: saveReplayArtifact,
+    setReplay,
+  });
 
   React.useEffect(() => {
-    setSaveError(null);
     setComparison(null);
     setComparisonError(null);
-    setPromoteResult(null);
   }, [resetToken]);
-
-  const refreshReplayHistory = React.useCallback(async () => {
-    setHistoryLoading(true);
-    setHistoryError(null);
-    try {
-      setSavedReplays(await loadSavedReplays());
-    } catch (caught) {
-      setHistoryError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setHistoryLoading(false);
-    }
-  }, []);
-
-  React.useEffect(() => {
-    void refreshReplayHistory();
-  }, [refreshReplayHistory]);
-
-  const refreshPromotedFixtures = React.useCallback(async () => {
-    setPromotedLoading(true);
-    setPromotedError(null);
-    try {
-      setPromotedFixtures(await loadPromotedFixtures());
-    } catch (caught) {
-      setPromotedError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setPromotedLoading(false);
-    }
-  }, []);
-
-  React.useEffect(() => {
-    void refreshPromotedFixtures();
-  }, [refreshPromotedFixtures]);
-
-  async function saveCurrentReplay() {
-    if (!replay) return;
-    setSaving(true);
-    setSaveError(null);
-    try {
-      const artifact = buildReplayArtifact(fixture, replay, mode, providerStatus[mode].model);
-      const savedPath = await saveReplayArtifact(artifact);
-      setReplay((current) => current ? { ...current, savedPath } : current);
-      setSelectedReviewPath(savedPath);
-      await refreshReplayHistory();
-    } catch (caught) {
-      setSaveError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  async function promoteSavedReplay(path: string) {
-    setPromotingPath(path);
-    setHistoryError(null);
-    setPromoteResult(null);
-    try {
-      const result = await promoteReplay(path);
-      setPromoteResult(result);
-      await refreshPromotedFixtures();
-    } catch (caught) {
-      setHistoryError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setPromotingPath(null);
-    }
-  }
 
   async function runComparison() {
     setComparisonRunning(true);
