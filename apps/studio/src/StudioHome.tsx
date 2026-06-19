@@ -128,17 +128,10 @@ export function CapabilityCard({
           <strong key={detail}>{detail}</strong>
         ))}
       </div>
-      <button
-        className="primaryAction"
-        type="button"
-        onClick={(event) => {
-          event.stopPropagation();
-          onOpen();
-        }}
-      >
+      <div className="primaryAction capabilityCardAction" aria-hidden="true">
         <Play size={15} />
         <span>Open</span>
-      </button>
+      </div>
     </article>
   );
 }

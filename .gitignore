@@ -4,3 +4,5 @@ dist/
 .env
 .env.local
 artifacts/replays/*.json
+playwright-report/
+test-results/

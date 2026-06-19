@@ -100,7 +100,8 @@ Studio is still a manual preview app. Before committing Studio or package change
 ```sh
 npm test
 npm run build
+npm run smoke:studio
 git diff --check
 ```
 
-The build includes the Studio TypeScript and Vite production build.
+The build includes the Studio TypeScript and Vite production build. The smoke test starts Studio on a fixed local port and verifies the main card navigation plus the Runtime & Eval Utilities fixture rerun counter.

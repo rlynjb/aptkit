@@ -68,6 +68,12 @@ npm run dev:studio
 
 Vite prints the local Studio URL. If `5173` is already in use, it chooses the next available port.
 
+Run the Studio browser smoke test:
+
+```sh
+npm run smoke:studio
+```
+
 ## Studio
 
 AptKit Studio is the preferred manual testing surface.

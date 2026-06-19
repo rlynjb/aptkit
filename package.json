@@ -14,6 +14,7 @@
     "build:core:deps": "npm run build -w @aptkit/runtime && npm run build -w @aptkit/tools && npm run build -w @aptkit/context && npm run build -w @aptkit/prompts && npm run build -w @aptkit/evals && npm run build -w @aptkit/workflows && npm run build -w @aptkit/agent-anomaly-monitoring && npm run build -w @aptkit/agent-diagnostic-investigation && npm run build -w @aptkit/agent-query && npm run build -w @aptkit/agent-recommendation",
     "build:core": "npm run build:core:deps && npm run build -w @rlynjb/aptkit-core",
     "dev:studio": "npm run dev -w @aptkit/studio",
+    "smoke:studio": "playwright test -c playwright.studio.config.ts",
     "preeval:replays": "npm run build -w @aptkit/evals",
     "eval:replays": "node scripts/eval-replay-artifacts.mjs",
     "pack:core": "node scripts/pack-core-standalone.mjs",
@@ -35,6 +36,7 @@
     "replay:query:promoted": "npm run replay:promoted -w @aptkit/agent-query"
   },
   "devDependencies": {
+    "@playwright/test": "^1.61.0",
     "typescript": "^5.5.0"
   }
 }
