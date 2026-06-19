@@ -37,7 +37,14 @@ jobs:
           enablement: true
 
       - name: Build workspace dependencies
-        run: npm run build --workspaces --if-present
+        # build:core:deps compiles the workspace packages in topological order
+        # first. Without it, `npm run build --workspaces` builds packages in
+        # lexical order, so packages/core compiles before its dependencies
+        # (runtime, prompts, agents, …) and fails with TS2307 on a clean
+        # checkout where no prior dist/*.d.ts exists.
+        run: |
+          npm run build:core:deps
+          npm run build --workspaces --if-present
 
       - name: Build static Studio
         run: npm run build:pages -w @aptkit/studio
