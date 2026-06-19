@@ -91,7 +91,7 @@ All P0/P1 inventory rows are packaged. The remaining work is Level 6 maturity, n
 | Package tests | In place for packaged core utilities, evals, agents, workflows, and providers. | Keep adding fixture tests when APIs expand. |
 | Studio previews | Agents and non-agent utilities have preview entries. | Add previews for future provider adapters and examples. |
 | READMEs/examples | Package READMEs exist for current reusable packages. | Keep README examples aligned with exported APIs. |
-| Manual testing guide | `docs/studio.md` explains Studio pages, modes, and smoke paths. | Keep it updated when Studio pages or modes change. |
+| Manual testing guide | `docs/studio.md` explains Studio pages, modes, shared agent architecture, custom runtime utility dashboard, and smoke paths. | Keep it updated when Studio pages or modes change. |
 | Versioning | Core bundle is published as `@rlynjb/aptkit-core`. | Publish only after API or example changes require a release. |
 | Adapter examples | Blooming consumes the public core package; provider adapters remain separate. | Add example adapters only when they are generic enough to reuse. |
 

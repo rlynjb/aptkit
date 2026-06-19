@@ -81,6 +81,22 @@ Use this page to check:
 
 The page uses fixture providers, so the result content is intentionally stable. The run number and timestamp confirm that **Run Fixtures** executed again.
 
+## Studio Architecture
+
+Studio has two page shapes:
+
+- Agent replay pages use `AgentReplayShell` for the shared topbar, fixture selector, replay modes, provider status, run button, metrics, live trace state, and run counter.
+- `Runtime & Eval Utilities` uses a custom dashboard because it previews non-agent utilities, not a single agent replay.
+
+Agent replay pages also share:
+
+- `useReplayArtifacts` for save, saved replay history, promoted fixture history, selected review replay, and promote state.
+- `AgentStatusPanel` for fixture/status key-value summaries.
+- `SaveReplayControl` for the primary workflow save action.
+- Primitive panels such as `Metric`, `Panel`, `ProviderStatusPanel`, `PromptPackagePanel`, `TracePanel`, and `EvalPanel`.
+
+Keep provider adapters, API routes, and app-specific data-source wiring outside the Studio shell. Studio should display and exercise packaged capabilities, not become the production runtime for an importing app.
+
 ## Modes
 
 | Mode | Meaning |
@@ -116,4 +132,4 @@ npm run smoke:studio
 git diff --check
 ```
 
-The build includes the Studio TypeScript and Vite production build. The smoke test starts Studio on a fixed local port and verifies the main card navigation plus the Runtime & Eval Utilities fixture rerun counter.
+The build includes the Studio TypeScript and Vite production build. The smoke test starts Studio on a fixed local port and verifies card navigation plus fixture rerun counters for Runtime & Eval Utilities, Rubric Improvement, Recommendation, Query, Diagnostic, and Monitoring.
