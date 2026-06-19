@@ -1,6 +1,6 @@
 {
   "name": "@rlynjb/aptkit-core",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "type": "module",
   "description": "Standalone AptKit core bundle for extracted agent capabilities.",
   "main": "./dist/src/index.js",
