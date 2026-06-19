@@ -38,6 +38,7 @@ export type AgentReplayShellContext<F, M extends string, R extends ReplayResultB
   running: boolean;
   runId: number;
   error: string | null;
+  setReplay: React.Dispatch<React.SetStateAction<ReplayStateFor<R> | null>>;
   startReplay: () => Promise<void>;
   selectMode: (mode: M) => void;
 };
@@ -53,6 +54,7 @@ export function AgentReplayShell<F, M extends string, R extends ReplayResultBase
   modes,
   onFixtureChange,
   onHome,
+  onModeChange,
   renderPanels,
   runFixture,
   runServer,
@@ -68,6 +70,7 @@ export function AgentReplayShell<F, M extends string, R extends ReplayResultBase
   modes: ReplayModeOption<M>[];
   onFixtureChange?: () => void;
   onHome: () => void;
+  onModeChange?: () => void;
   renderPanels: (context: AgentReplayShellContext<F, M, R>) => React.ReactNode;
   runFixture: (fixture: F) => Promise<R>;
   runServer: (
@@ -151,6 +154,7 @@ export function AgentReplayShell<F, M extends string, R extends ReplayResultBase
     setReplay(null);
     setLiveTrace([]);
     setError(null);
+    onModeChange?.();
   }
 
   const visibleTrace = replay?.trace ?? liveTrace;
@@ -169,6 +173,7 @@ export function AgentReplayShell<F, M extends string, R extends ReplayResultBase
     running,
     runId,
     error,
+    setReplay,
     startReplay,
     selectMode,
   };
