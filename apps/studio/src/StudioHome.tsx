@@ -1,5 +1,5 @@
 import React from 'react';
-import { Activity, CircleDollarSign, Database, MessageSquareText, Play, SearchCheck } from 'lucide-react';
+import { Activity, CircleDollarSign, MessageSquareText, Play, SearchCheck } from 'lucide-react';
 import { ECOMMERCE_ANOMALY_CATEGORIES, coverageReport, schemaCapabilities } from '@aptkit/agent-anomaly-monitoring';
 import { diagnosticFixtures, fixtures, monitoringFixtures, queryFixtures } from './fixtures';
 import type { StudioView } from './types';
@@ -69,18 +69,6 @@ export function StudioHome({ onOpen }: { onOpen: (view: StudioView) => void }) {
             'Fixture/OpenAI replay',
           ]}
           onOpen={() => onOpen('query')}
-        />
-        <CapabilityCard
-          icon={<Database size={20} />}
-          title="Synthetic Data Provider"
-          status="Fixture ready"
-          summary="Inspect the synthetic ecommerce data source, run provider tools, and preview the OpenAI-backed source boundary."
-          details={[
-            '3 provider tools',
-            'Fixture/OpenAI source shape',
-            'Agent-compatible ToolRegistry',
-          ]}
-          onOpen={() => onOpen('synthetic-data')}
         />
       </section>
     </main>

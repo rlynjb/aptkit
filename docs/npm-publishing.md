@@ -6,7 +6,7 @@ The package is built from `packages/core`, but it is packed as a standalone tarb
 
 ## Publish
 
-Publish `0.2.0` with GitHub Actions after adding an `NPM_TOKEN` repository secret:
+Publish `0.2.1` with GitHub Actions after adding an `NPM_TOKEN` repository secret:
 
 1. Open the `Publish AptKit Core` workflow from the GitHub Actions tab.
 2. Run the workflow manually from `main`.
@@ -30,7 +30,7 @@ npm run publish:core:npm
 Blooming can keep importing `@aptkit/core` by installing `@rlynjb/aptkit-core` through an npm alias:
 
 ```sh
-npm install @aptkit/core@npm:@rlynjb/aptkit-core@0.2.0
+npm install @aptkit/core@npm:@rlynjb/aptkit-core@0.2.1
 ```
 
 Because this package is public on npmjs, Vercel does not need a package registry token to install it.

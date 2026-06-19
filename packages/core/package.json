@@ -1,6 +1,6 @@
 {
   "name": "@rlynjb/aptkit-core",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "description": "Standalone AptKit core bundle for extracted agent capabilities.",
   "main": "./dist/src/index.js",
@@ -36,7 +36,6 @@
     "@aptkit/context": "0.0.0",
     "@aptkit/evals": "0.0.0",
     "@aptkit/prompts": "0.0.0",
-    "@aptkit/provider-synthetic": "0.0.0",
     "@aptkit/runtime": "0.0.0",
     "@aptkit/tools": "0.0.0"
   },
@@ -48,7 +47,6 @@
     "@aptkit/context",
     "@aptkit/evals",
     "@aptkit/prompts",
-    "@aptkit/provider-synthetic",
     "@aptkit/runtime",
     "@aptkit/tools"
   ],
