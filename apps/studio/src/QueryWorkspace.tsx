@@ -8,7 +8,8 @@ import { runQueryFixtureReplay } from './agent-runners';
 import { EvalPanel, Metric, Panel, PromptPackagePanel, ProviderStatusPanel, TracePanel } from './components';
 import { queryFixtures } from './fixtures';
 import { buildQueryReplayArtifact, formatCost, formatDuration } from './replay-artifacts';
-import type { PromotedQueryFixtureSummary, QueryFixture, QueryPromoteResult, QueryReplayMode, QueryReplayResult, SavedQueryReplaySummary } from './types';
+import { useReplayArtifacts } from './useReplayArtifacts';
+import type { QueryFixture, QueryReplayMode, QueryReplayResult } from './types';
 
 type QueryShellResult = QueryReplayResult & { savedPath?: string };
 
@@ -59,86 +60,35 @@ function queryMetrics(context: QueryShellContext) {
 
 function QueryPanels({ context, resetToken }: { context: QueryShellContext; resetToken: number }) {
   const { error, fixture, mode, providerStatus, replay, running, setReplay, usage, visibleTrace } = context;
-  const [saving, setSaving] = React.useState(false);
-  const [saveError, setSaveError] = React.useState<string | null>(null);
-  const [savedReplays, setSavedReplays] = React.useState<SavedQueryReplaySummary[]>([]);
-  const [historyLoading, setHistoryLoading] = React.useState(false);
-  const [historyError, setHistoryError] = React.useState<string | null>(null);
-  const [promotingPath, setPromotingPath] = React.useState<string | null>(null);
-  const [promoteResult, setPromoteResult] = React.useState<QueryPromoteResult | null>(null);
-  const [promotedFixtures, setPromotedFixtures] = React.useState<PromotedQueryFixtureSummary[]>([]);
-  const [promotedLoading, setPromotedLoading] = React.useState(false);
-  const [promotedError, setPromotedError] = React.useState<string | null>(null);
-
-  React.useEffect(() => {
-    setSaveError(null);
-    setPromoteResult(null);
-  }, [resetToken]);
-
-  const refreshReplayHistory = React.useCallback(async () => {
-    setHistoryLoading(true);
-    setHistoryError(null);
-    try {
-      setSavedReplays(await loadSavedQueryReplays());
-    } catch (caught) {
-      setHistoryError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setHistoryLoading(false);
-    }
-  }, []);
-
-  React.useEffect(() => {
-    void refreshReplayHistory();
-  }, [refreshReplayHistory]);
-
-  const refreshPromotedFixtures = React.useCallback(async () => {
-    setPromotedLoading(true);
-    setPromotedError(null);
-    try {
-      setPromotedFixtures(await loadPromotedQueryFixtures());
-    } catch (caught) {
-      setPromotedError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setPromotedLoading(false);
-    }
-  }, []);
-
-  React.useEffect(() => {
-    void refreshPromotedFixtures();
-  }, [refreshPromotedFixtures]);
-
-  async function saveCurrentReplay() {
-    if (!replay) return;
-    setSaving(true);
-    setSaveError(null);
-    try {
-      const artifact = buildQueryReplayArtifact(fixture, replay, mode, providerStatus[mode].model);
-      const savedPath = await saveReplayArtifact(artifact);
-      setReplay((current) => current ? { ...current, savedPath } : current);
-      await refreshReplayHistory();
-    } catch (caught) {
-      setSaveError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  async function promoteSavedReplay(path: string) {
-    setPromotingPath(path);
-    setHistoryError(null);
-    setPromoteResult(null);
-    try {
-      const result = await promoteQueryReplay(path);
-      setPromoteResult(result);
-      await refreshPromotedFixtures();
-    } catch (caught) {
-      setHistoryError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setPromotingPath(null);
-    }
-  }
-
-  const latestReviewPath = replay?.savedPath ?? savedReplays.find((savedReplay) => savedReplay.fixture.id === fixture.id && savedReplay.provider.id === mode)?.path;
+  const {
+    historyError,
+    historyLoading,
+    latestReviewPath,
+    promotedError,
+    promotedFixtures,
+    promotedLoading,
+    promoteResult,
+    promoteSavedReplay,
+    promotingPath,
+    refreshPromotedFixtures,
+    refreshReplayHistory,
+    saveCurrentReplay,
+    saveError,
+    savedReplays,
+    saving,
+  } = useReplayArtifacts({
+    buildArtifact: buildQueryReplayArtifact,
+    fixture,
+    loadPromotedFixtures: loadPromotedQueryFixtures,
+    loadSavedReplays: loadSavedQueryReplays,
+    mode,
+    model: providerStatus[mode].model,
+    promoteReplay: promoteQueryReplay,
+    replay,
+    resetToken,
+    saveArtifact: saveReplayArtifact,
+    setReplay,
+  });
   const renderedPrompt = renderPromptTemplate(queryPromptPackage.system, {
     schema: schemaSummary(fixture.workspace),
     project_id: fixture.workspace.projectId,

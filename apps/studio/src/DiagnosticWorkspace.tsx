@@ -8,7 +8,8 @@ import { runDiagnosticFixtureReplay } from './agent-runners';
 import { EvalPanel, Metric, Panel, PromptPackagePanel, ProviderStatusPanel, TracePanel } from './components';
 import { diagnosticFixtures } from './fixtures';
 import { buildDiagnosticReplayArtifact, formatCost, formatDuration } from './replay-artifacts';
-import type { DiagnosticFixture, DiagnosticPromoteResult, DiagnosticReplayMode, DiagnosticReplayResult, PromotedDiagnosticFixtureSummary, SavedDiagnosticReplaySummary } from './types';
+import { useReplayArtifacts } from './useReplayArtifacts';
+import type { DiagnosticFixture, DiagnosticReplayMode, DiagnosticReplayResult } from './types';
 
 type DiagnosticShellResult = DiagnosticReplayResult & { savedPath?: string };
 
@@ -62,86 +63,35 @@ function diagnosticMetrics(context: DiagnosticShellContext) {
 function DiagnosticPanels({ context, resetToken }: { context: DiagnosticShellContext; resetToken: number }) {
   const { error, fixture, mode, providerStatus, replay, running, setReplay, usage, visibleTrace } = context;
   const diagnosis = replay?.diagnosis;
-  const [saving, setSaving] = React.useState(false);
-  const [saveError, setSaveError] = React.useState<string | null>(null);
-  const [savedReplays, setSavedReplays] = React.useState<SavedDiagnosticReplaySummary[]>([]);
-  const [historyLoading, setHistoryLoading] = React.useState(false);
-  const [historyError, setHistoryError] = React.useState<string | null>(null);
-  const [promotingPath, setPromotingPath] = React.useState<string | null>(null);
-  const [promoteResult, setPromoteResult] = React.useState<DiagnosticPromoteResult | null>(null);
-  const [promotedFixtures, setPromotedFixtures] = React.useState<PromotedDiagnosticFixtureSummary[]>([]);
-  const [promotedLoading, setPromotedLoading] = React.useState(false);
-  const [promotedError, setPromotedError] = React.useState<string | null>(null);
-
-  React.useEffect(() => {
-    setSaveError(null);
-    setPromoteResult(null);
-  }, [resetToken]);
-
-  const refreshReplayHistory = React.useCallback(async () => {
-    setHistoryLoading(true);
-    setHistoryError(null);
-    try {
-      setSavedReplays(await loadSavedDiagnosticReplays());
-    } catch (caught) {
-      setHistoryError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setHistoryLoading(false);
-    }
-  }, []);
-
-  React.useEffect(() => {
-    void refreshReplayHistory();
-  }, [refreshReplayHistory]);
-
-  const refreshPromotedFixtures = React.useCallback(async () => {
-    setPromotedLoading(true);
-    setPromotedError(null);
-    try {
-      setPromotedFixtures(await loadPromotedDiagnosticFixtures());
-    } catch (caught) {
-      setPromotedError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setPromotedLoading(false);
-    }
-  }, []);
-
-  React.useEffect(() => {
-    void refreshPromotedFixtures();
-  }, [refreshPromotedFixtures]);
-
-  async function saveCurrentReplay() {
-    if (!replay) return;
-    setSaving(true);
-    setSaveError(null);
-    try {
-      const artifact = buildDiagnosticReplayArtifact(fixture, replay, mode, providerStatus[mode].model);
-      const savedPath = await saveReplayArtifact(artifact);
-      setReplay((current) => current ? { ...current, savedPath } : current);
-      await refreshReplayHistory();
-    } catch (caught) {
-      setSaveError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  async function promoteSavedReplay(path: string) {
-    setPromotingPath(path);
-    setHistoryError(null);
-    setPromoteResult(null);
-    try {
-      const result = await promoteDiagnosticReplay(path);
-      setPromoteResult(result);
-      await refreshPromotedFixtures();
-    } catch (caught) {
-      setHistoryError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setPromotingPath(null);
-    }
-  }
-
-  const latestReviewPath = replay?.savedPath ?? savedReplays.find((savedReplay) => savedReplay.fixture.id === fixture.id && savedReplay.provider.id === mode)?.path;
+  const {
+    historyError,
+    historyLoading,
+    latestReviewPath,
+    promotedError,
+    promotedFixtures,
+    promotedLoading,
+    promoteResult,
+    promoteSavedReplay,
+    promotingPath,
+    refreshPromotedFixtures,
+    refreshReplayHistory,
+    saveCurrentReplay,
+    saveError,
+    savedReplays,
+    saving,
+  } = useReplayArtifacts({
+    buildArtifact: buildDiagnosticReplayArtifact,
+    fixture,
+    loadPromotedFixtures: loadPromotedDiagnosticFixtures,
+    loadSavedReplays: loadSavedDiagnosticReplays,
+    mode,
+    model: providerStatus[mode].model,
+    promoteReplay: promoteDiagnosticReplay,
+    replay,
+    resetToken,
+    saveArtifact: saveReplayArtifact,
+    setReplay,
+  });
   const renderedPrompt = renderPromptTemplate(diagnosticPromptPackage.system, {
     schema: schemaSummary(fixture.workspace),
     project_id: fixture.workspace.projectId,
