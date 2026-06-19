@@ -1,5 +1,5 @@
 import React from 'react';
-import { Boxes, BrainCircuit, Cloud, FileText, KeyRound, ShieldCheck } from 'lucide-react';
+import { Boxes, BrainCircuit, Cloud, FileText, KeyRound, Save, ShieldCheck } from 'lucide-react';
 import type { PromptPackage } from '@aptkit/prompts';
 import type { CapabilityEvent } from '@aptkit/runtime';
 import type { ProviderStatus, ReplayMode } from './types';
@@ -73,6 +73,54 @@ export function Panel({ title, icon, children, wide = false }: { title: string; 
       </header>
       {children}
     </section>
+  );
+}
+
+export function AgentStatusPanel({
+  icon,
+  rows,
+  title = 'Fixture',
+}: {
+  icon: React.ReactNode;
+  rows: { label: string; value: React.ReactNode }[];
+  title?: string;
+}) {
+  return (
+    <Panel title={title} icon={icon}>
+      <div className="kv">
+        {rows.map((row) => (
+          <React.Fragment key={row.label}>
+            <span>{row.label}</span>
+            <strong>{row.value}</strong>
+          </React.Fragment>
+        ))}
+      </div>
+    </Panel>
+  );
+}
+
+export function SaveReplayControl({
+  canSave,
+  onSave,
+  savedPath,
+  saveError,
+  saving,
+}: {
+  canSave: boolean;
+  onSave: () => void;
+  savedPath: string | undefined;
+  saveError: string | null;
+  saving: boolean;
+}) {
+  return (
+    <div className="saveReplay">
+      <button type="button" onClick={onSave} disabled={!canSave || saving}>
+        <Save size={15} />
+        <span>{saving ? 'Saving' : savedPath ? 'Saved' : 'Save Replay'}</span>
+      </button>
+      <code>{savedPath ?? 'No saved artifact yet'}</code>
+      {saveError ? <p>{saveError}</p> : null}
+    </div>
   );
 }
 

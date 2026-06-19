@@ -1,11 +1,11 @@
 import React from 'react';
-import { Activity, BadgeCheck, Boxes, BrainCircuit, CircleDollarSign, FileCheck, Gauge, History, RefreshCw, Route, Save, SearchCheck, Timer } from 'lucide-react';
+import { Activity, BadgeCheck, Boxes, BrainCircuit, CircleDollarSign, FileCheck, Gauge, History, RefreshCw, Route, SearchCheck, Timer } from 'lucide-react';
 import { diagnosticPromptPackage, renderPromptTemplate } from '@aptkit/prompts';
 import { schemaSummary } from '@aptkit/context';
 import { loadPromotedDiagnosticFixtures, loadSavedDiagnosticReplays, promoteDiagnosticReplay, runServerDiagnosticReplay, saveReplayArtifact } from './api';
 import { AgentReplayShell, type AgentReplayShellContext } from './AgentReplayShell';
 import { runDiagnosticFixtureReplay } from './agent-runners';
-import { EvalPanel, Metric, Panel, PromptPackagePanel, ProviderStatusPanel, TracePanel } from './components';
+import { AgentStatusPanel, EvalPanel, Metric, Panel, PromptPackagePanel, ProviderStatusPanel, SaveReplayControl, TracePanel } from './components';
 import { diagnosticFixtures } from './fixtures';
 import { buildDiagnosticReplayArtifact, formatCost, formatDuration } from './replay-artifacts';
 import { useReplayArtifacts } from './useReplayArtifacts';
@@ -101,28 +101,20 @@ function DiagnosticPanels({ context, resetToken }: { context: DiagnosticShellCon
   return (
     <div className="layout">
       <section className="leftPane">
-        <Panel title="Fixture" icon={<Boxes size={17} />}>
-          <div className="kv">
-            <span>ID</span>
-            <strong>{fixture.id}</strong>
-            <span>Case</span>
-            <strong>{fixture.description}</strong>
-            <span>Status</span>
-            <strong>{error ? 'error' : running ? 'running' : replay ? `completed at ${replay.completedAt}` : 'not run'}</strong>
-            <span>Mode</span>
-            <strong>{mode} / {providerStatus[mode].model}{providerStatus[mode].available ? '' : ' unavailable'}</strong>
-            <span>Workspace</span>
-            <strong>{fixture.workspace.projectName}</strong>
-            <span>Run</span>
-            <strong>{context.runId || replay?.runId || 0}</strong>
-            <span>Turns</span>
-            <strong>{replay?.modelTurns ?? 0}</strong>
-            <span>Input</span>
-            <strong>{usage.inputTokens.toLocaleString()} tokens</strong>
-            <span>Output</span>
-            <strong>{usage.outputTokens.toLocaleString()} tokens</strong>
-          </div>
-        </Panel>
+        <AgentStatusPanel
+          icon={<Boxes size={17} />}
+          rows={[
+            { label: 'ID', value: fixture.id },
+            { label: 'Case', value: fixture.description },
+            { label: 'Status', value: error ? 'error' : running ? 'running' : replay ? `completed at ${replay.completedAt}` : 'not run' },
+            { label: 'Mode', value: `${mode} / ${providerStatus[mode].model}${providerStatus[mode].available ? '' : ' unavailable'}` },
+            { label: 'Workspace', value: fixture.workspace.projectName },
+            { label: 'Run', value: context.runId || replay?.runId || 0 },
+            { label: 'Turns', value: replay?.modelTurns ?? 0 },
+            { label: 'Input', value: `${usage.inputTokens.toLocaleString()} tokens` },
+            { label: 'Output', value: `${usage.outputTokens.toLocaleString()} tokens` },
+          ]}
+        />
 
         <Panel title="Anomaly" icon={<Activity size={17} />}>
           <div className="anomalyGrid">
@@ -219,14 +211,13 @@ function DiagnosticPanels({ context, resetToken }: { context: DiagnosticShellCon
               <li>Query context and timeseries tools</li>
               <li>Validate diagnosis JSON</li>
             </ol>
-            <div className="saveReplay">
-              <button type="button" onClick={() => void saveCurrentReplay()} disabled={!replay || saving}>
-                <Save size={15} />
-                <span>{saving ? 'Saving' : replay?.savedPath ? 'Saved' : 'Save Replay'}</span>
-              </button>
-              <code>{replay?.savedPath ?? 'No saved artifact yet'}</code>
-              {saveError ? <p>{saveError}</p> : null}
-            </div>
+            <SaveReplayControl
+              canSave={Boolean(replay)}
+              onSave={() => void saveCurrentReplay()}
+              savedPath={replay?.savedPath}
+              saveError={saveError}
+              saving={saving}
+            />
             <div className="reviewActions">
               <button
                 className="primaryAction"

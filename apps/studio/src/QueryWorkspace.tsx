@@ -1,11 +1,11 @@
 import React from 'react';
-import { BadgeCheck, Boxes, BrainCircuit, CircleDollarSign, FileCheck, FileText, Gauge, MessageSquareText, RefreshCw, Save, Timer } from 'lucide-react';
+import { BadgeCheck, Boxes, BrainCircuit, CircleDollarSign, FileCheck, FileText, Gauge, MessageSquareText, RefreshCw, Timer } from 'lucide-react';
 import { queryPromptPackage, renderPromptTemplate } from '@aptkit/prompts';
 import { schemaSummary } from '@aptkit/context';
 import { loadPromotedQueryFixtures, loadSavedQueryReplays, promoteQueryReplay, runServerQueryReplay, saveReplayArtifact } from './api';
 import { AgentReplayShell, type AgentReplayShellContext } from './AgentReplayShell';
 import { runQueryFixtureReplay } from './agent-runners';
-import { EvalPanel, Metric, Panel, PromptPackagePanel, ProviderStatusPanel, TracePanel } from './components';
+import { AgentStatusPanel, EvalPanel, Metric, Panel, PromptPackagePanel, ProviderStatusPanel, SaveReplayControl, TracePanel } from './components';
 import { queryFixtures } from './fixtures';
 import { buildQueryReplayArtifact, formatCost, formatDuration } from './replay-artifacts';
 import { useReplayArtifacts } from './useReplayArtifacts';
@@ -98,26 +98,19 @@ function QueryPanels({ context, resetToken }: { context: QueryShellContext; rese
   return (
     <div className="layout">
       <section className="leftPane">
-        <Panel title="Fixture" icon={<Boxes size={17} />}>
-          <div className="kv">
-            <span>ID</span>
-            <strong>{fixture.id}</strong>
-            <span>Question</span>
-            <strong>{fixture.question}</strong>
-            <span>Intent</span>
-            <strong>{fixture.intent}</strong>
-            <span>Status</span>
-            <strong>{error ? 'error' : running ? 'running' : replay ? `completed at ${replay.completedAt}` : 'not run'}</strong>
-            <span>Mode</span>
-            <strong>{mode} / {providerStatus[mode].model}{providerStatus[mode].available ? '' : ' unavailable'}</strong>
-            <span>Workspace</span>
-            <strong>{fixture.workspace.projectName}</strong>
-            <span>Run</span>
-            <strong>{context.runId || replay?.runId || 0}</strong>
-            <span>Turns</span>
-            <strong>{replay?.modelTurns ?? 0}</strong>
-          </div>
-        </Panel>
+        <AgentStatusPanel
+          icon={<Boxes size={17} />}
+          rows={[
+            { label: 'ID', value: fixture.id },
+            { label: 'Question', value: fixture.question },
+            { label: 'Intent', value: fixture.intent },
+            { label: 'Status', value: error ? 'error' : running ? 'running' : replay ? `completed at ${replay.completedAt}` : 'not run' },
+            { label: 'Mode', value: `${mode} / ${providerStatus[mode].model}${providerStatus[mode].available ? '' : ' unavailable'}` },
+            { label: 'Workspace', value: fixture.workspace.projectName },
+            { label: 'Run', value: context.runId || replay?.runId || 0 },
+            { label: 'Turns', value: replay?.modelTurns ?? 0 },
+          ]}
+        />
 
         <Panel title="Workflow" icon={<FileText size={17} />}>
           <div className="workflow">
@@ -131,14 +124,13 @@ function QueryPanels({ context, resetToken }: { context: QueryShellContext; rese
               <li>Return grounded prose answer</li>
               <li>Validate answer presence</li>
             </ol>
-            <div className="saveReplay">
-              <button type="button" onClick={() => void saveCurrentReplay()} disabled={!replay || saving}>
-                <Save size={15} />
-                <span>{saving ? 'Saving' : replay?.savedPath ? 'Saved' : 'Save Replay'}</span>
-              </button>
-              <code>{replay?.savedPath ?? 'No saved artifact yet'}</code>
-              {saveError ? <p>{saveError}</p> : null}
-            </div>
+            <SaveReplayControl
+              canSave={Boolean(replay)}
+              onSave={() => void saveCurrentReplay()}
+              savedPath={replay?.savedPath}
+              saveError={saveError}
+              saving={saving}
+            />
             <div className="reviewActions">
               <button
                 className="primaryAction"
