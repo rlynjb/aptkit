@@ -6,7 +6,7 @@ import { fixtures } from './fixtures';
 import { loadPromotedFixtures, loadSavedReplays, promoteReplay, runServerReplay, saveReplayArtifact } from './api';
 import { AgentReplayShell, type AgentReplayShellContext } from './AgentReplayShell';
 import { runFixtureReplay } from './agent-runners';
-import { EvalPanel, Metric, Panel, PromptPackagePanel, ProviderStatusPanel, TracePanel } from './components';
+import { AgentStatusPanel, EvalPanel, Metric, Panel, PromptPackagePanel, ProviderStatusPanel, TracePanel } from './components';
 import { buildReplayArtifact, comparableFromArtifact, comparisonForFixture, findReviewReplay, formatCost, formatDuration, toReplayState } from './replay-artifacts';
 import { ComparisonPanel, PromotedFixturesPanel, ReplayHistoryPanel, ReviewPanel, WorkflowPanel } from './recommendation-panels';
 import { useReplayArtifacts } from './useReplayArtifacts';
@@ -156,28 +156,20 @@ function RecommendationPanels({ context, resetToken }: { context: Recommendation
   return (
     <div className="layout">
         <section className="leftPane">
-          <Panel title="Fixture" icon={<Boxes size={17} />}>
-            <div className="kv">
-              <span>ID</span>
-              <strong>{fixture.id}</strong>
-              <span>Case</span>
-              <strong>{fixture.description}</strong>
-              <span>Status</span>
-              <strong>{error ? 'error' : running ? 'running' : replay ? `completed at ${replay.completedAt}` : 'not run'}</strong>
-              <span>Mode</span>
-              <strong>{mode} / {providerStatus[mode].model}{providerStatus[mode].available ? '' : ' unavailable'}</strong>
-              <span>Workspace</span>
-              <strong>{fixture.workspace.projectName}</strong>
-              <span>Input</span>
-              <strong>{usage.inputTokens.toLocaleString()} tokens</strong>
-              <span>Output</span>
-              <strong>{usage.outputTokens.toLocaleString()} tokens</strong>
-              <span>Cost</span>
-              <strong>{formatCost(context.costEstimate)}</strong>
-              <span>Horizon</span>
-              <strong>{fixture.workspace.dataHorizon?.from} to {fixture.workspace.dataHorizon?.to}</strong>
-            </div>
-          </Panel>
+          <AgentStatusPanel
+            icon={<Boxes size={17} />}
+            rows={[
+              { label: 'ID', value: fixture.id },
+              { label: 'Case', value: fixture.description },
+              { label: 'Status', value: error ? 'error' : running ? 'running' : replay ? `completed at ${replay.completedAt}` : 'not run' },
+              { label: 'Mode', value: `${mode} / ${providerStatus[mode].model}${providerStatus[mode].available ? '' : ' unavailable'}` },
+              { label: 'Workspace', value: fixture.workspace.projectName },
+              { label: 'Input', value: `${usage.inputTokens.toLocaleString()} tokens` },
+              { label: 'Output', value: `${usage.outputTokens.toLocaleString()} tokens` },
+              { label: 'Cost', value: formatCost(context.costEstimate) },
+              { label: 'Horizon', value: `${fixture.workspace.dataHorizon?.from} to ${fixture.workspace.dataHorizon?.to}` },
+            ]}
+          />
 
           <Panel title="Anomaly" icon={<Activity size={17} />}>
             <div className="anomalyGrid">

@@ -1,12 +1,12 @@
 import React from 'react';
-import { Activity, BadgeCheck, Boxes, BrainCircuit, CircleDollarSign, Clipboard, FileCheck, Gauge, History, Route, Save, Timer } from 'lucide-react';
+import { Activity, BadgeCheck, Boxes, BrainCircuit, CircleDollarSign, Clipboard, FileCheck, Gauge, History, Route, Timer } from 'lucide-react';
 import { ECOMMERCE_ANOMALY_CATEGORIES, coverageReport, formatCategoryChecklist, runnableCategories, schemaCapabilities } from '@aptkit/agent-anomaly-monitoring';
 import { monitoringPromptPackage, renderPromptTemplate } from '@aptkit/prompts';
 import { schemaSummary } from '@aptkit/context';
 import { loadPromotedMonitoringFixtures, loadSavedMonitoringReplays, promoteMonitoringReplay, runServerMonitoringReplay, saveReplayArtifact } from './api';
 import { AgentReplayShell, type AgentReplayShellContext } from './AgentReplayShell';
 import { runMonitoringFixtureReplay } from './agent-runners';
-import { EvalPanel, Metric, Panel, PromptPackagePanel, ProviderStatusPanel, TracePanel } from './components';
+import { AgentStatusPanel, EvalPanel, Metric, Panel, PromptPackagePanel, ProviderStatusPanel, SaveReplayControl, TracePanel } from './components';
 import { monitoringFixtures } from './fixtures';
 import { CoverageItem, MonitoringAnomalyCard, MonitoringComparisonPanel, MonitoringReplayHistoryPanel, MonitoringReviewPanel, PromotedMonitoringFixturesPanel } from './monitoring-panels';
 import { buildMonitoringReplayArtifact, comparableMonitoringFromArtifact, comparisonForMonitoringFixture, findMonitoringReviewReplay, formatCost, formatDuration, toMonitoringReplayState } from './replay-artifacts';
@@ -157,32 +157,22 @@ function MonitoringPanels({ context, resetToken }: { context: MonitoringShellCon
   return (
     <div className="layout">
       <section className="leftPane">
-        <Panel title="Fixture" icon={<Boxes size={17} />}>
-          <div className="kv">
-            <span>ID</span>
-            <strong>{fixture.id}</strong>
-            <span>Case</span>
-            <strong>{fixture.description}</strong>
-            <span>Status</span>
-            <strong>{error ? 'error' : running ? 'running' : replay ? `completed at ${replay.completedAt}` : 'not run'}</strong>
-            <span>Mode</span>
-            <strong>{mode} / {providerStatus[mode].model}{providerStatus[mode].available ? '' : ' unavailable'}</strong>
-            <span>Workspace</span>
-            <strong>{fixture.workspace.projectName}</strong>
-            <span>Input</span>
-            <strong>{usage.inputTokens.toLocaleString()} tokens</strong>
-            <span>Output</span>
-            <strong>{usage.outputTokens.toLocaleString()} tokens</strong>
-            <span>Cost</span>
-            <strong>{formatCost(context.costEstimate)}</strong>
-            <span>Events</span>
-            <strong>{fixture.workspace.totalEvents.toLocaleString()}</strong>
-            <span>Customers</span>
-            <strong>{fixture.workspace.totalCustomers.toLocaleString()}</strong>
-            <span>Horizon</span>
-            <strong>{fixture.workspace.dataHorizon?.from} to {fixture.workspace.dataHorizon?.to}</strong>
-          </div>
-        </Panel>
+        <AgentStatusPanel
+          icon={<Boxes size={17} />}
+          rows={[
+            { label: 'ID', value: fixture.id },
+            { label: 'Case', value: fixture.description },
+            { label: 'Status', value: error ? 'error' : running ? 'running' : replay ? `completed at ${replay.completedAt}` : 'not run' },
+            { label: 'Mode', value: `${mode} / ${providerStatus[mode].model}${providerStatus[mode].available ? '' : ' unavailable'}` },
+            { label: 'Workspace', value: fixture.workspace.projectName },
+            { label: 'Input', value: `${usage.inputTokens.toLocaleString()} tokens` },
+            { label: 'Output', value: `${usage.outputTokens.toLocaleString()} tokens` },
+            { label: 'Cost', value: formatCost(context.costEstimate) },
+            { label: 'Events', value: fixture.workspace.totalEvents.toLocaleString() },
+            { label: 'Customers', value: fixture.workspace.totalCustomers.toLocaleString() },
+            { label: 'Horizon', value: `${fixture.workspace.dataHorizon?.from} to ${fixture.workspace.dataHorizon?.to}` },
+          ]}
+        />
 
         <Panel title="Coverage" icon={<FileCheck size={17} />}>
           <div className="coverageSummary">
@@ -233,14 +223,13 @@ function MonitoringPanels({ context, resetToken }: { context: MonitoringShellCon
               <li>Validate anomaly JSON</li>
               <li>Review trace and coverage in Studio</li>
             </ol>
-            <div className="saveReplay">
-              <button type="button" onClick={() => void saveCurrentReplay()} disabled={!replay || saving}>
-                <Save size={15} />
-                <span>{saving ? 'Saving' : replay?.savedPath ? 'Saved' : 'Save Replay'}</span>
-              </button>
-              <code>{replay?.savedPath ?? 'No saved artifact yet'}</code>
-              {saveError ? <p>{saveError}</p> : null}
-            </div>
+            <SaveReplayControl
+              canSave={Boolean(replay)}
+              onSave={() => void saveCurrentReplay()}
+              savedPath={replay?.savedPath}
+              saveError={saveError}
+              saving={saving}
+            />
             <div className="commandList">
               <div className="commandRow">
                 <span>{mode === 'fixture' ? 'CLI replay' : 'Live shape'}</span>

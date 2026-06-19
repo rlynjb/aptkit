@@ -1,7 +1,7 @@
 import React from 'react';
 import { Check, Clipboard, FileCheck, History, Play, RefreshCw, Route, Save } from 'lucide-react';
 import type { Recommendation } from '@aptkit/agent-recommendation';
-import { Panel } from './components';
+import { Panel, SaveReplayControl } from './components';
 import { featureSet, formatCost, formatCostDelta, formatDelta, formatDuration } from './replay-artifacts';
 import type { ComparableReplay, ComparisonState, CostEstimate, PromoteResult, RecommendationFixture, ReplayMode, ReplayState, SavedReplaySummary, TokenUsageSummary, PromotedFixtureSummary } from './types';
 
@@ -306,14 +306,13 @@ export function WorkflowPanel({
           <li>Promote reviewed replay</li>
           <li>Regression test promoted fixture</li>
         </ol>
-        <div className="saveReplay">
-          <button type="button" onClick={onSave} disabled={!replay || saving}>
-            <Save size={15} />
-            <span>{saving ? 'Saving' : replay?.savedPath ? 'Saved' : 'Save Replay'}</span>
-          </button>
-          <code>{replay?.savedPath ?? 'No saved artifact yet'}</code>
-          {saveError ? <p>{saveError}</p> : null}
-        </div>
+        <SaveReplayControl
+          canSave={Boolean(replay)}
+          onSave={onSave}
+          savedPath={replay?.savedPath}
+          saveError={saveError}
+          saving={saving}
+        />
         <div className="commandList">
           {commands.map((item) => (
             <div className="commandRow" key={item.id}>
