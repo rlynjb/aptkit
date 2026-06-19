@@ -39,6 +39,7 @@ export type AgentReplayShellContext<F, M extends string, R extends ReplayResultB
   runId: number;
   error: string | null;
   setReplay: React.Dispatch<React.SetStateAction<ReplayStateFor<R> | null>>;
+  setRunId: React.Dispatch<React.SetStateAction<number>>;
   startReplay: () => Promise<void>;
   selectMode: (mode: M) => void;
 };
@@ -174,6 +175,7 @@ export function AgentReplayShell<F, M extends string, R extends ReplayResultBase
     runId,
     error,
     setReplay,
+    setRunId,
     startReplay,
     selectMode,
   };
