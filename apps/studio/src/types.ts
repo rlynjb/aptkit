@@ -113,6 +113,14 @@ export type DiagnosticReplayMode = 'fixture' | 'openai';
 
 export type QueryReplayMode = 'fixture' | 'openai';
 
+export type StudioView =
+  | 'home'
+  | 'recommendation'
+  | 'monitoring'
+  | 'diagnostic'
+  | 'query'
+  | 'capabilities';
+
 export type ProviderStatus = Record<ReplayMode, { available: boolean; model: string }>;
 
 export type { CostEstimate, TokenUsageSummary };
@@ -473,5 +481,3 @@ export type PromotedQueryFixtureSummary = {
   usage: TokenUsageSummary;
   costEstimate?: CostEstimate;
 };
-
-export type StudioView = 'home' | 'recommendation' | 'monitoring' | 'diagnostic' | 'query';

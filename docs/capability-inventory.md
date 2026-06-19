@@ -1,12 +1,12 @@
 # AptKit Capability Inventory
 
-This inventory turns the operational plan in `docs/ai-capability-library-plan.md` into a working list of extractable capabilities.
+This inventory turns the operational plan in `docs/ai-capability-library-plan.md` into a working list of packaged capabilities.
 
-Use it as the discovery ledger before code moves into `packages/*`. Each entry should answer three questions:
+Use it as the package ledger after code moves into `packages/*`. Each entry should answer three questions:
 
 - What reusable behavior exists?
 - What app-specific surface must stay behind?
-- What would make the capability safe to package?
+- What maturity gap remains before the capability is Level 6?
 
 ## Extraction Rubric
 
@@ -53,7 +53,46 @@ Maturity follows the plan's Level 0-6 model, where Level 6 means a reusable pack
 | P1 | `structural-diff-evaluator` | Structural diff evaluator | Evaluator | `blooming_insights` | `packages/evals` | High | Packaged |
 | P1 | `detection-scorer` | Detection scorer | Evaluator | `blooming_insights` | `packages/evals` | Medium | Packaged |
 
-## P0 Candidates
+## Packaged API Map
+
+| Capability ID | Primary Package | Main Exports | Studio Preview |
+| --- | --- | --- | --- |
+| `bounded-agent-loop` | `@aptkit/runtime` | `runAgentLoop`, `ModelProvider`, `CapabilityEvent` | Agent workspaces |
+| `capability-trace-events` | `@aptkit/runtime` | `CapabilityEvent`, `CapabilityTraceSink`, event helpers | Agent and utility traces |
+| `tool-registry` | `@aptkit/tools` | `ToolRegistry`, `InMemoryToolRegistry` | Agent workspaces |
+| `json-output-extractor` | `@aptkit/runtime` | `parseAgentJson`, `parseValidatedJson` | Runtime utilities |
+| `ndjson-event-streaming` | `@aptkit/runtime` | `encodeNdjsonRecord`, `decodeNdjsonStream`, `collectNdjsonStream` | Agent workspaces |
+| `recommendation-agent` | `@aptkit/agent-recommendation` | `RecommendationAgent`, validators, prompt package | Recommendation |
+| `anomaly-monitoring-agent` | `@aptkit/agent-anomaly-monitoring` | `AnomalyMonitoringAgent`, categories, coverage helpers | Monitoring |
+| `diagnostic-investigation-agent` | `@aptkit/agent-diagnostic-investigation` | `DiagnosticInvestigationAgent`, validators | Diagnostic |
+| `query-over-tools-agent` | `@aptkit/agent-query` | `QueryAgent`, `classifyIntent`, validators | Query |
+| `prompt-package` | `@aptkit/prompts` | prompt packages and render helpers | Agent prompt panels |
+| `tool-policy-manifest` | `@aptkit/tools` | `ToolPolicy`, `filterToolsForPolicy` | Agent workspaces |
+| `workspace-descriptor` | `@aptkit/context` | `WorkspaceDescriptor`, schema summary helpers | Agent workspaces |
+| `capability-coverage-gate` | `@aptkit/tools` | coverage gate helpers | Monitoring |
+| `provider-fallback-chain` | `@aptkit/provider-fallback` | `FallbackModelProvider` | Runtime utilities |
+| `usage-ledger` | `@aptkit/runtime` | `UsageLedger`, usage summary helpers | Agent traces |
+| `structured-generation` | `@aptkit/runtime` | `generateStructured` | Runtime utilities |
+| `local-context-guard` | `@aptkit/provider-local` | `ContextWindowGuardedProvider`, estimate helpers | Runtime utilities |
+| `rubric-judge` | `@aptkit/evals` | `RubricJudge`, prompt builders, validator | Runtime utilities |
+| `content-generation-workflow` | `@aptkit/workflows` | `ensureGeneratedContent`, `planContentVariant`, `splitMarkdownSections` | Runtime utilities |
+| `eval-harness` | `@aptkit/evals` | replay runner and assertions | Replay scripts |
+| `structural-diff-evaluator` | `@aptkit/evals` | `evaluateStructuralDiff`, `assertRequiredPaths`, `getPath` | Replay scripts |
+| `detection-scorer` | `@aptkit/evals` | detection scorer helpers | Package tests |
+
+## Maturity Gaps
+
+All P0/P1 inventory rows are packaged. The remaining work is Level 6 maturity, not extraction.
+
+| Gap | Status | Next Work |
+| --- | --- | --- |
+| Package tests | In place for packaged core utilities, evals, agents, workflows, and providers. | Keep adding fixture tests when APIs expand. |
+| Studio previews | Agents and non-agent utilities have preview entries. | Add previews for future provider adapters and examples. |
+| READMEs/examples | Package READMEs exist for current reusable packages. | Keep README examples aligned with exported APIs. |
+| Versioning | Core bundle is published as `@rlynjb/aptkit-core`. | Publish only after API or example changes require a release. |
+| Adapter examples | Blooming consumes the public core package; provider adapters remain separate. | Add example adapters only when they are generic enough to reuse. |
+
+## P0 Packaged Capabilities
 
 ### Capability: Bounded Agent Tool-Use Loop
 
@@ -243,7 +282,7 @@ Acceptance criteria:
 - Emits standard trace events.
 - Includes at least three examples and no real secrets.
 
-## P1 Candidates
+## P1 Packaged Capabilities
 
 ### Capability: Anomaly Monitoring Agent
 
@@ -710,7 +749,7 @@ Acceptance criteria:
 
 ## First Extraction Slice
 
-The first slice should make `recommendation-agent` runnable outside `blooming_insights` with fake providers and fixtures.
+The first slice made `recommendation-agent` runnable outside `blooming_insights` with fake providers and fixtures.
 
 Required supporting capabilities:
 
@@ -721,7 +760,7 @@ Required supporting capabilities:
 5. `tool-policy-manifest`
 6. `recommendation-agent`
 
-This keeps the initial package graph small while still proving the runtime seams that later agents need.
+This kept the initial package graph small while still proving the runtime seams that later agents needed.
 
 ## Inventory Maintenance Rules
 

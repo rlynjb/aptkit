@@ -4,6 +4,7 @@ import { RecommendationWorkspace } from './RecommendationWorkspace';
 import { MonitoringWorkspace } from './MonitoringWorkspace';
 import { DiagnosticWorkspace } from './DiagnosticWorkspace';
 import { QueryWorkspace } from './QueryWorkspace';
+import { CapabilitiesWorkspace } from './CapabilitiesWorkspace';
 import { StudioHome } from './StudioHome';
 import type { StudioView } from './types';
 import './styles.css';
@@ -25,6 +26,10 @@ function App() {
 
   if (view === 'query') {
     return <QueryWorkspace onHome={() => setView('home')} />;
+  }
+
+  if (view === 'capabilities') {
+    return <CapabilitiesWorkspace onHome={() => setView('home')} />;
   }
 
   return <StudioHome onOpen={setView} />;

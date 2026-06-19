@@ -174,7 +174,7 @@ h1 {
 
 .metrics {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(6, minmax(0, 1fr));
   gap: 10px;
   margin-bottom: 16px;
 }
@@ -195,6 +195,17 @@ h1 {
   border: 1px solid #d9dfd7;
   border-radius: 8px;
   background: #ffffff;
+  cursor: pointer;
+}
+
+.capabilityCard:focus-visible {
+  outline: 3px solid #9cc5ad;
+  outline-offset: 2px;
+}
+
+.capabilityCard:hover {
+  border-color: #b7c9bd;
+  box-shadow: 0 4px 12px rgba(34, 47, 39, 0.08);
 }
 
 .capabilityCardHeader {
@@ -258,6 +269,111 @@ h1 {
   color: #31453b;
   font-size: 13px;
   font-weight: 750;
+}
+
+.capabilityWorkspace {
+  display: grid;
+  grid-template-columns: minmax(300px, 1fr) minmax(300px, 1fr) minmax(300px, 0.9fr);
+  gap: 16px;
+  align-items: start;
+}
+
+.utilityPreview {
+  display: grid;
+  gap: 12px;
+}
+
+.jsonPreview {
+  max-height: 280px;
+  margin: 0;
+  padding: 10px;
+  border: 1px solid #e2e7e0;
+  border-radius: 6px;
+  overflow: auto;
+  background: #fafbf9;
+  color: #24362e;
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+
+.scoreGrid,
+.variantList,
+.capabilityInventoryList {
+  display: grid;
+  gap: 8px;
+}
+
+.scoreGrid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.scoreGrid div,
+.variantList div,
+.capabilityInventoryList div {
+  display: grid;
+  gap: 4px;
+  padding: 10px;
+  border: 1px solid #e2e7e0;
+  border-radius: 6px;
+  background: #fafbf9;
+}
+
+.scoreGrid span,
+.variantList span {
+  color: #66766c;
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.scoreGrid strong,
+.variantList strong,
+.capabilityInventoryList strong {
+  color: #24362e;
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.scoreGrid p,
+.variantList p {
+  margin: 0;
+  color: #54645a;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.capabilityChecks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.capabilityChecks span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 26px;
+  padding: 0 8px;
+  border-radius: 999px;
+  background: #eef2ed;
+  color: #5f6d64;
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.capabilityChecks span.passed {
+  background: #e3f3ea;
+  color: #145438;
+}
+
+.capabilityInventoryList code {
+  color: #405149;
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  font-size: 12px;
+  overflow-wrap: anywhere;
 }
 
 .metric {
@@ -1640,7 +1756,8 @@ h1 {
 }
 
 @media (max-width: 1180px) {
-  .layout {
+  .layout,
+  .capabilityWorkspace {
     grid-template-columns: 1fr 1fr;
   }
 
@@ -1679,8 +1796,10 @@ h1 {
 
   .metrics,
   .layout,
+  .capabilityWorkspace,
   .capabilityGrid,
-  .anomalyMeta {
+  .anomalyMeta,
+  .scoreGrid {
     grid-template-columns: 1fr;
   }
 

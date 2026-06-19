@@ -1,5 +1,5 @@
 import React from 'react';
-import { Activity, CircleDollarSign, MessageSquareText, Play, SearchCheck } from 'lucide-react';
+import { Activity, Boxes, CircleDollarSign, MessageSquareText, Play, SearchCheck } from 'lucide-react';
 import { ECOMMERCE_ANOMALY_CATEGORIES, coverageReport, schemaCapabilities } from '@aptkit/agent-anomaly-monitoring';
 import { diagnosticFixtures, fixtures, monitoringFixtures, queryFixtures } from './fixtures';
 import type { StudioView } from './types';
@@ -70,6 +70,18 @@ export function StudioHome({ onOpen }: { onOpen: (view: StudioView) => void }) {
           ]}
           onOpen={() => onOpen('query')}
         />
+        <CapabilityCard
+          icon={<Boxes size={20} />}
+          title="Runtime & Eval Utilities"
+          status="Preview ready"
+          summary="Exercise structured generation, rubric judging, content workflows, provider fallback, and local context guards."
+          details={[
+            '4 utility previews',
+            'Fixture providers',
+            'Trace and retry review',
+          ]}
+          onOpen={() => onOpen('capabilities')}
+        />
       </section>
     </main>
   );
@@ -90,8 +102,21 @@ export function CapabilityCard({
   details: string[];
   onOpen: () => void;
 }) {
+  const handleKeyDown = (event: React.KeyboardEvent<HTMLElement>) => {
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      onOpen();
+    }
+  };
+
   return (
-    <article className="capabilityCard">
+    <article
+      className="capabilityCard"
+      onClick={onOpen}
+      onKeyDown={handleKeyDown}
+      role="button"
+      tabIndex={0}
+    >
       <div className="capabilityCardHeader">
         <div className="capabilityIcon">{icon}</div>
         <span>{status}</span>
@@ -103,7 +128,14 @@ export function CapabilityCard({
           <strong key={detail}>{detail}</strong>
         ))}
       </div>
-      <button className="primaryAction" type="button" onClick={onOpen}>
+      <button
+        className="primaryAction"
+        type="button"
+        onClick={(event) => {
+          event.stopPropagation();
+          onOpen();
+        }}
+      >
         <Play size={15} />
         <span>Open</span>
       </button>
