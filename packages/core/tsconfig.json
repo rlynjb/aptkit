@@ -12,7 +12,8 @@
     { "path": "../evals" },
     { "path": "../prompts" },
     { "path": "../runtime" },
-    { "path": "../tools" }
+    { "path": "../tools" },
+    { "path": "../workflows" }
   ],
   "include": ["src/**/*.ts", "test/**/*.ts"]
 }

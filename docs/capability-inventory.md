@@ -45,10 +45,10 @@ Maturity follows the plan's Level 0-6 model, where Level 6 means a reusable pack
 | P1 | `capability-coverage-gate` | Capability coverage gate | Utility | `blooming_insights` | `packages/tools` | Medium | Packaged |
 | P1 | `provider-fallback-chain` | Provider fallback chain | Provider | `dryrun` | `packages/providers/fallback` | High | Packaged |
 | P1 | `usage-ledger` | LLM progress and usage accounting | Utility | `dryrun` | `packages/runtime` | Medium | Packaged |
-| P1 | `structured-generation` | On-device JSON retry/fallback pipeline | Utility | `dryrun` | `packages/runtime` or `packages/providers/local` | Medium | Candidate |
-| P1 | `local-context-guard` | Local model context-window guard | Provider | `dryrun` | `packages/providers/local` | Medium | Design only |
-| P1 | `rubric-judge` | Rubric judge capability | Evaluator | `dryrun` | `packages/evals` or `packages/agents/judge` | Medium | Candidate |
-| P1 | `content-generation-workflow` | Content chunking and multi-angle generation | Workflow | `dryrun` | `packages/workflows` or `packages/prompts` | Medium | Candidate |
+| P1 | `structured-generation` | On-device JSON retry/fallback pipeline | Utility | `dryrun` | `packages/runtime` | Medium | Packaged |
+| P1 | `local-context-guard` | Local model context-window guard | Provider | `dryrun` | `packages/providers/local` | Medium | Packaged |
+| P1 | `rubric-judge` | Rubric judge capability | Evaluator | `dryrun` | `packages/evals` | Medium | Packaged |
+| P1 | `content-generation-workflow` | Content chunking and multi-angle generation | Workflow | `dryrun` | `packages/workflows` | Medium | Packaged |
 | P1 | `eval-harness` | Eval runners and golden fixtures | Evaluator | `blooming_insights` | `packages/evals` | High | Packaged |
 | P1 | `structural-diff-evaluator` | Structural diff evaluator | Evaluator | `blooming_insights` | `packages/evals` | High | Packaged |
 | P1 | `detection-scorer` | Detection scorer | Evaluator | `blooming_insights` | `packages/evals` | Medium | Packaged |

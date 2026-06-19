@@ -25,7 +25,7 @@
     }
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -b tsconfig.json",
     "test": "npm run build && node --test dist/test/*.test.js"
   },
   "dependencies": {
@@ -37,7 +37,8 @@
     "@aptkit/evals": "0.0.0",
     "@aptkit/prompts": "0.0.0",
     "@aptkit/runtime": "0.0.0",
-    "@aptkit/tools": "0.0.0"
+    "@aptkit/tools": "0.0.0",
+    "@aptkit/workflows": "0.0.0"
   },
   "bundledDependencies": [
     "@aptkit/agent-anomaly-monitoring",
@@ -48,7 +49,8 @@
     "@aptkit/evals",
     "@aptkit/prompts",
     "@aptkit/runtime",
-    "@aptkit/tools"
+    "@aptkit/tools",
+    "@aptkit/workflows"
   ],
   "devDependencies": {
     "@types/node": "^20.0.0"
