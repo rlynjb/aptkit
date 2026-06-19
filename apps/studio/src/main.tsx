@@ -4,6 +4,7 @@ import { RecommendationWorkspace } from './RecommendationWorkspace';
 import { MonitoringWorkspace } from './MonitoringWorkspace';
 import { DiagnosticWorkspace } from './DiagnosticWorkspace';
 import { QueryWorkspace } from './QueryWorkspace';
+import { RubricImprovementWorkspace } from './RubricImprovementWorkspace';
 import { CapabilitiesWorkspace } from './CapabilitiesWorkspace';
 import { StudioHome } from './StudioHome';
 import type { StudioView } from './types';
@@ -26,6 +27,10 @@ function App() {
 
   if (view === 'query') {
     return <QueryWorkspace onHome={() => setView('home')} />;
+  }
+
+  if (view === 'rubric-improvement') {
+    return <RubricImprovementWorkspace onHome={() => setView('home')} />;
   }
 
   if (view === 'capabilities') {

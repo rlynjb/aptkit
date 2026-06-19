@@ -8,6 +8,7 @@
   },
   "references": [
     { "path": "../agents/recommendation" },
+    { "path": "../agents/rubric-improvement" },
     { "path": "../context" },
     { "path": "../evals" },
     { "path": "../prompts" },

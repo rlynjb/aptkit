@@ -2,6 +2,7 @@ import type { Anomaly, Diagnosis, Recommendation } from '@aptkit/agent-recommend
 import type { Anomaly as MonitoringAnomaly } from '@aptkit/agent-anomaly-monitoring';
 import type { Anomaly as DiagnosticAnomaly, Diagnosis as DiagnosticDiagnosis } from '@aptkit/agent-diagnostic-investigation';
 import type { Intent as QueryIntent } from '@aptkit/agent-query';
+import type { RubricDefinition, RubricImprovementResult } from '@aptkit/agent-rubric-improvement';
 import type { WorkspaceDescriptor } from '@aptkit/context';
 import type { CapabilityEvent, CostEstimate, ModelResponse, TokenUsageSummary } from '@aptkit/runtime';
 import type { ToolDefinition } from '@aptkit/tools';
@@ -41,6 +42,16 @@ export type QueryFixture = {
   question: string;
   intent: QueryIntent;
   workspace: WorkspaceDescriptor;
+  tools: FixtureTool[];
+  modelResponses: ModelResponse[];
+};
+
+export type RubricImprovementFixture = {
+  id: string;
+  description: string;
+  rubric: RubricDefinition;
+  subject: string;
+  context: Record<string, string>;
   tools: FixtureTool[];
   modelResponses: ModelResponse[];
 };
@@ -105,6 +116,20 @@ export type QueryReplayState = {
 
 export type QueryReplayResult = Omit<QueryReplayState, 'completedAt' | 'runId'>;
 
+export type RubricImprovementReplayState = {
+  result: RubricImprovementResult;
+  trace: CapabilityEvent[];
+  evalOk: boolean;
+  evalIssueDetails: { path: string; message: string }[];
+  evalIssues: string[];
+  modelTurns: number;
+  durationMs: number;
+  completedAt: string;
+  runId: number;
+};
+
+export type RubricImprovementReplayResult = Omit<RubricImprovementReplayState, 'completedAt' | 'runId'>;
+
 export type ReplayMode = 'fixture' | 'anthropic' | 'openai';
 
 export type MonitoringReplayMode = 'fixture' | 'openai';
@@ -119,6 +144,7 @@ export type StudioView =
   | 'monitoring'
   | 'diagnostic'
   | 'query'
+  | 'rubric-improvement'
   | 'capabilities';
 
 export type ProviderStatus = Record<ReplayMode, { available: boolean; model: string }>;

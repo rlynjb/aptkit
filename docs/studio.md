@@ -56,6 +56,17 @@ Use this page to check:
 - fixture and OpenAI replay modes
 - trace and eval status
 
+### Rubric Improvement Agent
+
+Validates agentic rubric feedback over a deterministic subject and judgment-history tool.
+
+Use this page to check:
+
+- rubric dimension scoring and weakest-dimension selection
+- history tool usage before final structured output
+- next action and optional next drill output
+- trace and eval status
+
 ### Runtime & Eval Utilities
 
 Validates non-agent package utilities with deterministic fixture providers.

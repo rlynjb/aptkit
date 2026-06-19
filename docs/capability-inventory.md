@@ -39,6 +39,7 @@ Maturity follows the plan's Level 0-6 model, where Level 6 means a reusable pack
 | P1 | `anomaly-monitoring-agent` | Monitoring/anomaly detection agent | Agent | `blooming_insights` | `packages/agents/anomaly-monitoring` | Medium | Packaged |
 | P1 | `diagnostic-investigation-agent` | Diagnostic investigation agent | Agent | `blooming_insights` | `packages/agents/diagnostic-investigation` | Medium | Packaged |
 | P1 | `query-over-tools-agent` | Free-form query agent | Agent | `blooming_insights` | `packages/agents/query` | Medium | Packaged |
+| P1 | `rubric-improvement-agent` | Rubric improvement agent | Agent | `dryrun` | `packages/agents/rubric-improvement` | Medium | Packaged |
 | P1 | `prompt-package` | Prompt packages | Prompt | `blooming_insights`, `dryrun` | `packages/prompts` | Medium | Packaged |
 | P1 | `tool-policy-manifest` | Tool allowlist manifests | Tool | `blooming_insights` | `packages/tools` | High | Packaged |
 | P1 | `workspace-descriptor` | Workspace/schema summarizer | Utility | `blooming_insights` | `packages/context` | Medium | Packaged |
@@ -66,6 +67,7 @@ Maturity follows the plan's Level 0-6 model, where Level 6 means a reusable pack
 | `anomaly-monitoring-agent` | `@aptkit/agent-anomaly-monitoring` | `AnomalyMonitoringAgent`, categories, coverage helpers | Monitoring |
 | `diagnostic-investigation-agent` | `@aptkit/agent-diagnostic-investigation` | `DiagnosticInvestigationAgent`, validators | Diagnostic |
 | `query-over-tools-agent` | `@aptkit/agent-query` | `QueryAgent`, `classifyIntent`, validators | Query |
+| `rubric-improvement-agent` | `@aptkit/agent-rubric-improvement` | `RubricImprovementAgent`, validators, prompt builders | Rubric Improvement |
 | `prompt-package` | `@aptkit/prompts` | prompt packages and render helpers | Agent prompt panels |
 | `tool-policy-manifest` | `@aptkit/tools` | `ToolPolicy`, `filterToolsForPolicy` | Agent workspaces |
 | `workspace-descriptor` | `@aptkit/context` | `WorkspaceDescriptor`, schema summary helpers | Agent workspaces |

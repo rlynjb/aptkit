@@ -1,7 +1,7 @@
 import React from 'react';
-import { Activity, Boxes, CircleDollarSign, MessageSquareText, Play, SearchCheck } from 'lucide-react';
+import { Activity, Boxes, CircleDollarSign, MessageSquareText, Play, Scale, SearchCheck } from 'lucide-react';
 import { ECOMMERCE_ANOMALY_CATEGORIES, coverageReport, schemaCapabilities } from '@aptkit/agent-anomaly-monitoring';
-import { diagnosticFixtures, fixtures, monitoringFixtures, queryFixtures } from './fixtures';
+import { diagnosticFixtures, fixtures, monitoringFixtures, queryFixtures, rubricImprovementFixtures } from './fixtures';
 import type { StudioView } from './types';
 
 export function StudioHome({ onOpen }: { onOpen: (view: StudioView) => void }) {
@@ -69,6 +69,18 @@ export function StudioHome({ onOpen }: { onOpen: (view: StudioView) => void }) {
             'Fixture/OpenAI replay',
           ]}
           onOpen={() => onOpen('query')}
+        />
+        <CapabilityCard
+          icon={<Scale size={20} />}
+          title="Rubric Improvement Agent"
+          status="Fixture ready"
+          summary="Score a subject against a rubric, use recent judgment history, and generate one focused next action."
+          details={[
+            `${rubricImprovementFixtures.length} fixture`,
+            'Rubric scoring output',
+            'Agentic improvement loop',
+          ]}
+          onOpen={() => onOpen('rubric-improvement')}
         />
         <CapabilityCard
           icon={<Boxes size={20} />}

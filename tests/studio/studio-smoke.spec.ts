@@ -5,6 +5,7 @@ const pages = [
   { card: 'Anomaly Monitoring Agent', heading: 'Anomaly Monitoring Replay' },
   { card: 'Diagnostic Investigation Agent', heading: 'Diagnostic Investigation Replay' },
   { card: 'Query Agent', heading: 'Query Replay' },
+  { card: 'Rubric Improvement Agent', heading: 'Rubric Improvement Agent' },
   { card: 'Runtime & Eval Utilities', heading: 'Runtime & Eval Utilities' },
 ];
 

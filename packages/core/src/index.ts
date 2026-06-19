@@ -45,3 +45,18 @@ export type {
   Intent as QueryIntent,
   QueryAnswer,
 } from '@aptkit/agent-query';
+export {
+  RUBRIC_IMPROVEMENT_CAPABILITY_ID,
+  RubricImprovementAgent,
+  buildRubricImprovementSystemPrompt,
+  buildRubricImprovementUserPrompt,
+  rubricImprovementToolPolicy,
+  validateRubricImprovementResult,
+} from '@aptkit/agent-rubric-improvement';
+export type {
+  RubricDefinition as ImprovementRubricDefinition,
+  RubricImprovementInput,
+  RubricImprovementNextDrill,
+  RubricImprovementResult,
+  RubricJudgment as ImprovementRubricJudgment,
+} from '@aptkit/agent-rubric-improvement';

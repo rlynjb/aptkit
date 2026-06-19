@@ -2,10 +2,11 @@ import { AnomalyMonitoringAgent, FixtureModelProvider as MonitoringFixtureModelP
 import { DiagnosticInvestigationAgent, FixtureModelProvider as DiagnosticFixtureModelProvider, validateDiagnosis } from '@aptkit/agent-diagnostic-investigation';
 import { FixtureModelProvider as QueryFixtureModelProvider, QueryAgent, validateQueryAnswer } from '@aptkit/agent-query';
 import { RecommendationAgent, FixtureModelProvider } from '@aptkit/agent-recommendation';
+import { FixtureModelProvider as RubricImprovementFixtureModelProvider, RubricImprovementAgent, validateRubricImprovementResult } from '@aptkit/agent-rubric-improvement';
 import { assertRecommendationShape } from '@aptkit/evals';
 import type { CapabilityEvent } from '@aptkit/runtime';
 import { InMemoryToolRegistry, type ToolHandler } from '@aptkit/tools';
-import type { DiagnosticFixture, DiagnosticReplayResult, MonitoringFixture, MonitoringReplayResult, QueryFixture, QueryReplayResult, RecommendationFixture, ReplayResult } from './types';
+import type { DiagnosticFixture, DiagnosticReplayResult, MonitoringFixture, MonitoringReplayResult, QueryFixture, QueryReplayResult, RecommendationFixture, ReplayResult, RubricImprovementFixture, RubricImprovementReplayResult } from './types';
 
 export function runFixtureReplay(fixture: RecommendationFixture): Promise<ReplayResult> {
   const startedAt = performance.now();
@@ -130,6 +131,40 @@ export function runQueryFixtureReplay(fixture: QueryFixture): Promise<QueryRepla
     const issues = evalResult.ok ? [] : [{ path: 'answer', message: evalResult.error }];
     return {
       answer,
+      trace,
+      evalOk: evalResult.ok,
+      evalIssueDetails: issues,
+      evalIssues: issues.map((issue) => `${issue.path}: ${issue.message}`),
+      modelTurns: model.requests.length,
+      durationMs: Math.round(performance.now() - startedAt),
+    };
+  });
+}
+
+export function runRubricImprovementFixtureReplay(
+  fixture: RubricImprovementFixture,
+): Promise<RubricImprovementReplayResult> {
+  const startedAt = performance.now();
+  const handlers: Record<string, ToolHandler> = {};
+  for (const tool of fixture.tools) {
+    handlers[tool.name] = () => tool.result;
+  }
+
+  const model = new RubricImprovementFixtureModelProvider(fixture.modelResponses);
+  const tools = new InMemoryToolRegistry(fixture.tools, handlers);
+  const trace: CapabilityEvent[] = [];
+  const agent = new RubricImprovementAgent({
+    model,
+    tools,
+    rubric: fixture.rubric,
+    trace: { emit: (event) => trace.push(event) },
+  });
+
+  return agent.improve({ subject: fixture.subject, context: fixture.context }).then((result) => {
+    const evalResult = validateRubricImprovementResult(fixture.rubric)(result);
+    const issues = evalResult.ok ? [] : [{ path: 'result', message: evalResult.error }];
+    return {
+      result,
       trace,
       evalOk: evalResult.ok,
       evalIssueDetails: issues,

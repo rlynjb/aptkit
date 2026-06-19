@@ -320,6 +320,11 @@ h1 {
   background: #fafbf9;
 }
 
+.scoreGrid div.weakDimension {
+  border-color: #9cc5ad;
+  background: #f2faf5;
+}
+
 .scoreGrid span,
 .variantList span {
   color: #66766c;
@@ -367,6 +372,11 @@ h1 {
 .capabilityChecks span.passed {
   background: #e3f3ea;
   color: #145438;
+}
+
+.rubricJudgment {
+  display: grid;
+  gap: 10px;
 }
 
 .capabilityInventoryList code {

@@ -14,7 +14,7 @@ It packages the reusable parts of agent systems, provider adapters, tool registr
 | `packages/prompts` | Prompt packages and render helpers. |
 | `packages/evals` | Replay assertions, structural diff, detection scoring, and rubric judge. |
 | `packages/workflows` | Content-generation workflow and markdown section helpers. |
-| `packages/agents/*` | Recommendation, anomaly monitoring, diagnostic investigation, and query agents. |
+| `packages/agents/*` | Recommendation, anomaly monitoring, diagnostic investigation, query, and rubric improvement agents. |
 | `packages/providers/*` | Anthropic, OpenAI, fallback, and local context-window provider adapters. |
 | `packages/core` | Public npm bundle published as `@rlynjb/aptkit-core`. |
 | `apps/studio` | Manual preview and replay UI for packaged capabilities. |
@@ -84,6 +84,7 @@ Current pages:
 - Anomaly Monitoring Agent
 - Diagnostic Investigation Agent
 - Query Agent
+- Rubric Improvement Agent
 - Runtime & Eval Utilities
 
 Use fixture mode first for deterministic checks. Use OpenAI or Anthropic modes when validating real model behavior, provider adapters, and replay-promotion candidates.

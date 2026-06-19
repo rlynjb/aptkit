@@ -11,7 +11,9 @@ import {
   QUERY_CAPABILITY_ID,
   QueryAgent,
   RecommendationAgent,
+  RUBRIC_IMPROVEMENT_CAPABILITY_ID,
   RubricJudge,
+  RubricImprovementAgent,
   anomalyMonitoringToolPolicy,
   diagnosticInvestigationToolPolicy,
   ensureGeneratedContent,
@@ -20,6 +22,7 @@ import {
   recommendationPromptPackage,
   recommendationToolPolicy,
   queryToolPolicy,
+  rubricImprovementToolPolicy,
   schemaSummary,
   splitMarkdownSections,
 } from '../src/index.js';
@@ -43,13 +46,16 @@ describe('@aptkit/core', () => {
     assert.equal(typeof AnomalyMonitoringAgent, 'function');
     assert.equal(typeof DiagnosticInvestigationAgent, 'function');
     assert.equal(typeof QueryAgent, 'function');
+    assert.equal(typeof RubricImprovementAgent, 'function');
     assert.equal(typeof parseIntent, 'function');
     assert.equal(ANOMALY_MONITORING_CAPABILITY_ID, 'anomaly-monitoring-agent');
     assert.equal(DIAGNOSTIC_INVESTIGATION_CAPABILITY_ID, 'diagnostic-investigation-agent');
     assert.equal(QUERY_CAPABILITY_ID, 'query-agent');
+    assert.equal(RUBRIC_IMPROVEMENT_CAPABILITY_ID, 'rubric-improvement-agent');
     assert.equal(anomalyMonitoringToolPolicy.capabilityId, 'anomaly-monitoring-agent');
     assert.equal(diagnosticInvestigationToolPolicy.capabilityId, 'diagnostic-investigation-agent');
     assert.equal(queryToolPolicy.capabilityId, 'query-agent');
+    assert.equal(rubricImprovementToolPolicy.capabilityId, 'rubric-improvement-agent');
     assert.equal(parseIntent('recommendation'), 'recommendation');
   });
 });
