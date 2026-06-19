@@ -138,6 +138,8 @@ export type DiagnosticReplayMode = 'fixture' | 'openai';
 
 export type QueryReplayMode = 'fixture' | 'openai';
 
+export type RubricImprovementReplayMode = 'fixture' | 'openai';
+
 export type StudioView =
   | 'home'
   | 'recommendation'

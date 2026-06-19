@@ -39,3 +39,17 @@ test('Runtime utility fixture run increments the run counter and renders panels'
   await expect(page.getByText('Checkout payment failures', { exact: true })).toBeVisible();
   await expect(page.getByText('cloud-fixture').first()).toBeVisible();
 });
+
+test('Rubric improvement fixture run increments the run counter', async ({ page }) => {
+  await page.goto('/');
+  await page.getByRole('button', { name: /Rubric Improvement Agent/ }).click();
+  await expect(page.getByRole('heading', { name: 'Rubric Improvement Agent' })).toBeVisible();
+
+  const runMetric = page.locator('.metric').filter({ hasText: 'Run' }).locator('strong');
+  await expect(runMetric).toHaveText('#1');
+
+  await page.getByRole('button', { name: 'Run Fixture' }).click();
+  await expect(runMetric).toHaveText('#2');
+  await expect(page.getByRole('heading', { name: 'Judgment' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Next Improvement' })).toBeVisible();
+});

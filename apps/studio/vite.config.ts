@@ -25,6 +25,13 @@ import {
 } from '@aptkit/agent-query';
 import { RecommendationAgent, FixtureModelProvider } from '@aptkit/agent-recommendation';
 import {
+  FixtureModelProvider as RubricImprovementFixtureModelProvider,
+  RubricImprovementAgent,
+  validateRubricImprovementResult,
+  type RubricDefinition,
+  type RubricImprovementResult,
+} from '@aptkit/agent-rubric-improvement';
+import {
   assertCapabilityReplayArtifactShape,
   assertDiagnosticReplayArtifactShape,
   assertMonitoringReplayArtifactShape,
@@ -46,6 +53,7 @@ import type { Anomaly as MonitoringAnomaly, WorkspaceDescriptor as MonitoringWor
 import monitoringFixture from '../../packages/agents/anomaly-monitoring/fixtures/sp-revenue-monitoring.json';
 import diagnosticFixture from '../../packages/agents/diagnostic-investigation/fixtures/sp-revenue-diagnostic.json';
 import queryFixture from '../../packages/agents/query/fixtures/revenue-by-state-query.json';
+import rubricImprovementFixture from '../../packages/agents/rubric-improvement/fixtures/brief-quality-actionability.json';
 import electronicsSpikeFixture from '../../packages/agents/recommendation/fixtures/electronics-spike.json';
 import spRevenueDropFixture from '../../packages/agents/recommendation/fixtures/sp-revenue-drop.json';
 import voucherDropoffFixture from '../../packages/agents/recommendation/fixtures/voucher-dropoff.json';
@@ -57,6 +65,8 @@ type MonitoringReplayMode = 'fixture' | 'openai';
 type DiagnosticReplayMode = 'fixture' | 'openai';
 
 type QueryReplayMode = 'fixture' | 'openai';
+
+type RubricImprovementReplayMode = 'fixture' | 'openai';
 
 type FixtureTool = ToolDefinition & { result: unknown };
 
@@ -121,6 +131,16 @@ type QueryFixture = {
   };
 };
 
+type RubricImprovementFixture = {
+  id: string;
+  description: string;
+  rubric: RubricDefinition;
+  subject: string;
+  context: Record<string, string>;
+  tools: FixtureTool[];
+  modelResponses: ModelResponse[];
+};
+
 type BehavioralExpectations = {
   requiredFeatures?: string[];
   requiredText?: string[];
@@ -164,6 +184,10 @@ const diagnosticFixtures = [
 const queryFixtures = [
   queryFixture,
 ] as QueryFixture[];
+
+const rubricImprovementFixtures = [
+  rubricImprovementFixture,
+] as RubricImprovementFixture[];
 
 export default defineConfig(({ mode }) => {
   const env = loadStudioEnv(mode);
@@ -407,6 +431,19 @@ export default defineConfig(({ mode }) => {
             await streamReplayResponse(req, res, async (body, onEvent) => {
               const fixture = queryFixtures.find((candidate) => candidate.id === body.fixtureId) ?? queryFixtures[0];
               return runQueryReplay(fixture, parseQueryMode(body.mode), { onEvent });
+            });
+          });
+
+          server.middlewares.use('/api/stream/rubric-improvement/replay', async (req, res) => {
+            if (req.method !== 'POST') {
+              res.statusCode = 405;
+              sendJson(res, { error: 'method not allowed' });
+              return;
+            }
+
+            await streamReplayResponse(req, res, async (body, onEvent) => {
+              const fixture = rubricImprovementFixtures.find((candidate) => candidate.id === body.fixtureId) ?? rubricImprovementFixtures[0];
+              return runRubricImprovementReplay(fixture, parseRubricImprovementMode(body.mode), { onEvent });
             });
           });
 
@@ -664,6 +701,53 @@ async function runQueryReplay(fixture: QueryFixture, mode: QueryReplayMode, opti
   };
 }
 
+async function runRubricImprovementReplay(
+  fixture: RubricImprovementFixture,
+  mode: RubricImprovementReplayMode,
+  options: TraceRunOptions = {},
+) {
+  const startedAt = Date.now();
+  const handlers: Record<string, ToolHandler> = {};
+  for (const tool of fixture.tools) {
+    handlers[tool.name] = () => tool.result;
+  }
+
+  const trace: CapabilityEvent[] = [];
+  const traceSink = {
+    emit: (event: CapabilityEvent) => {
+      trace.push(event);
+      options.onEvent?.(event);
+    },
+  };
+  const model = createRubricImprovementModelProvider(fixture, mode, traceSink);
+  const tools = new InMemoryToolRegistry(fixture.tools, handlers);
+  const agent = new RubricImprovementAgent({
+    model,
+    tools,
+    rubric: fixture.rubric,
+    trace: traceSink,
+  });
+
+  const result = await agent.improve({ subject: fixture.subject, context: fixture.context }) as RubricImprovementResult;
+  const validation = validateRubricImprovementResult(fixture.rubric)(result);
+  const issues = validation.ok ? [] : [{ path: 'result', message: validation.error }];
+
+  return {
+    fixture: fixture.id,
+    fixtureDescription: fixture.description,
+    mode,
+    result,
+    trace,
+    eval: {
+      name: 'rubric-improvement-shape',
+      ok: validation.ok,
+      issues,
+    },
+    modelTurns: modelTurnCount(trace),
+    durationMs: Date.now() - startedAt,
+  };
+}
+
 function createModelProvider(
   fixture: RecommendationFixture,
   mode: ReplayMode,
@@ -701,6 +785,15 @@ function createQueryModelProvider(
 ): ModelProvider {
   if (mode === 'fixture') return new QueryFixtureModelProvider(fixture.modelResponses);
   return providerWithConfiguredFallback(requireOpenAIProvider(), [configuredAnthropicProvider()], 'query-agent', trace);
+}
+
+function createRubricImprovementModelProvider(
+  fixture: RubricImprovementFixture,
+  mode: RubricImprovementReplayMode,
+  trace: { emit(event: CapabilityEvent): void },
+): ModelProvider {
+  if (mode === 'fixture') return new RubricImprovementFixtureModelProvider(fixture.modelResponses);
+  return providerWithConfiguredFallback(requireOpenAIProvider(), [configuredAnthropicProvider()], 'rubric-improvement-agent', trace);
 }
 
 function requireOpenAIProvider(): ModelProvider {
@@ -777,6 +870,11 @@ function parseDiagnosticMode(value: unknown): DiagnosticReplayMode {
 }
 
 function parseQueryMode(value: unknown): QueryReplayMode {
+  if (value === 'openai') return 'openai';
+  return 'fixture';
+}
+
+function parseRubricImprovementMode(value: unknown): RubricImprovementReplayMode {
   if (value === 'openai') return 'openai';
   return 'fixture';
 }

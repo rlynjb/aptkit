@@ -1,6 +1,6 @@
 import { decodeNdjsonStream } from '@aptkit/runtime';
 import type { CapabilityEvent } from '@aptkit/runtime';
-import type { DiagnosticFixture, DiagnosticPromoteResult, DiagnosticReplayArtifact, DiagnosticReplayMode, DiagnosticReplayResult, MonitoringFixture, MonitoringPromoteResult, MonitoringReplayResult, MonitoringReplayMode, MonitoringReplayArtifact, PromoteResult, PromotedDiagnosticFixtureSummary, PromotedFixtureSummary, PromotedMonitoringFixtureSummary, PromotedQueryFixtureSummary, QueryFixture, QueryPromoteResult, QueryReplayArtifact, QueryReplayMode, QueryReplayResult, RecommendationFixture, ReplayArtifact, ReplayMode, ReplayResult, SavedDiagnosticReplaySummary, SavedMonitoringReplaySummary, SavedQueryReplaySummary, SavedReplaySummary } from './types';
+import type { DiagnosticFixture, DiagnosticPromoteResult, DiagnosticReplayArtifact, DiagnosticReplayMode, DiagnosticReplayResult, MonitoringFixture, MonitoringPromoteResult, MonitoringReplayResult, MonitoringReplayMode, MonitoringReplayArtifact, PromoteResult, PromotedDiagnosticFixtureSummary, PromotedFixtureSummary, PromotedMonitoringFixtureSummary, PromotedQueryFixtureSummary, QueryFixture, QueryPromoteResult, QueryReplayArtifact, QueryReplayMode, QueryReplayResult, RecommendationFixture, ReplayArtifact, ReplayMode, ReplayResult, RubricImprovementFixture, RubricImprovementReplayMode, RubricImprovementReplayResult, SavedDiagnosticReplaySummary, SavedMonitoringReplaySummary, SavedQueryReplaySummary, SavedReplaySummary } from './types';
 import type { ProviderStatus } from './types';
 
 type StreamReplayOptions = {
@@ -22,6 +22,14 @@ export async function runServerQueryReplay(
   options: StreamReplayOptions = {},
 ): Promise<QueryReplayResult> {
   return runReplayStream('/api/stream/query/replay', fixture.id, mode, toQueryReplayResult, options);
+}
+
+export async function runServerRubricImprovementReplay(
+  fixture: RubricImprovementFixture,
+  mode: Exclude<RubricImprovementReplayMode, 'fixture'>,
+  options: StreamReplayOptions = {},
+): Promise<RubricImprovementReplayResult> {
+  return runReplayStream('/api/stream/rubric-improvement/replay', fixture.id, mode, toRubricImprovementReplayResult, options);
 }
 
 export async function runServerDiagnosticReplay(
@@ -51,6 +59,18 @@ export async function runServerReplay(
 function toQueryReplayResult(payload: any): QueryReplayResult {
   return {
     answer: payload.answer,
+    trace: payload.trace,
+    evalOk: payload.eval.ok,
+    evalIssueDetails: payload.eval.issues,
+    evalIssues: payload.eval.issues.map((issue: { path: string; message: string }) => `${issue.path}: ${issue.message}`),
+    modelTurns: payload.modelTurns,
+    durationMs: payload.durationMs,
+  };
+}
+
+function toRubricImprovementReplayResult(payload: any): RubricImprovementReplayResult {
+  return {
+    result: payload.result,
     trace: payload.trace,
     evalOk: payload.eval.ok,
     evalIssueDetails: payload.eval.issues,

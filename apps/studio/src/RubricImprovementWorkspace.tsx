@@ -1,55 +1,59 @@
 import React from 'react';
-import { BadgeCheck, Boxes, BrainCircuit, FileText, Gauge, ListChecks, Play, Scale, Timer } from 'lucide-react';
+import { BadgeCheck, Boxes, BrainCircuit, CircleDollarSign, FileText, Gauge, ListChecks, Scale, Timer } from 'lucide-react';
+import { runServerRubricImprovementReplay } from './api';
+import { AgentReplayShell, type AgentReplayShellContext } from './AgentReplayShell';
 import { runRubricImprovementFixtureReplay } from './agent-runners';
-import { EvalPanel, Metric, Panel, TracePanel } from './components';
+import { EvalPanel, Metric, Panel, ProviderStatusPanel, TracePanel } from './components';
 import { rubricImprovementFixtures } from './fixtures';
-import { formatDuration, summarizeUsage } from './replay-artifacts';
-import type { RubricImprovementReplayState } from './types';
+import { formatCost, formatDuration } from './replay-artifacts';
+import type { RubricImprovementFixture, RubricImprovementReplayMode, RubricImprovementReplayResult } from './types';
+
+type RubricShellContext = AgentReplayShellContext<
+RubricImprovementFixture,
+RubricImprovementReplayMode,
+RubricImprovementReplayResult
+>;
 
 export function RubricImprovementWorkspace({ onHome }: { onHome: () => void }) {
-  const [selectedFixtureId, setSelectedFixtureId] = React.useState(rubricImprovementFixtures[0].id);
-  const [replay, setReplay] = React.useState<RubricImprovementReplayState | null>(null);
-  const [running, setRunning] = React.useState(false);
-  const [runId, setRunId] = React.useState(0);
-  const [error, setError] = React.useState<string | null>(null);
-  const runCounter = React.useRef(0);
-  const selectedFixtureRef = React.useRef(rubricImprovementFixtures[0]);
-  const fixture = rubricImprovementFixtures.find((candidate) => candidate.id === selectedFixtureId) ?? rubricImprovementFixtures[0];
-  selectedFixtureRef.current = fixture;
+  return (
+    <AgentReplayShell
+      ariaLabel="Rubric improvement replay mode"
+      fixtures={rubricImprovementFixtures}
+      getFixtureId={(fixture) => fixture.id}
+      initialMode="fixture"
+      metricItems={rubricMetrics}
+      modeClassName="monitoringModeSwitch"
+      modes={[
+        { mode: 'fixture', label: 'Fixture' },
+        { mode: 'openai', label: 'OpenAI' },
+      ]}
+      onHome={onHome}
+      renderPanels={rubricPanels}
+      runFixture={runRubricImprovementFixtureReplay}
+      runServer={runServerRubricImprovementReplay}
+      title="Rubric Improvement Agent"
+    />
+  );
+}
 
-  const startReplay = React.useCallback(async () => {
-    const fixtureToRun = selectedFixtureRef.current;
-    const nextRunId = runCounter.current + 1;
-    runCounter.current = nextRunId;
-    setRunId(nextRunId);
-    setRunning(true);
-    setError(null);
-    setReplay(null);
-    try {
-      const result = await runRubricImprovementFixtureReplay(fixtureToRun);
-      setReplay({
-        ...result,
-        runId: nextRunId,
-        completedAt: new Date().toLocaleTimeString(),
-      });
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setRunning(false);
-    }
-  }, []);
+function rubricMetrics(context: RubricShellContext) {
+  const result = context.replay?.result;
+  return (
+    <>
+      <Metric icon={<BadgeCheck size={18} />} label="Eval" value={context.error ? 'Error' : context.replay?.evalOk ? 'Passing' : context.running ? 'Running' : 'Pending'} tone={context.replay?.evalOk ? 'good' : 'neutral'} />
+      <Metric icon={<Scale size={18} />} label="Verdict" value={result?.judgment.verdict ?? 'Pending'} />
+      <Metric icon={<ListChecks size={18} />} label="Weakest" value={result?.weakestDimension ?? 'Pending'} />
+      <Metric icon={<BrainCircuit size={18} />} label="Model" value={context.modelName} />
+      <Metric icon={<Gauge size={18} />} label="Tokens" value={context.usage.totalTokens.toLocaleString()} />
+      <Metric icon={<CircleDollarSign size={18} />} label="Est. Cost" value={formatCost(context.costEstimate)} />
+      <Metric icon={<Timer size={18} />} label="Duration" value={context.replay ? formatDuration(context.replay.durationMs) : context.running ? 'Running' : '0ms'} />
+      <Metric icon={<Boxes size={18} />} label="Run" value={`#${context.runId || context.replay?.runId || 0}`} />
+    </>
+  );
+}
 
-  React.useEffect(() => {
-    void startReplay();
-  }, [startReplay]);
-
-  function selectFixture(event: React.ChangeEvent<HTMLSelectElement>) {
-    setSelectedFixtureId(event.target.value);
-    setReplay(null);
-    setError(null);
-  }
-
-  const usage = summarizeUsage(replay?.trace ?? []);
+function rubricPanels(context: RubricShellContext) {
+  const { error, fixture, mode, providerStatus, replay, running, usage, visibleTrace } = context;
   const result = replay?.result;
   const dimensionRows = result
     ? fixture.rubric.dimensions.map((dimension) => ({
@@ -62,148 +66,125 @@ export function RubricImprovementWorkspace({ onHome }: { onHome: () => void }) {
     : [];
 
   return (
-    <main className="shell">
-      <header className="topbar">
-        <div>
-          <p className="eyebrow">AptKit Studio</p>
-          <h1>Rubric Improvement Agent</h1>
-        </div>
-        <div className="topbarActions">
-          <button className="secondaryAction topbarHome" type="button" onClick={onHome}>
-            <Boxes size={15} />
-            <span>Home</span>
-          </button>
-          <label className="fixtureSelect">
-            <span>Fixture</span>
-            <select value={selectedFixtureId} onChange={selectFixture} disabled={running}>
-              {rubricImprovementFixtures.map((candidate) => (
-                <option key={candidate.id} value={candidate.id}>
-                  {candidate.id}
-                </option>
-              ))}
-            </select>
-          </label>
-          <button className="runButton" onClick={startReplay} disabled={running}>
-            <Play size={17} aria-hidden="true" />
-            <span>{running ? 'Running' : 'Run Fixture'}</span>
-          </button>
-        </div>
-      </header>
+    <div className="layout">
+      <section className="leftPane">
+        <Panel title="Fixture" icon={<Boxes size={17} />}>
+          <div className="kv">
+            <span>ID</span>
+            <strong>{fixture.id}</strong>
+            <span>Rubric</span>
+            <strong>{fixture.rubric.title}</strong>
+            <span>Status</span>
+            <strong>{error ? 'error' : running ? 'running' : replay ? `completed at ${replay.completedAt}` : 'not run'}</strong>
+            <span>Mode</span>
+            <strong>{mode} / {providerStatus[mode].model}{providerStatus[mode].available ? '' : ' unavailable'}</strong>
+            <span>Run</span>
+            <strong>{context.runId || replay?.runId || 0}</strong>
+            <span>Turns</span>
+            <strong>{replay?.modelTurns ?? 0}</strong>
+            <span>Input</span>
+            <strong>{usage.inputTokens.toLocaleString()} tokens</strong>
+            <span>Output</span>
+            <strong>{usage.outputTokens.toLocaleString()} tokens</strong>
+          </div>
+        </Panel>
 
-      <section className="metrics" aria-label="Rubric improvement summary">
-        <Metric icon={<BadgeCheck size={18} />} label="Eval" value={error ? 'Error' : replay?.evalOk ? 'Passing' : running ? 'Running' : 'Pending'} tone={replay?.evalOk ? 'good' : 'neutral'} />
-        <Metric icon={<Scale size={18} />} label="Verdict" value={result?.judgment.verdict ?? 'Pending'} />
-        <Metric icon={<ListChecks size={18} />} label="Weakest" value={result?.weakestDimension ?? 'Pending'} />
-        <Metric icon={<BrainCircuit size={18} />} label="Model" value="fixture-model" />
-        <Metric icon={<Gauge size={18} />} label="Tokens" value={usage.totalTokens.toLocaleString()} />
-        <Metric icon={<Timer size={18} />} label="Duration" value={replay ? formatDuration(replay.durationMs) : running ? 'Running' : '0ms'} />
+        <Panel title="Workflow" icon={<FileText size={17} />}>
+          <div className="workflow">
+            <div className="layerCallout">
+              <strong>{mode === 'fixture' ? 'Fake model + fake tools' : 'Real model + fake tools'}</strong>
+              <span>{mode === 'fixture' ? 'Deterministic rubric replay for UI validation.' : 'OpenAI scores controlled fixture data through AptKit agent/tool seams.'}</span>
+            </div>
+            <ol className="workflowSteps">
+              <li>Load the rubric and subject</li>
+              <li>Read recent judgment history</li>
+              <li>Score each rubric dimension</li>
+              <li>Return one next action and optional drill</li>
+            </ol>
+          </div>
+        </Panel>
+
+        <EvalPanel
+          error={error}
+          evalOk={replay?.evalOk}
+          issues={replay?.evalIssues ?? []}
+          passedLabel="rubric improvement output valid"
+          running={running}
+        />
       </section>
 
-      <div className="layout">
-        <section className="leftPane">
-          <Panel title="Fixture" icon={<Boxes size={17} />}>
-            <div className="kv">
-              <span>ID</span>
-              <strong>{fixture.id}</strong>
-              <span>Rubric</span>
-              <strong>{fixture.rubric.title}</strong>
-              <span>Status</span>
-              <strong>{error ? 'error' : running ? 'running' : replay ? `completed at ${replay.completedAt}` : 'not run'}</strong>
-              <span>Run</span>
-              <strong>{runId || replay?.runId || 0}</strong>
-              <span>Turns</span>
-              <strong>{replay?.modelTurns ?? 0}</strong>
-            </div>
-          </Panel>
+      <section className="mainPane">
+        <Panel title="Subject" icon={<FileText size={17} />}>
+          <p className="answerText">{fixture.subject}</p>
+        </Panel>
 
-          <Panel title="Workflow" icon={<FileText size={17} />}>
-            <div className="workflow">
-              <div className="layerCallout">
-                <strong>Fake model + fake tools</strong>
-                <span>The model can call rubric-history tools before producing structured improvement feedback.</span>
+        <Panel title="Judgment" icon={<Scale size={17} />}>
+          {running ? <div className="emptyState compact">Scoring rubric...</div> : null}
+          {!providerStatus[mode].available ? <div className="errorState">Set OPENAI_API_KEY and restart Studio to enable OpenAI rubric improvement replay.</div> : null}
+          {error ? <div className="errorState">{error}</div> : null}
+          {result ? (
+            <div className="rubricJudgment">
+              <div className="reviewBanner ready">
+                <strong>{result.judgment.fix}</strong>
+                <span>{result.judgment.reasoning}</span>
               </div>
-              <ol className="workflowSteps">
-                <li>Load the rubric and subject</li>
-                <li>Read recent judgment history</li>
-                <li>Score each rubric dimension</li>
-                <li>Return one next action and optional drill</li>
-              </ol>
-            </div>
-          </Panel>
-
-          <EvalPanel
-            error={error}
-            evalOk={replay?.evalOk}
-            issues={replay?.evalIssues ?? []}
-            passedLabel="rubric improvement output valid"
-            running={running}
-          />
-        </section>
-
-        <section className="mainPane">
-          <Panel title="Subject" icon={<FileText size={17} />}>
-            <p className="answerText">{fixture.subject}</p>
-          </Panel>
-
-          <Panel title="Judgment" icon={<Scale size={17} />}>
-            {result ? (
-              <div className="rubricJudgment">
-                <div className="reviewBanner ready">
-                  <strong>{result.judgment.fix}</strong>
-                  <span>{result.judgment.reasoning}</span>
-                </div>
-                <div className="scoreGrid">
-                  {dimensionRows.map((dimension) => (
-                    <div className={dimension.weak ? 'weakDimension' : ''} key={dimension.id}>
-                      <span>{dimension.label}</span>
-                      <strong>{dimension.score}</strong>
-                      <p>{dimension.reason}</p>
-                    </div>
+              <div className="scoreGrid">
+                {dimensionRows.map((dimension) => (
+                  <div className={dimension.weak ? 'weakDimension' : ''} key={dimension.id}>
+                    <span>{dimension.label}</span>
+                    <strong>{dimension.score}</strong>
+                    <p>{dimension.reason}</p>
+                  </div>
+                ))}
+              </div>
+              {result.judgment.checks ? (
+                <div className="capabilityChecks">
+                  {Object.entries(result.judgment.checks).map(([check, passed]) => (
+                    <span className={passed ? 'passed' : ''} key={check}>{check}</span>
                   ))}
                 </div>
-                {result.judgment.checks ? (
-                  <div className="capabilityChecks">
-                    {Object.entries(result.judgment.checks).map(([check, passed]) => (
-                      <span className={passed ? 'passed' : ''} key={check}>{check}</span>
-                    ))}
-                  </div>
-                ) : null}
-              </div>
-            ) : (
-              <div className="emptyState compact">{running ? 'Scoring rubric...' : 'No judgment yet.'}</div>
-            )}
-          </Panel>
+              ) : null}
+            </div>
+          ) : !running && !error ? (
+            <div className="emptyState compact">No judgment yet.</div>
+          ) : null}
+        </Panel>
 
-          <Panel title="Next Improvement" icon={<ListChecks size={17} />}>
-            {result ? (
-              <div className="utilityPreview">
-                <div className="layerCallout">
-                  <strong>{result.nextAction}</strong>
-                  <span>Focus dimension: {result.weakestDimension}</span>
+        <Panel title="Next Improvement" icon={<ListChecks size={17} />}>
+          {result ? (
+            <div className="utilityPreview">
+              <div className="layerCallout">
+                <strong>{result.nextAction}</strong>
+                <span>Focus dimension: {result.weakestDimension}</span>
+              </div>
+              {result.nextDrill ? (
+                <div className="reviewGrid">
+                  <div>
+                    <span>Prompt</span>
+                    <strong>{result.nextDrill.prompt}</strong>
+                  </div>
+                  <div>
+                    <span>Goal</span>
+                    <strong>{result.nextDrill.goal}</strong>
+                  </div>
                 </div>
-                {result.nextDrill ? (
-                  <div className="reviewGrid">
-                    <div>
-                      <span>Prompt</span>
-                      <strong>{result.nextDrill.prompt}</strong>
-                    </div>
-                    <div>
-                      <span>Goal</span>
-                      <strong>{result.nextDrill.goal}</strong>
-                    </div>
-                  </div>
-                ) : null}
-              </div>
-            ) : (
-              <div className="emptyState compact">{running ? 'Preparing next action...' : 'No improvement yet.'}</div>
-            )}
-          </Panel>
-        </section>
+              ) : null}
+            </div>
+          ) : (
+            <div className="emptyState compact">{running ? 'Preparing next action...' : 'No improvement yet.'}</div>
+          )}
+        </Panel>
+      </section>
 
-        <aside className="rightPane">
-          <TracePanel running={running} trace={replay?.trace ?? []} />
-        </aside>
-      </div>
-    </main>
+      <aside className="rightPane">
+        <ProviderStatusPanel
+          mode={mode}
+          providerStatus={providerStatus}
+          supportedModes={['fixture', 'openai']}
+          trace={visibleTrace}
+        />
+        <TracePanel running={running} trace={visibleTrace} />
+      </aside>
+    </div>
   );
 }

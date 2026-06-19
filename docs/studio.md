@@ -62,6 +62,7 @@ Validates agentic rubric feedback over a deterministic subject and judgment-hist
 
 Use this page to check:
 
+- fixture and OpenAI replay modes
 - rubric dimension scoring and weakest-dimension selection
 - history tool usage before final structured output
 - next action and optional next drill output
@@ -102,7 +103,7 @@ After changing a capability or package API:
 6. If the capability has provider support, run OpenAI next.
 7. Save/promote replay artifacts only when the output is worth preserving as a future fixture.
 
-For cross-cutting runtime/provider changes, use **Runtime & Eval Utilities** first, then run one agent page as an integration check.
+For cross-cutting runtime/provider changes, use **Runtime & Eval Utilities** first, then run one agent page as an integration check. Agent pages should use the shared replay shell for fixture selection, runtime modes, provider status, live trace, and run state.
 
 ## CI Checks
 
