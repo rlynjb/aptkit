@@ -99,7 +99,10 @@ export function createSearchKnowledgeBaseTool(
 }
 
 function matchesFilter(hit: VectorHit, filter: Record<string, unknown>): boolean {
-  return Object.entries(filter).every(([key, value]) => hit.meta[key] === value);
+  // A filter key only excludes hits that HAVE that key with a different value.
+  // Keys absent from a chunk's meta are ignored, so a weak model's hallucinated
+  // filter (e.g. {textContains: "x"}) can't silently wipe every result.
+  return Object.entries(filter).every(([key, value]) => !(key in hit.meta) || hit.meta[key] === value);
 }
 
 function toResult(hit: VectorHit): SearchKnowledgeBaseResult {

@@ -102,6 +102,20 @@ test('tool honors a meta filter', async () => {
   for (const r of payload.results) assert.equal(r.meta.docId, 'cooking');
 });
 
+test('ignores filter keys absent from chunk metadata (a hallucinated filter does not wipe results)', async () => {
+  const pipeline = await seededPipeline();
+  const { definition, handler } = createSearchKnowledgeBaseTool(pipeline);
+  const registry = new InMemoryToolRegistry([definition], { [definition.name]: handler });
+
+  // A weak model invents a filter key no chunk carries. It must not zero out retrieval.
+  const { result } = await registry.callTool(SEARCH_KNOWLEDGE_BASE_TOOL_NAME, {
+    query: 'how often does the moon orbit earth',
+    filter: { textContains: 'moon' },
+  });
+  const payload = result as { results: unknown[] };
+  assert.ok(payload.results.length > 0, 'hallucinated filter key should be ignored, not exclude everything');
+});
+
 test('tool is selectable via filterToolsForPolicy', async () => {
   const pipeline = await seededPipeline();
   const { definition } = createSearchKnowledgeBaseTool(pipeline);
