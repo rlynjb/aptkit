@@ -1,5 +1,5 @@
 import React from 'react';
-import { Activity, Boxes, CircleDollarSign, MessageSquareText, Play, Scale, SearchCheck } from 'lucide-react';
+import { Activity, Boxes, CircleDollarSign, Github, MessageSquareText, Package, Play, Scale, SearchCheck } from 'lucide-react';
 import { ECOMMERCE_ANOMALY_CATEGORIES, coverageReport, schemaCapabilities } from '@aptkit/agent-anomaly-monitoring';
 import { diagnosticFixtures, fixtures, monitoringFixtures, queryFixtures, rubricImprovementFixtures } from './fixtures';
 import type { StudioView } from './types';
@@ -18,6 +18,26 @@ export function StudioHome({ onOpen }: { onOpen: (view: StudioView) => void }) {
         <div>
           <p className="eyebrow">AptKit Studio</p>
           <h1>Capability Gallery</h1>
+        </div>
+        <div className="topbarLinks">
+          <a
+            className="topbarLink"
+            href="https://www.npmjs.com/package/@rlynjb/aptkit-core"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            <Package size={15} />
+            <span>npm</span>
+          </a>
+          <a
+            className="topbarLink"
+            href="https://github.com/rlynjb/aptkit"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            <Github size={15} />
+            <span>GitHub</span>
+          </a>
         </div>
       </header>
 
