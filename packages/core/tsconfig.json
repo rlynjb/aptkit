@@ -7,6 +7,9 @@
     "types": ["node"]
   },
   "references": [
+    { "path": "../agents/anomaly-monitoring" },
+    { "path": "../agents/diagnostic-investigation" },
+    { "path": "../agents/query" },
     { "path": "../agents/recommendation" },
     { "path": "../agents/rubric-improvement" },
     { "path": "../context" },

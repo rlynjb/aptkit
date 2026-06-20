@@ -6,5 +6,8 @@
     "outDir": "dist",
     "types": ["node"]
   },
+  "references": [
+    { "path": "../../runtime" }
+  ],
   "include": ["src/**/*.ts", "test/**/*.ts"]
 }

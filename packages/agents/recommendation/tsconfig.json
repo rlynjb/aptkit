@@ -9,6 +9,7 @@
   "references": [
     { "path": "../../context" },
     { "path": "../../evals" },
+    { "path": "../../prompts" },
     { "path": "../../runtime" },
     { "path": "../../tools" }
   ],

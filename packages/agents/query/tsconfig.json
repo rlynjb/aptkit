@@ -3,6 +3,7 @@
     "target": "ES2022",
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
+    "composite": true,
     "strict": true,
     "declaration": true,
     "outDir": "dist",
@@ -10,5 +11,11 @@
     "resolveJsonModule": true,
     "skipLibCheck": true
   },
+  "references": [
+    { "path": "../../context" },
+    { "path": "../../prompts" },
+    { "path": "../../runtime" },
+    { "path": "../../tools" }
+  ],
   "include": ["src/**/*.ts", "scripts/**/*.ts", "test/**/*.ts", "fixtures/**/*.json"]
 }

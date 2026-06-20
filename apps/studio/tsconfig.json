@@ -9,5 +9,22 @@
     "types": ["vite/client"],
     "noEmit": true
   },
+  "references": [
+    { "path": "../../packages/context" },
+    { "path": "../../packages/evals" },
+    { "path": "../../packages/prompts" },
+    { "path": "../../packages/runtime" },
+    { "path": "../../packages/tools" },
+    { "path": "../../packages/workflows" },
+    { "path": "../../packages/agents/anomaly-monitoring" },
+    { "path": "../../packages/agents/diagnostic-investigation" },
+    { "path": "../../packages/agents/query" },
+    { "path": "../../packages/agents/recommendation" },
+    { "path": "../../packages/agents/rubric-improvement" },
+    { "path": "../../packages/providers/anthropic" },
+    { "path": "../../packages/providers/fallback" },
+    { "path": "../../packages/providers/local" },
+    { "path": "../../packages/providers/openai" }
+  ],
   "include": ["src/**/*.ts", "src/**/*.tsx"]
 }
