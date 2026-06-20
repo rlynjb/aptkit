@@ -23,6 +23,18 @@ standard checklist simply doesn't apply.
   filtered (lens 7), its tool-call count is bounded
   (`run-agent-loop.ts:101`), and its final output is parsed/validated before
   use (lens 3). → deep walk in `04-validated-model-output-gate.md`.
+- **Gemma's emulated tool calls** — the *sharpest* new surface. `gemma2:9b`
+  has no native tool-calling, so the provider renders tool schemas into system
+  prose and parses the model's free text back into a `{name, arguments}` tool
+  call (`packages/providers/gemma/src/gemma-provider.ts:168`). The model now
+  *names the tool* through prose — a control decision derived from untrusted
+  output. → deep walk in `05-local-model-tool-call-trust-boundary.md`.
+- **The local Ollama transport** — a network hop the cloud providers didn't
+  have. The Gemma chat/embedding providers POST to `http://localhost:11434`
+  with no API key and no TLS (`gemma-provider.ts:201-215`,
+  `ollama-embedding-provider.ts:60-74`). Untrusted input crosses *back* over an
+  unauthenticated plaintext channel. Safe on loopback; an open service the
+  moment `host` is non-loopback (lens 4).
 - **Studio replay HTTP bodies** — the Vite middleware reads JSON request
   bodies for replay/promote endpoints (`apps/studio/vite.config.ts:920`).
   Reachable only from `localhost`. The one with a real path is
@@ -30,8 +42,12 @@ standard checklist simply doesn't apply.
   that is constrained to `artifacts/replays/` (`vite.config.ts:1415`). →
   `03-server-side-key-boundary.md`.
 - **The user's free-form question** — passed straight into the query agent's
-  prompt as the user turn (`packages/agents/query/src/query-agent.ts:92`),
-  no sanitization. Prompt-injection surface (lens 3).
+  prompt as the user turn (`packages/agents/query/src/query-agent.ts:92`), and
+  the rag-query agent likewise (`rag-query-agent.ts:62`). No sanitization.
+  Prompt-injection surface (lens 3). The rag-query path additionally injects
+  user-profile (`me.md`) text into the system prompt
+  (`rag-query-agent.ts:55`), and retrieved knowledge-base chunks flow back as
+  tool results — both are untrusted-content channels into the prompt.
 - **Fixtures / artifacts on disk** — JSON read by the Studio server and the
   eval scripts. Trusted as developer-authored, but they're also the
   data-*exit* surface (lens 5).
@@ -91,11 +107,27 @@ injection**, and the defense is **output validation**, not input scrubbing.
   output is parsed and schema-validated before it's trusted as data (lens 3 →
   `04-validated-model-output-gate.md`), and the loop is turn-bounded.
 
+- **LLM-controlled query shaping** — *present, newly hardened*. The
+  `search_knowledge_base` tool lets the model pass a `top_k` and a `filter`
+  object — model-controlled retrieval parameters. A weak local model can
+  hallucinate an over-broad or wrong-keyed `filter` (e.g.
+  `{textContains: "x"}`) that, with naive AND-matching, would silently wipe
+  every result. The hardening: `matchesFilter` only *excludes* a hit that
+  *has* the key with a different value; keys absent from a chunk's metadata are
+  ignored (`packages/retrieval/src/search-knowledge-base-tool.ts:101-106`).
+  And `minTopK` floors the result count so a model passing `top_k: 1` can't
+  starve its own retrieval (`search-knowledge-base-tool.ts:51,81`). This is the
+  defensive posture for *model-controlled tool arguments*: don't trust the
+  filter to be well-formed, make a malformed one fail *open* (still return
+  results) rather than *closed* (silent empty). → lens 7.
+
 **Verdict:** the right call for this threat model is exactly what's here —
 don't try to sanitize the prompt, constrain what the model can *reach* and
-*emit*. The buildable hardening, if AptKit took genuinely hostile input,
-would be an allow/deny pass on tool *arguments* before `callTool`, not on the
-prompt.
+*emit*. The `search_knowledge_base` filter hardening is the one place AptKit
+already does an allow/deny-style pass on a model-controlled tool *argument*.
+The buildable hardening, if AptKit took genuinely hostile input, would extend
+that posture: an allow/deny pass on tool arguments before `callTool` across
+the board, not on the prompt.
 
 → `04-validated-model-output-gate.md` for the output gate;
 `.aipe/study-prompt-engineering/12-prompt-injection-defense.md` for the
@@ -125,9 +157,22 @@ The hygiene here is correct, and the one residual risk is the publish path.
   (`packages/evals/src/assertions.ts:397`), which runs over every replay
   artifact before it's accepted (lens 5).
 
+- **The Gemma path has no secret at all** — a different trust profile worth
+  naming. The local providers carry no API key: `GemmaModelProvider` and
+  `OllamaEmbeddingProvider` only hold a `host` and `model`, defaulting to
+  `http://localhost:11434` (`gemma-provider.ts:48`,
+  `ollama-embedding-provider.ts:47`). There's nothing to leak into a bundle or
+  artifact. The tradeoff: the *transport* is unauthenticated and unencrypted
+  (no key means the server isn't authenticated either), so the risk moves from
+  *key confidentiality* to *channel trust* — "whatever answers
+  `localhost:11434` is my model." Benign on a single laptop; an exposure the
+  moment Gemma runs on a shared host or `host` points off-loopback. → deep walk
+  in `05-local-model-tool-call-trust-boundary.md`.
+
 **Red flag check** — secret in source / client bundle / logs: none found. The
 residual risk isn't a leak *today*, it's that the publish pipeline inlines
-artifacts (lens 5/6), so the secret-scan is load-bearing.
+artifacts (lens 5/6), so the secret-scan is load-bearing. The Gemma path adds
+no key-leak surface but adds an unauthenticated-transport surface instead.
 
 ---
 
@@ -139,11 +184,15 @@ file exists for it.
 The exposure path: replay artifacts (`artifacts/replays/*.json`) and agent
 fixtures (`packages/agents/*/fixtures/`) are **committed to git** and
 **inlined into the published npm tarball**. The core package declares
-`bundledDependencies` for all 11 internal packages
-(`packages/core/package.json:44-56`), and each agent ships its compiled
-output — fixtures travel with the agents into a public registry artifact.
-Anything sensitive captured during a live run (a real workspace metric, an
-accidental key in a tool result) becomes world-readable on publish.
+`bundledDependencies` for every internal package
+(`packages/core/package.json:44-60`) — now including `provider-gemma`,
+`retrieval`, and `agent-rag-query` (`package.json:35,41,43`) — and each agent
+ships its compiled output, so fixtures travel with the agents into a public
+registry artifact. Anything sensitive captured during a live run (a real
+workspace metric, an accidental key in a tool result, an indexed
+knowledge-base chunk) becomes world-readable on publish. The new local-RAG
+path widens this: any fixture or artifact recorded from a real knowledge base
+ships in the tarball under the same `bundledDependencies` umbrella.
 
 The control: `findSecretLikeString` walks every artifact recursively and
 fails validation if any string matches `sk-[A-Za-z0-9_-]{10,}` or
@@ -221,12 +270,37 @@ genuinely good — with one sharp edge worth naming.
   registry holds *all* handlers, a tool name that reached `callTool` outside
   the policy would run. Today nothing puts it there (the model can't name a
   tool it never saw), but the trust assumption "the model only calls allowed
-  tools" rests entirely on by-omission, with no defense-in-depth gate.
+  tools" rests entirely on by-omission, with no defense-in-depth gate. The
+  Gemma path makes this seam more reachable in principle: there the model emits
+  the tool name directly as a JSON string (`gemma-provider.ts:168`), so the
+  only thing stopping an off-policy name is the registry's contents, not the
+  policy — see `05-local-model-tool-call-trust-boundary.md`.
 - **Output handling:** model output is never treated as trusted code/SQL. It's
   parsed (`packages/runtime/src/json-output.ts:7`), schema-validated, and
   retried once with a strict-JSON nudge before use
   (`packages/runtime/src/structured-generation.ts:54-101`). → lens 3 /
   `04-validated-model-output-gate.md`.
+- **Emulated tool calls on the Gemma path:** the highest-leverage new surface.
+  Because `gemma2:9b` has no native tool-calling, `GemmaModelProvider` renders
+  the tool schemas into system prose and parses the model's reply back into a
+  `{name, arguments}` tool call (`packages/providers/gemma/src/gemma-provider.ts:168`).
+  The model controls dispatch through free text — a control decision derived
+  from untrusted output. The defense is fail-closed parsing: `parseToolCall`
+  type-guards the parsed JSON and returns `null` (→ "plain answer", no
+  dispatch) on anything malformed. It does *not* re-check the allowlist, so the
+  by-omission gap below applies to this path too — what actually blocks an
+  off-policy name today is that the rag-query registry holds only the
+  `search_knowledge_base` handler (`rag-query-agent.ts:15-18`), so an
+  off-policy name throws "tool not found". → deep walk in
+  `05-local-model-tool-call-trust-boundary.md`.
+- **Model-controlled tool arguments, hardened:** `search_knowledge_base` lets
+  the model pass a `filter` and `top_k`. A weak local model can hallucinate an
+  over-broad filter; `matchesFilter` makes it fail *open* (ignores keys absent
+  from a chunk's metadata, so a bogus filter can't silently zero out results)
+  and `minTopK` floors the result count
+  (`search-knowledge-base-tool.ts:51,81,101-106`). This is the one place the
+  repo treats a *model-controlled tool argument* as hostile and shapes its
+  effect defensively. → lens 3.
 - **Data exfiltration through tool calls:** bounded — read-only tools can't
   write out, the loop caps tool calls (`run-agent-loop.ts:101`) and tool
   results are truncated to 16K chars (`run-agent-loop.ts:52`).
@@ -252,6 +326,9 @@ Consolidated checklist against this repo. `fires` = a real exposure here;
 | Secret in committed/published artifact | **fires (latent)** | `artifacts/`, fixtures inlined via `bundledDependencies` (`core/package.json:44`) | high | widen secret-scan + scan staged tarball pre-publish |
 | Narrow secret-scan regex | **fires** | `assertions.ts:399` | medium | add generic-token + entropy + PII passes |
 | Tool allowlist enforced only by omission | **fires** | `tool-registry.ts:56`, `run-agent-loop.ts:159` | medium | re-check policy in `callTool` |
+| Model names tool via parsed prose (Gemma) | **fires (by design)** | `gemma-provider.ts:168` | medium | fail-closed parse mitigates; add policy re-check in `callTool` |
+| Unauthenticated/plaintext local-model transport | **fires (latent)** | `gemma-provider.ts:201`, `ollama-embedding-provider.ts:60` | low (loopback) / high (off-loopback) | bind Ollama to loopback or add a shared token before non-local `host` |
+| Hallucinated model filter wipes retrieval | does not fire | guarded at `search-knowledge-base-tool.ts:101-106` (fail-open) | — | — |
 | Mutating tool in an agent grant | **fires (by design)** | `rubric-improvement-agent.ts:22` (`save_judgment`) | low | document it as the one write-capable capability |
 | Raw user input into prompt | fires (mitigated) | `query-agent.ts:92` | low | output gate + read-only tools already mitigate |
 | Path traversal on file endpoint | does not fire | guarded at `vite.config.ts:1415` | — | — |

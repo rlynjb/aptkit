@@ -4,11 +4,18 @@
 information hiding at the package level.
 **Type:** Industry standard.
 
+> **Updated: 2026-06-20** — the internal package count grew: `core/index.ts`
+> now re-exports fifteen internal `@aptkit/*` packages (added `@aptkit/retrieval`,
+> `@aptkit/provider-gemma`, and the `@aptkit/agent-rag-query` agent). The
+> *pattern* is unchanged — one facade hiding N packages — only N moved. The
+> teaching below holds; read "eleven" as "fifteen and counting." That the count
+> can grow without changing the public import path is the point of this file.
+
 ---
 
 ## Zoom out, then zoom in
 
-AptKit is eleven internal packages. The outside world sees *one*:
+AptKit is fifteen internal packages. The outside world sees *one*:
 `@rlynjb/aptkit-core`. That package contains almost no logic — it's a
 re-export.
 
@@ -21,13 +28,14 @@ re-export.
   └───────────────────────────────┬─────────────────────────────────┘
                                   │ one entry point
   ┌─ packages/core (the facade) ──▼─────────────────────────────────┐
-  │  ★ index.ts: export * from '@aptkit/runtime'; ...11 packages ★  │
-  │  bundledDependencies inlines all 11 into one tarball            │
+  │  ★ index.ts: export * from '@aptkit/runtime'; ...15 packages ★  │
+  │  bundledDependencies inlines all of them into one tarball       │
   └───────────────────────────────┬─────────────────────────────────┘
                                   │ re-exports (no logic of its own)
   ┌─ Internal packages (hidden) ──▼─────────────────────────────────┐
   │  runtime · tools · context · prompts · evals · workflows ·      │
-  │  5 agents — all versioned 0.0.0, never published directly       │
+  │  retrieval · provider-gemma · provider-local ·                  │
+  │  6 agents — all versioned 0.0.0, never published directly       │
   └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -162,7 +170,7 @@ whole repo: expose the narrow surface, hide the wide implementation.
   │  export { Anomaly as DiagnosticAnomaly } from diagnostic         │
   └───────────────────────────────┬─────────────────────────────────┘
                                   │ FREE TO REFACTOR below this line
-  ┌─ 11 internal packages ────────▼─────────────────────────────────┐
+  ┌─ 15 internal packages ────────▼─────────────────────────────────┐
   │  inlined via bundledDependencies → one standalone tarball       │
   └──────────────────────────────────────────────────────────────────┘
 ```
@@ -297,6 +305,9 @@ free. Collapsing the wiring changes only what's below the line.
 
 - `01-model-provider-deep-module.md` — the same information-hiding instinct at
   the type level.
+- `06-retrieval-contracts-as-deep-seams.md` — two of the newest packages
+  (`@aptkit/retrieval`, `@aptkit/provider-gemma`) that joined this public
+  surface, and the deep-module shape they reuse.
 - `04-capability-agent-template.md` — why the agent class names must survive
   their refactor (they cross this seam).
 - `audit.md` Lens 1 (the load-bearing contracts) and Lens 3 (provider-id

@@ -4,7 +4,7 @@
 
 ## Zoom out, then zoom in
 
-This is the audit's verdict turned into a plan. You've read what AptKit exercises (maps, sets, discriminated unions, linear scans, round-robin, comparator sorts) and what it doesn't (trees, heaps, graphs, binary search, DP). This file ranks what to *practice* — and the ranking is deliberately inverted from a textbook. Sharpen the exercised concepts first, because those are the ones you can defend with *this* repo's code in an interview. Keep the missing foundations warm second, leaning on your `reincodes` work, because AptKit gives you nowhere to anchor them.
+This is the audit's verdict turned into a plan. You've read what AptKit exercises (maps, sets, discriminated unions, linear scans, round-robin, comparator sorts — and now, in `@aptkit/retrieval`, cosine similarity, linear-scan k-NN, fixed-window chunking, and precision@k/recall@k set scoring) and what it doesn't (trees, heaps, graphs as traversal, binary search, DP). This file ranks what to *practice* — and the ranking is deliberately inverted from a textbook. Sharpen the exercised concepts first, because those are the ones you can defend with *this* repo's code in an interview. Keep the missing foundations warm second, leaning on your `reincodes` work, because AptKit gives you nowhere to anchor them.
 
 ```
   Zoom out — the practice map's two tiers
@@ -13,6 +13,7 @@ This is the audit's verdict turned into a plan. You've read what AptKit exercise
   │  hash map dispatch · set membership/least-privilege   │
   │  bounded JSON scan · comparator-sort top-k            │
   │  round-robin scheduling · cost-as-token-budget        │
+  │  cosine k-NN + chunking + precision@k (retrieval) ←new│
   └───────────────────────────┬───────────────────────────┘
                               │ then
   ┌─ TIER 2: not yet in AptKit (defend with reincodes) ───┐
@@ -36,6 +37,9 @@ Zoom in: Tier 1 is where you have a *live* code anchor — you can pull up `tool
   comparator-sort top-k   YES  monitoring-agent.ts:87
   round-robin             YES  content-workflow.ts:148
   token cost model        YES  run-agent-loop.ts:101, ledger:25
+  cosine k-NN + top-k     YES  in-memory-vector-store.ts:25,46  ← new
+  fixed-window chunking   YES  retrieval/chunker.ts:16          ← new
+  precision@k/recall@k    YES  evals/precision-at-k.ts:47,68    ← new
   ──────────────────────────────────────────────────────────
   heap / PQ               NO   reincodes PriorityQueue.ts
   binary search           NO   (none — practice cold)
@@ -87,9 +91,15 @@ You know the spaced-repetition idea from `dryrun` — practice the things you'll
      story: modulo fairness; guard i % 0
   6. bounded JSON scan        json-output.ts:7
      story: locate vs validate; delegate to JSON.parse
+  7. cosine k-NN + top-k      in-memory-vector-store.ts:25,46  ← new
+     story: dot-product/norms score; O(n·d) brute-force NN;
+            sort+slice top-k; the ANN/HNSW drop-in at scale
+  8. chunking + precision@k   retrieval/chunker.ts:16,
+                              evals/precision-at-k.ts:47
+     story: sliding window + overlap; Set-membership scoring
 ```
 
-The rehearsal target for each: a 60-second walk that names the structure, the file, the load-bearing line, and the boundary condition. Concept `1` and `2` are the two to nail cold — they're the repo's substrate, and "walk me through tool dispatch / the allowlist" is the most likely DSA-flavored question this codebase invites.
+The rehearsal target for each: a 60-second walk that names the structure, the file, the load-bearing line, and the boundary condition. Concept `1` and `2` are the two to nail cold — they're the repo's substrate, and "walk me through tool dispatch / the allowlist" is the most likely DSA-flavored question this codebase invites. Concept `7` is the new high-value one: it's the only place AptKit does numeric vector DSA, and "you built a vector store from scratch — what's the cost, and when does it break?" (O(n·d) scan → ANN/HNSW) is the strongest *scale-tradeoff* story the repo now hands you.
 
 **Tier 2 — not yet exercised, defend with `reincodes` (keep warm second).** No AptKit anchor, so the story is "built it elsewhere + here's the trigger." Ranked by how likely AptKit is to actually grow it (which is also how natural the "when it'd appear here" story is).
 
@@ -128,9 +138,11 @@ The whole practice map in one frame.
 
   ┌─ DO FIRST: rehearse Tier 1 (AptKit anchors) ─────────┐
   │  map dispatch → set policy → cost model →             │
-  │  sort top-k → round-robin → JSON scan                 │
+  │  sort top-k → round-robin → JSON scan →               │
+  │  cosine k-NN/chunking/precision@k (retrieval, new)    │
   │  goal: 60-sec walk each, file + load-bearing line     │
-  │  nail #1 (dispatch) and #2 (allowlist) cold           │
+  │  nail #1 (dispatch), #2 (allowlist) cold;             │
+  │  add the O(n·d)→ANN scale story for retrieval         │
   └───────────────────────────┬───────────────────────────┘
                               ▼
   ┌─ DO SECOND: keep Tier 2 warm (reincodes anchors) ────┐
@@ -165,6 +177,9 @@ The Tier 1 anchor map (open these to rehearse):
   JSON scan            json-output.ts:7,17          fence → first-open/last-close
   tree walk            structural-diff.ts:53        getPath dotted descent
   tree recursion       structural-diff.ts:185       collectText flatten
+  cosine k-NN          in-memory-vector-store.ts:25,46  scan + cosine + sort + slice
+  chunking             retrieval/chunker.ts:16,25   window slide, step = size−overlap
+  precision@k          evals/precision-at-k.ts:27,47  countDistinctHits over a Set
        │
        └─ each row is a 60-second interview answer waiting to be rehearsed.
           the file:line IS the anchor — "let me show you" beats "I know that."

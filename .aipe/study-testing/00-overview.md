@@ -14,13 +14,14 @@ replay. Everything else hangs off it.
   │  cards navigate · fixture run bumps counter · panels show │  1 file
   └───────────────────────────────────────────────────────────┘
   ┌─ Integration (fixture replay through the real agent) ────┐
-  │  packages/agents/*/scripts/replay-fixture.ts             │  4 of 5
+  │  packages/agents/*/scripts/replay-fixture.ts             │  4 of 6
   │  FixtureModelProvider → runAgentLoop → assert shape+text  │  agents
   └───────────────────────────────────────────────────────────┘
   ┌─ Unit (node --test on built dist) ───────────────────────┐
-  │  20 *.test.ts files, ~80 cases                           │  the base
+  │  28 *.test.ts files, ~123 cases                          │  the base
   │  evals · runtime · tools · context · prompts · workflows  │
-  │  providers · agents · core re-export surface              │
+  │  providers (incl. gemma) · retrieval · agents (incl.      │
+  │  rag-query) · core re-export surface                      │
   └───────────────────────────────────────────────────────────┘
 ```
 
@@ -58,22 +59,34 @@ is `03-promote-to-fixture-baseline.md`.
 ## What's solid, what's thin (the headline)
 
 **Solid:**
-- The eval seam (`packages/evals/`) is the best-tested code in the repo — 14 cases
-  across structural-diff, detection-scorer, rubric-judge, replay-runner.
+- The eval seam (`packages/evals/`) is the best-tested code in the repo — now ~26
+  cases across structural-diff, detection-scorer, rubric-judge, replay-runner, and
+  the new hand-computed precision@k / recall@k.
 - Every agent has a deterministic unit test that swaps in a scripted/fixture
   provider. No agent test calls a live model.
 - The provider seam is tested at the boundary: fallback chain, context-window
   guard, structured-generation retry all have direct tests.
+- **The new RAG packages add a second isolation seam — the injectable transport.**
+  `GemmaModelProvider` and `OllamaEmbeddingProvider` take their HTTP call as a
+  constructor option, so the *real* provider decode (Gemma's tool-call emulation)
+  runs against recorded bytes with no live Ollama. This is the new pattern worth
+  studying → `06-injectable-transport.md`. The RAG packages also carry the repo's
+  strongest error/boundary coverage (dimension guards, the minTopK floor, the
+  hallucinated-filter case, precision@k not-well-formed branches).
 
 **Thin / missing (full detail in `audit.md`):**
 - `runAgentLoop` — the bounded agent loop, the single most load-bearing function
-  in the repo — has **no direct unit test**. It's only exercised transitively.
-- `rubric-improvement` has a unit test but **no fixture replay and no promoted
-  baseline** — the only agent left out of the regression loop.
+  in the repo — still has **no direct unit test**. It's only exercised transitively
+  (now by six agents, including the new `rag-query`).
+- `rubric-improvement` AND `rag-query` have unit tests but **no fixture replay and
+  no promoted baseline** — two agents left out of the regression loop.
 - **No CI test gate.** The only workflow is `publish-core.yml`; it does not run
   `npm test`, `eval:replays`, or the Playwright smoke. Tests are local-only.
-- Error/edge coverage is uneven: structured-generation and fallback test their
-  failure branches well; the agents mostly test the happy path.
+- Error/edge coverage is uneven by area: the runtime/provider layer and the new
+  RAG packages test their failure branches well; the *legacy* agents
+  (recommendation/monitoring/diagnostic/query) mostly test the happy path.
+- The real-`fetch` transports (`defaultHttpTransport`) are exercised by nothing in
+  the suite — live-only by design (see `06-injectable-transport.md`).
 
 ## Where to go next
 

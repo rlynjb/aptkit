@@ -6,36 +6,38 @@ standard*
 ## Zoom out, then zoom in
 
 Chunking decides *what* you embed and therefore *what* you can retrieve. It sits
-between raw documents and the embedder. AptKit has a genuine structural splitter
-already — but it feeds content generation, not retrieval. Here's the map, with
-the splitter that exists marked separately from the retrieval wiring that does
-not.
+between raw documents and the embedder. AptKit now ships *two* chunkers, and they
+feed two different sinks: a fixed-size character chunker that feeds retrieval
+(`packages/retrieval/src/chunker.ts`), and the older structural splitter that
+feeds content generation (`splitMarkdownSections`). Here's the map.
 
 ```
-  Zoom out — chunking's place (and AptKit's existing splitter)
+  Zoom out — chunking's place (AptKit ships TWO chunkers, two sinks)
+
+  ┌─ Retrieval layer (packages/retrieval) — EXISTS ──────────────────┐
+  │  chunkText(doc.text) ──► chunks ──► embed each ──► index  ★ HERE  │
+  │     fixed-size 512/64 character windows (the retrieval chunker)   │
+  └──────────────────────────────────┬───────────────────────────────┘
+                                      │  top-k chunks
+  ┌─ Tool boundary ────────────────────▼───────────────────────────────┐
+  │  search_knowledge_base returns ranked chunks as a TOOL RESULT      │
+  └─────────────────────────────────────────────────────────────────────┘
 
   ┌─ Workflows layer (packages/workflows) — EXISTS ──────────────────┐
   │  splitMarkdownSections(md) ──► sections   ◄── structural chunking │
   │       │                                       (for content gen,   │
   │       └─► round-robin angles ──► generate         NOT retrieval)  │
   └──────────────────────────────────────────────────────────────────┘
-
-  ┌─ (new) Retrieval layer — packages/retrieval — DOES NOT EXIST ────┐
-  │  chunk(doc) ──► chunks ──► embed each ──► index   ★ THIS CONCEPT  │
-  └──────────────────────────────────┬────────────────────────────────┘
-                                      │  top-k chunks
-  ┌─ Context layer (packages/context) ▼────────────────────────────────┐
-  │  schemaSummary() + retrieved-chunks block ──► system prompt         │
-  └─────────────────────────────────────────────────────────────────────┘
 ```
 
 Zoom in: a **chunk** is the atomic span you embed and store as one vector. It is
 the unit of retrieval — you get back whole chunks, never half a chunk. So the
 chunk boundary is a *product* decision: too big and you retrieve irrelevant
 padding around the one relevant sentence; too small and you retrieve a fragment
-with no context. In AdvntrCue you tuned this. The thing to internalize: **the
-chunking primitive already exists in AptKit (`splitMarkdownSections`) — it is
-just not connected to any retrieval index.**
+with no context. In AdvntrCue you tuned this. The thing to internalize: **AptKit's
+retrieval pipeline chunks fixed-size by character (`chunkText`), while content
+generation chunks structurally (`splitMarkdownSections`) — same primitive, two
+boundary rules, two sinks.**
 
 ## Structure pass
 
@@ -142,33 +144,33 @@ wall of text with no headings collapses to one giant chunk — which is why
 real pipelines often combine structural + a size cap (split a too-big section
 further by fixed-size).
 
-### Move 2.5 — current state vs future state
+### Move 2.5 — two chunkers, two sinks
 
-This is the one concept in this section where AptKit has half the machinery.
-Worth drawing the gap precisely.
+AptKit ships two chunkers that pick *different* boundary rules for *different*
+sinks. Worth drawing the split precisely, because it's the live answer to "which
+strategy and why."
 
 ```
-  Phase A (now) vs Phase B (retrieval) — same splitter, different sink
+  Two chunkers, two sinks — same primitive, different boundary rule
 
-  Phase A — TODAY (content generation)
+  Retrieval (packages/retrieval) — fixed-size by character
+    doc.text ─► chunkText (512/64 windows) ─► chunks
+                                                │
+                                                ▼ embed each chunk
+                                        store vector ─► search at query time
+
+  Content generation (packages/workflows) — structural
     sourceMarkdown ─► splitMarkdownSections ─► sections
-                                                  │
-                                                  ▼ round-robin by angle
-                                          generate a content variant per section
-
-  Phase B — IF RETRIEVAL ADDED
-    sourceMarkdown ─► splitMarkdownSections ─► sections
-                                                  │
-                                                  ▼ embed each section
-                                          store vector ─► search at query time
-
-  what does NOT change: the splitter. The cut logic is reusable as-is.
-  what's missing: the embed + index + search sink. That's the whole gap.
+                                                │
+                                                ▼ round-robin by angle
+                                        generate a content variant per section
 ```
 
-The takeaway: AptKit already *splits structurally*. Retrieval would reuse that
-exact function and add an embedding sink. The chunking primitive is not the
-missing piece — the index is.
+The interesting part: structural is usually the *better* default (each chunk is
+a complete thought), yet retrieval here picks fixed-size. That's deliberate —
+see the next section for why a from-scratch in-memory pipeline wants the dumb,
+deterministic, tokenizer-free cut first, with the smarter splitter as a later
+drop-in behind the same `chunkText`-shaped seam.
 
 ### Move 3 — the principle
 
@@ -191,27 +193,60 @@ The decision and the pipeline in one frame.
   ┌──────────────┬───────────────────┬─────────────────────┐
   │ fixed-size   │ sentence-window   │ structural (## )     │
   │ + overlap    │ embed s, return   │ author's headings    │
-  │ any text     │ s ± neighbours    │ (AptKit's splitter)  │
+  │ AptKit RETR. │ s ± neighbours    │ AptKit content-gen   │
   └──────┬───────┴─────────┬─────────┴──────────┬───────────┘
          └─────────────────┼────────────────────┘
                            ▼
                   ordered list of chunks
-                           │ embed each (NOT wired in AptKit)
+                           │ embed each (chunkText, wired in retrieval)
                            ▼
                   vector index ──► top-k at query time
                            │
-                           ▼  retrieved spans → schemaSummary seam → prompt
+                           ▼  ranked chunks returned as a TOOL RESULT
 ```
 
 ## Implementation in codebase
 
-**Partially present — but NOT for retrieval.** AptKit ships exactly one chunking
-primitive: `splitMarkdownSections` in
-`packages/workflows/src/markdown-sections.ts`. It is real structural chunking,
-and it's used by the content-generation workflow, not a retriever.
+**Two chunkers, two boundary rules.** AptKit ships a fixed-size character chunker
+for retrieval (`packages/retrieval/src/chunker.ts`) and a structural splitter for
+content generation (`splitMarkdownSections`). The retrieval one is the new arrival
+and the surprising choice — fixed-size, not structural — so look at it first.
 
 ```
-  packages/workflows/src/markdown-sections.ts  (lines 25-34)
+  packages/retrieval/src/chunker.ts  (lines 16-31) — the RETRIEVAL chunker
+
+  export function chunkText(text, size = 512, overlap = 64): string[] {
+    if (text.length === 0) return [];          ← empty doc → no chunks
+    if (text.length <= size) return [text];     ← fits in one window → one chunk
+
+    const step = Math.max(1, size - overlap);   ← slide forward by size-overlap
+    const chunks: string[] = [];                   (512-64 = 448 chars/step)
+    for (let start = 0; start < text.length; start += step) {
+      chunks.push(text.slice(start, start + size));  ← a 512-char window
+      if (start + size >= text.length) break;        ← last window covers the tail
+    }
+    return chunks;
+  }
+       │
+       └─ pure arithmetic: no tokenizer, no headings, no sentence parsing.
+          The 64-char overlap carries the seam between windows so a fact that
+          straddles char 510 survives whole in the NEXT chunk. The output
+          string[] is what indexDocument embeds (pipeline.ts:37-46).
+```
+
+Why fixed-size here, when structural is usually the better default? Because this
+is a from-scratch in-memory pipeline, and fixed-size-by-character is the right
+*first* cut for it: deterministic (same input → same chunks, every run), vendor-
+neutral (no tokenizer dependency to pin per model), and trivially testable (the
+boundaries are arithmetic you can assert). ~512 chars keeps each chunk inside
+nomic-embed-text's context window. The doc comment is explicit that a smarter
+semantic/recursive splitter is a later drop-in — the contracts above `chunkText`
+don't change when you swap it.
+
+The other chunker is structural, and it feeds content generation, not retrieval:
+
+```
+  packages/workflows/src/markdown-sections.ts  (lines 25-34) — content-gen chunker
 
   for (const line of markdown.split(/\r?\n/)) {
     const trimmed = line.trimStart();
@@ -224,18 +259,16 @@ and it's used by the content-generation workflow, not a retriever.
   }
   flush();
        │
-       └─ this IS structural chunking: cut on ##, keep ###+ inside.
-          The output `MarkdownSection[]` is exactly the granularity a
-          retriever would embed — but nothing embeds it. The consumer is
-          ensureGeneratedContent (content gen), via splitMarkdownSections
-          at content-generation-workflow.ts:72.
+       └─ this IS structural chunking: cut on ##, keep ###+ inside. Its
+          MarkdownSection[] flows into planContentVariant (content-generation-
+          workflow.ts:139-157), picked round-robin to GENERATE content for —
+          never embedded, never indexed. Different sink entirely.
 ```
 
-The honest gap: `MarkdownSection` flows into `planContentVariant`
-(`packages/workflows/src/content-generation-workflow.ts:139-157`) which picks a
-section to *generate content for* by round-robin — not to embed and index. There
-is no `embed(section)`, no vector store, no similarity search. The chunking step
-of RAG exists in the repo; the retrieval that consumes chunks does not.
+The honest point: AptKit's retrieval uses the *dumber* strategy on purpose. The
+structural splitter already existed and is arguably the nicer chunk shape, but
+retrieval reached for fixed-size because a from-scratch pipeline is easier to
+trust when its chunk boundaries are arithmetic.
 
 ## Elaborate
 
@@ -249,9 +282,11 @@ whether the relevant fact lives intact inside one chunk.
 The subtle trap is the *embed-vs-return mismatch* (sentence-window): the text you
 embed for matching need not be the text you hand the model. Embedding a short,
 focused span gives a clean match; returning a wider window gives the model the
-context to use it. AptKit's structural sections happen to be reasonable as *both*
-the embed unit and the return unit, which is why structural chunking is a good
-default.
+context to use it. AptKit sidesteps that mismatch entirely in retrieval: a
+fixed-size chunk is the embed unit *and* the return unit — the same 512-char
+window goes into the vector and comes back as the citation snippet. Simpler, at
+the cost of the cleaner boundaries structural chunking would give. That trade is
+the whole reason a structural-with-size-cap splitter is the natural next drop-in.
 
 Adjacent: embeddings ([01-embeddings.md](01-embeddings.md)) consume chunks;
 incremental indexing ([10-incremental-indexing.md](10-incremental-indexing.md))
@@ -261,25 +296,28 @@ re-chunks only what changed; the chunk's freshness vs its source is
 ## Project exercises
 
 *Provenance: Phase 2A — Retrieval foundations (C2.x). No `aieng-curriculum.md`
-present; IDs are by-phase convention. **Case B — the splitter exists but is not
-wired to retrieval; this exercise wires it.***
+present; IDs are by-phase convention. **Case A — the fixed-size retrieval chunker
+ships; this exercise upgrades it to structural and proves the trade was real.***
 
-### Exercise — turn `splitMarkdownSections` into a retrieval chunker
+### Exercise — swap the fixed-size chunker for structural, behind the same seam
 
-- **Exercise ID:** `[B2A.3]` Phase 2A, chunking concept
-- **What to build:** A `chunkDocument(markdown, { maxChars })` in
-  `packages/retrieval` that calls the existing `splitMarkdownSections`, then
-  splits any section longer than `maxChars` into fixed-size sub-chunks with a
-  small overlap. Emit a `{ id, heading, content }[]` ready to embed.
-- **Why it earns its place:** It reuses AptKit's real structural splitter (no
-  reinventing) and adds the size-cap fallback that production chunkers need —
-  demonstrating the structural-plus-size hybrid that's the field default.
-- **Files to touch:** `packages/retrieval/src/chunk.ts` (imports
-  `@aptkit/workflows` `splitMarkdownSections`),
-  `packages/retrieval/test/chunk.test.ts`.
+- **Exercise ID:** `[A2A.3]` Phase 2A, chunking concept
+- **What to build:** A `chunkText`-shaped replacement in `packages/retrieval`
+  that calls the existing `splitMarkdownSections`, then size-caps any section
+  longer than `maxChars` into fixed-size sub-chunks with overlap (structural with
+  a size-cap fallback). Keep it behind the same `string[]`-returning seam the
+  pipeline already calls so `indexDocument` doesn't change.
+- **Why it earns its place:** It exercises the explicit drop-in the doc comment
+  promises, reuses AptKit's real structural splitter, and — the point — lets you
+  *measure* whether structural actually beats fixed-size here with
+  `scorePrecisionAtK` (from `packages/evals`), before and after the swap.
+- **Files to touch:** `packages/retrieval/src/chunker.ts`,
+  `packages/retrieval/test/` (a chunker test plus a precision@k comparison over a
+  small fixture corpus).
 - **Done when:** A test proves a doc with one 5,000-char section under a 1,000-char
-  cap yields multiple overlapping sub-chunks, while short sections pass through
-  whole; chunk ids are stable across runs of identical input.
+  cap yields multiple overlapping sub-chunks while short sections pass through
+  whole; chunk ids are stable across runs; and a precision@k number is recorded
+  for both strategies on the same corpus.
 - **Estimated effort:** `1–4hr`
 
 ## Interview defense
@@ -300,9 +338,12 @@ matter?**
 boundary sets the ceiling on relevance. I prefer structural chunking, cutting on
 the document's own headings, because each chunk is then a complete thought. I
 fall back to fixed-size with overlap for unstructured text so a fact straddling a
-boundary survives in at least one chunk. Interestingly, our repo already has a
-structural splitter — `splitMarkdownSections` — it's just wired to content
-generation, not a retriever."
+boundary survives in at least one chunk. Interestingly, our retrieval pipeline
+actually went the other way — fixed-size by character (`chunkText`), not
+structural — because it's a from-scratch in-memory pipeline and deterministic,
+tokenizer-free boundaries were easier to trust. The structural splitter
+(`splitMarkdownSections`) exists too, but it's wired to content generation; making
+it the retrieval chunker is the planned drop-in."
 *Anchor: the unit you embed is the unit you're forever stuck retrieving.*
 
 **Q: Sentence-window chunking — what's the trick?**
@@ -313,18 +354,20 @@ the text you hand the model don't have to be the same span."
 
 ## Validate
 
-- **Reconstruct:** Write the structural boundary rule from memory: split on `## `,
-  keep `### `+ inside the section. Check against
-  `packages/workflows/src/markdown-sections.ts:27`.
+- **Reconstruct:** Write the fixed-size slide-window from memory: `step = size -
+  overlap`, push `text.slice(start, start+size)`, break when `start+size >=
+  text.length`. Check against `packages/retrieval/src/chunker.ts:24-29`.
 - **Explain:** Why does fixed-size chunking need overlap? (A fact spanning a cut
-  point would otherwise appear fully in neither chunk and be unretrievable.)
-- **Apply:** You point `splitMarkdownSections` at a markdown doc that's one giant
-  paragraph with no `##`. How many chunks? (One — see the
-  `sections.length === 0` fallback at `markdown-sections.ts:36`. That's the case
-  the size-cap exercise fixes.)
-- **Defend:** Why is structural chunking a good *default* but not sufficient
-  alone? (It's only as good as the document's structure; a heading-less wall of
-  text collapses to one chunk, so you need a size-cap fallback.)
+  point would otherwise appear fully in neither chunk and be unretrievable —
+  the 64-char `CHUNK_OVERLAP` carries it into the next window.)
+- **Apply:** You call `chunkText` on a doc shorter than 512 chars. How many
+  chunks? (One — the `text.length <= size` early return at `chunker.ts:22`.)
+  And on `splitMarkdownSections` over a heading-less wall of text? (Also one,
+  via its `sections.length === 0` fallback at `markdown-sections.ts:36`.)
+- **Defend:** Why did retrieval pick fixed-size over structural, when structural
+  is usually the better default? (Deterministic, vendor-neutral, tokenizer-free,
+  trivially testable — the right first cut for a from-scratch in-memory pipeline;
+  the structural-plus-size-cap splitter is an explicit later drop-in.)
 
 ## See also
 

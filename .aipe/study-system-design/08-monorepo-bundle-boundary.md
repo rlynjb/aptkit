@@ -1,4 +1,4 @@
-# Monorepo bundle boundary — 11 internal packages, one published tarball
+# Monorepo bundle boundary — 15 internal packages, one published tarball
 
 **Industry names:** Monorepo workspace + bundled publish / facade package / API boundary. **Type:** Industry standard (the `bundledDependencies` inlining is a specific npm mechanism).
 
@@ -12,19 +12,20 @@ This is the boundary that wraps the *entire* repo for the outside world. Find th
   ┌─ External — npm consumers / host apps ──────────────────┐
   │  import { ... } from '@rlynjb/aptkit-core'               │ ← they see ONLY this
   └───────────────────────────┬──────────────────────────────┘
-                              │  one tarball, version 0.3.0
+                              │  one tarball, version 0.4.x
   ┌─ Publish boundary — packages/core ────────▼──────────────┐
-  │  ★ @rlynjb/aptkit-core ★  re-exports all 11 packages     │ ← we are here
+  │  ★ @rlynjb/aptkit-core ★  re-exports all 15 packages     │ ← we are here
   │  bundledDependencies inlines them into the tarball       │
   └───────────────────────────┬──────────────────────────────┘
                               │  internal workspace deps (0.0.0)
-  ┌─ Internal — 11 @aptkit/* workspace packages ──────────────┐
+  ┌─ Internal — 15 @aptkit/* workspace packages ──────────────┐
   │  runtime, tools, context, prompts, evals, workflows,      │
-  │  + 5 agents  (none published individually)                │
+  │  retrieval, provider-gemma, provider-local,               │
+  │  + 6 agents  (none published individually)                │
   └──────────────────────────────────────────────────────────┘
 ```
 
-Now zoom in. You know the two failure modes this avoids: publishing eleven separately-versioned packages that consumers must keep in lockstep (dependency hell), *or* dumping everything into one giant unstructured package (no internal boundaries). The pattern is a **facade package over a workspace monorepo**: develop as many small internal packages with clean dependency edges, but publish *one* tarball that inlines them all via `bundledDependencies`. Consumers get a single dependency at a single version; the team gets modular internals. The constraint that makes it work: app-specific product logic must never leak *into* core.
+Now zoom in. You know the two failure modes this avoids: publishing fifteen separately-versioned packages that consumers must keep in lockstep (dependency hell), *or* dumping everything into one giant unstructured package (no internal boundaries). The pattern is a **facade package over a workspace monorepo**: develop as many small internal packages with clean dependency edges, but publish *one* tarball that inlines them all via `bundledDependencies`. Consumers get a single dependency at a single version; the team gets modular internals. The constraint that makes it work: app-specific product logic must never leak *into* core.
 
 ## Structure pass
 
@@ -36,13 +37,13 @@ Now zoom in. You know the two failure modes this avoids: publishing eleven separ
   "what's visible from here?" — traced across the publish boundary
 
   ┌─ external consumer ─┐  seam   ┌─ packages/core ─────┐  seam  ┌─ internal pkgs ─┐
-  │ sees ONE package    │ ══╪════► │ sees ALL 11 (deps)  │ ══╪═══►│ see each other  │
+  │ sees ONE package    │ ══╪════► │ sees ALL 15 (deps)  │ ══╪═══►│ see each other  │
   │ @rlynjb/aptkit-core │ (flips) │ re-exports a SUBSET │(flips) │ via @aptkit/*   │
-  │ @ version 0.3.0     │         │ (the API surface)   │        │ versioned 0.0.0 │
+  │ @ version 0.4.x     │         │ (the API surface)   │        │ versioned 0.0.0 │
   └─────────────────────┘         └─────────────────────┘        └─────────────────┘
 ```
 
-Visibility flips twice. The external world sees exactly one name at one version; core sees all eleven internals but deliberately re-exports only a *curated subset* (the API surface); the internals see each other through the workspace. *That curated re-export is the seam* — it's the published API contract (a must-not-change surface), and it's where you decide what's public vs internal. Hand off to How it works.
+Visibility flips twice. The external world sees exactly one name at one version; core sees all fifteen internals but deliberately re-exports only a *curated subset* (the API surface); the internals see each other through the workspace. *That curated re-export is the seam* — it's the published API contract (a must-not-change surface), and it's where you decide what's public vs internal. Hand off to How it works.
 
 ## How it works
 
@@ -54,10 +55,12 @@ The shape is a facade that re-exports a controlled surface, plus a build/pack st
   The facade + inline kernel
 
   develop:                          publish:
-  ┌─ 11 internal pkgs ─┐            ┌─ core/index.ts ──────────┐
+  ┌─ 15 internal pkgs ─┐            ┌─ core/index.ts ──────────┐
   │ @aptkit/runtime    │  build     │ export * from runtime    │
   │ @aptkit/tools      │  order:    │ export * from tools      │  curated surface
-  │ ... 5 agents       │  deps      │ export { A, B } from agentX  ← subset, aliased
+  │ ... retrieval,     │  deps      │ export * from retrieval   │
+  │ gemma, local,      │  first     │ export { A, B } from agentX  ← subset, aliased
+  │ 6 agents           │            │                          │
   └─────────┬──────────┘  first     └───────────┬──────────────┘
             │                                   │  pack-core-standalone.mjs
             ▼                                   ▼
@@ -66,13 +69,13 @@ The shape is a facade that re-exports a controlled surface, plus a build/pack st
                                        = ONE tarball, deps inlined
 ```
 
-The two halves: the *re-export* decides the public API (compile-time), and the *bundling* makes the tarball self-contained (publish-time). Both matter — re-export without bundling means consumers must install eleven `@aptkit/*` packages that don't exist on npm; bundling without a curated re-export means leaking internals.
+The two halves: the *re-export* decides the public API (compile-time), and the *bundling* makes the tarball self-contained (publish-time). Both matter — re-export without bundling means consumers must install fifteen `@aptkit/*` packages that don't exist on npm; bundling without a curated re-export means leaking internals.
 
 #### Move 2 — the step-by-step walkthrough
 
-**The dependency edges are real and ordered.** Internally, the packages form a DAG: `runtime` depends on nothing; `tools`/`context`/`prompts`/`evals`/`workflows` depend on `runtime`; the five agents depend on those; `core` depends on all eleven. The build script compiles them in topological order — runtime first, core last. The bridge: it's a build graph, like a bundler resolving module order. The boundary condition: if you compiled core before its deps, the type declarations it re-exports wouldn't exist yet — hence the explicit ordered `build:core:deps` chain.
+**The dependency edges are real and ordered.** Internally, the packages form a DAG: `runtime` depends on nothing; `tools`/`context`/`prompts`/`evals`/`workflows` depend on `runtime`; `retrieval` depends on `tools` (for the tool contract); the providers (`gemma`/`local`) depend only on `runtime`'s `ModelProvider` contract; the six agents depend on those (rag-query additionally on `retrieval` + `provider-gemma`); `core` depends on all fifteen. The build script compiles them in topological order — runtime first, core last. The bridge: it's a build graph, like a bundler resolving module order. The boundary condition: if you compiled core before its deps, the type declarations it re-exports wouldn't exist yet — hence the explicit ordered `build:core:deps` chain.
 
-**The facade re-exports a curated surface.** `core/src/index.ts` does `export * from '@aptkit/runtime'` (and tools, context, prompts, evals, workflows) to expose those wholesale, but for the *agents* it re-exports a hand-picked named subset — and aliases collide (e.g. `Anomaly as MonitoringAnomaly` vs `Anomaly as DiagnosticAnomaly`, since both agent packages export a type named `Anomaly`). The bridge: it's a barrel file with deliberate `export { x, y }` instead of `export *`, so internal helpers stay internal. The boundary condition: this re-export list *is* the public API — a must-not-change compatibility contract at semver `0.3.0`. Removing or renaming an export is a breaking change for every consumer.
+**The facade re-exports a curated surface.** `core/src/index.ts` does `export * from '@aptkit/runtime'` (and tools, context, prompts, evals, workflows) to expose those wholesale, but for the *agents* it re-exports a hand-picked named subset — and aliases collide (e.g. `Anomaly as MonitoringAnomaly` vs `Anomaly as DiagnosticAnomaly`, since both agent packages export a type named `Anomaly`). The bridge: it's a barrel file with deliberate `export { x, y }` instead of `export *`, so internal helpers stay internal. The boundary condition: this re-export list *is* the public API — a must-not-change compatibility contract at semver `0.4.x`. Removing or renaming an export is a breaking change for every consumer.
 
 ```
   Layers-and-hops — a name crossing from internal to public
@@ -84,11 +87,11 @@ The two halves: the *re-export* decides the public API (compile-time), and the *
   │ curate + alias            │   Anomaly as MonitoringAnomaly } from '...'  ← collision fix
   └───────────┬───────────────┘                                                │
   ┌─ consumer ▼──────────────┐ hop 3: import { MonitoringAnomaly } from        │
-  │ @rlynjb/aptkit-core 0.3.0 │   '@rlynjb/aptkit-core'  ◄─────────────────────┘
+  │ @rlynjb/aptkit-core 0.4.x │   '@rlynjb/aptkit-core'  ◄─────────────────────┘
   └───────────────────────────┘   (never names @aptkit/* at all)
 ```
 
-**The pack step inlines everything into one tarball.** `pack-core-standalone.mjs` runs `npm pack` on each internal package (producing `.tgz` files), stages core to a temp dir, then for *each* internal package extracts its tarball into core's `node_modules/@aptkit/<pkg>/` tree, and finally runs `npm pack` on the staged core. The result is one tarball with all dependencies physically inlined under `node_modules`. The bridge: it's `bundledDependencies` — npm's mechanism for shipping deps *inside* your package rather than as registry references. The boundary condition: the `bundledDependencies` array in `package.json` lists all eleven `@aptkit/*` names; if a package is missing from that list, it won't be inlined and the published tarball breaks at install for any consumer (the missing `@aptkit/*` isn't on the public registry).
+**The pack step inlines everything into one tarball.** `pack-core-standalone.mjs` runs `npm pack` on each internal package (producing `.tgz` files), stages core to a temp dir, then for *each* internal package extracts its tarball into core's `node_modules/@aptkit/<pkg>/` tree, and finally runs `npm pack` on the staged core. The result is one tarball with all dependencies physically inlined under `node_modules`. The bridge: it's `bundledDependencies` — npm's mechanism for shipping deps *inside* your package rather than as registry references. The boundary condition: the `bundledDependencies` array in `package.json` lists all fifteen `@aptkit/*` names; if a package is missing from that list, it won't be inlined and the published tarball breaks at install for any consumer (the missing `@aptkit/*` isn't on the public registry).
 
 **The must-not-change rule guards the boundary's direction.** Dependencies point *into* core (internals → core → consumer). The architectural constraint is that app-specific product logic must never point the *other* way — core must not import anything app-specific, because the whole reason the monorepo exists is to ship the *reusable* parts cleanly. The bridge: it's the dependency-rule from clean architecture — dependencies point inward toward the stable core, never outward toward volatile app code. The boundary condition: if a product-specific helper sneaks into core, every consumer inherits product logic they didn't ask for, and the "reusable capabilities" promise breaks.
 
@@ -97,7 +100,7 @@ The two halves: the *re-export* decides the public API (compile-time), and the *
 1. **Isolate the kernel.** A set of internal workspace packages with a clean dependency DAG + a facade package that re-exports a curated surface + a `bundledDependencies` inline so the published tarball is self-contained + the rule that dependencies only point *into* core.
 
 2. **Name each part by what breaks if removed.**
-   - Remove the **facade re-export** → consumers must import from eleven `@aptkit/*` packages that aren't published; there's no single entry point.
+   - Remove the **facade re-export** → consumers must import from fifteen `@aptkit/*` packages that aren't published; there's no single entry point.
    - Remove the **`bundledDependencies` inline** → the tarball references `@aptkit/*` packages that don't exist on npm; `npm install` fails for every consumer.
    - Remove the **curated subset** (just `export *` everything) → internal helpers and unstable types leak into the public API, and every internal refactor risks a breaking change.
    - Remove the **dependency-direction rule** → app-specific logic leaks into core, defeating the entire purpose of extracting reusable capabilities.
@@ -108,7 +111,7 @@ The interview payoff: name **`bundledDependencies` vs regular `dependencies`**. 
 
 #### Move 3 — the principle
 
-Develop modular, publish monolithic. A workspace monorepo lets you keep clean internal boundaries (eleven packages, a real dependency DAG, independent tests), while a facade-plus-bundle lets the outside world see one stable package at one version. The consumer gets simplicity; the team keeps structure. The one rule that protects it: dependencies point *into* the published core, never out toward app-specific code.
+Develop modular, publish monolithic. A workspace monorepo lets you keep clean internal boundaries (fifteen packages, a real dependency DAG, independent tests), while a facade-plus-bundle lets the outside world see one stable package at one version. The consumer gets simplicity; the team keeps structure. The one rule that protects it: dependencies point *into* the published core, never out toward app-specific code.
 
 ## Primary diagram
 
@@ -122,17 +125,20 @@ The full recap — the DAG, the facade, the inline, the direction rule.
   │    ▲                                                                    │
   │  tools  context  prompts  evals  workflows   (depend on runtime)        │
   │    ▲                                                                    │
-  │  5 agents  (recommendation, anomaly, diagnostic, query, rubric)         │
+  │  retrieval (→tools)   provider-gemma  provider-local                     │
+  │    ▲                                                                    │
+  │  6 agents  (recommendation, anomaly, diagnostic, query, rubric,         │
+  │             rag-query → retrieval + gemma)                               │
   │    ▲                                                                    │
   └────┼────────────────────────────────────────────────────────────────────┘
        │  build:core:deps (topological: runtime → ... → agents → core)
   ┌────┼─ packages/core (facade) ─────────────────────────────────────────┐
   │  index.ts: export * from runtime/tools/context/prompts/evals/workflows │
   │            export { curated, Anomaly as MonitoringAnomaly } from agents│ ← API surface
-  │  package.json: bundledDependencies = [all 11 @aptkit/*]                │
+  │  package.json: bundledDependencies = [all 15 @aptkit/*]                │
   │  pack-core-standalone.mjs: npm pack each → inline into node_modules     │
   └──────────────────────────────┬─────────────────────────────────────────┘
-                                 ▼  ONE tarball @ 0.3.0
+                                 ▼  ONE tarball @ 0.4.x
   ┌─ external consumer ────────────────────────────────────────────────────┐
   │  import { ... } from '@rlynjb/aptkit-core'   (or legacy @aptkit/core)    │
   │  → never names @aptkit/* ; product logic NEVER flows back up (the rule)  │
@@ -141,7 +147,7 @@ The full recap — the DAG, the facade, the inline, the direction rule.
 
 ## Implementation in codebase
 
-**Use cases.** A host app (the "Blooming Insights" app these capabilities were extracted from) installs one package, `@rlynjb/aptkit-core`, and imports the recommendation agent, the provider adapters, and the eval functions from it — without ever knowing there are eleven packages underneath. The CI workflow (`.github/workflows/publish-core.yml`) builds the dep chain, packs the standalone tarball, and publishes. The legacy `@aptkit/core` alias keeps older host apps working without a rename.
+**Use cases.** A host app (the "Blooming Insights" app these capabilities were extracted from) installs one package, `@rlynjb/aptkit-core`, and imports the recommendation agent, the provider adapters, and the eval functions from it — without ever knowing there are fifteen packages underneath. The CI workflow (`.github/workflows/publish-core.yml`) builds the dep chain, packs the standalone tarball, and publishes. The legacy `@aptkit/core` alias keeps older host apps working without a rename.
 
 **The facade surface** — `packages/core/src/index.ts` (lines 1–62):
 
@@ -166,14 +172,14 @@ The full recap — the DAG, the facade, the inline, the direction rule.
        └─ export * for foundation packages; CURATED export { } for agents. Both agent
           packages export a type named `Anomaly` — aliasing (MonitoringAnomaly vs
           DiagnosticAnomaly) resolves the collision. THIS list is the must-not-change
-          public API at 0.3.0; renaming an export breaks every consumer.
+          public API at 0.4.x; renaming an export breaks every consumer.
 ```
 
 **The inline declaration** — `packages/core/package.json` (lines 2–3, 44–56):
 
 ```
   "name": "@rlynjb/aptkit-core",                  ← line 2, the ONE public name
-  "version": "0.3.0",                             ← line 3, the compatibility contract
+  "version": "0.4.x",                             ← line 3, the compatibility contract
   ...
   "bundledDependencies": [                        ← lines 44-56
     "@aptkit/agent-anomaly-monitoring",
@@ -185,7 +191,7 @@ The full recap — the DAG, the facade, the inline, the direction rule.
     "@aptkit/runtime", "@aptkit/tools", "@aptkit/workflows"
   ],
        │
-       └─ All 11 internal packages listed. These are INLINED into the tarball, not
+       └─ All 15 internal packages listed. These are INLINED into the tarball, not
           fetched from the registry (they're not published individually). Drop one
           from this list and the published tarball 404s on install — the missing
           @aptkit/* isn't on the public registry.
@@ -216,7 +222,7 @@ The full recap — the DAG, the facade, the inline, the direction rule.
        │
        └─ This is bundledDependencies made physical: each internal package's packed
           tarball is extracted INTO core's node_modules before core itself is packed.
-          The output tarball carries all 11 deps inside it — self-contained, installs
+          The output tarball carries all 15 deps inside it — self-contained, installs
           with no @aptkit/* registry lookups.
 ```
 
@@ -230,13 +236,13 @@ This is the outermost boundary in the repo. It wraps everything the other seven 
 
 ## Interview defense
 
-**Q: You have eleven internal packages. How do you publish them without making consumers manage eleven dependencies?**
+**Q: You have fifteen internal packages. How do you publish them without making consumers manage fifteen dependencies?**
 
-A facade package that re-exports a curated surface, with `bundledDependencies` inlining the internals into one tarball. Consumers install one package (`@rlynjb/aptkit-core`) at one version; the eleven `@aptkit/*` packages ship *inside* the tarball and are never published individually.
+A facade package that re-exports a curated surface, with `bundledDependencies` inlining the internals into one tarball. Consumers install one package (`@rlynjb/aptkit-core`) at one version; the fifteen `@aptkit/*` packages ship *inside* the tarball and are never published individually.
 
 ```
-  11 internal pkgs ─► core/index.ts (curated re-export)
-                   ─► bundledDependencies inlines all 11 ─► ONE tarball @ 0.3.0
+  15 internal pkgs ─► core/index.ts (curated re-export)
+                   ─► bundledDependencies inlines all 15 ─► ONE tarball @ 0.4.x
 ```
 
 Anchor: `core/src/index.ts:1-62` (facade), `core/package.json:44-56` (inline).

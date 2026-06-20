@@ -116,7 +116,9 @@ You know that `fetch()` returns a Promise and your `.then`/`await` runs "later,"
                (resumes when consumer asks again)
 ```
 
-**The boundary condition — don't block the loop.** The loop's one rule: synchronous code between awaits must be short, because nothing else runs during it. AptKit's synchronous spans are small (`JSON.parse` of a tool result capped at 16KB, `.filter`/`.map` over a handful of content blocks). There's no synchronous megabyte parse or tight CPU loop that would freeze the loop. The one place to watch: `truncate(JSON.stringify(result))` on a tool result — bounded at `MAX_TOOL_RESULT_CHARS` precisely so the synchronous stringify stays cheap.
+**The boundary condition — don't block the loop.** The loop's one rule: synchronous code between awaits must be short, because nothing else runs during it. AptKit's synchronous spans are mostly small (`JSON.parse` of a tool result capped at 16KB, `.filter`/`.map` over a handful of content blocks). The one bounded span to watch is `truncate(JSON.stringify(result))` on a tool result — capped at `MAX_TOOL_RESULT_CHARS` precisely so the synchronous stringify stays cheap.
+
+The new RAG code adds the *first* synchronous span whose cost scales with data, not with a fixed bound: `InMemoryVectorStore.search` walks every stored chunk and runs `cosineSimilarity` — an O(N·dim) dot-product loop — entirely on the JS thread before it returns, then sorts (`in-memory-vector-store.ts:25-33`, `:46-57`). For the 3-doc demo corpus this is microseconds. But there's no `await` inside that scan: index a large corpus and a single `search` call freezes the loop for the whole linear scan. It's unbounded by design — the `dimension` is fixed (768) but the chunk *count* is not. This is the one place in the repo where corpus growth turns a cheap span into a loop-blocking one; the fix is the `PgVectorStore` drop-in the contract already anticipates (the scan moves into Postgres, off the JS thread). See `05`, `08`.
 
 ### Move 3 — the principle
 
@@ -227,13 +229,13 @@ The event loop comes from the same lineage as the browser's — Node took libuv'
 
 Answer: "Running other ready work. The await suspends the function and returns the thread to the loop; the socket wait happens off-thread in the kernel. When the reply lands, my continuation is queued as a microtask and resumes." Anchor: `run-agent-loop.ts:103`.
 
-**Q: "What would freeze the loop here, and does the code risk it?"** A long *synchronous* span — e.g. stringifying a giant object. The code bounds exactly this with `MAX_TOOL_RESULT_CHARS = 16_000` before `JSON.stringify` (`run-agent-loop.ts:52,162`), so synchronous spans stay tiny. No tight CPU loops anywhere.
+**Q: "What would freeze the loop here, and does the code risk it?"** A long *synchronous* span — e.g. stringifying a giant object, or a CPU scan whose length scales with data. The tool-result path is bounded (`MAX_TOOL_RESULT_CHARS = 16_000` before `JSON.stringify`, `run-agent-loop.ts:52,162`), so that span stays tiny. The one unbounded sync span is `InMemoryVectorStore.search`'s cosine scan over every chunk (`in-memory-vector-store.ts:25-33`): harmless at demo corpus size, a loop freeze at scale because no `await` interrupts the linear scan. The move is the `PgVectorStore` drop-in that pushes ranking into Postgres, off the JS thread.
 
 ## Validate
 
 1. **Reconstruct:** Draw one loop tick (macrotask → drain microtasks → I/O poll). Mark where an `await` continuation lands.
 2. **Explain:** Why can one Node process serve three Studio replays on one thread? (All three park at `await model.complete()` — `run-agent-loop.ts:103`.)
-3. **Apply:** A reviewer adds a synchronous `JSON.stringify` of an un-truncated 5MB tool result. What happens to other requests? (Loop frozen for the duration; bound it like `truncate` at `:54–57`.)
+3. **Apply:** A reviewer adds a synchronous `JSON.stringify` of an un-truncated 5MB tool result. What happens to other requests? (Loop frozen for the duration; bound it like `truncate` at `:54–57`.) Then: someone indexes a 200k-chunk corpus into `InMemoryVectorStore` and calls `search`. What freezes, and what's the fix? (The synchronous cosine scan over all chunks, `in-memory-vector-store.ts:25-33`; move ranking into `PgVectorStore` so it runs off the JS thread.)
 4. **Defend:** Explain why `decodeNdjsonStream`'s `yield` gives implicit backpressure but `res.write` in the server does not (`06`).
 
 ## See also

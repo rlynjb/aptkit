@@ -2,10 +2,16 @@
 
 Pass 1. One section per design lens. Every lens checked; where a principle
 has nothing to bite on, it says so. The deep walks for the significant
-patterns live in the Pass 2 files (`01`–`05`); this audit cross-links rather
+patterns live in the Pass 2 files (`01`–`06`); this audit cross-links rather
 than restating them.
 
 Source for every term: Ousterhout, *A Philosophy of Software Design*.
+
+> **Updated: 2026-06-20** — re-walked against `@aptkit/retrieval` (the RAG
+> package: `EmbeddingProvider`/`VectorStore` contracts, the `search_knowledge_base`
+> tool, the dimension one-way door) and `@aptkit/provider-gemma` (tool-call
+> emulation). Both are now re-exported by `@rlynjb/aptkit-core`. New deep walk:
+> `06-retrieval-contracts-as-deep-seams.md`.
 
 ---
 
@@ -42,6 +48,15 @@ tell whether the run was free, uncosted, or a bug. That's the textbook
 unknown-unknown: the information you'd need to reason about it isn't visible
 where you'd look.
 
+**A new unknown-unknown contained well — the dimension one-way door.** The
+retrieval package surfaces a fact that would otherwise be a silent landmine: a
+corpus embedded at one dimension can't be searched by a query of another, or
+ranking returns plausible-but-meaningless results. `assertWiring`
+(`packages/retrieval/src/pipeline.ts:22`) turns that unknown-unknown into a
+loud, immediate config error. This is the *good* handling of the symptom — the
+information you'd need is made visible exactly where you'd hit the bug. Contrast
+with the pricing `undefined` above. → `06`.
+
 **Top 3 hotspots by path:**
 1. `packages/agents/*/src/*-agent.ts` — duplicated wiring (cognitive load).
 2. `packages/runtime/src/usage-ledger.ts:71` — provider pricing as a hidden
@@ -73,6 +88,17 @@ And `evaluateStructuralDiff` (`structural-diff.ts:20`): one function takes a
 value and a rule list and hides six different assertion strategies behind a
 single switch. → `03`.
 
+**The deep-module move, reused — the retrieval contracts.** `EmbeddingProvider`
+and `VectorStore` (`packages/retrieval/src/contracts.ts:22-37`) are the same
+shape as `ModelProvider`: three members each hiding HTTP transport, cosine
+ranking, and dimension validation. The strongest signal here is *reuse* — the
+repo has a house style for swappable dependencies and applies it again to two
+new seams at once. `GemmaModelProvider`
+(`packages/providers/gemma/src/gemma-provider.ts:39`) is another instance:
+behind the same `ModelProvider` interface sits a whole tool-call *emulation*
+(no native tools array) the caller never sees — an unusually large body behind
+the standard narrow neck. → full walk in `06-retrieval-contracts-as-deep-seams.md`.
+
 **The shallowest modules — the agent classes.** Take `QueryAgent`
 (`packages/agents/query/src/query-agent.ts:67-103`). The class body is:
 store a prompt in the constructor, then in `answer()` call `listTools`,
@@ -80,8 +106,9 @@ store a prompt in the constructor, then in `answer()` call `listTools`,
 The interface (`new QueryAgent(opts).answer(question)`) is nearly as complex
 as the body, and the body is mostly forwarding to deeper modules. That's the
 definition of shallow. It's not *classitis* in the worst sense (these aren't
-one-method-per-class fragmentation), but it's five near-identical shallow
-wrappers where one parameterised helper would do.
+one-method-per-class fragmentation), but it's six near-identical shallow
+wrappers where one parameterised helper would do — the newest, `RagQueryAgent`,
+copied the same skeleton to wire up retrieval (`04`).
 
 **The fix for the worst:** don't delete the agent classes — their *names*
 and types are part of the public surface. Fold the shared body into one
@@ -190,6 +217,16 @@ that earns its place only if a caller actually flips it.
 are all defaulted in the module. Callers *can* override but never *have to*.
 Complexity owned downward. This is the pattern the pricing table should copy.
 
+**Done right, at a tool boundary — the search tool's weak-caller defenses.**
+`createSearchKnowledgeBaseTool` (`search-knowledge-base-tool.ts:51,81`) pulls
+two decisions down so no prompt has to coach the model: a `minTopK` floor
+(`topK = Math.max(requestedTopK, minTopK)`) stops a weak model from starving
+its own retrieval with `top_k: 1`, and the filter
+(`search-knowledge-base-tool.ts:105`) *ignores* keys absent from a chunk's meta
+so a hallucinated filter key degrades to a no-op instead of wiping every result.
+The caller here is an unreliable model rather than a programmer, which is exactly
+why the complexity belongs in the tool, not the prompt. → `06`.
+
 ---
 
 ## 6. errors-and-special-cases
@@ -225,6 +262,16 @@ re-throws.
 carrying `attempts[]`. Instead of N scattered failures, the caller gets one
 exception that explains the whole chain. Errors aggregated, not multiplied.
 
+**The inverse move, done deliberately — fail loud on the unrecoverable.** Most
+of the repo defines errors *out*; retrieval does the opposite where it's right
+to. A dimension mismatch can't be recovered from (ranking would silently corrupt),
+so `assertWiring` (`pipeline.ts:22`) and `InMemoryVectorStore.assertDimension`
+(`in-memory-vector-store.ts:36`) *throw*, loudly, naming both sides and the fix.
+Two checks for one invariant: once at wiring (config bug), once per vector (a
+lying adapter). Knowing *which* errors to define out and which to make
+impossible-to-miss is the lesson — return-a-warning for malformed NDJSON, throw
+for a dimension mismatch. → `06`.
+
 ---
 
 ## 7. readability (names · comments · consistency · obviousness)
@@ -241,8 +288,13 @@ matter: `/** Capability-scoped allowlist that keeps agents from seeing tools
 outside their role. */` (`tool-policy.ts:4`) tells you *why*, not *what*. The
 `structured-generation.ts:49-53` block comment carries history a comment is
 uniquely good for — "this is the provider-neutral version of Dryrun's
-on-device JSON pipeline." Missing: `runAgentLoop` (`run-agent-loop.ts:76`),
-the deepest module in the repo, has *no* interface comment explaining the
+on-device JSON pipeline." The retrieval package is the strongest example of
+*why*-comments in the repo: `chunker.ts` explains why fixed-size-by-character
+(deterministic, tokenizer-free), `contracts.ts:28-32` documents the dimension
+one-way door at the type, and `matchesFilter`'s comment
+(`search-knowledge-base-tool.ts:102-104`) explains why absent keys are ignored.
+These carry reasoning the code alone can't. Missing: `runAgentLoop`
+(`run-agent-loop.ts:76`), the deepest module in the repo, has *no* interface comment explaining the
 forced-synthesis contract or the recovery turn. The one place a comment would
 carry the most is the one place it's absent.
 
@@ -269,7 +321,7 @@ severity. This is the actionable index.
 ```
   red flag                  fires?  where + one-line fix
   ───────────────────────── ──────  ─────────────────────────────────────
-  Shallow module            YES     5 agent classes ≈ wiring around 4 lines.
+  Shallow module            YES     6 agent classes ≈ wiring around 4 lines.
    (highest severity)               Fold body into runCapability<T>().  → 04
 
   Information leakage        YES     buildRecoveryPrompt evidence formatter
@@ -308,9 +360,11 @@ severity. This is the actionable index.
 **Severity-ranked verdict:** the repo's foundation passes the red-flag
 checklist cleanly — the contracts are deep, errors are defined out, comments
 explain why. Every *firing* flag clusters in one place: the capability/agent
-layer, where five classes duplicate wiring instead of sharing one
-abstraction. Fix that one layer (`04`) and most of this table goes quiet.
+layer, where six classes duplicate wiring instead of sharing one
+abstraction (and the count keeps growing — `RagQueryAgent` is the newest).
+Fix that one layer (`04`) and most of this table goes quiet.
 
 The deep walks: `01` (the deep module to copy), `02` (the decorator stack),
 `03` (rules-as-data, which also shows the fix for the pricing flag), `04`
-(the shallow-module fix), `05` (the public surface).
+(the shallow-module fix), `05` (the public surface), `06` (the deep-module move
+reused for retrieval, plus the dimension fail-loud and the weak-caller defenses).

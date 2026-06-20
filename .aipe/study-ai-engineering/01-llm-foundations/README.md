@@ -29,6 +29,8 @@ them real in this repo.
 07-heuristic-before-llm.md    ← cheap deterministic check before paying the LLM
 08-provider-abstraction.md    ← factory/adapter over multiple vendors (flagship)
 09-user-override-locks.md     ← _overridden_at; NOT exercised — taught as foundation
+10-local-vs-cloud-models.md   ← ★ NEW: local Gemma (Ollama) vs cloud frontier
+                                models; the open-weights tradeoff, zero-cloud RAG
 ```
 
 If you read only one file here, read `04-structured-outputs.md`. The typed
@@ -45,7 +47,8 @@ hopeful.
 | `temperature` plumbed through both adapters | `top_p` / `top_k` sampling surface |
 | Cost ledger for OpenAI gpt-4.1 (`usage-ledger.ts`) | Cost for Anthropic (pricing returns `undefined`) |
 | Heuristic intent routing before the LLM (`intent.ts`) | User-override locks (`_overridden_at`) |
-| Provider adapters: Anthropic, OpenAI, Fixture, local guard | — |
+| Provider adapters: Anthropic, OpenAI, Fixture, local guard, **Gemma (local, Ollama)** | — |
+| **Local open-weights model** (Gemma2:9b) behind the same port | A bigger local model / GPU serving |
 
 ## Cross-links
 

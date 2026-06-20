@@ -21,19 +21,24 @@ whole file.
   Zoom out — where "query execution" lives
 
   ┌─ Service layer (the read endpoints) ──────────────────────┐
-  │  /api/replays         → list + parse (cheap-ish)          │ ← we are here
+  │  /api/replays         → list + parse (cheap-ish)          │
   │  /api/promoted-*-fixtures → list + RE-RUN A REPLAY each   │ ← the N+1
   └───────────────────────────┬───────────────────────────────┘
+  ┌─ Capability layer (@aptkit/retrieval) ────────────────────┐
+  │  VectorStore.search(vec,k) → scan + cosine + sort + topK  │ ← the real "query"
+  └───────────────────────────┬───────────────────────────────┘
   ┌─ Storage layer ───────────▼───────────────────────────────┐
-  │  artifacts/replays/*.json   ·   fixtures/promoted/*.json  │
+  │  artifacts/*.json · fixtures/*.json · in-mem VectorChunk  │
   └───────────────────────────────────────────────────────────┘
 ```
 
-**Zoom in.** The question: *what is AptKit's only "query plan," and where does
-it bite?* The plan is a sequential scan with no index assist and no join. It
-bites in `listPromoted*FixtureSummaries`, which does one directory scan *plus*
-a full agent replay per file — the canonical N+1 shape, where the "+1" is
-expensive.
+**Zoom in.** The question: *what are AptKit's "query plans," and where do they
+bite?* There are three. The disk read plan is a sequential scan with no index
+assist and no join — and it bites in `listPromoted*FixtureSummaries`, which does
+one directory scan *plus* a full agent replay per file (the canonical N+1, where
+the "+1" is expensive). The third plan is the genuinely query-shaped one:
+`InMemoryVectorStore.search` runs a `SCAN → SORT → LIMIT k` over embeddings —
+ranking, not just listing — and its lack of an index is the lesson, not a bug.
 
 ---
 
@@ -141,6 +146,43 @@ agent runs), and adding one baseline adds one full replay to every page load.
   1 scan  +  M agent executions  =  classic N+1, where +1 is heavy
 ```
 
+**The cosine top-k scan — the new, genuinely query-shaped path.** Everything
+above is a *list*; this one is a *query* with ranking. `@aptkit/retrieval`'s
+`InMemoryVectorStore.search(vector, k)` is the closest the repo gets to a real
+`SELECT ... ORDER BY ... LIMIT k` execution. The "plan" is fixed and has three
+operators in sequence: a **sequential scan** (compute cosine similarity against
+every stored chunk — no index narrows it), a **sort** (descending by score),
+and a **limit** (`slice(0, k)`). What concretely happens: it iterates
+`this.chunks.values()`, scores each, sorts the full result set, and returns the
+top k. Boundary condition: cost is O(N·d) for the scan plus O(N log N) for the
+sort — linear in corpus size, which is exactly the cost an ANN index exists to
+eliminate (see `03`). One operator is *missing* versus a real planner: there's
+no `WHERE` pushdown. The `search_knowledge_base` tool's metadata filter runs
+*after* the scan (`search-knowledge-base-tool.ts:88-90`), over-fetching `topK*4`
+then filtering in memory — a post-scan filter, not a pushed-down predicate.
+
+```
+  the cosine top-k plan (InMemoryVectorStore.search, in-memory-vector-store.ts:25-33)
+
+  query vector q
+       │
+       ▼
+  ┌─ SCAN ──────────────────────────────────┐  for each of N chunks:
+  │  score = cosineSimilarity(q, chunk)      │    O(d) work, O(N) chunks
+  └────────────────────┬────────────────────┘    → O(N·d), no index assist
+                       ▼
+  ┌─ SORT ──────────────────────────────────┐  hits.sort(desc by score)
+  │  ORDER BY score DESC                     │    O(N log N)
+  └────────────────────┬────────────────────┘
+                       ▼
+  ┌─ LIMIT ─────────────────────────────────┐  slice(0, k)
+  │  LIMIT k                                 │    top-k returned
+  └─────────────────────────────────────────┘
+
+  the tool layer adds a POST-scan filter (over-fetch k×4, filter in memory) —
+  a predicate that a real planner would push into the index, here run after.
+```
+
 ### Move 3 — the principle
 
 Without a planner, your "query cost" is exactly the shape of the loop you
@@ -233,6 +275,26 @@ each re-running its agent per baseline file.
           reference into the fixtures "table").
 ```
 
+**The cosine top-k query** — `packages/retrieval/src/in-memory-vector-store.ts:25-33`:
+
+```
+  async search(vector, k) {
+    this.assertDimension(vector, 'query vector');
+    const hits = [];
+    for (const chunk of this.chunks.values())        ← SCAN operator: O(N)
+      hits.push({ id: chunk.id,
+        score: cosineSimilarity(vector, chunk.vector), ← O(d) score per row
+        meta: chunk.meta });
+    hits.sort((a, b) => b.score - a.score);          ← SORT operator: ORDER BY DESC
+    return hits.slice(0, Math.max(0, k));            ← LIMIT operator: top-k
+  }
+       │
+       └─ a fixed three-operator plan (scan→sort→limit). No index, no WHERE
+          pushdown. The metadata filter lives one layer up, AFTER this returns:
+          search-knowledge-base-tool.ts:88-90 over-fetches k×4 and filters in
+          memory — a post-scan predicate, not a pushed-down one.
+```
+
 ---
 
 ## Elaborate
@@ -291,6 +353,10 @@ only cares about the execution cost of resolving them.
 ## See also
 
 - `02-records-pages-and-storage-layout.md` — why each row read parses a whole file
-- `03-btree-hash-and-secondary-indexes.md` — why there's no `WHERE` pushdown
-- `09-database-systems-red-flags-audit.md` — the N+1 ranked as a risk
+- `03-btree-hash-and-secondary-indexes.md` — why there's no `WHERE` pushdown,
+  and why the cosine scan has no ANN index
+- `09-database-systems-red-flags-audit.md` — the N+1 and the linear-scan vector
+  search ranked as risks
 - `study-system-design` → caching the computed status to kill the N+1
+- `study-ai-engineering` / `study-agent-architecture` → the RAG retrieval that
+  this `search` powers

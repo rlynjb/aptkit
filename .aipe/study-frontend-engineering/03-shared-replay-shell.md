@@ -44,7 +44,7 @@ Axis — **"who owns this concern, the shell or the workspace?"** — traced acr
 ```
 
 - **Layers:** generic shell (no agent knowledge) → render-prop slots → concrete workspace (all agent knowledge).
-- **The seam** is the `AgentReplayShellContext<F, M, R>` object (`AgentReplayShell.tsx:29-45`). It's the contract: the shell promises to hand the workspace `{ fixture, mode, replay, visibleTrace, usage, costEstimate, running, error, startReplay, ... }`; the workspace promises to turn that into JSX. Ownership flips exactly here.
+- **The seam** is the `AgentReplayShellContext<F, M, R>` object (`AgentReplayShell.tsx:30-46`). It's the contract: the shell promises to hand the workspace `{ fixture, mode, replay, visibleTrace, usage, costEstimate, running, error, startReplay, ... }`; the workspace promises to turn that into JSX. Ownership flips exactly here.
 - **The generics `<F, M, R>`** are what make the seam typed rather than `any`: F = fixture type, M = mode union, R = result shape. Each workspace pins them (`RecommendationWorkspace.tsx:17-21`) so the context is fully typed inside `renderPanels`.
 
 ## How it works
@@ -77,7 +77,7 @@ Strategy in one line: **the shell is a closure over the run state; the workspace
 
 #### Part A — the generic signature and the context contract
 
-`AgentReplayShell<F, M extends string, R extends ReplayResultBase>` (`AgentReplayShell.tsx:47`). `R extends ReplayResultBase` is the key constraint: every agent result, whatever else it has, must carry `{ trace, evalOk, evalIssues, modelTurns, durationMs }` (`:15-22`). That shared base is what lets the shell compute `usage`, `costEstimate`, and the metrics bar generically without knowing whether the agent returned recommendations or a diagnosis.
+`AgentReplayShell<F, M extends string, R extends ReplayResultBase>` (`AgentReplayShell.tsx:48`). `R extends ReplayResultBase` is the key constraint: every agent result, whatever else it has, must carry `{ trace, evalOk, evalIssues, modelTurns, durationMs }` (`:15-22`). That shared base is what lets the shell compute `usage`, `costEstimate`, and the metrics bar generically without knowing whether the agent returned recommendations or a diagnosis.
 
 What breaks without the base constraint: the shell couldn't read `result.trace` to derive `visibleTrace` — it'd have to push trace handling down into each workspace, duplicating it five times.
 
@@ -115,7 +115,7 @@ What breaks if `startReplay` weren't memoized: the effect's dependency would cha
 #### Part D — derived context, computed every render
 
 ```
-  derived in render body (AgentReplayShell.tsx:161-181)
+  derived in render body (AgentReplayShell.tsx:163-181)
 
   visibleTrace = replay?.trace ?? liveTrace      // final trace, or live one
   usage        = summarizeUsage(visibleTrace)    // pure fn of trace
@@ -173,7 +173,7 @@ Five of the six workspaces are shell adapters. The clearest is `RecommendationWo
 ### Code, line by line
 
 ```
-  apps/studio/src/AgentReplayShell.tsx:47-83  — the generic signature
+  apps/studio/src/AgentReplayShell.tsx:48-83  — the generic signature
 
   export function AgentReplayShell<F, M extends string, R extends ReplayResultBase>({
     fixtures,          ← F[]: populate the fixture <select>
@@ -193,7 +193,7 @@ Five of the six workspaces are shell adapters. The clearest is `RecommendationWo
 ```
 
 ```
-  apps/studio/src/AgentReplayShell.tsx:117-125  — the only place
+  apps/studio/src/AgentReplayShell.tsx:118-126  — the only place
   the fixture/server paths meet
 
   const result = modeToRun === 'fixture'
@@ -208,7 +208,7 @@ Five of the six workspaces are shell adapters. The clearest is `RecommendationWo
 ```
 
 ```
-  apps/studio/src/AgentReplayShell.tsx:227-231  — the two slots rendered
+  apps/studio/src/AgentReplayShell.tsx:230-233  — the two slots rendered
 
   <section className="metrics" aria-label={`${title} summary`}>
     {metricItems(context)}            ← slot 1: workspace supplies metrics
@@ -235,7 +235,7 @@ Five of the six workspaces are shell adapters. The clearest is `RecommendationWo
           'anthropic' (2-provider agent), modeClassName collapses the grid
 ```
 
-The shared base type `ReplayResultBase` (`AgentReplayShell.tsx:15-22`) and the per-agent result types (`ReplayResult`, `MonitoringReplayResult`, etc. in `types.ts`) are the typed contract that makes `<F, M, R>` worth the generics. Module-depth analysis of this as a deep generic module belongs to `study-software-design`.
+The shared base type `ReplayResultBase` (`AgentReplayShell.tsx:16-23`) and the per-agent result types (`ReplayResult`, `MonitoringReplayResult`, etc. in `types.ts`) are the typed contract that makes `<F, M, R>` worth the generics. Module-depth analysis of this as a deep generic module belongs to `study-software-design`.
 
 ## Elaborate
 
@@ -251,7 +251,7 @@ A generic shell component, `AgentReplayShell<F, M, R>`, owns the lifecycle — f
 ```
   shell owns lifecycle + chrome ──► renderPanels(context) ──► workspace owns body
 ```
-Anchor: `AgentReplayShell.tsx:47,227-231`.
+Anchor: `AgentReplayShell.tsx:48,230-233`.
 
 **Q: Why generics instead of `any` on the context?**
 So `renderPanels` gets a fully typed `context.replay` — `Recommendation[]` in one workspace, a `Diagnosis` in another — checked at compile time. The generics turn the shell↔workspace seam into a real contract.
@@ -261,10 +261,10 @@ So `renderPanels` gets a fully typed `context.replay` — `Recommendation[]` in 
 
 ## Validate
 
-1. **Reconstruct:** sketch the `AgentReplayShell` signature with its generics and the two render-prop slots. (`AgentReplayShell.tsx:47-83`)
-2. **Explain:** what does `R extends ReplayResultBase` buy the shell? (Guaranteed `.trace` + eval fields, so usage/cost/metrics are computed once, generically — `:15-22,162-164`.)
+1. **Reconstruct:** sketch the `AgentReplayShell` signature with its generics and the two render-prop slots. (`AgentReplayShell.tsx:48-83`)
+2. **Explain:** what does `R extends ReplayResultBase` buy the shell? (Guaranteed `.trace` + eval fields, so usage/cost/metrics are computed once, generically — `:16-23,164-166`.)
 3. **Apply:** add a sixth agent that returns a `Summary`. List what you'd write. (A result type extending `ReplayResultBase`, a `runFixture`/`runServer` pair, a `metricItems` and `renderPanels`, and a ~25-line workspace adapter — no shell change.)
-4. **Defend:** why is `visibleTrace` derived (`replay?.trace ?? liveTrace`) rather than stored in state? (Storing it would let it drift from `liveTrace`/`replay`; deriving each render keeps it consistent across the running→done transition — `:161`.)
+4. **Defend:** why is `visibleTrace` derived (`replay?.trace ?? liveTrace`) rather than stored in state? (Storing it would let it drift from `liveTrace`/`replay`; deriving each render keeps it consistent across the running→done transition — `:163`.)
 
 ## See also
 

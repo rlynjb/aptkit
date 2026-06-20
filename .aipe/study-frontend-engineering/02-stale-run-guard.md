@@ -145,12 +145,12 @@ Any UI that kicks off async work the user can re-trigger needs a way to answer "
 
 ### Use cases
 
-Fires whenever a user re-runs before a stream completes — most realistically when they click "Run OpenAI," see it's slow, switch the fixture (`selectFixture` clears trace and would re-run) or hit Run again. Also implicitly on mount: `startReplay` runs in a `useEffect` (`AgentReplayShell.tsx:133-135`), and the `selectFixture`/`selectMode` handlers reset trace and the user often re-runs immediately. The comparison flow in `RecommendationWorkspace` runs *three* sequential replays (fixture, then openai) and uses its own separate `comparisonRunCounter` ref for the same reason (`RecommendationWorkspace.tsx:67,112-122`).
+Fires whenever a user re-runs before a stream completes — most realistically when they click "Run OpenAI," see it's slow, switch the fixture (`selectFixture` clears trace and would re-run) or hit Run again. Also implicitly on mount: `startReplay` runs in a `useEffect` (`AgentReplayShell.tsx:134-136`), and the `selectFixture`/`selectMode` handlers reset trace and the user often re-runs immediately. The comparison flow in `RecommendationWorkspace` runs *three* sequential replays (fixture, then openai) and uses its own separate `comparisonRunCounter` ref for the same reason (`RecommendationWorkspace.tsx:67,112-122`).
 
 ### Code, line by line
 
 ```
-  apps/studio/src/AgentReplayShell.tsx:96, 103-131
+  apps/studio/src/AgentReplayShell.tsx:97, 104-132
 
   const runCounter = React.useRef(0);              ← the monotonic token (REF)
 
@@ -206,7 +206,7 @@ A monotonic run id. `startReplay` bumps a `useRef` counter and captures the new 
 ```
   runCounter(ref) bumps per run → onEvent appends only if ref === its frozen id
 ```
-Anchor: `AgentReplayShell.tsx:96,106-115`.
+Anchor: `AgentReplayShell.tsx:97,107-116`.
 
 **Q: Why a ref instead of state for the counter?**
 Because `onEvent` is a closure created at run-start; it freezes whatever it captures. I need it to compare its own frozen id against the *latest* current id. A ref's `.current` reads present-time even from an old closure; `useState` would hand the closure a stale snapshot and the guard would be meaningless.
@@ -221,7 +221,7 @@ No — and that's the honest limitation. It drops stale *events* from touching t
 
 ## Validate
 
-1. **Reconstruct:** write the three skeleton parts (ref counter, frozen capture, in-updater equality check) from memory. (`AgentReplayShell.tsx:96,106-115`)
+1. **Reconstruct:** write the three skeleton parts (ref counter, frozen capture, in-updater equality check) from memory. (`AgentReplayShell.tsx:97,107-116`)
 2. **Explain:** why does `setRunId(nextRunId)` exist alongside the ref, and which one is authoritative? (State copy is for the "Run #N" badge only; the ref is the guard's authority — `:108` vs `:106-107`.)
 3. **Apply:** the comparison flow runs fixture then OpenAI back-to-back. Why does it need its *own* `comparisonRunCounter` separate from the shell's? (It launches replays outside `startReplay`, so it can't reuse the shell's counter without colliding — `RecommendationWorkspace.tsx:67,112`.)
 4. **Defend:** you switch this to `useState` for the counter. Walk the bug that appears. (The `onEvent` closure captures the state value at creation; `runCounter.current` becomes a stale snapshot, the `===` check compares two frozen values, and stale events are no longer reliably dropped.)

@@ -1,12 +1,21 @@
 # 00 — Overview: the database-systems map of AptKit
 
-**Verdict first:** AptKit has no database engine. It has a filesystem and an
-in-memory replay cursor. Everything a database does for you — durable
-storage layout, indexing, query planning, transactions, isolation,
-concurrency control, write-ahead logging, recovery, replication — is either
-solved by the cheapest filesystem mechanism available or not solved at all.
-This file is the map: where the analogs live, what's genuinely missing, and
-the single trigger that would force a real database into the repo.
+**Verdict first:** AptKit has no *durable* database engine — but as of the
+`@aptkit/retrieval` package it now ships one genuine in-memory storage engine.
+There are three "stores" to hold in your head: (1) the **filesystem** —
+artifacts/fixtures as JSON files, the durable persistence surface; (2) the
+in-memory **replay cursor** (`FixtureModelProvider`) — a read-only positional
+index; and (3) the new **`InMemoryVectorStore`** — a vector store that does
+cosine-similarity *search* over an in-memory array. That third one is the
+closest thing in the repo to a real database query engine: it has a contract
+(`VectorStore`: upsert/search-by-vector), it ranks records by similarity, and
+it does a linear scan that stands in for an index. What it does *not* have is
+durability (a `Map` that dies with the process), transactions, or an ANN index
+— which is exactly the database-systems lesson. The real Postgres/pgvector/HNSW
+implementation of the same `VectorStore` contract lives in a **separate repo
+(buffr)**, not aptkit; aptkit ships only the in-memory store + the contract.
+This file is the map: where each store lives, what each does (and doesn't)
+guarantee, and the triggers that force the real engine in.
 
 ## The one diagram to hold
 
@@ -40,6 +49,36 @@ There is a second, even smaller "store": the `FixtureModelProvider`
 is a read-only cursor over a fixed page — the closest thing in the repo to a
 deterministic read path, and the analog `08-replication-and-read-consistency`
 leans on.
+
+And now there is a third, the one that actually behaves like a database query
+engine: the `InMemoryVectorStore`
+(`packages/retrieval/src/in-memory-vector-store.ts:10-43`). It holds
+`VectorChunk`s in a `Map` keyed by id, and its `search(vector, k)` ranks every
+stored chunk by cosine similarity, sorts, and returns the top-k. That's a real
+storage engine with a real (if naive) execution strategy — `upsert` is an
+INSERT/UPSERT, `search` is a `SELECT ... ORDER BY similarity LIMIT k` run as a
+full table scan. It just lacks the three things that make a database a
+database: it never touches disk (no durability), it has no transaction around a
+multi-chunk upsert (no atomicity), and its "index" is a linear scan, not an ANN
+structure (no real index). Files `03` and `04` walk it as a storage engine;
+the buffr `PgVectorStore` is the durable counterpart behind the same contract.
+
+```
+  The three "stores" — one durable on disk, two in memory
+
+  ┌─ Filesystem (durable) ────────────────────────────────────┐
+  │  artifacts/replays/*.json   ·   fixtures/promoted/*.json  │
+  │  write-once JSON; durability = writeFile resolved          │
+  └───────────────────────────────────────────────────────────┘
+  ┌─ In-memory store #1: FixtureModelProvider ────────────────┐
+  │  ModelResponse[] served by integer cursor (read-only)      │
+  └───────────────────────────────────────────────────────────┘
+  ┌─ In-memory store #2: InMemoryVectorStore ─────────────────┐
+  │  Map<id, VectorChunk>; search = scan + cosine + sort + topK│
+  │  ★ the only thing with upsert/query semantics ★            │
+  │  no disk · no txn · no ANN index → dies with the process   │
+  └───────────────────────────────────────────────────────────┘
+```
 
 ## The query paths (all four of them)
 
@@ -83,8 +122,26 @@ intent first. Full walk in `07-wal-durability-and-recovery.md`.
 
 ## Ranked findings — what's most consequential
 
-1. **The only index is a filename sort, and it's a string sort, not a time
-   sort.** `listReplayArtifacts` does `.sort()` on filenames
+0. **`@aptkit/retrieval` adds the repo's first real storage engine — an
+   in-memory vector store with upsert/search semantics but no durability, no
+   transactions, and a linear-scan "index."** `InMemoryVectorStore`
+   (`packages/retrieval/src/in-memory-vector-store.ts:10-43`) holds chunks in a
+   `Map` and answers `search(vector, k)` by computing cosine similarity against
+   *every* stored chunk, sorting, and slicing top-k (`lines 25-33`). It is a
+   `SELECT ... ORDER BY similarity LIMIT k` executed as a full scan: O(N·d) per
+   query, where a production system would use an ANN index (HNSW) for
+   sub-linear search. It persists nothing — the `Map` dies with the process — so
+   "durability" is zero and re-indexing is the only recovery. The one integrity
+   guard it does enforce is a **dimension check** (`lines 36-42`): a
+   wrong-length vector throws loudly, because a silent dimension mismatch
+   corrupts ranking. The real Postgres/pgvector/HNSW version of the same
+   `VectorStore` contract lives in the **buffr** repo
+   (`/Users/rein/Public/buffr/src/pg-vector-store.ts`), not aptkit — aptkit
+   ships only the in-memory store and the contract. Detail in `03` (the
+   scan-vs-ANN-index lesson) and `04` (the query execution path).
+
+1. **The only on-disk index is a filename sort, and it's a string sort, not a
+   time sort.** `listReplayArtifacts` does `.sort()` on filenames
    (`packages/evals/src/replay-runner.ts:43`); `listReplaySummaries` sorts by
    `createdAt.localeCompare` (`apps/studio/vite.config.ts:983`). Both work
    *only because* the ISO-8601 timestamp filename prefix sorts
@@ -132,27 +189,44 @@ a concept, then marked absent with its trigger:
   topic                         status              trigger to reach for it
   ───────────────────────────── ─────────────────── ──────────────────────────
   records & pages               analog: JSON files  artifacts outgrow a directory
+                                + in-mem VectorChunk
   B-tree / LSM storage          not yet exercised   need range scans by a key
   hash / secondary indexes      analog: filename    need lookup by capabilityId
-                                sort (one "index")   without scanning every file
+                                sort + Map<id>       without scanning every file
+                                point lookup
+  vector / ANN index            ANALOG: linear scan  corpus outgrows a few hundred
+                                (InMemoryVectorStore  chunks → swap in HNSW/pgvector
+                                cosine, NO ANN)       (buffr's PgVectorStore)
   query planning / joins        analog: scan+filter  need to relate two record sets
+                                + cosine top-k scan
   N+1 behavior                  PRESENT (read note)  listPromoted* re-runs replay
                                                      per file — a real N+1 shape
-  ACID transactions             not yet exercised   one logical write spans 2+ files
+  ACID transactions             not yet exercised   multi-chunk upsert must be atomic
+                                (aptkit) — buffr's    (buffr PgVectorStore wraps it in
+                                PgVectorStore HAS one  begin/commit/rollback)
   isolation levels / anomalies  not yet exercised   concurrent writers to one record
   locks / MVCC                  not yet exercised    in-place updates under contention
   WAL / fsync durability        not yet exercised   a crash mid-write must not corrupt
+                                (vector store: ZERO   (in-mem Map → no persistence at all)
+                                 durability)
   backup / restore              partial (git)        artifacts must survive a wipe
   replication / read replicas   not yet exercised    multi-process or multi-host reads
   failover / stale reads        not yet exercised    a replica can lag a primary
 ```
 
-The one genuinely-present database *pathology* worth flagging: the
-promoted-fixture listing endpoints (`listPromotedFixtureSummaries` et al.,
-`vite.config.ts:986-1168`) read every file in a directory and *re-run the
-full replay for each one*. That is an N+1 read pattern — one directory scan
-plus one expensive operation per row. It's covered in
-`04-query-planning-and-execution.md`.
+Two genuinely-present database mechanisms worth flagging:
+
+1. **A real query execution path with a linear-scan "index."** The
+   `InMemoryVectorStore.search` (`packages/retrieval/src/in-memory-vector-store.ts:25-33`)
+   ranks every chunk by cosine similarity then sorts and slices — a
+   `SELECT ... ORDER BY similarity LIMIT k` run as a full scan. No ANN index, no
+   persistence. Covered in `03` and `04`.
+
+2. **An N+1 read pattern.** The promoted-fixture listing endpoints
+   (`listPromotedFixtureSummaries` et al., `vite.config.ts:986-1168`) read every
+   file in a directory and *re-run the full replay for each one* — one directory
+   scan plus one expensive operation per row. Covered in
+   `04-query-planning-and-execution.md`.
 
 ## Where to go next
 

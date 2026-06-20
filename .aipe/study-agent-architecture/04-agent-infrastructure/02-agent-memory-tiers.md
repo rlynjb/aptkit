@@ -28,7 +28,8 @@ one tier and is honest about the other two.
                                   │  ...and would survive indefinitely
   ┌─ LONG-TERM memory ── lives indefinitely, semantic ─────────────────┐
   │  facts/embeddings in a vector store, retrieved by similarity        │
-  │  NOT in AptKit (no vector store, no cross-session persistence)      │
+  │  vector store EXISTS (rag-query) but holds a knowledge base, not    │
+  │  memory — no cross-session persistence of what the agent learns     │
   └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -132,12 +133,19 @@ the host wires in, not a memory store AptKit owns (next section).
   fact ──▶ embed ──▶ vector store
   query ──▶ embed ──▶ nearest-neighbor search ──▶ relevant facts into context
        ▲
-   AptKit has no embeddings, no vector store, no semantic recall
+   AptKit has a vector store (rag-query) — but it's a KNOWLEDGE BASE,
+   not agent MEMORY: no fact is written back across sessions
 ```
 
-Pseudocode (hypothetical): `relevant = vectorStore.search(embed(query), k=5)`.
-AptKit's "retrieval" is tool-calling over analytics APIs plus the deterministic
-schema summary — not similarity search.
+Pseudocode: `relevant = vectorStore.search(embed(query), k=5)`. AptKit now
+*does* run this — the `rag-query` capability embeds with `nomic-embed-text` and
+similarity-searches an in-memory store (see
+`../02-agentic-retrieval/04-agentic-rag-over-vector-search.md`). But that store
+is a **read-side knowledge base**, not long-term *memory*: nothing the agent
+learns during a run is embedded and written back for the next session. The five
+analytics agents' "retrieval" is still tool-calling over analytics APIs plus the
+deterministic schema summary. So the memory tier is empty even though the
+similarity-search machinery now exists.
 
 ### Move 3 — the principle
 
@@ -221,8 +229,12 @@ prior runs from a store AptKit maintains; `messages[]` dies on return and nothin
 writes it through. See SECTION F (`../06-orchestration-system-design-templates/`)
 for the runs-store design.
 
-**Not yet exercised: long-term / vector memory.** No embeddings, no vector store,
-no similarity recall anywhere in the repo. See SECTION F.
+**Not yet exercised: long-term / vector *memory*.** The similarity-search
+machinery now exists — `rag-query` embeds and ANN-searches a vector store — but
+it serves a read-only knowledge base, not cross-session memory: no run writes a
+learned fact back for the next session. The memory tier is still empty; only the
+retrieval mechanism is present. See
+`../02-agentic-retrieval/04-agentic-rag-over-vector-search.md` and SECTION F.
 
 ## Elaborate
 

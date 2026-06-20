@@ -2,6 +2,8 @@
 
 **Industry names:** Adapter pattern / Strategy pattern / Hexagonal-architecture "port." **Type:** Industry standard.
 
+> Note on the current lineup: the Anthropic/OpenAI adapters referenced below are still the clearest illustration of the seam and remain in `packages/providers/`, but the **published bundle's default is now local — `GemmaModelProvider` (Ollama) + `ContextWindowGuardedProvider`** (the cloud adapters are out of the `build:core:deps` chain). The pattern is identical; only which adapter is wired by default changed. The retrieval capability applies this same seam a second time, to embeddings and vector stores — see `09-retrieval-pipeline-seam.md`.
+
 ## Zoom out, then zoom in
 
 Here's the whole system, and the one box every model call has to pass through. Find the seam in the middle band — that's the entire point of this file.
@@ -10,7 +12,7 @@ Here's the whole system, and the one box every model call has to pass through. F
   Zoom out — where the provider seam lives
 
   ┌─ Capability layer — packages/agents/* ──────────────────┐
-  │  5 agents call runAgentLoop(...)                         │
+  │  6 agents call runAgentLoop(...)                         │
   └───────────────────────────┬──────────────────────────────┘
                               │  model.complete(request)
   ┌─ Runtime core — packages/runtime ─────────▼──────────────┐

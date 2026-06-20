@@ -24,6 +24,7 @@ each vendor gets an adapter that translates. Here's the shape.
                   implemented by │
   ┌─ Adapters (each owns ONE vendor's quirks) ─▼───────────────────────┐
   │  AnthropicModelProvider  OpenAIModelProvider  FixtureModelProvider │
+  │  ★ GemmaModelProvider (local, Ollama — emulated tool-calling)      │
   │  ContextWindowGuardedProvider (decorator over any of the above)    │
   └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -322,6 +323,19 @@ checks the token estimate in `complete()`, and on success calls
 `this.provider.complete(request)` — composing over any adapter because it speaks
 the same port.
 
+**The hard adapter — Gemma**,
+`packages/providers/gemma/src/gemma-provider.ts:39-92`: `GemmaModelProvider
+implements ModelProvider` over local Ollama (`gemma2:9b`). It's the one adapter
+where translation is *not* trivial: Gemma has no native tools API, so
+`complete()` renders the tool definitions into the system prompt text
+(`buildSystemText`), demands a JSON tool call back, parses it into a neutral
+`tool_use` block (`parseToolCall`), and retries with a corrective nudge if the
+JSON is malformed. Same port, but the adapter does real work to fake a feature
+the vendor lacks — the deep dive is
+[../04-agents-and-tool-use/07-emulated-tool-calling.md](../04-agents-and-tool-use/07-emulated-tool-calling.md).
+That this fits behind the *same* `complete()` the cloud adapters satisfy is the
+strongest proof the port is well-chosen.
+
 ## Elaborate
 
 This is hexagonal architecture (ports and adapters): the application core defines a
@@ -349,23 +363,26 @@ pricing (`06-token-economics.md`).
 ## Project exercises
 
 *Provenance: Phase 1 — LLM foundations (C1.x). No `aieng-curriculum.md` present;
-IDs are by-phase convention. Case A — the abstraction exists; this extends it.*
+IDs are by-phase convention. Case A — the abstraction exists and now spans four
+adapters (Anthropic, OpenAI, Fixture, Gemma); this extends it.*
 
-### Exercise — add a third provider adapter
+### Exercise — compose Gemma under the fallback chain
 
 - **Exercise ID:** `[C1.9]` Phase 1, provider abstraction
-- **What to build:** A new adapter (e.g. a Gemini or Ollama `ModelProvider`) that
-  implements the contract — translating the neutral request to that vendor's call
-  and the response back to neutral content blocks + usage — without touching the
-  runtime or any agent.
-- **Why it earns its place:** Adding a vendor by writing exactly one file and
-  changing nothing else *proves* the abstraction holds. It also forces you to
-  confront a new vendor's quirks (its tool format, its usage field names) and keep
-  them behind the seam — the core skill the pattern teaches.
-- **Files to touch:** new `packages/providers/<vendor>/src/<vendor>-provider.ts`,
-  a unit test, and run an existing agent test against it via dependency injection.
-- **Done when:** An existing agent test passes with the new adapter swapped in,
-  with zero changes to `packages/runtime` or `packages/agents`.
+- **What to build:** Wire the existing `GemmaModelProvider` as the *primary* in a
+  `FallbackModelProvider` (`packages/providers/fallback`) with a cloud adapter as
+  the backup, wrapped in `ContextWindowGuardedProvider`. The result: a local-first
+  provider that only reaches the cloud when Gemma fails or its context overflows —
+  built entirely out of providers-wrapping-providers, no new agent code.
+- **Why it earns its place:** It proves the same port serves *four* roles at once
+  (real adapter, test double, decorator, chain element) and that a weak local
+  model can be made production-safe purely by composition behind `complete()`.
+- **Files to touch:** a small composition module + a unit test that injects a
+  failing Gemma transport and asserts the fallback fires; reuse
+  `packages/providers/{gemma,fallback,local}`.
+- **Done when:** A test proves the composed provider returns Gemma's answer on the
+  happy path and the cloud answer when Gemma's transport throws — with zero
+  changes to `packages/runtime` or any agent.
 - **Estimated effort:** `4hr–1d`
 
 ## Interview defense
@@ -417,4 +434,6 @@ decorator are both just 'implements `ModelProvider`.'"
 - [01-what-an-llm-is.md](01-what-an-llm-is.md) — the contract this pattern implements
 - [02-tokenization.md](02-tokenization.md) — the estimate the guarding decorator uses
 - [06-token-economics.md](06-token-economics.md) — why provider `id` rides on every usage event
+- [10-local-vs-cloud-models.md](10-local-vs-cloud-models.md) — Gemma local vs the cloud adapters, and when to pick which
+- [../04-agents-and-tool-use/07-emulated-tool-calling.md](../04-agents-and-tool-use/07-emulated-tool-calling.md) — how the Gemma adapter fakes a tools API
 - [../06-production-serving/](../06-production-serving/) — the fallback chain built from composed providers

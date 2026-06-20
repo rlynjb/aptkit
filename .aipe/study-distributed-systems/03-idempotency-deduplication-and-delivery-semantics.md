@@ -122,10 +122,16 @@ non-deterministic, so even a "successful" retry gives a different answer. Failin
 over to a *different* provider sidesteps both — you're not re-running the same
 op, you're running a fresh one elsewhere.
 
-**Step 2 — the one safe retry: the parse-failure re-prompt.** The agent loop has
-exactly one retry, and it's safe precisely because it's **read-only**. When the
-model's final text doesn't parse into the expected JSON shape, the loop runs one
-recovery turn — re-prompting for just the structured answer.
+**Step 2 — the safe retries: parse-failure re-prompts.** The repo has two
+same-target retries, and both are safe for the *same* reason — they're
+**read-only**, so re-running mutates nothing. (1) The agent loop's recovery turn:
+when the model's final text doesn't parse into the expected JSON shape, it
+re-prompts once for just the structured answer. (2) The Gemma provider's
+tool-call nudge (`packages/providers/gemma/src/gemma-provider.ts:62-91`): when a
+local model returns a malformed tool call, it re-asks the same model with a
+corrective nudge, bounded by `maxToolCallAttempts`. Neither is a network retry
+and neither needs an idempotency key — re-asking a model to *read* and answer is
+inherently safe; the danger only appears when a retried call has a side effect.
 
 ```
   The re-prompt — safe retry because it mutates nothing

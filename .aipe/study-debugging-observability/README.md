@@ -28,6 +28,12 @@ to explain it — and to reproduce it deterministically later?**
      provider switched or a local model was skipped.
    - `06-eval-as-embedded-evidence.md` — the pass/fail verdict stamped onto every
      snapshot, and the secret-scan that guards artifacts before they're shared.
+   - `07-reproduction-spike-harness.md` — a forward-looking de-risk spike
+     (`scripts/gemma-toolcall-spike.mjs`): run a flaky component N times, measure the
+     pass rate, band it into a build / harden / no-go decision *before* building on it.
+   - `08-retrieval-miss-diagnosis.md` — a real war story: a silent "not available" on a
+     good corpus, diagnosed by reading the trajectory backward to a hallucinated tool
+     argument. The local-incident loop run end to end, with the regression guard.
 
 ## Where this sits — partition
 

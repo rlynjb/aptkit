@@ -14,11 +14,15 @@ got one bundle of context and produced one answer.
 AptKit does retrieval differently, and the difference is the entire point of
 this sub-section. Here the model is *in* the retrieval loop. It calls an
 analytics tool, the harness runs it, the result comes back as a message, and the
-model looks at that result and decides what to fetch next. There is no
-embedding, no vector store, no chunking anywhere in this repo — the "store" is a
-set of read-only workspace analytics endpoints. But the *control structure* is
-the thing the literature calls agentic RAG: retrieval that the model steers,
-turn by turn, until it has enough.
+model looks at that result and decides what to fetch next. For the two agents
+this file teaches — monitoring and diagnostic — there is no embedding, no vector
+store, no chunking: the "store" is a set of read-only workspace analytics
+endpoints. (The repo *does* now have a real vector store — the
+`@aptkit/agent-rag-query` capability in `04-agentic-rag-over-vector-search.md`
+runs this same loop over `nomic-embed` embeddings and ANN search. This file is
+the analytics-source flavor; file 04 is the similarity-index flavor.) The
+*control structure* is identical, and it is the thing the literature calls
+agentic RAG: retrieval that the model steers, turn by turn, until it has enough.
 
 ```
   Where agentic-RAG sits among the agent-architecture concepts
@@ -30,7 +34,8 @@ turn by turn, until it has enough.
   │   │   ★ Agentic RAG ★  ── the driven loop: query → eval → query   │ │
   │   │       │              → synthesize. monitoring + diagnostic    │ │
   │   │       ├─ Self-corrective RAG — grade what you got (02)         │ │
-  │   │       └─ Retrieval routing — pick the right tool (03)          │ │
+  │   │       ├─ Retrieval routing — pick the right tool (03)          │ │
+  │   │       └─ RAG over vector search — same loop, real ANN (04)     │ │
   │   └───────────────────────────────────────────────────────────────┘ │
   │                                                                     │
   ├─ Multi-agent orchestration (03) — latent pipeline ──────────────────┤
@@ -451,8 +456,10 @@ A few things that surprise people coming from one-hop RAG:
 
 **Q: "Walk me through how your agent does retrieval. Is it RAG?"**
 
-> It is agentic RAG, but the source is structured analytics APIs, not a vector
-> store. There are no embeddings or ANN search in this system. The agent runs a
+> It is agentic RAG, but for these two agents the source is structured analytics
+> APIs, not a vector store — no embeddings or ANN search in *this* loop. (The
+> repo's `rag-query` capability does run real vector RAG; that's a separate
+> agent.) The agent runs a
 > bounded loop: the model proposes a read-only analytics tool call, the harness
 > executes it against the workspace API, the result is truncated to 16k chars and
 > fed back into the message history, and the model reads it and decides whether to
@@ -512,6 +519,8 @@ Four levels, each tied to a real file you can open.
 - `02-self-corrective-rag.md` — grading what the loop retrieved (the diagnostic
   agent's hypothesis evaluation).
 - `03-retrieval-routing.md` — how the model picks *which* tool to fetch from.
+- `04-agentic-rag-over-vector-search.md` — the same loop over a real vector store
+  (`@aptkit/agent-rag-query`), driven by a local Gemma with tool-call emulation.
 - `../01-reasoning-patterns/02-agent-loop-skeleton.md` — the loop kernel in full.
 - `.aipe/study-ai-engineering/03-retrieval-and-rag/` — vector-RAG mechanics
   (embeddings, chunking, ANN) that AptKit deliberately does **not** use.

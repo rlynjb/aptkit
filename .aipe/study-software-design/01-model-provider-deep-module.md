@@ -254,7 +254,14 @@ vendor-neutral while the host app picks the provider. → `05`.
 
 Adjacent: the wrappers in `02` are *also* `ModelProvider` implementations —
 that's the decorator pattern stacking on top of this adapter pattern, both
-keyed to the same three-member interface.
+keyed to the same three-member interface. And `06` shows the move *reused
+wholesale*: the `EmbeddingProvider`/`VectorStore` contracts in
+`@aptkit/retrieval` are the same deep-module shape applied to two new seams.
+The most interesting stress-test of this interface is `GemmaModelProvider`
+(`@aptkit/provider-gemma`): Gemma over Ollama has *no native tools array*, so
+the adapter emulates tool calls entirely below the seam — proof the interface
+holds even when an adapter's body has to fake a capability the vendor lacks.
+→ `06`.
 
 ---
 
@@ -303,8 +310,11 @@ adapter. Naming that tension is the senior signal.
 2. **Explain:** why does `packages/runtime` have no vendor dependency, and
    what would break if you imported `@anthropic-ai/sdk` into
    `run-agent-loop.ts`?
-3. **Apply:** you need to add Gemini. Which files change? (Answer: a new
-   `packages/providers/gemini` only; `run-agent-loop.ts:103` does not.)
+3. **Apply:** you need to add a new provider. Which files change? (Answer: a new
+   `packages/providers/<vendor>` only; `run-agent-loop.ts:103` does not. This
+   already happened for real — `@aptkit/provider-gemma` was added with zero
+   runtime changes, even though it emulates tool calls Gemma can't do natively.
+   → `06`.)
 4. **Defend:** a teammate wants to add `topP` to every agent. Do you put it on
    `ModelRequest` or inside one adapter? Argue both, then pick — widening the
    neutral request makes it shallower but serves all vendors; per-adapter
@@ -316,6 +326,8 @@ adapter. Naming that tension is the senior signal.
 
 - `02-provider-decorator-stack.md` — the wrappers that also implement this
   interface.
+- `06-retrieval-contracts-as-deep-seams.md` — the same deep-module move reused
+  twice for retrieval, and Gemma as the adapter that stresses this interface.
 - `05-bundle-as-public-surface.md` — why provider-neutrality is the whole
   point of the bundle.
 - `audit.md` Lens 2 (deepest module) and Lens 3 (the one place `id` leaks).

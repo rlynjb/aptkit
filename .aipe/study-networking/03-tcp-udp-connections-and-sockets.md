@@ -25,7 +25,7 @@ Sockets are the layer directly under HTTP — the actual byte pipe. Here's where
 
 ## Zoom in — narrow to the concept
 
-A socket is the OS object both sides hold for one connection. The question this file answers: *who opens each socket, how long is it held open, and who closes it?* AptKit has two TCP connections and the interesting one is connection 1 — it's held open far longer than a normal request because the server streams into it. There's no UDP anywhere; everything is TCP because everything is HTTP. The repo never touches a raw socket — both connections are opened by code it doesn't own (the browser, the SDK) — but it *controls the lifetime* of connection 1 by choosing when to call `res.end()`.
+A socket is the OS object both sides hold for one connection. The question this file answers: *who opens each socket, how long is it held open, and who closes it?* AptKit has up to three TCP connections and the interesting one is still connection 1 — it's held open far longer than a normal request because the server streams into it. There's no UDP anywhere; everything is TCP because everything is HTTP. The repo never touches a *raw* socket — but the socket-ownership story now splits: connection 1 is opened by the browser/Node HTTP server, connection 2 by the SDK's HTTP agent, and connection 3 (Node↔local Ollama, new) by Node's global `fetch`/undici pool because the repo's transport calls `fetch` directly. Connection 3 is an ordinary short request/response — the contrast with conn 1 (long-held) still holds; the new wrinkle is just that the repo, not an SDK, is the code making the `fetch`.
 
 ## The structure pass
 
@@ -175,6 +175,8 @@ Both connections, their full lifecycle, who owns each.
 ```
 
 **Connection 2 has no repo-side socket config — by design.** The SDK clients (`openai-provider.ts:30`, `anthropic-provider.ts:25`) are constructed with `apiKey` only. No `httpAgent`, no `maxSockets`, no `keepAlive`. The pool exists; the repo doesn't tune it.
+
+**Connection 3 rides Node's global `fetch` pool — also untuned, but now repo-initiated.** The Gemma/embedding transports call the global `fetch` (`gemma-provider.ts:204`, `ollama-embedding-provider.ts:63`), which uses Node's built-in undici connection pool against `localhost:11434`. Like connection 2 it's a short request/response with keep-alive reuse handled below the repo — but unlike connection 2, the *call* is repo code, so this is the one delegated pool the repo could most easily reach into (pass a custom `dispatcher` to `fetch`). It doesn't, so socket tuning here is `not yet exercised` too. The socket-lifetime lesson is unchanged: conn 3 is "many short exchanges over a reused socket," the same shape as conn 2, just hand-initiated.
 
 ## Elaborate
 

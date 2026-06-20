@@ -204,5 +204,6 @@ Anchor: *one fact, two read paths; the structured copy is the source of truth.*
 - `01-type-as-schema.md` — the entity schema; the denormalization upside this file's duplication is the downside of.
 - `03-versioned-artifact-schema.md` — why adding a variant is a schema change worth a version bump.
 - `05-structural-diff-integrity.md` — how the trace shape is re-validated at read time (`trace` must be an array).
+- `06-vector-store-row-model.md` — the same "self-describing rows" denormalization: `docId`-per-chunk there is the shape of `capabilityId`-per-event here.
 - `audit.md` — Lens 1 (shape), Lens 2 (the recommendation + `capabilityId` duplications).
 - `study-system-design` → trace/observability flow — how the trace streams as NDJSON (the system view).

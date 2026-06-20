@@ -25,7 +25,7 @@ Names and addresses are the very first thing that happens on any network hop, be
 
 ## Zoom in — narrow to the concept
 
-DNS answers "what IP do I open a socket to?" In AptKit there are two addresses to resolve and the repo resolves *neither* itself. The browser uses a relative URL (no hostname at all — it inherits the page's origin). The provider hostname is resolved inside the SDK by Node's default resolver. So this concept is almost entirely `not yet exercised` at the repo level — but understanding *why* it's absent is the lesson.
+DNS answers "what IP do I open a socket to?" In AptKit there are now three addresses, and the repo writes a real hostname for exactly one of them. The browser uses a relative URL (no hostname — it inherits the page's origin). The cloud provider hostname is resolved inside the SDK by Node's default resolver. The *new* one: the repo's own Gemma/Ollama transports name `http://localhost:11434` explicitly (`gemma-provider.ts:48`, `ollama-embedding-provider.ts:47`) — but `localhost` resolves to the loopback `127.0.0.1` with no real DNS query, so even this hand-written hostname touches no resolver. So this concept stays almost entirely `not yet exercised` at the resolver level — but the repo now *does* write an addressable host string, which is the change worth noting.
 
 ## The structure pass
 
@@ -140,6 +140,22 @@ Both resolutions in one frame, neither owned by repo code.
 ```
 
 Note the `options.client` escape hatch — a caller *could* inject a pre-configured client with a custom `baseURL`, which is the seam for routing through a proxy. The repo never uses it, but it's there.
+
+**The local provider names its host explicitly — and exposes it as a `host` option.** Unlike the cloud providers, the Gemma/Ollama transports write the address themselves. `packages/providers/gemma/src/gemma-provider.ts:48`:
+
+```
+  gemma-provider.ts  (constructor, line 48)
+
+  this.chat = options.chat
+    ?? defaultHttpTransport(options.host ?? 'http://localhost:11434');
+       │
+       └─ the repo writes a real host string here (the only one in the codebase),
+          but `localhost` → 127.0.0.1 loopback, so no resolver runs. `host` is the
+          addressing seam: pass a different value and you re-point boundary 3 —
+          which is also where the off-host TLS/auth risk enters (see 04/08 R8)
+```
+
+The embedder mirrors this (`ollama-embedding-provider.ts:47`). So addressing is *authored* on boundary 3 but still doesn't exercise DNS — loopback is resolver-free.
 
 **The browser uses relative URLs.** `apps/studio/src/api.ts:11` (`fetch('/api/model-status')`), `:126` (`fetch(endpoint, ...)` where `endpoint` is `/api/stream/replay`). Leading slash = same-origin, no remote hostname.
 

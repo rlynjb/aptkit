@@ -2,7 +2,7 @@
 
 Eight lenses, walked against real `file:line` evidence. Each lens names what AptKit actually does, or says `not yet exercised` honestly. When a finding is big enough to deserve a full walk, it cross-links to a Pass 2 pattern file rather than restating it.
 
-The honest framing up front: this is a **library monorepo**, not a deployed distributed system. Five of the eight lenses have rich findings (boundaries, flow, state, failure, evolution). The caching and scale lenses are mostly `not yet exercised` — and that's correct, not a gap to paper over. There's no traffic, no datastore, no replicas.
+The honest framing up front: this is a **library monorepo** of 15 internal packages (published as `@rlynjb/aptkit-core` 0.4.x), not a deployed distributed system. Six of the eight lenses have rich findings (boundaries, flow, state, durability, failure, evolution). The caching lens stays mostly `not yet exercised`, and the scale lens now has one real internal bottleneck — the in-memory vector store's linear scan — which is correct for a from-scratch RAG adapter, not a gap to paper over. There's still no traffic, no SQL datastore, no replicas. The default model is now *local*: Gemma + nomic embeddings over Ollama, so the default deployment makes no cloud call at all.
 
 ---
 
@@ -10,17 +10,19 @@ The honest framing up front: this is a **library monorepo**, not a deployed dist
 
 Every major component, its responsibility, and its trust boundaries. The full picture is in `00-overview.md`; this lens names the boundaries.
 
-**Layered dependency boundary (the spine).** `packages/runtime` has zero internal dependencies — it's the foundation everything points at. The dependency arrow always points *toward* runtime: agents depend on runtime + tools + context + prompts; providers depend only on runtime's `ModelProvider` contract; core depends on all eleven. This is enforced by the build order in `package.json:14` (`build:core:deps`), which compiles runtime first, then tools/context/prompts/evals/workflows, then the five agents, then core last (`package.json:15`).
+**Layered dependency boundary (the spine).** `packages/runtime` has zero internal dependencies — it's the foundation everything points at. The dependency arrow always points *toward* runtime: agents depend on runtime + tools + context + prompts; providers depend only on runtime's `ModelProvider` contract; retrieval depends on tools (for the tool contract); core depends on all of them. This is enforced by the build order in `package.json` (`build:core:deps`), which compiles runtime first, then tools/context/prompts/evals/workflows, then the six agents (now including `agent-rag-query`), then `retrieval` + `provider-gemma` + `provider-local`, then core last (`build:core`).
 
-**The central seam — `ModelProvider.complete()`** (`packages/runtime/src/model-provider.ts:54-58`). Every model call in the entire system crosses this one interface. No agent, no loop, no eval ever touches `@anthropic-ai/sdk` or `openai` directly. → see `01-provider-abstraction.md`.
+**The central seam — `ModelProvider.complete()`** (`packages/runtime/src/model-provider.ts:54-58`). Every model call in the entire system crosses this one interface. No agent, no loop, no eval ever touches a vendor SDK directly. → see `01-provider-abstraction.md`.
+
+**The two retrieval seams — `EmbeddingProvider` and `VectorStore`** (`packages/retrieval/src/contracts.ts:22-37`). The from-scratch RAG capability adds a *second* pair of provider-neutral seams, the same shape as `ModelProvider`: the pipeline turns text→vectors→search without ever naming nomic, OpenAI, pgvector, or in-memory. A `dimension` field on both sides is the safety latch that makes the swap safe. → see `09-retrieval-pipeline-seam.md`.
 
 **Trust boundaries.** There are two real ones:
-- **The vendor SDK call** (`packages/providers/anthropic/src/anthropic-provider.ts:29-39`, `packages/providers/openai/src/openai-provider.ts:39-48`) — the only place data leaves the process, over HTTPS. API keys are read from env (`process.env.ANTHROPIC_API_KEY`, `process.env.OPENAI_API_KEY`), gitignored in `.env`.
-- **The tool-policy boundary** (`packages/tools/src/tool-policy.ts:11-23`) — each agent can only see the tools on its allowlist. This is a *capability* boundary, not a security perimeter, but it's a real containment seam. → see `04-capability-as-tool-policy.md`.
+- **The model/embedding HTTP calls** — the only places data leaves the process, over HTTP(S). The bundled default is *local*: `GemmaModelProvider` POSTs to Ollama's `/api/chat` (`packages/providers/gemma/src/gemma-provider.ts`), and `OllamaEmbeddingProvider` POSTs to Ollama's `/api/embed` (`packages/retrieval/src/ollama-embedding-provider.ts:60-75`) — both default to `http://localhost:11434`, so the default deployment never leaves the machine. (Cloud SDK adapters for Anthropic/OpenAI still exist under `packages/providers/` but are no longer in the published bundle's build chain — see lens 8.)
+- **The tool-policy boundary** (`packages/tools/src/tool-policy.ts:11-23`) — each agent can only see the tools on its allowlist. The rag-query agent is the tightest case: its policy grants exactly one tool, `search_knowledge_base` (`packages/agents/rag-query/src/rag-query-agent.ts:15-18`). This is a *capability* boundary, not a security perimeter, but it's a real containment seam. → see `04-capability-as-tool-policy.md`.
 
-**The publish boundary** (`packages/core/package.json:44-56`). `bundledDependencies` inlines all eleven internal packages into one tarball; the must-not-change rule is that app-specific product logic never crosses *into* core. → see `08-monorepo-bundle-boundary.md`.
+**The publish boundary** (`packages/core/package.json` `bundledDependencies`). `bundledDependencies` inlines all 15 internal packages into one tarball (runtime, tools, context, prompts, evals, workflows, retrieval, provider-gemma, provider-local, and the six agents); the must-not-change rule is that app-specific product logic never crosses *into* core. → see `08-monorepo-bundle-boundary.md`.
 
-**External dependencies:** Anthropic HTTP API (`@anthropic-ai/sdk ^0.60`, default `claude-sonnet-4-6`), OpenAI HTTP API (`openai ^6.44`, default `gpt-4.1`). That's the entire external surface. No database, no cache server, no message broker.
+**External dependencies:** the default surface is the **local Ollama HTTP server** (`gemma2:9b` for reasoning, `nomic-embed-text` 768-dim for embeddings). No database, no cache server, no message broker. Anthropic/OpenAI remain as optional cloud adapters but are not in the default bundle.
 
 ---
 
@@ -36,7 +38,9 @@ The important end-to-end flows.
 
 **The eval flow — the testing backbone** (`packages/evals/src/replay-runner.ts`, `scripts/*.mjs`). Live run → write artifact JSON → evaluate → promote to fixture → deterministic replay. → see `06-replay-eval-pipeline.md`.
 
-No parallel fan-out anywhere — every flow is sequential. The agent loop is sequential by construction (each turn depends on the last), the pipeline is sequential by data dependency, and the fallback chain is sequential by design.
+**The retrieval flow — RAG's two paths** (`packages/retrieval/src/pipeline.ts:32-59`). Two sequential paths over one validated wiring: the *index* path `doc → chunkText → embedder.embed → store.upsert` builds the corpus offline; the *query* path `query → embedder.embed → store.search → ranked hits` answers online. The query path is reached as a *tool* inside the agent loop — `search_knowledge_base` (`packages/retrieval/src/search-knowledge-base-tool.ts`) wraps `pipeline.query()` so the rag-query agent calls retrieval the same way it would call any other tool. → see `09-retrieval-pipeline-seam.md`.
+
+No parallel fan-out anywhere — every flow is sequential. The agent loop is sequential by construction (each turn depends on the last), the multi-agent pipeline is sequential by data dependency, the fallback chain is sequential by design, and retrieval's two paths run one chunk-batch at a time.
 
 ---
 
@@ -66,6 +70,8 @@ The one thing that *rhymes* with caching is the **fixture-as-recorded-response**
 
 If this repo ever needs a real cache (e.g. dedup identical `complete()` calls), the `ModelProvider` seam is exactly where a caching decorator would slot in — same shape as `ContextWindowGuardedProvider` already uses. Worth naming as the natural future seam.
 
+The newer thing that *rhymes* differently is the **`InMemoryVectorStore`** (`packages/retrieval/src/in-memory-vector-store.ts`). It's a process-lifetime store of embeddings — closer to an index than a cache (no TTL, no invalidation; the corpus is rebuilt on each run by re-indexing). It carries a `dimension` and rejects mismatched vectors loudly, which is the analogue of a cache-key contract. → see `09-retrieval-pipeline-seam.md`.
+
 ---
 
 ## 5. storage-choice-and-durability-boundaries
@@ -74,6 +80,7 @@ If this repo ever needs a real cache (e.g. dedup identical `complete()` calls), 
 
 - **NDJSON streams** — `CapabilityEvent`s encoded one-per-line (`packages/runtime/src/ndjson-stream.ts:31-33`). Ephemeral on the wire to Studio; durable when a script writes them into an artifact's `trace`.
 - **JSON files on the filesystem** — replay artifacts (`artifacts/replays/*.json`), fixtures (`packages/agents/*/fixtures/*.json`). Durability is "whatever the filesystem and git give you." Promoted fixtures are committed; replay artifacts are working output.
+- **In-memory embeddings (ephemeral)** — `InMemoryVectorStore` holds the indexed corpus in a process-lifetime `Map` (`packages/retrieval/src/in-memory-vector-store.ts:12`). Zero durability by design: the corpus is re-indexed on each run. The `VectorStore` contract is the seam where a durable store (`PgVectorStore` is the named drop-in) would slot in without touching the pipeline. → see `09-retrieval-pipeline-seam.md`.
 
 Why no database? Because nothing here needs one. The agents are stateless request-shaped capabilities; the only persistent data is test fixtures and observability records, both of which are git-tracked JSON. Adding Postgres would be architecture for its own sake.
 
@@ -109,7 +116,9 @@ What breaks first, and what would force a rearchitecture.
 
 **At 10x fixtures/replays:** the eval pipeline reads every artifact file synchronously (`packages/evals/src/replay-runner.ts:70-94`, `evaluateReplayArtifactFiles` loops files one at a time). That's fine at tens of fixtures; at thousands it's a linear file-IO scan with no parallelism. Stays stable far longer than you'd think because evals run in CI, not the hot path.
 
-**What stays stable under any growth:** the `ModelProvider` contract, `CapabilityEvent`, `ToolRegistry`, `WorkspaceDescriptor` (`context.md` names these the load-bearing contracts). They're narrow interfaces; growth happens behind them.
+**At 10x corpus (10x more indexed chunks):** `InMemoryVectorStore.search` does an O(n) cosine scan over every chunk per query (`packages/retrieval/src/in-memory-vector-store.ts:25-33`), and the corpus re-indexes on each process start. That's the first retrieval bottleneck — fine for a personal-notes corpus, linear at thousands of chunks. The fix is the `VectorStore` seam: a `PgVectorStore` with an ANN index replaces the scan and adds persistence, with no change to the pipeline, the `search_knowledge_base` tool, or the rag-query agent. → `09-retrieval-pipeline-seam.md`.
+
+**What stays stable under any growth:** the `ModelProvider` contract, the `EmbeddingProvider` / `VectorStore` retrieval contracts, `CapabilityEvent`, `ToolRegistry`, `WorkspaceDescriptor` (the load-bearing interfaces). They're narrow; growth happens behind them.
 
 **What would force a rearchitecture:** moving from "library a host app imports" to "hosted service with traffic." That introduces everything currently `not yet exercised` — an HTTP server, auth, a request queue, a real datastore for traces, horizontal replicas. The current architecture has *no server* (Studio's Vite middleware is a dev convenience, not production). That's the cliff. Everything up to it is incremental.
 
@@ -119,14 +128,16 @@ What breaks first, and what would force a rearchitecture.
 
 Ranked architectural risks, each grounded in real evidence. These are honest observations, not alarms — most are "fine for a library, would bite as a service."
 
-1. **The pipeline orchestration lives in Studio, not in a package** (`apps/studio/vite.config.ts`, `apps/studio/src/agent-runners.ts`). The monitor→diagnose→recommend wiring is in the dev app, not in `packages/`. A host app importing core gets the five agents but has to re-wire the pipeline itself. If the pipeline is a real product capability, it belongs in a package with its own contract. Right now it's only demonstrated, not shipped. → `05-multi-agent-pipeline.md` walks this.
+1. **The pipeline orchestration lives in Studio, not in a package** (`apps/studio/vite.config.ts`, `apps/studio/src/agent-runners.ts`). The monitor→diagnose→recommend wiring is in the dev app, not in `packages/`. A host app importing core gets the six agents but has to re-wire the pipeline itself. If the pipeline is a real product capability, it belongs in a package with its own contract. Right now it's only demonstrated, not shipped. → `05-multi-agent-pipeline.md` walks this.
 
-2. **OpenAI cost pricing only covers `gpt-4.1-*`** (`context.md` notes this; `usage-ledger.ts`). The usage/cost ledger silently under-reports for any other OpenAI model. Low blast radius (it's observability, not behavior), but a model swap would produce wrong cost numbers without erroring.
+2. **Cost pricing only covers `gpt-4.1-*`** (`usage-ledger.ts`). The usage/cost ledger silently under-reports for any other model. Lower blast radius now that the default reasoning model is *local Gemma* (zero marginal cost) — but if a host app wires a cloud adapter back in, a model the ledger doesn't price reports wrong cost numbers without erroring.
 
-3. **`rubric-improvement` has no `replay:promoted` script wired into the root pipeline** (`context.md`). The other four agents have deterministic regression coverage via promoted fixtures; this one doesn't. It can drift under a model update without a test catching it. → `06-replay-eval-pipeline.md` covers what the others get that this one misses.
+3. **`InMemoryVectorStore.search` is a full linear scan** (`packages/retrieval/src/in-memory-vector-store.ts:25-33`) and the corpus is re-indexed on every run (no persistence). Correct for the from-scratch in-memory adapter and tiny corpora; at thousands of chunks it's O(n) cosine per query with no ANN index. The `VectorStore` contract is exactly the seam where `PgVectorStore` slots in to fix both — named, not yet built. → `09-retrieval-pipeline-seam.md`.
 
-4. **Token estimation is a `charsPerToken` heuristic** (`packages/providers/local/src/context-window-guard.ts:100-103`, default 3 chars/token). It's a coarse approximation — a request near the budget edge could be wrongly admitted or wrongly rejected. Fine as a guard rail; not a precise accountant. The code is honest about this (it's an *estimate*).
+4. **`rubric-improvement` has no `replay:promoted` script wired into the root pipeline** (`context.md`). The other agents with deterministic regression coverage have promoted fixtures; this one doesn't. It can drift under a model update without a test catching it. → `06-replay-eval-pipeline.md` covers what the others get that this one misses.
 
-5. **No cache means identical `complete()` calls re-hit the API** (lens 4). Not a bug, but at scale it's wasted cost. The seam to fix it already exists.
+5. **Token estimation is a `charsPerToken` heuristic** (`packages/providers/local/src/context-window-guard.ts:100-103`, default 3 chars/token). It's a coarse approximation — a request near the budget edge could be wrongly admitted or wrongly rejected. This guard matters *more* now: the bundled default is local Gemma with a ~8k window (`ask.ts:52` sets `maxTokens: 8192`), so the estimate is the thing standing between a too-long prompt and a vendor rejection. Fine as a guard rail; not a precise accountant.
+
+6. **No cache means identical `complete()` calls re-run** (lens 4). Cheaper now that the default model is local (no per-token cost), but still wasted compute at scale. The seam to fix it already exists.
 
 None of these are "stop the ship." They're the difference between a clean library and a production service — which is exactly the line this repo sits on.

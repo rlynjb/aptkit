@@ -22,6 +22,9 @@ one access pattern changes. Each names the trigger.
   │  #1 filename-sort index   #2 read-time constraints         │
   │  #3 N+1 in listing        #4 no-fsync durability           │
   └───────────────────────────┬───────────────────────────────┘
+  ┌─ Capability layer (@aptkit/retrieval) ────────────────────┐
+  │  #4b vector store: no durability · linear scan · no txn    │
+  └───────────────────────────┬───────────────────────────────┘
   ┌─ Storage layer ───────────▼───────────────────────────────┐
   │  #5 full-scan reads   #6 no backup beyond git              │
   └───────────────────────────────────────────────────────────┘
@@ -119,6 +122,46 @@ reproduce). Fix: write to a temp file then `rename` (atomic on POSIX), and
 `fsync` for anything that must survive a crash. Detail:
 `07-wal-durability-and-recovery.md`.
 
+### #4b — The vector store has zero durability and a linear-scan "index"
+
+**Consequence: LOW today / MEDIUM at scale (latent, by design).** The new
+`InMemoryVectorStore` (`packages/retrieval/src/in-memory-vector-store.ts:10-43`)
+is the repo's first storage engine with upsert/search semantics, and it makes
+two deliberate omissions that are fine now and sharp later. First, **no
+durability**: chunks live in a `Map` that dies with the process
+(`line 11`), so the entire indexed corpus is lost on restart and re-indexing is
+the only recovery — there is no disk, no WAL, nothing to recover *from*. Second,
+**no ANN index**: `search` computes cosine similarity against every chunk then
+sorts (`lines 25-33`), an O(N·d) full scan. At a few hundred chunks that's
+microseconds; at tens of thousands it's the latency floor an HNSW index exists
+to remove. Third, a multi-chunk `upsert` is **not atomic** — it loops `set`s
+with no transaction (`lines 18-23`), so a mid-loop throw (e.g. a dimension
+mismatch on chunk 3 of 5) leaves a partially-indexed corpus. The one integrity
+guard it *does* enforce is the dimension check (`lines 36-42`), which fails
+loudly rather than corrupting ranking silently.
+
+```
+  evidence chain — three omissions, all deliberate
+  in-memory-vector-store.ts:11    private chunks = new Map(...)   → no disk (no durability)
+  in-memory-vector-store.ts:25-33 search = scan + cosine + sort  → no ANN index (O(N·d))
+  in-memory-vector-store.ts:18-23 upsert loops set()             → no txn (partial on throw)
+        │
+        └─ all three are correct for a from-scratch in-memory pipeline; each has
+           a named trigger. None is a bug today.
+```
+
+**Trigger / fix:** corpus outgrows a few hundred chunks, or the index must
+survive a restart, or a partial upsert is unacceptable. Fix: swap in the
+durable implementation of the *same* `VectorStore` contract — which already
+exists in the **buffr** repo (`/Users/rein/Public/buffr/src/pg-vector-store.ts`):
+Postgres-backed, an HNSW index (`buffr/sql/001_agents_schema.sql:28-29`), and a
+real `begin/commit/rollback` around the multi-chunk upsert
+(`pg-vector-store.ts:40-64`). The swap is a one-line wiring change because the
+pipeline never names a store. Detail: `03` (scan vs ANN index) and `04` (the
+query path). **Boundary note:** that durable engine, its transactions, and its
+HNSW index live in buffr, *not* aptkit — aptkit ships only the in-memory store
+and the contract.
+
 ### #5 — Every read is a full directory scan with no projection
 
 **Consequence: LOW today / MEDIUM at scale.** There's no index for any
@@ -150,18 +193,28 @@ Worth stating, so the audit isn't read as alarmist:
 ```
   non-risk                        why it's fine
   ─────────────────────────────── ──────────────────────────────────────────
-  no transactions / isolation     no operation spans 2+ files; no in-place update
-                                  → no atomicity or anomaly exposure (file 05)
+  no transactions / isolation     filesystem: no op spans 2+ files, no in-place
+   (filesystem path)              update → no atomicity exposure (file 05).
+                                  vector store: a multi-chunk upsert COULD partial
+                                  on throw, but the corpus is in-memory and
+                                  rebuildable, so the blast radius is "re-index"
   no locks / MVCC                 unique-filename writes + immutable records →
-                                  zero write contention by construction (file 06)
+                                  zero write contention by construction (file 06).
+                                  vector store is single-process in-memory: no
+                                  concurrent writers to contend
   no replication / failover       single-node; reads reproducible via deterministic
                                   replay, not distribution (file 08)
-  lost-update anomaly             impossible: nothing is updated in place (file 05)
+  lost-update anomaly             filesystem: impossible, nothing updated in place.
+                                  vector store: upsert DOES replace by id, but
+                                  single-process → no concurrent lost update (file 05)
 ```
 
-These are absent *correctly*. Append-only-immutable-single-node deletes whole
-categories of database risk. The audit's real content is the six latent items
-above, each one trigger away from mattering.
+These are absent *correctly*. Append-only-immutable-single-node (filesystem)
+plus single-process-rebuildable (vector store) deletes whole categories of
+database risk. Where those guarantees come from a real engine instead of from
+construction — transactions, isolation, an HNSW index — they live in the
+**buffr** `PgVectorStore`, not aptkit. The audit's real content is the latent
+items above, each one trigger away from mattering.
 
 ---
 
@@ -178,11 +231,13 @@ above, each one trigger away from mattering.
   MED   ├──────────────────────────────────────────────────────────┤
         │ #3 N+1 listing → latency cliff   vite.config.ts:1001 +3   │
         │ #4 no-fsync write → corruption window  vite.config.ts:377 │
+        │ #4b vector store: no durability + linear scan + no txn    │
+        │     in-memory-vector-store.ts:11,25,18 (durable: buffr)   │
   LOW   ├──────────────────────────────────────────────────────────┤
         │ #5 full-scan reads   replay-runner.ts:81 · vite.config:949│
         │ #6 git-only manual backup                                 │
         └──────────────────────────────────────────────────────────┘
-  all six are LATENT: harmless now, sharp when their trigger fires.
+  all seven are LATENT: harmless now, sharp when their trigger fires.
 ```
 
 ---

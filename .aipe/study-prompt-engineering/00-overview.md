@@ -53,6 +53,18 @@ synthesis instruction (`run-agent-loop.ts:104`). The output text gets parsed and
 validated; on a parse miss, a recovery turn re-injects the prior tool results and
 asks once more for the structured answer (`run-agent-loop.ts:195`).
 
+Two newer additions extend this surface without changing the path. The **Gemma
+provider** (`packages/providers/gemma/src/gemma-provider.ts:133`) handles a model
+with no native tool API by *emulating* tool calls in prompt text — it renders the
+tools into the system prompt and parses a JSON tool call back out, with a
+`RETRY_NUDGE` corrective turn on a botched parse (the weak-local-model end of the
+structured-output spectrum; 02). The **rag-query agent**
+(`packages/agents/rag-query/src/rag-query-agent.ts:20`) adds two prompt-text
+techniques: a grounding/citation system template ("search first, ground answers,
+cite sources, say so if not found"; 12) and a prepended user **profile** injected
+by `injectProfile` (`packages/context/src/profile-injector.ts:25`) before
+rendering (the persona section of the anatomy; 01).
+
 ## What's load-bearing here
 
 Three mechanics carry the weight, and they're the ones to look at first:
@@ -73,13 +85,16 @@ Three mechanics carry the weight, and they're the ones to look at first:
 
 ## What this repo does NOT do (read these honestly)
 
-- No provider `response_format` / tool-calling-for-output. Structured output is
-  JSON-in-a-markdown-fence parsed defensively. See 02.
+- No provider `response_format` / native tool-calling-for-output. Hosted
+  structured output is JSON-in-a-markdown-fence parsed defensively. (The Gemma
+  provider *emulates* tool calling by rendering tools into the system prompt and
+  parsing a JSON tool call back out — prompt-text, not provider-enforced.) See 02.
 - No real tokenizer. Token budgeting is a `length / 3` heuristic in the local
   context guard. See 04.
 - No prompt-cache / `cache_control` directives. See 04.
 - No self-critique or self-consistency loop. See 10.
-- No explicit prompt-injection delimiters or instruction-hierarchy framing. See 12.
+- No input delimiters or instruction-hierarchy framing. One explicit prompt-text
+  guardrail exists — the rag-query agent's grounding/citation instructions. See 12.
 - No forbidden-opening lists or rotation history. See 13.
 
 Each of those is a buildable target, not a hidden failure. The files name the

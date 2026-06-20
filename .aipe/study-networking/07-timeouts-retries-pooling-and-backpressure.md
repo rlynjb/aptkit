@@ -25,7 +25,7 @@ This file covers what happens when the network doesn't cooperate — slow, faili
 
 ## Zoom in — narrow to the concept
 
-Verdict first: AptKit's failure story is **failover, not retry**. When a provider call throws, the `FallbackModelProvider` moves to the next provider in the chain — it does not back off and retry the *same* provider, and it does not distinguish a 429 rate-limit from a 500 from a timeout. There's no jitter, no backoff curve, no circuit breaker. Cancellation, by contrast, is clean and first-class: one `AbortSignal` cancels both the upstream provider call and the downstream stream decode. Timeouts and connection pooling are entirely the SDK's job. This file is honest about what's built, what's delegated, and what's genuinely missing.
+Verdict first: AptKit's failure story is mostly **failover, not retry** — *with one new exception*. When a cloud provider call throws, the `FallbackModelProvider` moves to the next provider in the chain — it does not back off and retry the *same* provider, and it does not distinguish a 429 rate-limit from a 500 from a timeout. There's no jitter, no backoff curve, no circuit breaker. The exception, new this session: `GemmaModelProvider` *does* run a real repo-owned retry loop — but it retries for a *parsing* failure, not a *network* failure. If Gemma returns a malformed tool-call JSON, the provider re-asks (up to `maxToolCallAttempts`, default 2) with a corrective nudge appended (`gemma-provider.ts:62-89`). That's the repo's first hand-written retry loop, and it's worth seeing precisely because it is *not* a network retry — a 500 from Ollama still throws on the first try and bubbles straight up. Cancellation stays clean and first-class: one `AbortSignal` cancels the cloud SDK call, the Gemma `fetch`, and the downstream stream decode. Timeouts: the cloud SDK sets one; the Ollama `fetch` sets *none*. This file is honest about what's built, what's delegated, and what's genuinely missing.
 
 ## The structure pass
 
@@ -108,13 +108,39 @@ The kernel above is the *whole* repo-owned failure strategy. Everything else is 
   Comparison — built vs delegated vs missing
 
   BUILT (repo):     failover across providers, abort short-circuit,
-                    attempt recording, give-up error
+                    attempt recording, give-up error,
+                    Gemma's PARSE-retry loop (malformed JSON → re-ask)
   DELEGATED (SDK):  per-request timeout, retry on 5xx/network,
-                    connection pool / keep-alive
+                    connection pool / keep-alive  ── cloud providers only
   MISSING:          backoff + jitter on the SAME provider,
                     429-specific handling (Retry-After),
-                    circuit breaker (cooldown after repeated failures)
+                    circuit breaker (cooldown after repeated failures),
+                    ANY timeout on the local Ollama fetch (B3),
+                    network-level retry for Gemma (it only retries PARSING)
 ```
+
+**Gemma's retry loop is a parse-retry, not a network-retry — know the difference.** This is the repo's only hand-written retry, and it's easy to mistake for resilience it doesn't provide. The loop in `gemma-provider.ts:62-89` runs up to `maxToolCallAttempts` times; on each pass it sends the chat request, and if the model's reply *looks like a botched tool call* (`looksLikeToolAttempt` — a `{` in the text, `gemma-provider.ts:185`), it appends a corrective nudge and asks again. What it retries is the model getting the *JSON shape* wrong. What it does **not** retry is the HTTP call failing: a non-2xx from Ollama throws inside the transport (`gemma-provider.ts:210`) and propagates out of the loop on the first attempt — there's no catch, no backoff, no second network try.
+
+```
+  Gemma's loop — retries the MODEL's output, not the WIRE
+
+  for attempt in 0..maxToolCallAttempts:
+      check abort
+      resp = await chat(messages)        ← network error here → THROWS, loop ends
+      if wantsTool:
+          call = parseToolCall(resp)
+          if call: return tool_use        ← good JSON → done
+          if looksLikeToolAttempt(resp):  ← bad JSON → nudge + retry
+              continue
+      break                               ← plain prose is a real answer
+  return text(resp)
+       │
+       └─ the retry covers a malformed tool call, NOT a failed HTTP request.
+          A 500 from Ollama is a first-try throw, same as a cloud SDK exhausting
+          its own retries — except Ollama has NO retries underneath to exhaust.
+```
+
+**The local fetch has no timeout — a wedged Ollama hangs on the signal, or forever.** Neither `gemma-provider.ts:202-215` nor `ollama-embedding-provider.ts:60-74` passes a timeout to `fetch`. If the Ollama daemon accepts the connection but never responds (model loading, OOM, stuck), the `await fetch(...)` blocks indefinitely. The only escape is the `AbortSignal`: Gemma threads `request.signal` into the transport (`gemma-provider.ts:73`) and the embedder threads `options.signal` (`ollama-embedding-provider.ts:55`), so a caller-driven cancel *can* unwedge it. But if no signal is passed — which is the case for a bare `embedder.embed(texts)` call with no options — the request can hang with nothing to cancel it. Unlike the cloud SDK, there's no built-in default timeout underneath to backstop this.
 
 **Timeouts and same-provider retries are the SDK's.** The repo sets no timeout and no retry count on the provider call. Both SDKs have built-in defaults (a request timeout, automatic retries on transient 5xx/network errors with their own backoff). So a *transient blip* is absorbed by the SDK before the fallback chain ever sees it; the fallback chain only engages when the SDK has *exhausted its own retries* and thrown.
 
@@ -209,6 +235,33 @@ The full failure-and-cancellation picture across layers.
 
 **No SDK timeout/retry/pool config — delegated.** The SDK clients (`openai-provider.ts:30`, `anthropic-provider.ts:25`) take `apiKey` only. No `timeout`, no `maxRetries`, no `httpAgent`. The SDK defaults apply: `not yet exercised` at the repo level.
 
+**Gemma's parse-retry loop — the repo's one hand-written retry.** `packages/providers/gemma/src/gemma-provider.ts:62-89`:
+
+```
+  gemma-provider.ts  (complete, lines 62–89)
+
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    request.signal?.throwIfAborted();             ← cancel bails before each try
+    const messages = attempt === 0
+      ? baseMessages
+      : [...baseMessages, { role: 'user', content: RETRY_NUDGE }]; ← corrective nudge on retry
+    lastResponse = await this.chat({ ... });       ← network error here THROWS, no catch
+    raw = lastResponse.message?.content ?? '';
+    if (wantsTool) {
+      const call = parseToolCall(raw);
+      if (call) return this.toResponse([tool_use], lastResponse);  ← good JSON → done
+      if (looksLikeToolAttempt(raw)) continue;     ← bad JSON → retry
+    }
+    break;
+  }
+       │
+       └─ maxAttempts = maxToolCallAttempts only when tools are requested, else 1.
+          The retry is for MALFORMED OUTPUT, not a failed request — a thrown
+          fetch ends the loop immediately
+```
+
+**The local transports set no timeout.** `gemma-provider.ts:202-215` and `ollama-embedding-provider.ts:60-74` call `fetch` with `method`/`headers`/`body`/`signal` only — no `timeout`, no `dispatcher`. A hung daemon blocks on the `await` until the `AbortSignal` fires; with no signal, indefinitely. `not yet exercised` and a real gap (see `08` R7).
+
 ## Elaborate
 
 The two-level failure split (SDK retries transient blips, app fails over on outages) is the correct mental model for any "thin server in front of an external API" — and it's exactly the shape your AdvntrCue and dryrun work hint at: dryrun runs on-device Gemini Nano with an *API fallback*, which is the same "primary fails → switch source" move AptKit's chain makes, just across a device/cloud boundary instead of two clouds. The lesson that transfers: failover (switch source) and retry (try the same source again) are different tools for different failures, and stacking them naively multiplies latency. AptKit's deliberate *absence* of an app-level retry layer is the disciplined choice — it lets the SDK own retries and keeps the app layer focused on the one thing it's positioned to do (pick a different provider). The single gap worth flagging in a review is the 429 case; the `shouldFallback` hook is the designed place to close it, so it's a one-function extension, not a redesign.
@@ -245,7 +298,8 @@ One `AbortSignal` threads from the agent loop (`run-agent-loop.ts:99`) through `
 ## See also
 
 - `06-websockets-sse-streaming-and-realtime.md` — the no-resume limit (cancel/drop = no recovery)
-- `03-tcp-udp-connections-and-sockets.md` — the SDK pool this delegates to
-- `08-networking-red-flags-audit.md` — the 429 gap ranked among the risks
+- `03-tcp-udp-connections-and-sockets.md` — the SDK pool (and conn-3 undici pool) this delegates to
+- `04-tls-and-trust-establishment.md` — boundary 3's keyless/plaintext posture the retry runs over
+- `08-networking-red-flags-audit.md` — the 429 gap and the no-timeout-on-Ollama gap ranked among the risks
 - study-distributed-systems — failover as partial-failure handling across external systems
 - study-runtime-systems — `AbortSignal` plumbing and cooperative cancellation

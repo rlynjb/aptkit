@@ -145,7 +145,7 @@ A router is a function from location to view; the location can be a URL or a loc
 
 ### Use cases
 
-Every screen transition in Studio. Open a capability from the gallery → `onOpen(view)` (`StudioHome.tsx:35,47,59,…`). Return to the gallery → the Home button in `AgentReplayShell`'s topbar (`AgentReplayShell.tsx:191`) or `CapabilitiesWorkspace`'s topbar (`CapabilitiesWorkspace.tsx:159`) calls `onHome`. That's the complete navigation surface — there is no other way to move between screens.
+Every screen transition in Studio. Open a capability from the gallery → `onOpen(view)` (`StudioHome.tsx:35,47,59,…`). Return to the gallery → the Home button in `AgentReplayShell`'s topbar (`AgentReplayShell.tsx:193`) or `CapabilitiesWorkspace`'s topbar (`CapabilitiesWorkspace.tsx:159`) calls `onHome`. That's the complete navigation surface — there is no other way to move between screens.
 
 ### Code, line by line
 

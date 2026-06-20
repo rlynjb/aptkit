@@ -4,10 +4,10 @@
 
 ## Zoom out — where this concept lives
 
-Every other file in this guide zooms into one slice of the wire. This file is the slice they all sit inside: the complete path a byte travels and the boundaries it crosses. Here's the whole system as bands, with the two network boundaries marked.
+Every other file in this guide zooms into one slice of the wire. This file is the slice they all sit inside: the complete path a byte travels and the boundaries it crosses. Here's the whole system as bands, with all three network boundaries marked — the provider tier now forks into a cloud destination (B2) and a local Ollama destination (B3).
 
 ```
-  Zoom out — the two boundaries, top to bottom
+  Zoom out — the three boundaries, top to bottom
 
   ┌─ UI layer (browser) ──────────────────────────────────────┐
   │  React panel   →   fetch()                                 │
@@ -15,21 +15,22 @@ Every other file in this guide zooms into one slice of the wire. This file is th
                               │  ★ BOUNDARY 1 ★  HTTP (same-origin, dev)
   ┌─ Service layer (Node / Vite dev server) ──▼─────────────────┐
   │  configureServer middleware → runReplay → agent loop        │
-  │  ModelProvider.complete()                                   │
-  └───────────────────────────┬────────────────────────────────┘
-                              │  ★ BOUNDARY 2 ★  HTTPS (SDK-owned)
-  ┌─ Provider layer (external) ──▼──────────────────────────────┐
-  │  api.anthropic.com   /   api.openai.com                     │
-  └──────────────────────────────────────────────────────────────┘
+  │  ModelProvider.complete()  ·  embedder.embed()              │
+  └──────────┬───────────────────────────────┬──────────────────┘
+             │ ★ BOUNDARY 2 ★ HTTPS (SDK)     │ ★ BOUNDARY 3 ★ HTTP (repo fetch)
+  ┌─ Cloud provider ──▼──────────┐  ┌─ Local Ollama daemon ──▼────┐
+  │  api.anthropic.com           │  │  http://localhost:11434     │
+  │  api.openai.com              │  │  /api/chat · /api/embed     │
+  └──────────────────────────────┘  └──────────────────────────────┘
 ```
 
 ## Zoom in — narrow to the concept
 
-A network map answers one question: *if I follow a single user action, every place does it leave a process, and what promise does each crossing make?* For AptKit the answer is short — two crossings — but each one has a completely different protocol, trust model, and failure story. The map is the skeleton; the rest of the guide is the anatomy.
+A network map answers one question: *if I follow a single user action, every place does it leave a process, and what promise does each crossing make?* For AptKit the answer is short — up to three crossings — but each one has a completely different protocol, trust model, and failure story. Boundary 2 (cloud) and boundary 3 (local Ollama) are *alternatives*: a given run uses one or the other depending on which provider is configured, not both. The map is the skeleton; the rest of the guide is the anatomy.
 
 ## The structure pass
 
-**Layers.** Three bands: browser (UI), Node/Vite (service), external provider. The repo's code lives entirely in the first two; the third is someone else's server.
+**Layers.** Bands: browser (UI), Node/Vite (service), and the provider tier — which is now *two* destinations: an external cloud API (B2) or a local Ollama daemon (B3). The repo's code lives in the first two bands; for B2 the third band is someone else's server reached through an SDK, for B3 it's a separate local process reached through a repo-written `fetch`.
 
 **Axis — trust (what can each side see or tamper with?).** Trace it down the stack:
 
@@ -45,9 +46,9 @@ A network map answers one question: *if I follow a single user action, every pla
    the stream sends    API_KEY in env       API key directly
 ```
 
-The trust answer *flips at both boundaries*. At B1, the browser is untrusted code talking to a server that holds secrets — but it's same-origin plaintext localhost, so the channel itself isn't defended (it doesn't need to be in dev). At B2, the Node process is the trusted party authenticating *itself* to an external service over TLS with a bearer key. That's two different trust postures, which is exactly why they're studied as separate boundaries.
+The trust answer *flips at every boundary*. At B1, the browser is untrusted code talking to a server that holds secrets — but it's same-origin plaintext localhost, so the channel itself isn't defended (it doesn't need to be in dev). At B2, the Node process is the trusted party authenticating *itself* to an external service over TLS with a bearer key. At B3, there's *no authentication at all*: the Node process reaches a local Ollama daemon over plaintext HTTP and Ollama trusts any caller that can open its port. So B3's trust comes from *locality* (same machine) like B1, but unlike B1 it crosses a process boundary to a daemon the repo didn't write. Three boundaries, three trust postures — keyed-and-encrypted (B2), locality-no-auth-same-process (B1), locality-no-auth-cross-process (B3).
 
-**Seams.** Boundary 1 is the seam where the repo's own protocol (NDJSON) lives — it's load-bearing because the *direction of streaming* flips here (server pushes records to a passive browser reader). Boundary 2 is the seam where the repo *stops owning the protocol* — control of the wire flips from repo code to SDK code. Both are worth studying before either side's internals.
+**Seams.** Boundary 1 is the seam where the repo's own protocol (NDJSON) lives — load-bearing because the *direction of streaming* flips here (server pushes records to a passive browser reader). Boundary 2 is the seam where the repo *stops owning the protocol* — control of the wire flips from repo code to SDK code. Boundary 3 is the opposite of B2: the seam where the repo *re-owns the wire* — control of DNS/socket/HTTP framing flips *back* to repo code (an injectable transport, `gemma-provider.ts:19`/`ollama-embedding-provider.ts:18`, defaulting to a hand-written `fetch`). B2 and B3 are the same architectural seam (`ModelProvider.complete`) with opposite wire ownership — that contrast is the single most instructive thing on this map.
 
 ## How it works
 
@@ -104,7 +105,7 @@ You know how a `fetch()` in a React app crosses exactly one boundary — your co
 
 ### Move 3 — the principle
 
-A network map is worth drawing *first* because it tells you which problems are yours and which are someone else's. AptKit's map has exactly one boundary the repo defends and tunes (boundary 1) and one it delegates wholesale (boundary 2). Most "why is this slow / why did this fail" questions resolve the moment you know which side of which boundary you're on.
+A network map is worth drawing *first* because it tells you which problems are yours and which are someone else's. AptKit's map has two boundaries the repo defends and tunes (boundary 1's NDJSON stream and boundary 3's hand-rolled Ollama `fetch`) and one it delegates wholesale (boundary 2, the cloud SDK). Most "why is this slow / why did this fail" questions resolve the moment you know which side of which boundary you're on — and the new wrinkle is that boundary 3 *looks* delegated (it's just a model call behind `ModelProvider.complete`) but is actually repo-owned wire code, so its failures are yours, not an SDK's.
 
 ## Primary diagram
 
@@ -164,6 +165,31 @@ The full map, both boundaries, both directions, every hop labelled.
           the repo's whole contribution at this boundary is the abort signal
 ```
 
+**Boundary 3 — the hand-rolled `fetch`, the inverse of boundary 2.** `packages/providers/gemma/src/gemma-provider.ts:201-215`:
+
+```
+  packages/providers/gemma/src/gemma-provider.ts  (defaultHttpTransport, lines 201–215)
+
+  const base = host.replace(/\/$/, '');          ← host defaults to localhost:11434
+  return async ({ signal, ...payload }) => {
+    const res = await fetch(`${base}/api/chat`, { ← REPO builds the HTTP request itself
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },  ← no Authorization header
+      body: JSON.stringify(payload),
+      ...(signal ? { signal } : {}),             ← abort threads in, same as B2
+    });
+    if (!res.ok) {                               ← REPO owns the failure path now
+      throw new Error(`ollama HTTP ${res.status}: ${await res.text()}`);
+    }
+    return (await res.json()) as OllamaChatResponse;
+  };
+       │
+       └─ everything the SDK did invisibly at B2 (build request, check status,
+          parse body) the repo does explicitly here. No DNS-of-a-remote-host,
+          no TLS, no key. The embedder mirrors this exactly at /api/embed
+          (ollama-embedding-provider.ts:60-74)
+```
+
 ## Elaborate
 
 This two-boundary shape is the default for a "thin server in front of an LLM" app, and you've shipped its cousin: in AdvntrCue, the Next.js serverless function is the equivalent of the Node middleware here, the OpenAI call is boundary 2, and the streaming response back to the Next.js client is boundary 1. The difference is that AdvntrCue's boundary 1 is a deployed HTTPS endpoint with real origins; AptKit's is a localhost dev server. Same topology, different trust posture — which is exactly why the trust axis (above) is the right lens for this map.
@@ -193,6 +219,7 @@ Boundary 2 wouldn't change at all — same SDK, same delegation. Boundary 1 woul
 ## See also
 
 - `02-dns-routing-and-addressing.md` — how each boundary's hostname resolves
+- `04-tls-and-trust-establishment.md` — why B2 is TLS+keyed and B3 is plaintext+keyless
 - `06-websockets-sse-streaming-and-realtime.md` — boundary 1's NDJSON protocol in full
 - `08-networking-red-flags-audit.md` — the risks living at each boundary
-- study-system-design — the same two boundaries as *architectural* seams
+- study-system-design — the same boundaries as *architectural* seams (the `ModelProvider` contract behind B2/B3)

@@ -12,6 +12,14 @@ build a **deterministic harness around the non-deterministic core**: record the
 model's responses once, replay them forever, and assert on the replay. That seam
 is what makes this repo worth a testing study.
 
+The recent RAG / personal-agent packages (a Gemma provider, a retrieval stack, a
+profile injector, a precision@k metric, a `rag-query` agent) push this further with
+a **second, finer isolation seam**: inject the HTTP transport *inside* a provider
+so the provider's own decode logic runs against recorded bytes with no live Ollama.
+That's `06-injectable-transport.md` — the new pattern, sitting one layer below the
+replay seam. (The vector store's pg integration tests, DATABASE_URL-gated, live in
+a separate repo, buffr, and are out of scope here.)
+
 ## The seam that organizes everything
 
 ```
@@ -55,6 +63,11 @@ prompt assembly and output validation are deterministic and ARE tested here.
    anomaly detector, the half-step from assertion toward evaluation.
 6. **`05-playwright-smoke-gate.md`** — the one E2E test: does the Studio UI still
    wire up and run fixtures end to end?
+7. **`06-injectable-transport.md`** — the newest pattern, from the RAG / Gemma
+   packages: a *finer* isolation seam below the provider. Inject the HTTP transport
+   so the real provider decode (Gemma's tool-call emulation, the embedder) runs
+   against recorded bytes with no live Ollama. Read after `01` — it's the seam that
+   sits one layer beneath it.
 
 ## Cross-links to other study guides
 

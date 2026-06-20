@@ -2,7 +2,9 @@
 
 One page, one diagram. Skim only this file and you have the map: every major component, what it owns, and what it talks to. The detail lives in `audit.md` and the eight pattern files; this is the orientation you return to.
 
-AptKit is not a deployed service. It's a **library monorepo** — eleven internal packages plus a Studio dev app, published as one npm tarball. There's no request coming in from the internet; the "request" is a host app calling an agent's method, or you clicking "Replay" in Studio. So the system map is a *dependency-and-data-flow* map, not a traffic map.
+AptKit is not a deployed service. It's a **library monorepo** — 15 internal packages plus a Studio dev app, published as one npm tarball (`@rlynjb/aptkit-core` 0.4.x). There's no request coming in from the internet; the "request" is a host app calling an agent's method, or you clicking "Replay" in Studio. So the system map is a *dependency-and-data-flow* map, not a traffic map.
+
+Two things changed the shape recently and are worth flagging before the diagram: (1) the default reasoning model is now **local Gemma over Ollama** (the bundled providers are `provider-gemma` + `provider-local`; Anthropic/OpenAI adapters still exist but are out of the published build chain), and (2) there's a from-scratch **retrieval (RAG)** capability — `@aptkit/retrieval` plus a capstone `@aptkit/agent-rag-query` — that adds two new provider-neutral seams the same shape as `ModelProvider`. → see `09-retrieval-pipeline-seam.md`.
 
 ## The full system
 
@@ -19,12 +21,14 @@ This is the whole thing — every package as a labelled band, every arrow a real
   └────────┼─────────────────────────────────────┼──────────────────────────┘
            │  body: {fixtureId, mode}             │
            ▼                                      ▼
-  ┌─ Capability layer — packages/agents/* (5 agents) ─────────────────────┐
+  ┌─ Capability layer — packages/agents/* (6 agents) ─────────────────────┐
   │                                                                        │
   │   anomaly-monitoring ──► diagnostic-investigation ──► recommendation   │
   │   (scan → Anomaly[])     (Anomaly → Diagnosis)        (Anomaly+        │
   │                                                        Diagnosis →     │
   │   query (NL → answer)    rubric-improvement            Recs[])         │
+  │                                                                        │
+  │   rag-query (NL → grounded answer)  ── model + search tool + profile   │
   │                                                                        │
   │   each agent = prompt package + tool policy + loop config + validator  │
   └────────────────────────────────┬───────────────────────────────────────┘
@@ -40,19 +44,28 @@ This is the whole thing — every package as a labelled band, every arrow a real
   └──────────────────────────────────────────────────────────┼────────────┘
                                                               │
   ┌─ Policy + context layer ───────────┐   ┌─ Provider layer — packages/providers/* ─┐
-  │  packages/tools                    │   │  anthropic   openai   (vendor SDK calls) │
-  │   ToolRegistry (Map by name)       │   │      ▲          ▲                        │
-  │   ToolPolicy (Set allowlist)       │   │      └──────────┴── FallbackModelProvider│
-  │   coverage-gate (Set tokens)       │   │            (sequential chain)            │
-  │  packages/context (WorkspaceDescr) │   │  ContextWindowGuardedProvider (pre-flight│
-  │  packages/prompts (templates)      │   │            token budget guard)           │
+  │  packages/tools                    │   │  gemma (Ollama /api/chat)  ◄ bundled     │
+  │   ToolRegistry (Map by name)       │   │      ▲                                   │
+  │   ToolPolicy (Set allowlist)       │   │      └── FallbackModelProvider (chain)   │
+  │   coverage-gate (Set tokens)       │   │  ContextWindowGuardedProvider (pre-flight│
+  │  packages/context (WorkspaceDescr  │   │            token budget guard, ~8k)      │
+  │    + injectProfile)                │   │  (anthropic/openai adapters: out of      │
+  │  packages/prompts (templates)      │   │            the published bundle)         │
   └────────────────────────────────────┘   └──────────────────┬───────────────────────┘
-                                                               │  HTTPS (only wire hop)
+                                                               │  HTTP (only wire hop)
                                                                ▼
                                                     ┌─ External ──────────┐
-                                                    │ Anthropic / OpenAI  │
-                                                    │ model HTTP APIs     │
+                                                    │ Ollama @ localhost  │
+                                                    │ gemma2:9b (reason)  │
+                                                    │ nomic-embed (768d)  │
                                                     └─────────────────────┘
+
+  ┌─ Retrieval (RAG) — packages/retrieval ────────────────────────────────────────────┐
+  │  search_knowledge_base tool ──► RetrievalPipeline                                  │
+  │    index: doc→chunk→embed→upsert    query: q→embed→search→rank                     │
+  │    EmbeddingProvider seam (Ollama/nomic) │ VectorStore seam (InMemory cosine)      │
+  │    dimension checked at wiring + per-vector (the one-way door)                     │
+  └───────────────────────────────────────────────────────────────────────────────────┘
 
   ┌─ Testing / observability backbone — packages/evals + scripts + artifacts ─────────┐
   │  live run → artifact (artifacts/replays/*.json) → eval (structural-diff /          │
@@ -61,8 +74,8 @@ This is the whole thing — every package as a labelled band, every arrow a real
   └─────────────────────────────────────────────────────────────────────────────────┘
 
   ┌─ Publish boundary — packages/core ────────────────────────────────────────────────┐
-  │  @rlynjb/aptkit-core: re-exports all 11 packages; bundledDependencies inlines       │
-  │  them into ONE standalone tarball. App-specific product logic must not leak in.    │
+  │  @rlynjb/aptkit-core (0.4.x): re-exports all 15 packages; bundledDependencies        │
+  │  inlines them into ONE standalone tarball. App-specific product logic must not leak.│
   └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -71,14 +84,16 @@ This is the whole thing — every package as a labelled band, every arrow a real
 | Component | What it is | What it owns | What it talks to |
 | --- | --- | --- | --- |
 | `apps/studio` | React + Vite dev app | The manual preview/replay UI; 5 NDJSON stream routes (`vite.config.ts`) | Imports core; POSTs to its own Vite middleware; consumes NDJSON |
-| `packages/agents/*` | 5 capability agents | One capability each: `*_CAPABILITY_ID`, a tool policy, a loop config, a validator | Calls `runAgentLoop`; reads tools filtered by its policy |
+| `packages/agents/*` | 6 capability agents (incl. `rag-query`) | One capability each: `*_CAPABILITY_ID`, a tool policy, a loop config, a validator | Calls `runAgentLoop`; reads tools filtered by its policy |
+| `packages/agents/rag-query` | The RAG capstone | Composes a model + the `search_knowledge_base` tool + an injected profile; grants exactly one tool | Calls `runAgentLoop`; imports `@aptkit/retrieval`, `@aptkit/provider-gemma` |
+| `packages/retrieval` | From-scratch RAG | `EmbeddingProvider` + `VectorStore` contracts, `RetrievalPipeline`, `chunkText`, `InMemoryVectorStore`, `OllamaEmbeddingProvider`, `search_knowledge_base` tool | Imports tool contract from `@aptkit/tools`; talks to Ollama over HTTP |
 | `packages/runtime` | Foundation, zero internal deps | The `ModelProvider` contract, `runAgentLoop`, `CapabilityEvent`, structured-generation, NDJSON helpers | Nothing internal depends downward; everything depends *on* it |
 | `packages/tools` | Registry + policy + gate | `ToolRegistry` (Map by name), `ToolPolicy` (Set allowlist), `coverage-gate` (Set tokens) | Imports `ModelTool` from runtime; consumed by agents |
 | `packages/context` | Pure types + renderer | `WorkspaceDescriptor`, `schemaSummary()` | No internal deps; consumed by agents/prompts |
 | `packages/prompts` | Prompt packages | Per-agent templates with id/version/capabilityId provenance | Consumed by agents |
-| `packages/providers/*` | `ModelProvider` adapters | anthropic/openai SDK adaptation; `FallbackModelProvider` chain; `ContextWindowGuardedProvider` | Implements the runtime contract; calls vendor SDKs over HTTPS |
+| `packages/providers/*` | `ModelProvider` adapters | `GemmaModelProvider` (Ollama, bundled default); `FallbackModelProvider` chain; `ContextWindowGuardedProvider`. anthropic/openai adapters exist but are out of the published bundle | Implements the runtime contract; calls Ollama (or a vendor SDK) over HTTP |
 | `packages/evals` | Eval functions | shape assertions, structural-diff, detection-scorer, rubric-judge, replay-runner | Reads replay artifacts; consumed by scripts |
-| `packages/core` | The published surface | `@rlynjb/aptkit-core` re-export bundle; `bundledDependencies` | Re-exports all 11 packages; published to npm |
+| `packages/core` | The published surface | `@rlynjb/aptkit-core` re-export bundle; `bundledDependencies` | Re-exports all 15 packages; published to npm (0.4.x) |
 | `scripts/*.mjs` | Pipeline CLIs | eval / promote / replay / pack-standalone | Read artifacts + fixtures; write fixtures + tarball |
 | `artifacts/replays/` | Saved JSON | Replay artifacts (the observability record) | Written by replay scripts/Studio; read by evals |
 
@@ -93,8 +108,8 @@ Trace that single question down the layers and the seams pop:
   multi-agent pipeline     → CODE decides (fixed order: monitor→diagnose→recommend)
   runAgentLoop             → LLM decides (per turn: emit tool calls or finish)
   ...but bounded by        → CODE decides (maxTurns/maxToolCalls hard ceiling)
-  ModelProvider.complete   → PROVIDER decides (which vendor, fallback, guard)
-  vendor SDK               → EXTERNAL decides (the model itself)
+  ModelProvider.complete   → PROVIDER decides (gemma/local, fallback, guard)
+  Ollama / vendor          → EXTERNAL decides (the model itself)
 ```
 
 The answer flips four times. Each flip is a seam worth studying — and each is a pattern file. The most important flip is at `runAgentLoop`: control hands from code to the LLM, then code claws it back with a hard iteration budget. That tension is the heart of the repo.

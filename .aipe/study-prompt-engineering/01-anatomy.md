@@ -137,6 +137,32 @@ for this diagnosis and return the JSON array"); in the query agent it's the
 literal user question. **Breaks if missing:** there's nothing for the model to
 act on.
 
+**Persona / profile injection — a prepended constant section.** The rag-query
+agent adds a fifth slot to the front of the system prompt: a *profile* document
+(a `me.md`-style "about the person you are assisting") prepended ahead of the
+role and rules. It's done by `injectProfile`, and the ordering is deliberate —
+profile is injected *before* `renderPromptTemplate` runs, so the result is still
+a valid template whose `{var}` holes get filled afterward. The profile is
+constant per user (not per call) and answers a different question than context
+injection: not "what's in this workspace" but "who am I talking to." **Breaks if
+missing:** the assistant has no sense of the person and gives generic answers; mix
+it into the role line instead of giving it its own heading and you can't swap the
+person without re-reading the whole prompt.
+
+```
+  Profile injection — a constant persona block, prepended
+
+  injectProfile(template, profileText, { position: 'start', heading })
+
+  ┌─ # About the person you are assisting ─┐  ← heading
+  │ <me.md text>                           │  ← per-user constant
+  └────────────────────────────────────────┘
+                  ▼  then the existing template
+  ┌─ "You are a personal knowledge assistant. Always call search... " ─┐
+  └─────────────────────────────────────────────────────────────────────┘
+        │  THEN renderPromptTemplate fills any {var} holes (order matters)
+```
+
 #### Move 3 — the principle
 
 One job per section, named explicitly. The reason this matters isn't tidiness —
@@ -168,9 +194,10 @@ The full anatomy, assembled, as `runAgentLoop` sees it.
 
 ## Implementation in codebase
 
-**Use cases.** Every one of the four agents assembles a prompt this way. The
-cleanest example is the recommendation agent, which injects three context
-variables and a constant output contract.
+**Use cases.** Every one of the agents assembles a prompt this way. The cleanest
+example is the recommendation agent, which injects three context variables and a
+constant output contract. The rag-query agent adds a fifth section — a prepended
+user profile — via `injectProfile`.
 
 The `PromptPackage` type defines the envelope — the system string plus its
 declared variables and examples:
@@ -235,6 +262,42 @@ variable, separate from the system:
           single per-call message. Clean separation = the seam stays clean.
 ```
 
+The rag-query agent shows the fifth section — a profile prepended ahead of the
+template, *then* rendered, so the order (inject → render) is preserved:
+
+```
+  packages/agents/rag-query/src/rag-query-agent.ts  (lines 52–59)
+
+  const template = options.prompt ?? DEFAULT_SYSTEM_TEMPLATE;
+  // C then render: inject the profile, then resolve any template placeholders.
+  const withProfile = options.profile
+    ? injectProfile(template, options.profile,
+        { position: 'start', heading: PROFILE_HEADING })   ← prepend the persona block
+    : template;
+  this.system = renderPromptTemplate(withProfile, {});       ← {var} holes filled after
+       │
+       └─ injectProfile runs BEFORE renderPromptTemplate by design — the profile
+          block becomes part of the template, so any {var} in either still renders.
+          Swap the order and a {placeholder} inside the profile would leak unrendered.
+```
+
+`injectProfile` itself is a pure string-in/string-out helper — it never touches
+`fs`; the caller reads the profile file and hands it in:
+
+```
+  packages/context/src/profile-injector.ts  (lines 25–38)
+
+  export function injectProfile(systemTemplate, profileText, opts?) {
+    const position = opts?.position ?? 'start';
+    const block = opts?.heading ? `${opts.heading}\n${profileText}` : profileText;
+    return position === 'end'
+      ? `${systemTemplate}\n\n${block}`
+      : `${block}\n\n${systemTemplate}`;                      ← default: prepend persona
+        │
+        └─ pure: the package never reads files. That keeps prompt assembly testable
+           and the persona swappable without an fs dependency in the prompt layer.
+```
+
 ## Elaborate
 
 The four-section split is the oldest stable convention in production prompting —
@@ -242,10 +305,19 @@ it predates tool calling and survives every model upgrade because it's about
 *ownership of lines*, not provider syntax. Anthropic's prompt guide and the
 OpenAI cookbook both land on the same decomposition under different names.
 
+The profile/persona section is a newer addition to the same convention — modern
+RAG assistants prepend a "who you're assisting" block so answers are personalized
+without re-stating it per call. The discipline that matters is the same: give it
+its own heading, keep it constant-per-user, inject it *before* template rendering
+so the envelope stays renderable. AptKit's `injectProfile` does exactly that.
+
 Where it connects: the system/user split is also a trust boundary (12 — user
 content belongs in the user message, never spliced into the system rules), and
 the output-contract section is where structured-output discipline starts (02).
-Read 03 next for why the whole envelope carries a version.
+The rag-query agent's grounding-and-citation instructions ("ground every answer
+in the retrieved chunks, say so plainly if not found") are an anti-hallucination
+guardrail covered alongside the injection defenses in 12. Read 03 next for why the
+whole envelope carries a version.
 
 ## Interview defense
 
@@ -272,6 +344,15 @@ belongs with the constant contract, filled once per render by
 muddies the trust boundary.
 Anchor: "`{schema}` is per-workspace context, filled at `types.ts:24`."
 
+**Q: Where does a user-profile / persona block go, and why inject it before render?**
+Its own prepended section with a heading, ahead of the role line — it's
+constant-per-user, not per-call, so it belongs with the constant contract. Inject
+it *before* `renderPromptTemplate`, not after: `injectProfile` makes the profile
+part of the template, so any `{var}` in either still resolves. Render first and a
+placeholder inside the profile would leak unrendered.
+Anchor: "`injectProfile(template, profile, {position:'start'})` then
+`renderPromptTemplate` at `rag-query-agent.ts:55`."
+
 ## Validate
 
 - **Reconstruct:** Draw the four sections and label each constant / per-workspace
@@ -291,4 +372,4 @@ Anchor: "`{schema}` is per-workspace context, filled at `types.ts:24`."
 - [02-structured-outputs.md](02-structured-outputs.md) — the output-contract section, enforced.
 - [03-prompts-as-code.md](03-prompts-as-code.md) — why the envelope carries id + version.
 - [08-few-shot.md](08-few-shot.md) — the examples section in depth.
-- [12-prompt-injection-defense.md](12-prompt-injection-defense.md) — the system/user split as a trust boundary.
+- [12-prompt-injection-defense.md](12-prompt-injection-defense.md) — the system/user split as a trust boundary; grounding/citation as anti-hallucination.

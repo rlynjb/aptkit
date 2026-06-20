@@ -29,6 +29,15 @@ how big is each one?
   perf work here = bound the number of these hops + the tokens each one carries
 ```
 
+**New since the last audit: a RAG retrieval pipeline (`@aptkit/retrieval`)
+and a local Gemma provider.** This adds a second class of perf surface
+*below* the model hop — embedding calls, a vector scan, chunking, and a
+retrieval-depth knob — plus a local-inference latency story that's slower
+per turn than a cloud call. None of it dethrones the model round-trip as
+the dominant cost; it widens the picture. The two patterns worth a file:
+the O(n·d) linear vector scan (**07**) and embedding batching + the top-k
+floor (**08**).
+
 The lenses below are walked in order. Where a lens finds nothing, it
 says `not yet exercised` and names when it would start to matter.
 
@@ -88,12 +97,32 @@ compare.
 
 → Cost measurement is significant enough for its own file: **02-token-cost-ledger.md**.
 
+**Retrieval quality now has a real baseline instrument too.**
+`scorePrecisionAtK` / `scoreRecallAtK`
+(`packages/evals/src/precision-at-k.ts:47-78`) score top-k retrieval
+against a labeled set, and `packages/agents/rag-query/scripts/eval.ts` runs
+them over a 6-doc corpus with real nomic embeddings — a "measure retrieval
+in isolation, no model generation" number. That's the before/after
+instrument for a chunking or top-k change: re-run the eval, compare P@1 and
+R@k. It's a *quality* baseline, not a latency one.
+
 CPU/memory profiling, flamegraphs, and a benchmarking harness are
 **not yet exercised** — and correctly so. There is no CPU-bound hot
-path to profile. The thing worth measuring (tokens, turns, cost) *is*
-measured. A profiler becomes relevant only if a non-model code path
-(say, a large NDJSON decode or schema render over a huge workspace)
-ever shows up as slow — nothing suggests it does today.
+path to profile. The one new candidate is the in-memory vector scan
+(lens 4), but at the corpus sizes the repo exercises (3–6 docs) it's
+sub-millisecond. The thing worth measuring (tokens, turns, cost,
+retrieval P@k) *is* measured. A profiler becomes relevant only if a
+non-model code path (a large NDJSON decode, schema render over a huge
+workspace, or a vector scan over a large corpus) ever shows up as slow —
+nothing suggests it does today.
+
+A single live observation worth recording, *not* a benchmark: in one
+observed `ask.ts` run a local Gemma tool-call turn took roughly 7 seconds.
+Treat it as an anecdote about local-inference latency on one machine — no
+harness, no percentile, no repeated sampling. It's the reminder that the
+*model turn* dominates wall-clock here even harder for a local model than a
+cloud one (the embed call and the scan over a 3-doc corpus are sub-ms next
+to a multi-second local turn). → see **08-embedding-batch-and-topk-floor.md**.
 
 ## 3. latency-throughput-and-tail-behavior
 
@@ -142,10 +171,23 @@ Two places do deliberately bound work to avoid unbounded CPU/allocation:
   back into context (`run-agent-loop.ts:52-57`), bounding both the
   allocation and the downstream token cost.
 
-→ The bounded JSON scan is a recognizable pattern: **05-bounded-json-scan.md**.
+→ The bounded JSON scan is a recognizable pattern: **06-bounded-json-scan.md**.
+
+**The one new CPU-shaped path: the vector scan.**
+`InMemoryVectorStore.search` does an O(n·d) cosine pass over *every* stored
+chunk on *every* query, then a full O(n log n) sort
+(`packages/retrieval/src/in-memory-vector-store.ts:25-33`). At n = 3–6 docs
+(the corpora in `ask.ts` / `eval.ts`) this is ~tens of thousands of
+multiply-adds — sub-millisecond, invisible next to the embed call and the
+model turn. It's the exact-search *baseline*; it becomes the bottleneck at
+large n, where buffr's HNSW-indexed `PgVectorStore` (same `VectorStore`
+contract) replaces it with a sub-linear ANN walk.
+
+→ The linear scan and its HNSW contrast get a file: **07-linear-vector-scan.md**.
 
 CPU/memory profiling under load is **not yet exercised** and won't
-matter until a non-model path proves hot.
+matter until a non-model path proves hot — the vector scan is the first
+candidate, but only at a corpus size the repo doesn't yet reach.
 
 ## 5. io-network-and-database-bottlenecks
 
@@ -173,10 +215,22 @@ the provider's real token-counting endpoint behind the same interface.
 
 → Covered in **03-context-window-preflight-guard.md**.
 
+**A second network hop now exists: the embedding call.**
+`OllamaEmbeddingProvider.embed(texts[])` POSTs to Ollama's `/api/embed`
+(`packages/retrieval/src/ollama-embedding-provider.ts:50-74`). It's I/O on
+both paths — once per indexed document and once per query — but it's
+**batched**: a whole document's chunks embed in *one* round-trip, not one
+per chunk, because the contract takes a `texts[]` array
+(`pipeline.ts:40`). That's request batching, exercised (contrast: model
+calls are *not* batched). When the store is buffr's `PgVectorStore`, a
+real database hop joins the picture — `study-database-systems` owns that.
+
+→ Embedding batching is covered in **08-embedding-batch-and-topk-floor.md**.
+
 Filesystem I/O (reading fixtures, listing replay artifacts in
 `replay-runner.ts:31-44`) is sequential and unbounded in count, but
 runs at dev/CI time over small directories, so it's not a bottleneck.
-Connection pooling, retry/backoff timing, and request batching are
+Connection pooling, retry/backoff timing, and *model*-request batching are
 **not yet exercised** (see lens 6).
 
 ## 6. caching-batching-and-backpressure
@@ -203,9 +257,22 @@ rides on it.
 
 → Covered in **04-fixture-replay-as-zero-cost-path.md**.
 
-**Batching** of provider requests: **not yet exercised**. Each turn is
-one `complete()` call; there's no request coalescing or the providers'
-batch APIs.
+**Batching is now exercised — but at the embedding layer, not the model
+layer.** `OllamaEmbeddingProvider.embed(texts[])` embeds a whole document's
+chunks in one HTTP call (`ollama-embedding-provider.ts:50-74`,
+`pipeline.ts:40`) — one round-trip for N chunks, amortizing the fixed HTTP
+cost. *Model* request batching is still **not yet exercised**: each agent
+turn is one `complete()` call, no coalescing, no provider batch APIs
+(OpenAI `/v1/batch`, Anthropic Message Batches). → see
+**08-embedding-batch-and-topk-floor.md**.
+
+**One retrieval-depth knob: the top-k floor.** `minTopK` clamps the model's
+requested `top_k` *up* to a floor (`search-knowledge-base-tool.ts:51,
+80-81`) — a deliberate quality/cost tradeoff found live: Gemma
+self-selected `top_k: 1` and starved a multi-part question's retrieval. The
+floor costs a few extra retrieved chunks and tokens to buy answer
+completeness. Not backpressure (it doesn't shed load) — it's a guard on a
+model-controlled perf/quality knob, same family as `maxTurns`. → **08**.
 
 **Backpressure / overload control**: **not yet exercised** in the true
 sense (no queue, no token-bucket rate limiter, no concurrency cap). The
@@ -235,7 +302,7 @@ steps and tool calls appear live instead of staring at a spinner until
 the whole run finishes. That's a **perceived-latency** win — total time
 is unchanged, but time-to-first-feedback drops to the first event.
 
-→ Covered in **06-streaming-for-perceived-latency.md**.
+→ Covered in **05-streaming-for-perceived-latency.md**.
 
 A bundle-size budget, code-splitting, Lighthouse/Web-Vitals tracking,
 and mobile constraints are **not yet exercised**. They'd matter if
@@ -292,6 +359,25 @@ thundering herd rather than queueing. Acceptable today (no concurrency);
 the move is a bounded work queue + token-bucket limiter in front of the
 provider when concurrency arrives.
 
+**6. The vector scan is O(n·d) — exact-search baseline, not built to
+scale.** Evidence: `InMemoryVectorStore.search` loops every chunk on every
+query and sorts all n (`in-memory-vector-store.ts:25-33`). Consequence:
+query latency grows linearly with corpus size. Acceptable today (3–6 docs,
+sub-ms) and *correct* as a first move — it's exact top-k with zero infra.
+Becomes a wall at large n. The move is already proven: buffr's
+`PgVectorStore` with an HNSW index (`buffr/sql/001_agents_schema.sql:28-29`)
+behind the same `VectorStore` contract — sub-linear ANN, pipeline unchanged.
+This is a *known, contracted* scaling story, not an unowned risk. → **07**.
+
+**7. Embedding-call cost is unpriced and unmetered.** Evidence: the cost
+ledger prices only model `complete()` turns (`usage-ledger.ts`); the
+embedding round-trips (`ollama-embedding-provider.ts:50-74`) emit no
+`model_usage` event and carry no price. Consequence: with the *local*
+Ollama embedder, cost is genuinely $0 so this is moot — but if the embedder
+swaps to a paid API (OpenAI embeddings), per-embed cost would be invisible.
+Acceptable while embeddings are local; the move is to emit usage for the
+embed path the moment a paid embedder is wired.
+
 ---
 
 ### Cross-links
@@ -307,3 +393,9 @@ provider when concurrency arrives.
 - **study-distributed-systems** — owns the provider-hop latency and the
   fallback chain as a partial-failure concern; this guide owns the
   pre-flight guard that avoids paying for a doomed hop.
+- **study-database-systems** — owns pgvector and the HNSW index mechanics
+  (in buffr) that the in-memory linear scan is the exact-search baseline
+  for; this guide owns the O(n·d) cost contract and when to cross the seam.
+- **study-ai-engineering** — owns the RAG retrieval-quality story
+  (precision@k/recall@k, chunking strategy); this guide reads those scores
+  as a *baseline instrument* for a chunking or top-k perf change.

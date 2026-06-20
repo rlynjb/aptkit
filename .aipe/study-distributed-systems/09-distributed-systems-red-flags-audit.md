@@ -5,9 +5,11 @@
 
 This file ranks the actual coordination and partial-failure risks in *this*
 repo, by consequence. The honest headline carries through: AptKit is
-single-process; the only place these risks can bite is the provider boundary.
-The list is short on purpose — inventing risks for a system that doesn't have
-them would be the worst kind of distributed-systems theater.
+single-process; the only place these risks can bite is at its external-service
+boundaries — cloud APIs and (now) the local Ollama process. The list is short on
+purpose — inventing risks for a system that doesn't have them would be the worst
+kind of distributed-systems theater. The multi-node sync plane that *would* add
+real coordination risk is deferred to `buffr` and out of scope here.
 
 ## Zoom out — where the risks concentrate
 
@@ -24,10 +26,11 @@ node B misbehaves and node A has to cope.
                                │ complete()  ◄── ALL real risk here
   ┌─ Provider boundary ─────────▼────────────────────────────────┐
   │  no backoff · no timeout override · default shouldFallback     │ ← the findings
-  └─────────────────────────────┬────────────────────────────────┘
-                               │ HTTPS — partial failure
-  ┌─ External provider ─────────▼────────────────────────────────┐
-  └───────────────────────────────────────────────────────────────┘
+  │  Ollama edges: no SDK, no default timeout · dim one-way door    │
+  └──────────────┬───────────────────────────────┬────────────────┘
+       HTTPS      │  ◄── all real risk here ──►   │ HTTP (localhost)
+  ┌─ Cloud ───────▼───────────┐  ┌─ Ollama process ─▼──────────────┐
+  └────────────────────────────┘  └──────────────────────────────────┘
 ```
 
 ## Structure pass — the axis for ranking
@@ -78,20 +81,26 @@ before someone "helpfully" adds a naive retry.
 **The fix when triggered:** exponential backoff + jitter on same-provider retry.
 See `02`, Step 5.
 
-### R3 — no explicit timeout at AptKit's layer (LOW)
+### R3 — no explicit timeout at AptKit's layer; worse on the Ollama edges (LOW→MEDIUM for local)
 
 **Evidence:** `packages/providers/anthropic/src/anthropic-provider.ts:28-39`
 passes `request.signal` to the SDK but sets no `timeout` or `maxRetries` —
-AptKit relies on the provider SDK's defaults.
+AptKit relies on the provider SDK's defaults. The Ollama edges
+(`packages/providers/gemma/src/gemma-provider.ts:201-215`,
+`packages/retrieval/src/ollama-embedding-provider.ts:60-75`) use a raw `fetch`
+with **no SDK and no default timeout at all** — only the passed `AbortSignal`.
 
-**The risk:** the effective request deadline is whatever the SDK defaults to,
-not something AptKit controls or documents. A hung provider connection is
-bounded only by the SDK timeout + the loop's `maxTurns`, not by an explicit
-per-call deadline. Fine for a CLI/dev tool; a problem the day a latency-sensitive
-caller (a UI with a 2s budget) needs a tighter, explicit deadline.
+**The risk:** for cloud, the effective deadline is whatever the SDK defaults to,
+not something AptKit controls. For the **Ollama edges it's worse**: a local model
+that's cold-loading or wedged will hang the `fetch` indefinitely unless the
+caller supplies an `AbortSignal`. A 9B model's first token after a cold load can
+take many seconds; with no per-call deadline, a RAG run can stall on `embed()`
+or `complete()` with no upper bound but `maxTurns`. Fine for a hand-run CLI; a
+real problem for any unattended or latency-sensitive caller.
 
-**The fix when triggered:** pass an explicit `timeout` into the SDK client, or
-wrap `complete()` with an `AbortSignal.timeout(ms)`.
+**The fix when triggered:** pass an explicit `timeout` into the SDK client for
+cloud; wrap the Ollama `fetch` with `AbortSignal.timeout(ms)` (or pass one from
+the caller) so a cold/wedged local model can't hang the run.
 
 ### R4 — `AbortError` detection is duck-typed by name (LOW)
 
@@ -125,6 +134,28 @@ where AptKit answers it — incompletely.
 
 **The fix:** add Anthropic pricing rows to `pricingForModel`.
 
+### R6 — embedding-dimension mismatch is a corpus-wide one-way door (LOW, handled well)
+
+**Evidence:** `packages/retrieval/src/pipeline.ts:22-29` (`assertWiring`) throws a
+`dimension mismatch` error at pipeline-construction time if the embedder's
+dimension (`OllamaEmbeddingProvider` is fixed at 768,
+`ollama-embedding-provider.ts:40`) disagrees with the store's.
+
+**The risk:** the *consequence* is large but the *handling* is good. A corpus
+indexed at one dimension can only be queried by a same-dimension provider —
+swap the embedding model and every stored vector is unsearchable until you
+re-index. That's a data-migration coordination problem in disguise (it's exactly
+the kind of "schema change forces a backfill" risk that bites replicated stores).
+AptKit defuses it correctly: it checks at *wiring time* and throws loudly, so you
+can never silently index unsearchable vectors. Listed not as a bug but as the
+one place where a model choice is a one-way door over indexed data — and a
+forward-looking flag for when `InMemoryVectorStore` becomes a persistent
+`PgVectorStore` (in `buffr`), where re-indexing isn't a free in-memory rebuild.
+
+**The fix when triggered:** treat re-index as a first-class operation; version
+the corpus by embedding model so a dimension change triggers a backfill rather
+than a silent empty-result regression.
+
 ## The non-findings — deliberately absent
 
 These are the risks a checklist would expect that AptKit *correctly* doesn't
@@ -151,19 +182,24 @@ audit:
 
   R1  shouldFallback default = retry-all      MEDIUM   fallback-provider.ts:44
   R2  no backoff / same-provider retry         LOW*     fallback-provider.ts:50-86
-  R3  no explicit timeout at AptKit's layer    LOW      anthropic-provider.ts:28-39
+  R3  no timeout (cloud) / none at all (Ollama) LOW→MED  ollama-embedding-provider.ts:60-75
   R4  AbortError detected by name string       LOW      fallback-provider.ts:92-95
   R5  ledger pricing OpenAI-gpt-4.1 only       INFO     usage-ledger.ts:71-78
+  R6  embedding-dim one-way door (handled well) LOW      pipeline.ts:22-29
 
   * LOW today; becomes MEDIUM the instant same-provider retry is added.
+  R3 is LOW for cloud (SDK default) but MEDIUM for the Ollama edges (no timeout).
 ```
 
 The verdict: **for a single-process library, the partial-failure handling at the
-one boundary is sound.** The fallback chain, fail-fast guard, bounded loop, and
-abort passthrough are the right primitives. R1 is the one finding worth acting on
-now (inject real error classification). The rest are latent gaps whose triggers
-are clearly named — and most of the distributed-systems checklist correctly
-doesn't apply, because the system has one node and one edge.
+external-service boundaries is sound.** The fallback chain, fail-fast guard,
+bounded loop, retry-on-parse, and abort passthrough are the right primitives. R1
+is the one finding worth acting on now (inject real error classification); R3 on
+the Ollama edges (no timeout) is the next. The rest are latent gaps whose
+triggers are clearly named — and most of the distributed-systems checklist
+correctly doesn't apply, because the system is one process talking to external
+services, not a multi-node system. The coordination plane that would change that
+verdict is deferred to `buffr`.
 
 ## Interview defense
 

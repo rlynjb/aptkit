@@ -4,7 +4,7 @@
 
 ## Zoom out, then zoom in
 
-This is the engine room. Every one of the five agents is a thin wrapper around this one function. Find it in the runtime band — everything above it is configuration, everything below it is the provider seam.
+This is the engine room. Every one of the six agents — including the new `rag-query` capstone — is a thin wrapper around this one function. Find it in the runtime band — everything above it is configuration, everything below it is the provider seam.
 
 ```
   Zoom out — where the loop lives
@@ -169,7 +169,7 @@ The full recap — outer budget, inner turn, two exits, the recovery tail.
 
 ## Implementation in codebase
 
-**Use cases.** All five agents are this loop with different config. Anomaly monitoring runs it with `maxTurns: 8, maxToolCalls: 6` to scan metrics and return `Anomaly[]`. Recommendation runs it tighter (`maxTurns: 6, maxToolCalls: 4`) to propose ≤3 recommendations. Query runs it and takes the raw `finalText`. Every agent passes a `synthesisInstruction` so the forced-final turn produces the right shape (`packages/agents/*/src/*.ts`, the `buildSynthesisInstruction(...)` calls at e.g. `recommendation-agent.ts:88`, `monitoring-agent.ts:78`).
+**Use cases.** All six agents are this loop with different config. Anomaly monitoring runs it with `maxTurns: 8, maxToolCalls: 6` to scan metrics and return `Anomaly[]`. Recommendation runs it tighter (`maxTurns: 6, maxToolCalls: 4`) to propose ≤3 recommendations. Query runs it and takes the raw `finalText`. The newest, `rag-query`, runs it with `maxTurns: 6, maxToolCalls: 4` and a single retrieval tool (`packages/agents/rag-query/src/rag-query-agent.ts:66-80`). Every agent passes a `synthesisInstruction` so the forced-final turn produces the right shape (`packages/agents/*/src/*.ts`, the `buildSynthesisInstruction(...)` calls at e.g. `recommendation-agent.ts:88`, `monitoring-agent.ts:78`).
 
 **The loop kernel** — `packages/runtime/src/run-agent-loop.ts` (lines 87–135):
 

@@ -219,7 +219,7 @@ The full recap — three stages, the typed handoffs, the convergence, the orches
                                                        fixture.diagnosis); ← stage 3
        │
        └─ This orchestration lives in the Studio DEV APP, not in a package. A host
-          app importing @rlynjb/aptkit-core gets the 5 agents but NOT this wiring —
+          app importing @rlynjb/aptkit-core gets the 6 agents but NOT this wiring —
           it has to rebuild the order itself. If the pipeline is a product
           capability, it belongs in packages/ with a contract. (audit red-flag 1.)
 ```

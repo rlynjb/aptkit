@@ -28,7 +28,15 @@ round-trips a run can make, how big each one is, and what each one costs.
               (3) measure the spend        (cost ledger)
               (4) skip hops entirely        (fixtures, dev/eval)
               (5) hide the latency you can't cut (streaming)
+              (6) amortize the hops you keep (embed batching)
 ```
+
+The RAG retrieval pipeline (`@aptkit/retrieval`) adds a second, cheaper
+class of work *below* the model hop — an embedding round-trip (batched) and
+an O(n·d) in-memory vector scan. Neither dethrones the model turn as the
+dominant cost; both are sub-millisecond-to-low-ms at the corpus sizes the
+repo runs. With a *local* Gemma model the turn is slower still — one
+observed `ask.ts` tool-call turn took ~7s (an anecdote, not a benchmark).
 
 If you read nothing else, read **01-turn-and-tool-budget.md** — the hard
 turn/tool ceiling is the load-bearing control that makes a run's worst-case
@@ -68,6 +76,21 @@ cost a number you can write down before it starts.
 6. **Bounded JSON extraction avoids unbounded parse work** — a fixed
    three-rung ladder ending in a throw (`json-output.ts:7-28`). → **06**
 
+7. **The RAG vector search is an O(n·d) linear scan — the exact-search
+   baseline.** `InMemoryVectorStore.search` scores every stored chunk on
+   every query and sorts all n (`in-memory-vector-store.ts:25-33`).
+   Sub-millisecond at the 3–6 doc corpora the repo runs; a wall at large n,
+   where buffr's HNSW-indexed `PgVectorStore` (same `VectorStore` contract)
+   takes over. Ship the cheap exact version, earn the index later. → **07**
+
+8. **Embedding calls are batched; the model-controlled top-k is floored.**
+   `embed(texts[])` POSTs a whole document's chunks in one round-trip
+   (`ollama-embedding-provider.ts:50-74`). The `minTopK` floor clamps a
+   model's `top_k` up — a live fix for Gemma self-selecting `top_k: 1` and
+   starving a multi-part question (`search-knowledge-base-tool.ts:51,80-81`).
+   A local Gemma tool-call turn was observed at ~7s once — an anecdote, not
+   a benchmark; the model turn dominates wall-clock. → **08**
+
 ## `not yet exercised` lenses (and when each starts to matter)
 
 - **Model-response caching (prompt cache / response cache)** — none. The
@@ -77,8 +100,15 @@ cost a number you can write down before it starts.
   waiting.
 - **CPU/memory profiling, flamegraphs, benchmarking harness** — none, and
   correctly so: there's no CPU-bound hot path to profile.
-- **Request batching** — none; each turn is one `complete()`. Matters with
-  high throughput or provider batch APIs.
+- **Model request batching** — none; each turn is one `complete()`. (Note:
+  *embedding* requests ARE batched — `embed(texts[])` — see finding 8.)
+  Matters with high throughput or provider batch APIs.
+- **Indexed / ANN vector search** — none here; the in-memory store is a flat
+  O(n·d) scan. Matters at large corpus size; the HNSW-indexed `PgVectorStore`
+  in buffr is the proven drop-in behind the same contract. → **07**
+- **Embedding-call cost metering** — the embed path emits no usage event.
+  Moot while embeddings are local ($0); matters the moment a paid embedder
+  is wired.
 - **Real backpressure / overload control** (queue, rate limiter,
   concurrency cap) — none. The fallback chain is failure-handling, not
   backpressure. Matters the moment concurrent runs share a provider rate
@@ -95,6 +125,8 @@ cost a number you can write down before it starts.
 5. **04-fixture-replay-as-zero-cost-path.md** — the $0 dev/eval path.
 6. **05-streaming-for-perceived-latency.md** — hiding latency.
 7. **06-bounded-json-scan.md** — bounded recovery work.
+8. **07-linear-vector-scan.md** — the O(n·d) RAG search baseline vs HNSW.
+9. **08-embedding-batch-and-topk-floor.md** — embed batching + the top-k floor.
 
 ## Cross-links
 
@@ -102,10 +134,13 @@ cost a number you can write down before it starts.
   cancellation (the loop, `AbortSignal`); this guide owns the *budget*.
 - **study-debugging-observability** — the `model_usage`/`CapabilityEvent`
   trace as observability; this guide reads it as the cost/latency instrument.
-- **study-ai-engineering** — cost-of-serving and provider economics at the
-  system level; this guide owns per-run measurement.
+- **study-ai-engineering** — cost-of-serving, provider economics, and RAG
+  retrieval quality at the system level; this guide owns per-run measurement
+  and reads precision@k/recall@k as a perf baseline instrument.
 - **study-distributed-systems** — the provider-hop latency and fallback
   chain; this guide owns the pre-flight guard that avoids the doomed hop.
+- **study-database-systems** — pgvector + HNSW index mechanics (in buffr)
+  that the in-memory linear scan is the exact-search baseline for.
 
 ## Background contrast — Rein's other perf work
 

@@ -24,7 +24,8 @@ read those.
 2. [02-eval-methods.md](02-eval-methods.md) — the method ladder from exact match
    up to human review. AptKit exercises structural match
    (`structural-diff.ts`), detection scoring (`detection-scorer.ts`,
-   precision/recall-style), and LLM-as-judge (`rubric-judge.ts`).
+   precision/recall over a set), ranked-retrieval scoring (`precision-at-k.ts`,
+   new), and LLM-as-judge (`rubric-judge.ts`).
 
 3. [03-llm-as-judge-bias.md](03-llm-as-judge-bias.md) — position, verbosity, and
    self-preference bias. How AptKit's `RubricJudge` contract — scale clamping,
@@ -35,6 +36,13 @@ read those.
    traces (`CapabilityEvent` NDJSON), usage/cost (`usage-ledger.ts`), and replay
    (the artifact → eval → promote pipeline). Includes the secret-scanning detail
    in `assertions.ts`.
+
+5. [05-precision-at-k.md](05-precision-at-k.md) — ★ NEW. `scorePrecisionAtK` /
+   `scoreRecallAtK` (`precision-at-k.ts`): the deterministic ranked-retrieval
+   RULER for the RAG stack. Measures the *retriever* (`pipeline.query` /
+   `InMemoryVectorStore.search`), not the generation — the scorer that makes
+   "measure before you add reranking" executable. (The live run over a durable
+   corpus lives in the buffr repo; aptkit ships the scorer.)
 
 ## Where this sits in the family
 

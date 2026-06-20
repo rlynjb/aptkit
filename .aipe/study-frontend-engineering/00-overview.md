@@ -22,7 +22,7 @@ The app is shallow and wide. One root, a `useState` switch picking one of seven 
   │   ├─ RecommendationWorkspace ─┐                                  │
   │   ├─ MonitoringWorkspace ─────┤                                  │
   │   ├─ DiagnosticWorkspace ─────┼─► AgentReplayShell<F,M,R>  §03    │
-  │   ├─ QueryWorkspace ──────────┤    AgentReplayShell.tsx:47        │
+  │   ├─ QueryWorkspace ──────────┤    AgentReplayShell.tsx:48        │
   │   ├─ RubricImprovementWorkspace┘    │                            │
   │   │                                  ├─ metricItems(ctx)  slot    │
   │   │                                  └─ renderPanels(ctx) slot    │
@@ -50,7 +50,7 @@ This is the mechanic to understand. When you click "Run" in a workspace, the bro
   Live replay data flow (the load-bearing seam)
 
   ┌─ UI layer (browser) ──────────────────────────────────────────┐
-  │  startReplay()                       AgentReplayShell.tsx:103   │
+  │  startReplay()                       AgentReplayShell.tsx:104   │
   │    runServer(fixture, mode, {onEvent}) ─────────┐              │
   └──────────────────────────────────────────────────┼────────────┘
                                                       │ POST /api/stream/<agent>/replay
@@ -72,9 +72,9 @@ This is the mechanic to understand. When you click "Run" in a workspace, the bro
   └──────────────────────────────────────────────────┬────────────┘
                                                       │ onEvent callback
   ┌─ UI layer: React state ◄──────────────────────────┼────────────┐
-  │  setLiveTrace(c => [...c, event])    AgentReplayShell.tsx:115   │
+  │  setLiveTrace(c => [...c, event])    AgentReplayShell.tsx:116   │
   │    (guarded by runCounter === nextRunId  §02)                  │
-  │  visibleTrace = replay?.trace ?? liveTrace   :161              │
+  │  visibleTrace = replay?.trace ?? liveTrace   :163              │
   │  <TracePanel trace={visibleTrace}/>  → repaints each event     │
   └────────────────────────────────────────────────────────────────┘
 ```
@@ -101,12 +101,16 @@ There is no Redux, no Zustand, no Context store. State is entirely **local compo
 
 Server state (saved replays, promoted fixtures, provider availability) is fetched imperatively in `useEffect`, stored in `useState`, and manually re-fetched after mutations. No cache library. That's a deliberate fit for a single-user dev tool — covered in `audit.md` lens 4.
 
+One build-mode wrinkle rides on top of all this network state: Studio ships in two shapes — the live dev server, and a **fixture-only static demo for GitHub Pages** (`npm run build:pages`). A compile-time flag `STATIC_DEMO` (`src/env.ts`) gates every fetch effect and mutation so the static build never calls an `/api/*` route that isn't there. It's woven through the shell, the artifact hook, and nine components — see `07-static-demo-gated-ui.md`.
+
 ## The three highest-leverage patterns
 
 1. **Live stream consumption** (`01-live-stream-consumption.md`) — `apps/studio/src/api.ts:119-180`. Strip it out and the trace panel goes from a live ticker to a spinner that dumps everything at the end. This is the most interesting frontend mechanic in the repo.
-2. **The shared replay shell** (`03-shared-replay-shell.md`) — `apps/studio/src/AgentReplayShell.tsx:47-234`. One generic component over `<F, M, R>` carries the run lifecycle, provider status, fixture/mode selectors, and the live-trace state for five workspaces. Strip it out and you'd hand-copy that lifecycle five times.
-3. **The stale-run guard** (`02-stale-run-guard.md`) — `apps/studio/src/AgentReplayShell.tsx:96,106-115`. A `useRef` counter that discards stream events from a superseded run. Strip it out and re-running mid-stream interleaves two runs' trace events into one corrupted list.
+2. **The shared replay shell** (`03-shared-replay-shell.md`) — `apps/studio/src/AgentReplayShell.tsx:48-254`. One generic component over `<F, M, R>` carries the run lifecycle, provider status, fixture/mode selectors, and the live-trace state for five workspaces. Strip it out and you'd hand-copy that lifecycle five times.
+3. **The stale-run guard** (`02-stale-run-guard.md`) — `apps/studio/src/AgentReplayShell.tsx:97,107-116`. A `useRef` counter that discards stream events from a superseded run. Strip it out and re-running mid-stream interleaves two runs' trace events into one corrupted list.
 
 ## What Studio does NOT do (honest gaps)
 
 SSR / RSC, react-router, any state library (Redux/Zustand/Jotai), React Query / SWR, CSS framework / CSS Modules / CSS-in-JS, route-level code-splitting, dark mode / theming tokens, and a deliberate accessibility pass are all **not yet exercised**. Most are correct omissions for a single-user local dev tool; `audit.md` lens 8 ranks the few that actually bite.
+
+One more honest note about scope: the repo grew a new **`rag-query` agent** (`packages/agents/rag-query`) plus a retrieval package and a Gemma provider in the most recent work, but that capability has **no Studio page yet** — there's no `RagQueryWorkspace`, no fixtures wired into `vite.config.ts`, no card on `StudioHome`. It's **not yet exercised in the UI**. When it gets a Studio surface it will almost certainly drop into the same `AgentReplayShell` the other five agents share (`03-shared-replay-shell.md`), so this guide's patterns already cover it — there's just nothing frontend to study about it today.

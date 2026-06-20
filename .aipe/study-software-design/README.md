@@ -30,8 +30,9 @@ every term here comes from.
 AptKit's whole reason for existing — extract reusable agent parts so they
 ship as one npm bundle without app logic leaking in — *is* an information-
 hiding argument at the package level. The repo is unusually deliberate about
-one interface (`ModelProvider`) and unusually repetitive about another (the
-five agent classes). Both are findings here.
+one interface (`ModelProvider` — and now reuses that exact shape for the
+retrieval contracts) and unusually repetitive about another (the six agent
+classes, newest being `RagQueryAgent`). Both are findings here.
 
 ---
 
@@ -48,13 +49,18 @@ five agent classes). Both are findings here.
   03-rules-as-data-validation.md   ← structural-diff: many rule types, one walk
   04-capability-agent-template.md  ← the 5-agent duplication (the weak spot)
   05-bundle-as-public-surface.md   ← @rlynjb/aptkit-core re-export boundary
+  06-retrieval-contracts-as-deep-  ← the deep-module move reused: Embedding +
+     seams.md                         VectorStore contracts, the dimension
+                                      one-way door, weak-caller defenses, Gemma
 ```
 
 **Pass 1** (`audit.md`) is fixed: one section per design lens, same shape every
 repo. **Pass 2** is the discovered patterns — named after design moves AptKit
 actually makes. The file list itself is a finding: a deep module, a decorator
 stack, a rules engine, a template that *should* be an abstraction but isn't,
-and a public surface.
+a public surface, and (newest) the deep-module move *reused* for retrieval —
+`ModelProvider`'s shape applied to two more swappable seams, plus the one new
+idea retrieval adds: a shared `dimension` fact promoted to a checked invariant.
 
 ---
 
@@ -66,7 +72,10 @@ and a public surface.
    is the actionable index; if you read one thing, read that.
 3. **`01`** then **`04`** — the best example (deep module) and the worst
    (agent duplication), back to back. The contrast is the lesson.
-4. **`02`, `03`, `05`** — in any order.
+4. **`06`** right after `01` if retrieval is what you're here for — it's the
+   same deep-module move seen a second and third time, which is the cleanest
+   way to confirm you actually internalised `01`.
+5. **`02`, `03`, `05`** — in any order.
 
 ---
 

@@ -12,9 +12,11 @@ re-teaches, and goes deeper on orchestration.
 
 ## The shape: single-agent
 
-AptKit is five independent ReAct loops sharing one kernel
+AptKit is six independent ReAct loops sharing one kernel
 (`packages/runtime/src/run-agent-loop.ts`). No autonomous planner, no
-supervisor, no agent-to-agent negotiation, no persistent memory. The
+supervisor, no agent-to-agent negotiation, no persistent memory. Five agents
+retrieve over workspace analytics APIs; the sixth (`rag-query`) does real vector
+RAG over a similarity index, driven by a local Gemma. The
 "monitor → diagnose → recommend" pipeline is **latent** — connected by data
 contracts, not by a live orchestrator. Read `00-overview.md` first.
 
@@ -52,8 +54,9 @@ contracts, not by a live orchestrator. Read `00-overview.md` first.
   reflexion/self-critique (the rubric agent), tree-of-thoughts, routing (the
   query intent router).
 - **[02-agentic-retrieval/](02-agentic-retrieval/)** — agentic RAG as a
-  tool-calling loop over workspace analytics tools (not vector retrieval),
-  self-corrective retrieval, retrieval routing.
+  tool-calling loop: over workspace analytics tools (files 01–03), and over a
+  real vector store via `rag-query` with a local Gemma + tool emulation
+  (file 04). Plus self-corrective retrieval and retrieval routing.
 - **[03-multi-agent-orchestration/](03-multi-agent-orchestration/)** — when not
   to go multi-agent, supervisor-worker, the latent sequential pipeline,
   parallel fan-out, debate/critic, swarm/handoff, graph orchestration, shared
@@ -87,6 +90,13 @@ These are **not yet exercised** and are marked as such throughout:
 - any LLM planner/router choosing *which agent* runs (the query router picks an
   intent string, not an agent)
 - supervisor-worker, parallel fan-out, debate, swarm, graph orchestration
-- long-term / episodic memory across runs
-- vector retrieval (retrieval here is tool-calling over analytics APIs)
+- long-term / episodic memory across runs (the `rag-query` vector store is a
+  knowledge base, not agent memory — no cross-session persistence yet)
+- trajectory persistence and a multi-device "body" (deferred to a separate repo)
 - cross-turn caching, fan-out backpressure, per-tool circuit breaking
+
+Newly exercised this session (was previously "not yet"):
+- **real vector retrieval** — `rag-query` does embed → ANN → ground → cite over
+  `@aptkit/retrieval`; the five analytics agents still use tool-calling, not ANN
+- **tool-call emulation for a weak local model** — Gemma has no native tools; the
+  provider renders tools into prose and parses JSON tool calls back

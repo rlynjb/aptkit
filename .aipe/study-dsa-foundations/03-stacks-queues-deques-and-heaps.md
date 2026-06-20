@@ -123,7 +123,7 @@ The heap is `not yet exercised`, and it's worth being precise about why, because
   n is single/double digits, so full sort already wins.
 ```
 
-The honest call: AptKit's "serve next" problems are all small (≤10 anomalies, ≤3 recommendations) or cyclic (round-robin), and neither benefits from a heap. A heap earns its O(log n) overhead only when you repeatedly extract the extreme from a *large, changing* collection. Nothing here is large and changing. The trigger that would flip this to Phase B: a bounded-concurrency worker pool over many pending tasks (min-heap keyed by ready-time), or top-k selection where k ≪ n on a genuinely large candidate set. See `06` for the top-k discussion in depth.
+The honest call: AptKit's "serve next" problems are all small (≤10 anomalies, ≤3 recommendations) or cyclic (round-robin), and neither benefits from a heap. A heap earns its O(log n) overhead only when you repeatedly extract the extreme from a *large, changing* collection. Nothing here is large and changing — *yet*. The trigger that would flip this to Phase B: a bounded-concurrency worker pool over many pending tasks (min-heap keyed by ready-time), or top-k selection where k ≪ n on a genuinely large candidate set. The newest package, `@aptkit/retrieval`, is the first place the second trigger gets close: `InMemoryVectorStore.search` (`in-memory-vector-store.ts:31-32`) sorts *all* scored chunks then slices the top-k, so once a corpus grows past a handful of documents a size-k heap (O(n log k)) would beat the full sort — though the bigger win there is skipping the linear scan entirely with an ANN index, not the heap (see `05`, `06`). Still not exercised, but no longer hypothetical. See `06` for the top-k discussion in depth.
 
 ### Move 3 — the principle
 

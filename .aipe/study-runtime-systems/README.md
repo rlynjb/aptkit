@@ -1,6 +1,6 @@
 # Study — Runtime Systems (AptKit)
 
-How AptKit's code actually *executes*: where work runs, what owns memory, how I/O is awaited, what's bounded, and how a run is cancelled. This is a single-threaded JavaScript/TypeScript codebase running on Node.js (servers, scripts) and in the browser (Studio UI). There are no worker threads, no shared-memory concurrency, no manual thread pools. The execution model is **Node's event loop plus the Promise microtask queue** — and that frame is the honest one for this repo, not a limitation to apologize for.
+How AptKit's code actually *executes*: where work runs, what owns memory, how I/O is awaited, what's bounded, and how a run is cancelled. This is a single-threaded JavaScript/TypeScript codebase running on Node.js (servers, scripts, the `npm run ask` RAG CLI) and in the browser (Studio UI), now also talking to a local Ollama HTTP server for the Gemma provider and embeddings. There are no worker threads, no shared-memory concurrency, no manual thread pools. The execution model is **Node's event loop plus the Promise microtask queue** — and that frame is the honest one for this repo, not a limitation to apologize for. Two new wrinkles since the last pass: a bounded retry loop *nested inside* the Gemma provider's `complete()`, and the first synchronous CPU span (in-memory cosine search) whose cost scales with data rather than a fixed bound. Both are covered in 07 and 03/08.
 
 ## Reading order
 

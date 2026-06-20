@@ -4,11 +4,15 @@ One page to put the whole thing on the map before you open any concept file.
 
 ## The shape this repo matches: single-agent (with a latent sequential pipeline)
 
-AptKit is a **single-agent codebase**. Five capabilities, each one ReAct-style
+AptKit is a **single-agent codebase**. Six capabilities, each one ReAct-style
 loop with tools, a tool policy, a prompt package, a loop budget, and a
 validator. There is no autonomous planner choosing which agent runs, no
 supervisor delegating to workers, no agent spawning sub-agents, and no
-long-term memory store. Where the spec's multi-agent topologies show up at
+long-term memory store. (Trajectory persistence and a multi-device "body" are
+deferred to a separate repo — not present here.) The sixth capability,
+`rag-query`, is the same single-agent shape pointed at a *real vector store* and
+driven by a local Gemma; it is the first agentic-RAG-over-similarity-index
+capability in the repo. Where the spec's multi-agent topologies show up at
 all, they show up as a *latent* pipeline: the three diagnostic agents are
 wired by their **data contracts** (`Anomaly` → `Diagnosis` → `Recommendation`),
 not by a live orchestrator. `investigate(anomaly)` consumes a scan output and
@@ -62,7 +66,7 @@ times over. Its load-bearing mechanics:
   `recoveryPrompt` turn re-asks for the structured shape using the evidence
   already gathered.
 
-## The five capabilities
+## The six capabilities
 
 | Capability | Pattern | maxTurns / maxToolCalls | Output |
 | --- | --- | --- | --- |
@@ -71,13 +75,15 @@ times over. Its load-bearing mechanics:
 | `recommendation-agent` | ReAct (grounded propose) | 6 / 4 | `Recommendation[]`, ≤3 |
 | `query-agent` | routed ReAct | 8 / 6 | plain-text answer |
 | `rubric-improvement-agent` | self-critique loop | 6 / 3 | scored judgment + next action |
+| `rag-query-agent` | agentic RAG over vector search (local Gemma, tool emulation) | 6 / 4 | cited prose answer, profile-shaped |
 
 ## Reading order
 
 Sub-sections run `A → B → C → D → E → F`, then the codebase pattern file:
 
 1. `01-reasoning-patterns/` — the loop kernel and the single-agent family (the core)
-2. `02-agentic-retrieval/` — tool-calling-as-retrieval over workspace analytics tools
+2. `02-agentic-retrieval/` — tool-calling-as-retrieval: analytics tools (files
+   01–03) and real vector search via `rag-query` (file 04)
 3. `03-multi-agent-orchestration/` — the latent pipeline, and everything not yet built
 4. `04-agent-infrastructure/` — tool policy, coverage gate, structured-output contract, control envelope
 5. `05-production-serving/` — what the budgets, fallback chain, and context guard buy under a loop

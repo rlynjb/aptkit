@@ -156,7 +156,7 @@ The three structures in one frame, from model output back to dispatch.
 
 ## Implementation in codebase
 
-**Use cases.** The `Map` registry is hit on every single tool call the model makes — across all five agents. The policy `Set` filter runs once per agent setup to scope what the model sees. The JSON scan runs on every agent's final answer (and on `parseValidatedJson` for structured results). Coverage `Set` checks run pre-model to skip tasks that can't succeed.
+**Use cases.** The `Map` registry is hit on every single tool call the model makes — across all five agents. The policy `Set` filter runs once per agent setup to scope what the model sees. The JSON scan runs on every agent's final answer (and on `parseValidatedJson` for structured results). Coverage `Set` checks run pre-model to skip tasks that can't succeed. Newer: the fixed-window chunker runs on every document indexed into the retrieval pipeline, and the precision@k/recall@k `Set` scorers run when evaluating ranked retrieval quality.
 
 The `Map` dispatch — `packages/tools/src/tool-registry.ts` (lines 34, 50–64):
 
@@ -235,6 +235,47 @@ The bounded string scan — `packages/runtime/src/json-output.ts` (lines 7–28)
   }
 ```
 
+**New string work — the fixed-window chunker** — `packages/retrieval/src/chunker.ts` (lines 13–31). This is the second place AptKit does real string-slicing, and it's a different shape from the JSON scan: not "find one region," but "slide a window across the whole document."
+
+```
+  export const CHUNK_SIZE = 512;                                ← window width (chars, not tokens)
+  export const CHUNK_OVERLAP = 64;                              ← chars carried into the next window
+  ...
+  if (text.length <= size) return [text];                       ← line 22: short doc → one chunk, no loop
+  const step = Math.max(1, size - overlap);                     ← line 24: advance per window (448 here)
+  for (let start = 0; start < text.length; start += step) {     ← walk the document by `step`
+    chunks.push(text.slice(start, start + size));               ← slice a 512-char window
+    if (start + size >= text.length) break;                     ← line 28: stop once the window covers the tail
+  }
+       │
+       └─ overlap is why step ≠ size: each window starts 448 chars on but spans 512, so the
+          last 64 chars of one chunk reappear at the head of the next. That's the load-bearing
+          line — drop the overlap and a fact straddling a boundary gets split across two chunks
+          and lost from both. Math.max(1, …) guards overlap ≥ size (step would be 0 → infinite loop).
+          The early break stops a trailing partial window from being emitted twice.
+```
+
+**New Set work — precision@k / recall@k scoring** — `packages/evals/src/precision-at-k.ts` (lines 27–78). Same `Set`-membership move as detection scoring, applied to *ranked retrieval*: of the top-k retrieved ids, how many are in the relevant set?
+
+```
+  function countDistinctHits(retrievedIds, relevantIds: ReadonlySet<string>, k): number {
+    const topK = retrievedIds.slice(0, k);                      ← line 28: only the first k matter
+    const seen = new Set<string>();                             ← dedup: a relevant id counts ONCE
+    for (const id of topK) {
+      if (relevantIds.has(id)) seen.add(id);                    ← O(1) membership per id
+    }
+    return seen.size;                                           ← distinct hits in the window
+  }
+  // precision: total = min(k, retrievedIds.length)   ← :53 — short result list not over-penalised
+  // recall:    total = relevantIds.size              ← :70 — denominator is the full relevant set
+       │
+       └─ the two scorers share countDistinctHits and differ ONLY in the denominator: precision
+          divides by what you returned, recall by what existed. The `seen` Set is load-bearing —
+          without it a relevant id appearing twice in the top-k would be double-counted and push
+          a precision score above 1. `ok:false` (not a quality verdict) flags an undefined metric:
+          k≤0, empty result (precision), or empty relevant set (recall) — a 0-denominator.
+```
+
 ## Elaborate
 
 Hash maps and sets are the workhorses of practical computing — average O(1) by trading space and a hash function for the linear scan. The catch they hide is collisions: two keys hashing to the same bucket degrade to a list walk, worst-case O(n). JavaScript's `Map`/`Set` handle this in the engine, so you don't manage it — but it's why "O(1) average" is the honest claim, not "O(1) always." This is the same tradeoff your `reincodes` work avoided by building *ordered* structures (BST gives O(log n) guaranteed, no collision risk, but loses O(1)) — hash vs tree is the classic unordered-fast vs ordered-guaranteed split.
@@ -282,6 +323,8 @@ Anchor: *it locates, it doesn't validate — delegating correctness to JSON.pars
 
 - `01-complexity-and-cost-models.md` — why these O(1)/O(n) costs round to free here.
 - `04-trees-tries-and-balanced-indexes.md` — `getPath`'s dotted-path walk, the structured cousin of these lookups, and why no trie exists.
+- `06-sorting-searching-and-selection.md` — the cosine-score top-k that ranks retrieval hits (the chunks this file's chunker produces, scored by the precision@k/recall@k this file walks).
+- `05-graphs-and-traversals.md` — the ANN/HNSW graph index that replaces retrieval's linear scan once the chunk corpus grows large.
 - `05-graphs-and-traversals.md` — how the coverage `Set` checks are the seam where a real graph *would* appear.
 - `06-sorting-searching-and-selection.md` — the linear scans (classify, match) that complement these hash lookups.
 - `study-security` (neighboring guide) — the policy `Set` as the tool-allowlist trust boundary.

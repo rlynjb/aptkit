@@ -98,6 +98,25 @@ Six parts. Remove any of (1)–(5) and the loop loses a safety property — that
 
 **(6) Hardening, not skeleton: the recovery turn.** After the loop, if `parseResult` returns null (the model's final text wasn't valid structured output), an optional `recoveryPrompt` runs *one more* `model.complete` with a strict "conclude now, output only the answer" system prompt. This is layered hardening — the loop is already correct without it; recovery just salvages a malformed final answer. It still checks the signal first and re-throws aborts.
 
+**The nested bounded loop — `GemmaModelProvider.complete` has its own.** The agent loop isn't the only bounded loop anymore. Because Gemma2 has no native tool-calling, the Gemma provider emulates it: it renders tools into the system prompt, asks for JSON, and if the reply is a *botched* tool call, re-asks with a corrective nudge — a bounded retry loop *inside a single `model.complete()`*. The same two safety properties apply one level down.
+
+```
+  Two bounded loops now nest — outer agent loop, inner parse-retry
+
+  runAgentLoop  for turn 0..maxTurns:          ← OUTER bound (turns)
+    await model.complete(...)                  │
+      └─ GemmaProvider.complete:               │
+           for attempt 0..maxToolCallAttempts: ← INNER bound (attempts, default 2)
+             signal.throwIfAborted()           ← INNER cancel checkpoint
+             raw = await chat({ signal })      ← localhost HTTP, signal → socket
+             if parseToolCall(raw): return     ← natural termination
+             if looksLikeToolAttempt(raw):     ← only retry a BOTCHED call
+               continue (append RETRY_NUDGE)   │  (plain prose is a real answer)
+             break                             │
+```
+
+*What bounds it:* `maxToolCallAttempts` (default 2, floored at 1 — `gemma-provider.ts:49`) caps how many times Gemma is re-asked before the provider gives up and returns the raw text as a plain `text` block. Remove it and a model that *always* emits malformed JSON loops forever inside one `complete()` call — the outer turn ceiling wouldn't save you, because the run never returns to the outer loop. *What makes it cancellable:* `signal.throwIfAborted()` runs once before the loop and again at the top of every attempt (`gemma-provider.ts:53,63`), and the `signal` is threaded into the `chat` transport down to the localhost `fetch` (`:69-74`, `:203-214`). The "throws if already aborted" test proves the pre-loop checkpoint (`test/gemma-provider.test.ts:126-136`). The one subtlety worth naming: the loop only retries when `looksLikeToolAttempt(raw)` is true (the reply contains a `{`) — plain prose is treated as a real answer and breaks immediately, so a model that simply chose to answer in words doesn't burn its retry budget (`:85-88`).
+
 **Cancellation propagation — the full chain.** The same `AbortSignal` threads through every layer. This is what makes cancellation *real* rather than a flag:
 
 ```
@@ -120,7 +139,9 @@ Six parts. Remove any of (1)–(5) and the loop loses a safety property — that
 
 The subtle, correct detail: `FallbackModelProvider` checks `isAbortError(error) || request.signal?.aborted` and *re-throws* instead of falling back. Without that, aborting a run would just trigger the fallback provider — you'd cancel Anthropic and accidentally call OpenAI. The abort short-circuits the entire chain.
 
-**Backpressure — the honest gap.** "Bounded work" has a sibling, *backpressure* — slowing the producer when the consumer can't keep up. AptKit has it on the *read* side (the pull-based async generator in `06`/`03`) but **not** on the *write* side (`res.write` ignores `drain`). And there's **no timeout** on the awaited model call — the only way to bound a hung request is the external signal. So the loop is bounded in *iterations and budget* but not in *wall-clock time per call*.
+**Cancellation's new dead end — the embedding call.** The cancellation chain is end-to-end for the *model* path, but the new RAG retrieval path has a gap. `OllamaEmbeddingProvider.embed` is built correctly — it accepts an `AbortSignal` via `EmbedCallOptions`, checks `throwIfAborted()`, and threads the signal to the localhost `fetch` (`ollama-embedding-provider.ts:50-57`). But nobody hands it one. The agent's signal reaches `runAgentLoop` → `callTool` → the `search_knowledge_base` handler → `pipeline.query` → `embedder.embed(query)` — and `pipeline.query` calls `embed([query])` with no options arg (`pipeline.ts:56`), so the signal is dropped at the pipeline seam. The plumbing exists on the provider but the wiring stops at the pipeline. Concretely: abort a RAG run while it's embedding the query, and the model call would tear down but an in-flight embedding HTTP request would run to completion. It's a one-line fix (thread `signal` through `RetrievalPipeline.query` → `embed`), and it's the mirror image of the *correct* model-path wiring.
+
+**Backpressure — the honest gap.** "Bounded work" has a sibling, *backpressure* — slowing the producer when the consumer can't keep up. AptKit has it on the *read* side (the pull-based async generator in `06`/`03`) but **not** on the *write* side (`res.write` ignores `drain`). And there's **no timeout** on the awaited model call — nor on the new local Gemma/embed `fetch` calls (`gemma-provider.ts:203-214`, `ollama-embedding-provider.ts:62-74`) — the only way to bound a hung request is the external signal. So both loops are bounded in *iterations and budget* but not in *wall-clock time per call*.
 
 ### Move 2.5 — current state vs future state
 
@@ -246,9 +267,36 @@ The agent setting the budgets:
   });
 ```
 
+The nested bounded-and-cancellable retry loop inside the Gemma provider:
+
+```
+  packages/providers/gemma/src/gemma-provider.ts (lines 52–92)
+
+  async complete(request) {
+    request.signal?.throwIfAborted();              ← CANCEL: before the loop
+    const maxAttempts = wantsTool ? this.maxToolCallAttempts : 1; ← BOUND: attempt ceiling
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      request.signal?.throwIfAborted();            ← CANCEL: every attempt
+      const messages = attempt === 0 ? base
+        : [...base, { role: 'user', content: RETRY_NUDGE }]; ← corrective re-ask
+      lastResponse = await this.chat({ ..., signal: request.signal }); ← CANCEL → socket
+      if (wantsTool) {
+        const call = parseToolCall(raw);
+        if (call) return this.toResponse([tool_use ...]); ← natural termination
+        if (looksLikeToolAttempt(raw)) continue;   ← retry ONLY a botched call
+      }
+      break;                                        ← prose answer → stop, don't burn budget
+    }
+    return this.toResponse([{ type: 'text', text: raw }]); ← give up → raw text
+  }
+       │
+       └─ same shape as the outer loop one level down: a hard attempt ceiling
+          plus a signal checkpoint per iteration, threaded to the localhost fetch
+```
+
 ## Elaborate
 
-The bounded-loop-plus-cancellation pattern is the canonical safe shape for any "call an external system in a loop until done" — it predates LLMs (think a polling loop with a max-attempts cap and a cancel token). What's specific to agent loops is `forceFinal`: a normal retry loop just gives up at the ceiling, but an agent loop must *produce an answer* at the ceiling, so it strips the tools and changes the prompt to force synthesis rather than returning empty. That's the move that separates a toolbox-call loop from a usable agent. The cancellation design — one `AbortSignal` threaded everywhere, with the fallback chain explicitly *not* treating abort as a retryable failure — is textbook cooperative cancellation done right. The reasoning *shape* of this loop (ReAct: reason → act → observe, with forced synthesis) is `study-agent-architecture`'s territory; this file owns the *control-flow and safety* half. The gaps (no per-call timeout, no write backpressure) are the realistic next steps, both cheap given the existing signal plumbing.
+The bounded-loop-plus-cancellation pattern is the canonical safe shape for any "call an external system in a loop until done" — it predates LLMs (think a polling loop with a max-attempts cap and a cancel token). It's worth noticing the pattern is now *self-similar* in this repo: the same kernel (hard iteration ceiling + per-iteration signal checkpoint + signal threaded to the wire) appears at two nesting depths — the outer `runAgentLoop` turn loop and the inner `GemmaModelProvider` parse-retry loop. The inner one exists for a different reason (Gemma's lack of native tool-calling forces a re-ask-until-valid-JSON loop) but reaches for the identical safety primitives. When the same mechanism reappears at two levels, that's the signal it's load-bearing, not incidental. What's specific to agent loops is `forceFinal`: a normal retry loop just gives up at the ceiling, but an agent loop must *produce an answer* at the ceiling, so it strips the tools and changes the prompt to force synthesis rather than returning empty. That's the move that separates a toolbox-call loop from a usable agent. The cancellation design — one `AbortSignal` threaded everywhere, with the fallback chain explicitly *not* treating abort as a retryable failure — is textbook cooperative cancellation done right. The reasoning *shape* of this loop (ReAct: reason → act → observe, with forced synthesis) is `study-agent-architecture`'s territory; this file owns the *control-flow and safety* half. The gaps (no per-call timeout, no write backpressure) are the realistic next steps, both cheap given the existing signal plumbing.
 
 ## Interview defense
 
@@ -284,11 +332,15 @@ Answer: "The signal is wired into the SDK, so the in-flight HTTPS request is tor
 2. **Explain:** Why does `forceFinal` set `tools: undefined` instead of just adding a prompt? (To make tool-calling *physically impossible*, not merely discouraged — `run-agent-loop.ts:107`.)
 3. **Apply:** A model hangs for 90 seconds on one call. What stops it today, and what would you add? (Only the external signal today; add a composed `AbortSignal.timeout` — the plumbing exists.)
 4. **Defend:** Explain why the fallback chain must re-throw aborts, and what bug occurs if it doesn't (`fallback-provider.ts:65`).
+5. **Apply (nested loop):** Gemma emits malformed tool-call JSON on every attempt. What stops `complete()` from looping forever, and why wouldn't the outer `maxTurns` save you? (`maxToolCallAttempts`, `gemma-provider.ts:49,62`; the outer ceiling can't help because the run hasn't returned to the outer loop yet.)
+6. **Defend (cancellation gap):** Trace the agent's `AbortSignal` from `runAgentLoop` to the embedding HTTP call and name where it's dropped (`pipeline.ts:56` calls `embed([query])` with no options — the provider accepts a signal but the pipeline never passes one).
 
 ## See also
 
 - `02-processes-threads-and-tasks.md` — why the tool loop is sequential (and how cancellation survives a fan-out).
 - `03-event-loop-and-async-io.md` — why cancellation only fires at await boundaries.
 - `06-filesystem-streams-and-resource-lifecycle.md` — the write-side backpressure gap.
-- `.aipe/study-agent-architecture/` — the reasoning shape (ReAct, forced synthesis) of this same loop.
+- `03-event-loop-and-async-io.md` — the new unbounded synchronous span (`InMemoryVectorStore.search`).
+- `.aipe/study-agent-architecture/` — the reasoning shape (ReAct, forced synthesis) of this same loop, and the Gemma tool-call emulation behind the nested retry loop.
+- `.aipe/study-ai-engineering/` *(when generated)* — the RAG pipeline (chunk → embed → store → search) whose execution this file bounds.
 - `.aipe/study-distributed-systems/` *(when generated)* — the fallback chain as partial-failure handling.

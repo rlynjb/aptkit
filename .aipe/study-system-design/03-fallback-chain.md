@@ -238,7 +238,7 @@ The full recap — guard on top, chain under it, adapters at the bottom, the two
        └─ It's a chars/token HEURISTIC (default 3), not a real tokenizer. Honest
           coarse guard — a request right at the edge could be mis-admitted. The
           outputReserve carves out room for the response so the answer doesn't
-          blow the window after the input fits. (audit.md red-flag 4.)
+          blow the window after the input fits. (audit.md red-flag 5.)
 ```
 
 ## Elaborate
@@ -287,4 +287,4 @@ Anchor: `fallback-provider.ts:52` and `:65` (the two abort checks).
 - `01-provider-abstraction.md` — the port that makes both of these composable.
 - `02-bounded-agent-loop.md` — the caller that's oblivious to all this resilience.
 - `06-replay-eval-pipeline.md` — the fixture provider, a third port implementation.
-- `audit.md` lens 6 — failure handling; red-flag 4 on the token heuristic.
+- `audit.md` lens 6 — failure handling; red-flag 5 on the token heuristic.

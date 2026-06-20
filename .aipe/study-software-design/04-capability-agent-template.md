@@ -13,8 +13,12 @@ the lesson.
 
 ## Zoom out, then zoom in
 
-AptKit has five agents. Each is a class. Open any two of them and you'll read
-the same thing twice.
+AptKit has six agents (a `RagQueryAgent` joined the original five). Each is a
+class. Open any two of them and you'll read the same thing twice — and the
+sixth proves the point: it wires up the new retrieval primitives
+(`injectProfile`, the `search_knowledge_base` tool) but threads them through the
+*exact same copied skeleton* as the other five. The duplication grew precisely
+where this file predicted it would.
 
 ```
   Zoom out — the five sibling classes

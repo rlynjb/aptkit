@@ -5,12 +5,14 @@ hand-waving — the patterns that are in the code, and the ones that are not.
 
 ## The verdict first
 
-AptKit is a **single-agent codebase**: five ReAct loops that share one kernel.
+AptKit is a **single-agent codebase**: six ReAct loops that share one kernel.
 The kernel is `runAgentLoop` in `packages/runtime/src/run-agent-loop.ts:76`.
 Every capability is a thin class that assembles a prompt, a tool policy, a loop
 budget, and a validator, then calls that one function. There is no orchestrator,
 no planner, no supervisor. The multi-agent pipeline you might expect from the
 three diagnostic agents is **latent** — wired by data types, not by running code.
+The sixth capability, `rag-query`, is the same single-agent shape pointed at a
+real vector store (see `02-agentic-retrieval/04-agentic-rag-over-vector-search.md`).
 
 ## The patterns table
 
@@ -23,6 +25,7 @@ three diagnostic agents is **latent** — wired by data types, not by running co
 | Query answering | `packages/agents/query/src/query-agent.ts:75` | routed ReAct, 8 / 6 | intent router picks a *string*, then one loop over ~35 read-only tools |
 | Intent routing | `packages/agents/query/src/intent.ts:12` | heuristic + LLM router | one cheap classify call picks `monitoring`/`diagnostic`/`recommendation` |
 | Rubric improvement | `packages/agents/rubric-improvement/src/rubric-improvement-agent.ts:57` | self-critique loop, 6 / 3 | scores a subject against a rubric; the model judges, not produces |
+| RAG query | `packages/agents/rag-query/src/rag-query-agent.ts:62` | agentic RAG over vector search, 6 / 4 | model decides when to `search_knowledge_base`; grounds + cites; driven by a *local Gemma* with tool-call emulation |
 | Tool gating | `packages/tools/src/tool-policy.ts:11` | per-capability least-privilege allowlist | each agent sees only its role's tools |
 | Coverage gate | `packages/tools/src/coverage-gate.ts:73` | pre-model runnability filter | drop tasks that can't run before spending tokens |
 | Structured output | `packages/runtime/src/run-agent-loop.ts:192` + each `validate.ts` | parse → validate → one-shot recovery | typed result contract per capability |
@@ -107,9 +110,15 @@ templates.
 - **No persistent memory.** State lives in the `messages` array for the
   duration of one `runAgentLoop` call and is gone when the run returns. No
   episodic or long-term tier.
-- **No vector retrieval.** "Retrieval" here is tool-calling over workspace
-  analytics APIs (`execute_analytics_eql`, `get_metric_timeseries`, etc.) — not
-  embeddings and ANN.
+- **Vector retrieval now exists — in one capability.** Five agents do
+  "retrieval" as tool-calling over workspace analytics APIs
+  (`execute_analytics_eql`, `get_metric_timeseries`, etc.) with no embeddings.
+  The sixth, `rag-query`, does real vector RAG: `@aptkit/retrieval` chunks and
+  embeds a corpus with `nomic-embed-text`, an in-memory cosine store does ANN,
+  and the `search_knowledge_base` tool grounds + cites. Driven by a local Gemma
+  via tool-call emulation — see
+  `02-agentic-retrieval/04-agentic-rag-over-vector-search.md`. The store/embedder
+  *mechanics* are ai-engineering's partition, not this guide's.
 - **No cross-turn cache, fan-out backpressure, or per-tool circuit breaker.**
   The budgets and the fallback chain are the only serving controls.
 
@@ -121,5 +130,7 @@ name the concrete refactor each would require.
 
 - `00-overview.md` — the whole system in one diagram
 - `01-reasoning-patterns/02-agent-loop-skeleton.md` — the kernel, taught
+- `02-agentic-retrieval/04-agentic-rag-over-vector-search.md` — the sixth
+  capability: agentic RAG over real vector search, local Gemma, tool emulation
 - `03-multi-agent-orchestration/03-sequential-pipeline.md` — the latent pipeline, deep
 - `04-agent-infrastructure/03-tool-calling-and-mcp.md` — the tool policy + coverage gate

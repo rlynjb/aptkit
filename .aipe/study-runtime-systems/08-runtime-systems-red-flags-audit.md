@@ -15,6 +15,9 @@ The ranked execution-model risks in AptKit, most consequential first. Each is gr
   ┌─ Streaming layer ────────▼───────────────────────────────────┐
   │  read backpressure ✓     write backpressure ✗               │ ← R1
   └──────────────────────────┬───────────────────────────────────┘
+  ┌─ Retrieval layer ────────▼───────────────────────────────────┐
+  │  sync cosine scan (unbounded) · embed cancel not wired       │ ← R6, R7
+  └──────────────────────────┬───────────────────────────────────┘
   ┌─ Concurrency layer ──────▼───────────────────────────────────┐
   │  serial tools (latency) · filesystem last-write-wins         │ ← R2, R4
   └───────────────────────────────────────────────────────────────┘
@@ -30,8 +33,10 @@ Zoom in: an execution-model risk is a place where the runtime behaves badly unde
   Ranking axis: trigger likelihood × blast radius
 
   R1 write backpressure   slow client (plausible) × process memory  → HIGH
+  R6 sync cosine scan     large corpus (when used) × frozen loop     → MED
   R2 serial tool calls    every multi-tool turn    × per-run latency → MED
   R3 no per-call timeout  hung provider (rare-ish) × one hung run    → MED
+  R7 embed cancel gap     abort mid-embed (rare)   × one orphan req  → LOW
   R4 fs last-write-wins   same-second collision    × one file        → LOW
   R5 client trace heap    huge trace in browser    × one tab         → LOW
 ```
@@ -47,6 +52,16 @@ Zoom in: an execution-model risk is a place where the runtime behaves badly unde
 **Inference vs observed.** Observed: the return value is ignored. Inferred: under a flood-to-slow-client it buffers unboundedly (standard Node stream behavior, not measured here).
 
 **The move.** Honor backpressure: `if (!res.write(line)) await once(res, 'drain')`. The NDJSON protocol, the `finally{ res.end() }`, and the client decoder all stay identical — it's a write-loop change only. See `06` Phase B.
+
+### R6 — In-memory vector search is an unbounded synchronous scan (MEDIUM)
+
+**Observed.** `InMemoryVectorStore.search` iterates every stored chunk and computes `cosineSimilarity` (an O(dim) dot-product loop) inline, then sorts — all synchronously, no `await` in the scan. `packages/retrieval/src/in-memory-vector-store.ts:25-33`, `:46-57`. The `dimension` is fixed (768), but the chunk *count* is unbounded.
+
+**Trigger and blast radius.** For the demo corpus (3 docs) this is microseconds. Index a large corpus and a single `search` call runs an O(N·768) scan with no yield point — the event loop is frozen for the whole scan, blocking every other request on that process. Blast radius is process-wide (it's a loop-freeze, like R1), which is why it outranks the latency-only R2/R3.
+
+**Inference vs observed.** Observed: the scan is synchronous and linear in chunk count. Inferred: at large N it freezes the loop (standard single-threaded behavior; the demo corpus is too small to measure it).
+
+**The move.** It's deliberately the "zero-cloud, from-scratch" adapter — the contract (`VectorStore`) already anticipates a `PgVectorStore` drop-in that pushes ranking into Postgres/pgvector, off the JS thread, behind the identical interface. (That pgvector store lives in a separate repo, not here.) Until then, the bound is operational: keep the in-memory corpus small. See `03`.
 
 ### R2 — Tool calls execute serially, never fanned out (MEDIUM)
 
@@ -67,6 +82,16 @@ Zoom in: an execution-model risk is a place where the runtime behaves badly unde
 **Inference vs observed.** Observed: no `Promise.race` against a timer, no configured SDK timeout. Inferred: a non-responsive provider hangs until the SDK's built-in timeout (if any) or an external abort.
 
 **The move.** Compose a deadline into the existing signal: `AbortSignal.timeout(ms)` merged with the caller's signal at the top of the loop. Zero new plumbing — every layer already accepts and honors an `AbortSignal`. See `07` Phase B.
+
+### R7 — The agent's AbortSignal never reaches the embedding call (LOW)
+
+**Observed.** `OllamaEmbeddingProvider.embed` accepts an `AbortSignal` and threads it to the socket (`packages/retrieval/src/ollama-embedding-provider.ts:50-57`), but `pipeline.query` calls `embed([query])` with no options (`packages/retrieval/src/pipeline.ts:56`), so the agent's signal — which reaches the model call correctly — is dropped at the pipeline seam and never reaches the query embedding.
+
+**Trigger and blast radius.** Abort a RAG run while it's embedding the query: the model call tears down, but the in-flight embedding HTTP request to localhost Ollama runs to completion as an orphan. Blast radius is one orphaned localhost request that finishes unwatched — small, hence LOW.
+
+**Inference vs observed.** Observed: the provider accepts a signal; the pipeline doesn't pass one. Inferred: an abort mid-embed leaves the request running (the provider's `throwIfAborted` only fires if a signal is supplied).
+
+**The move.** One-line fix: thread `signal` through `RetrievalPipeline.query` → `embedder.embed(texts, { signal })`. The provider half is already built correctly; only the pipeline wiring is missing. See `07`.
 
 ### R4 — Filesystem writes are last-write-wins with no lock (LOW)
 
@@ -100,8 +125,9 @@ These are the things an auditor might flag in another codebase but which are cor
   cancellation reaching    ✓ signal threaded to the SDK socket (07)
     the wire
   unbounded message growth ✓ maxTurns + 16KB truncate (05, 07)
-  loop-blocking sync work  ✓ synchronous spans tiny + bounded (03)
+  loop-blocking sync work  ✓ tool-result spans bounded; cosine scan = R6 (03)
   fallback-on-abort bug    ✓ fallback re-throws aborts (07)
+  nested Gemma retry loop  ✓ maxToolCallAttempts caps it + signal checks (07)
 ```
 
 ## `not yet exercised`
@@ -116,7 +142,7 @@ Runtime-systems mechanisms absent from the repo (not risks — just untouched te
 
 ## Validate
 
-1. **Reconstruct:** Rank R1–R5 by trigger-likelihood × blast-radius from memory; justify why R1 outranks R2.
+1. **Reconstruct:** Rank R1–R7 by trigger-likelihood × blast-radius from memory; justify why R1 and R6 (both loop-freezes, process-wide) outrank the latency-only R2/R3.
 2. **Explain:** Why is "no in-memory races" not a finding here? (Run-to-completion + per-run state — `04`, `run-agent-loop.ts:94–95`.)
 3. **Apply:** A new endpoint streams a 100k-event export to a phone on a slow connection. Which finding bites, and what's the fix? (R1 — honor `drain`, `vite.config.ts:907`.)
 4. **Defend:** Argue why R2 (serial tools) might be left exactly as-is, and the one condition under which you'd fan out.
@@ -125,6 +151,7 @@ Runtime-systems mechanisms absent from the repo (not risks — just untouched te
 
 - `00-overview.md` — the same findings in the overview's ranked list.
 - `06-filesystem-streams-and-resource-lifecycle.md` — R1, R4 in depth.
-- `07-backpressure-bounded-work-and-cancellation.md` — R3 and the clean bounds/cancellation.
+- `07-backpressure-bounded-work-and-cancellation.md` — R3, R7, the nested Gemma loop, and the clean bounds/cancellation.
+- `03-event-loop-and-async-io.md` — R6 (the unbounded synchronous cosine scan) in depth.
 - `02-processes-threads-and-tasks.md` — R2 in depth.
 - `.aipe/study-performance-engineering/` *(when generated)* — measuring R1/R2/R3 under load.

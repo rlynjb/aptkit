@@ -46,8 +46,8 @@ Axis — **"where does control actually execute?"** — flipped by `mode`.
 ```
 
 - **Layers:** mode selection (UI) → execution-path branch (`startReplay`) → either in-browser fixture run or server-streamed live run.
-- **The seam** is `mode === 'fixture'` in `startReplay` (`AgentReplayShell.tsx:117`). On one side, `runFixture` runs the actual agent class in the browser against recorded `ModelResponse[]` (`agent-runners.ts:18-34`). On the other, `runServer` POSTs and consumes the NDJSON stream (`api.ts:51-57`). Control-of-execution flips here.
-- **A second seam** is availability: `providerStatus[mode].available` gates the Run button (`AgentReplayShell.tsx:220`). Fixture is always available; providers are available only if their API key is set server-side. Trust/secret handling of those keys belongs to `study-security`.
+- **The seam** is `mode === 'fixture'` in `startReplay` (`AgentReplayShell.tsx:118`). On one side, `runFixture` runs the actual agent class in the browser against recorded `ModelResponse[]` (`agent-runners.ts:18-34`). On the other, `runServer` POSTs and consumes the NDJSON stream (`api.ts:51-57`). Control-of-execution flips here.
+- **A second seam** is availability: `providerStatus[mode].available` gates the Run button (`AgentReplayShell.tsx:222`). Fixture is always available; providers are available only if their API key is set server-side. Trust/secret handling of those keys belongs to `study-security`.
 
 ## How it works
 
@@ -78,7 +78,7 @@ What breaks if mode weren't per-agent: you'd show an "Anthropic" button on agent
 
 #### Part B — provider availability from the server
 
-On mount, the shell GETs `/api/model-status` and stores `providerStatus` (`AgentReplayShell.tsx:137-143`). The Vite middleware reports availability purely from env: `anthropic.available = Boolean(env.ANTHROPIC_API_KEY)` (`vite.config.ts:206-212`). Fixture is hardcoded `available: true`. So the client never sees the keys — it sees booleans.
+On mount, the shell GETs `/api/model-status` and stores `providerStatus` (`AgentReplayShell.tsx:138-145`). The Vite middleware reports availability purely from env: `anthropic.available = Boolean(env.ANTHROPIC_API_KEY)` (`vite.config.ts:206-212`). Fixture is hardcoded `available: true`. So the client never sees the keys — it sees booleans.
 
 ```
   availability flow (layers-and-hops)
@@ -109,7 +109,7 @@ What breaks if fixture mode faked the output instead of running the agent: you'd
 
 #### Part D — selecting a mode resets the run
 
-`selectMode(next)` sets the mode and clears `replay`, `liveTrace`, and `error` (`AgentReplayShell.tsx:153-159`), then the workspace bumps its `resetToken` (`RecommendationWorkspace.tsx:40`) to reset child panels (comparison, save state). It does *not* auto-run — the user clicks Run. This keeps a mode switch from silently firing a paid provider call.
+`selectMode(next)` sets the mode and clears `replay`, `liveTrace`, and `error` (`AgentReplayShell.tsx:155-161`), then the workspace bumps its `resetToken` (`RecommendationWorkspace.tsx:40`) to reset child panels (comparison, save state). It does *not* auto-run — the user clicks Run. This keeps a mode switch from silently firing a paid provider call.
 
 What breaks if selecting a provider mode auto-ran: switching to "OpenAI" to *look* at the option would spend tokens. Requiring an explicit Run is a cost-safety choice.
 
@@ -155,7 +155,7 @@ Every workspace built on the shell. The richest example is `RecommendationWorksp
 ### Code, line by line
 
 ```
-  apps/studio/src/AgentReplayShell.tsx:117-119  — the execution branch
+  apps/studio/src/AgentReplayShell.tsx:118-120  — the execution branch
 
   const result = modeToRun === 'fixture'
     ? await runFixture(fixtureToRun)                          ← browser, recorded
@@ -167,7 +167,7 @@ Every workspace built on the shell. The richest example is `RecommendationWorksp
 ```
 
 ```
-  apps/studio/src/AgentReplayShell.tsx:220-223  — the gated Run button
+  apps/studio/src/AgentReplayShell.tsx:222-225  — the gated Run button
 
   <button className="runButton" onClick={startReplay}
           disabled={running || !providerStatus[providerKey(mode)].available}>  ← gate
@@ -227,7 +227,7 @@ The execution strategy. Fixture runs the real agent loop *in the browser* agains
 ```
   mode → fixture: browser+recorded | provider: server+live+stream; button gated on key present
 ```
-Anchor: `AgentReplayShell.tsx:117-119,220`.
+Anchor: `AgentReplayShell.tsx:118-120,222`.
 
 **Q: Is fixture mode just a mock?**
 No — it runs the genuine agent class, tool registry, and shape validator, only swapping a `FixtureModelProvider` for the live model. So it catches bugs in the agent loop, not just the UI. That's why it's trustworthy as a deterministic regression run.
@@ -237,11 +237,11 @@ Anchor: `agent-runners.ts:18-34`.
 **Q: Why doesn't switching to OpenAI auto-run?**
 Cost. A provider run spends tokens. Selecting a mode clears the prior run and waits for an explicit Run click, so just *looking* at the OpenAI option costs nothing.
 
-Anchor: `AgentReplayShell.tsx:153-159`.
+Anchor: `AgentReplayShell.tsx:155-161`.
 
 ## Validate
 
-1. **Reconstruct:** write the `startReplay` execution branch and the Run-button `disabled` expression. (`AgentReplayShell.tsx:117-119,220`)
+1. **Reconstruct:** write the `startReplay` execution branch and the Run-button `disabled` expression. (`AgentReplayShell.tsx:118-120,222`)
 2. **Explain:** why does fixture mode instantiate the real `RecommendationAgent` rather than returning canned output? (To exercise the real loop/tools/validator as a regression baseline — `agent-runners.ts:26-34`.)
 3. **Apply:** Monitoring offers only `fixture | openai`. Why not `anthropic`? (Its server path wires OpenAI-primary with Anthropic only as *fallback*, not as a selectable mode — `vite.config.ts:769`.)
 4. **Defend:** the availability flag comes from the server, not the client. Why is that better than checking for a key in the browser? (The client never holds the keys — security — and the server is the source of truth for whether a live run can actually succeed; `vite.config.ts:206-212`.)

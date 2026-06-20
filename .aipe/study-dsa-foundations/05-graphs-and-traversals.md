@@ -133,6 +133,26 @@ What would make it a graph: if `requires: ["capability:diagnosis"]` meant "this 
 
 The honest read: the day AptKit grows a *planner* that chains capabilities — "to answer this, first run diagnosis, which first needs monitoring" — the coverage system becomes a real dependency graph and you'll want BFS/DFS for reachability, topological sort for execution order, and cycle detection to reject impossible configs. That's exactly your `reincodes` `Graph.ts` (BFS/DFS, valid-tree check, connected components) and the topo-sort layer on top. It hasn't arrived because today every agent is independent and every dependency is one hop to a raw token.
 
+**The second, more concrete graph trigger — the ANN index inside retrieval.** This one isn't speculative: the code already points at it. `InMemoryVectorStore.search` (`packages/retrieval/src/in-memory-vector-store.ts:25-33`) finds the top-k nearest vectors by *scanning every chunk* — an exact, brute-force k-NN at O(n·d). The class docstring even names the successor: a `PgVectorStore` "drop-in behind the same contract." The moment the corpus is large enough that scanning every vector hurts, the replacement isn't another linear structure — it's an **approximate-nearest-neighbor (ANN) index**, and the dominant one (HNSW — Hierarchical Navigable Small World) is a *graph you traverse*.
+
+```
+  Phase A (now)                    Phase B (a real graph traversal)
+
+  search(): linear scan over       HNSW index: a multi-layer proximity
+  ALL n chunks, cosine each,       GRAPH. each node links to its near
+  sort, slice → exact top-k        neighbors. query = greedy traversal:
+  O(n·d + n log n)                 start at an entry node, hop to the
+  → no graph, just a loop          neighbor closest to the query, repeat
+                                   until no neighbor is closer → O(log n)
+                                   approximate top-k. THIS is BFS/greedy
+                                   best-first search over a navigable graph.
+
+  cost of switching: the contract (VectorStore.search) doesn't change;
+  the in-memory loop is swapped for an index that traverses edges.
+```
+
+The point that makes this the repo's *most concrete* graph trigger: it doesn't need a new feature to invent it. The contract and the "drop-in" comment are already there — it's purely a scale threshold. Exact brute-force k-NN (a `for` loop) is correct while the corpus is a handful of documents; cross into thousands and the right structure is a proximity graph traversed greedily, which is the same visited-set, frontier, best-first machinery as your `reincodes` graph work, just optimizing for *nearness* instead of reachability. So unlike the planner trigger (which needs a planner to exist first), this one is one corpus-size away.
+
 ### Move 3 — the principle
 
 A relationship is only a *graph* when you traverse it transitively — follow edges across multiple hops, tracking visited to handle cycles. Data that's shaped like edges but only ever checked one hop deep (membership) is a set problem, not a graph problem, and a flat `Set.has` is the right tool — reaching for BFS there is over-engineering. The skill is spotting the difference: ask "do I follow this relationship through to a node I didn't start from?" If no, it's membership; if yes, it's a graph. AptKit always answers no.
@@ -240,4 +260,6 @@ Anchor: *a fixed linear fallback is a loop, not a traversal — no frontier, no 
 - `02-arrays-strings-and-hash-maps.md` — the `Set.has` coverage check, the membership solution that stands in for traversal.
 - `03-stacks-queues-deques-and-heaps.md` — the queue (BFS frontier) and heap (Dijkstra) that a real graph would need.
 - `04-trees-tries-and-balanced-indexes.md` — trees as the acyclic special case; also absent for the same flat-data reason.
+- `06-sorting-searching-and-selection.md` — the linear-scan k-NN (`InMemoryVectorStore.search`) that an HNSW *graph* index would replace, and its cosine-score top-k.
+- `study-ai-engineering` (neighboring guide) — the RAG pipeline as an AI concern; this file owns only the graph-index angle (ANN/HNSW).
 - `study-system-design` (neighboring guide) — the package build DAG and provider fallback as architectural shape.

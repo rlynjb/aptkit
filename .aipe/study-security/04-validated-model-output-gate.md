@@ -299,5 +299,7 @@ injection from corrupting the output?**
 
 - `audit.md` → lens 3 (input validation / injection) and lens 7 (output handling)
 - `01-tool-policy-enforcement-by-omission.md` — the reach-side companion
+- `05-local-model-tool-call-trust-boundary.md` — Gemma's `parseToolCall` reuses
+  this same `parseAgentJson` extractor to turn model prose into a tool call
 - `.aipe/study-prompt-engineering/12-prompt-injection-defense.md`
 - `.aipe/study-prompt-engineering/02-structured-outputs.md`

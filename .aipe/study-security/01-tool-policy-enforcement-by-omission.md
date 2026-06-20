@@ -149,7 +149,10 @@ What's **optional hardening that isn't here:** a *second* check inside
 `callTool` that the name is in the active policy. Its absence is why the
 control is "by omission" rather than "defense in depth." Add it and a model
 that somehow named an off-policy tool (prompt injection that guesses a name,
-a future bug that leaks schemas) would still be denied at execution.
+a future bug that leaks schemas) would still be denied at execution. This gap
+gets *more reachable* on the local Gemma path, where the model emits the tool
+name directly as a parsed JSON string rather than picking from a structured
+menu — see `05-local-model-tool-call-trust-boundary.md`.
 
 ### Move 3 — the principle
 
@@ -312,5 +315,7 @@ second check at the bar.
 
 - `audit.md` → lens 7 (LLM/agent security)
 - `04-validated-model-output-gate.md` — the output-side companion control
+- `05-local-model-tool-call-trust-boundary.md` — the same execution-seam gap,
+  reached from the Gemma path where the model names the tool via prose
 - `.aipe/study-system-design/04-capability-as-tool-policy.md`
 - `.aipe/study-agent-architecture/` — read-only grants as safety

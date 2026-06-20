@@ -140,15 +140,17 @@ One agent is outside the deterministic net. Worth seeing:
 ```
   Phase A (now)                          Phase B (full coverage)
   ─────────────                          ────────────────────────
-  4 agents: replay:promoted wired        all 5 agents wired into the
-  into the root pipeline                 promoted-replay pipeline
-  rubric-improvement: NOT wired          rubric-improvement: wired
+  4 of the 5 analytics agents:           all 5 analytics agents wired
+  replay:promoted wired into the         into the promoted-replay pipeline
+  root pipeline                          (rag-query has its own eval.ts,
+  rubric-improvement: NOT wired          separate from this root pipeline)
+                                         rubric-improvement: wired
        │                                       │
        └─ can drift under a model              └─ regression-protected like
           update with no test catching it         the other four
 ```
 
-The cost to close it: add a `replay:promoted` script for rubric-improvement and a promoted fixture. Notable because rubric-improvement is *also* the agent with the widest tool grant (it can `save_judgment` — `04-`), so it's the one you'd most want protected. (audit red-flag 3.)
+The cost to close it: add a `replay:promoted` script for rubric-improvement and a promoted fixture. Notable because rubric-improvement is *also* the agent with the widest tool grant (it can `save_judgment` — `04-`), so it's the one you'd most want protected. (audit red-flag 4.)
 
 #### Move 3 — the principle
 
@@ -288,7 +290,7 @@ Anchor: `fixture-provider.ts:15` (cursor exhaustion throws on drift); the three 
 1. **Reconstruct.** Write `FixtureModelProvider.complete` from memory — the cursor, the advance, the exhaustion throw. Check against `fixture-provider.ts:3-18`.
 2. **Explain.** Where does determinism "flip" in the pipeline, and what does the promotion step actually transform? (Hint: `promote-replay-to-fixture.mjs:52-67`.)
 3. **Apply.** You change the recommendation agent's prompt and a promoted-fixture replay starts failing. Is that a real regression or a false alarm — and how do you tell? (Hint: replay is blind to model drift but catches code changes.)
-4. **Defend.** `rubric-improvement` has no `replay:promoted` coverage and the widest tool grant (audit red-flag 3, `04-`). Argue why that's the highest-priority gap to close.
+4. **Defend.** `rubric-improvement` has no `replay:promoted` coverage and the widest tool grant (audit red-flag 4, `04-`). Argue why that's the highest-priority gap to close.
 
 ## See also
 
@@ -296,5 +298,5 @@ Anchor: `fixture-provider.ts:15` (cursor exhaustion throws on drift); the three 
 - `02-bounded-agent-loop.md` — the loop whose trace fills the artifact.
 - `04-capability-as-tool-policy.md` — why rubric-improvement's gap matters most.
 - `05-multi-agent-pipeline.md` — fixtures let each pipeline stage be tested alone.
-- `audit.md` lens 3 (artifact as source of truth), lens 4 (fixture vs cache), red-flag 3.
+- `audit.md` lens 3 (artifact as source of truth), lens 4 (fixture vs cache), red-flag 4.
 - study-ai-engineering (when generated) — the eval methodology itself.

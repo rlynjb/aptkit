@@ -13,13 +13,15 @@ layers, where depth lives, and where it doesn't.
                                   │ re-exports
   ┌─ Capabilities (agents) ───────▼────────────────────────────────┐
   │  recommendation · anomaly-monitoring · diagnostic · query ·    │
-  │  rubric-improvement                                            │
-  │  ★ 5 classes, ~85% identical wiring — the shallowest layer ★   │
+  │  rubric-improvement · rag-query (newest)                       │
+  │  ★ 6 classes, ~85% identical wiring — the shallowest layer ★   │
   └───────────────────────────────┬────────────────────────────────┘
                                   │ compose
   ┌─ Building blocks ─────────────▼────────────────────────────────┐
   │  prompts (data) · tools (registry+policy) · evals (rules) ·    │
-  │  workflows · context                                           │
+  │  workflows · context (injectProfile) · retrieval (RAG)         │
+  │  retrieval: EmbeddingProvider + VectorStore = ModelProvider's  │
+  │  deep-module shape, reused twice  → 06                         │
   └───────────────────────────────┬────────────────────────────────┘
                                   │ depend on
   ┌─ Foundation (runtime) ────────▼────────────────────────────────┐
@@ -29,8 +31,9 @@ layers, where depth lives, and where it doesn't.
   └───────────────────────────────┬────────────────────────────────┘
                                   │ ModelProvider.complete()
   ┌─ Provider adapters ───────────▼────────────────────────────────┐
-  │  anthropic · openai · fallback (wrapper) · local-guard (wrapper)│
+  │  anthropic · openai · gemma · fallback (wrap) · local-guard(wrap)│
   │  every vendor SDK hidden behind one 3-field interface          │
+  │  gemma: an unusually large body (tool-call emulation) → 06     │
   └────────────────────────────────────────────────────────────────┘
 ```
 
@@ -51,6 +54,12 @@ interface. Here's the repo, best to worst.
   runAgentLoop           one call hides the whole tool-using loop,
                          trace emission, budget, recovery turn
                          packages/runtime/src/run-agent-loop.ts:76
+  Embedding/VectorStore  3 members each hide HTTP + cosine + dim check;
+                         ModelProvider's shape, reused twice  → 06
+                         packages/retrieval/src/contracts.ts:22
+  GemmaModelProvider     3-member ModelProvider; body emulates tool
+                         calls Gemma can't do natively  → 06
+                         packages/providers/gemma/src/gemma-provider.ts:39
 
   MEDIUM   (earns its interface, nothing wasted)
   ─────────────────────────────────────────────────────────
@@ -60,8 +69,9 @@ interface. Here's the repo, best to worst.
 
   SHALLOWEST  (interface ≈ body — the fix targets)
   ─────────────────────────────────────────────────────────
-  the 5 agent classes    each is ~30 lines of identical wiring
-                         around 4 lines of unique logic.
+  the 6 agent classes    each is ~30 lines of identical wiring
+                         around 4 lines of unique logic. RagQueryAgent,
+                         the newest, copied the same skeleton.
                          see 04-capability-agent-template.md
 ```
 
@@ -70,9 +80,10 @@ interface. Here's the repo, best to worst.
 ## The one-sentence verdict
 
 **AptKit's foundation is deep and its capability layer is shallow.** The
-runtime contracts (`ModelProvider`, `runAgentLoop`, `structural-diff`) are
-textbook deep modules — narrow interfaces hiding real behaviour. The five
-agent classes are the opposite: each re-implements the same constructor +
+runtime contracts (`ModelProvider`, `runAgentLoop`, `structural-diff`, and now
+the retrieval `EmbeddingProvider`/`VectorStore` pair) are textbook deep modules
+— narrow interfaces hiding real behaviour. The six agent classes are the
+opposite: each re-implements the same constructor +
 `listTools → filterToolsForPolicy → renderPromptTemplate → runAgentLoop →
 parse` skeleton, so the duplication that the monorepo extraction was supposed
 to eliminate has reappeared one layer up. That's the single highest-leverage
@@ -82,10 +93,10 @@ fix in the repo (`04-capability-agent-template.md`).
 
 ## The three highest-leverage fixes (ranked)
 
-1. **Collapse the 5-agent boilerplate into one `runCapability<T>()` helper.**
-   ~120 lines of duplicated wiring across five files; the divergent parts
-   (prompt vars, policy, parse, recovery) are already first-class parameters.
-   → `04-capability-agent-template.md`.
+1. **Collapse the 6-agent boilerplate into one `runCapability<T>()` helper.**
+   ~140 lines of duplicated wiring across six files (the new `RagQueryAgent`
+   added the sixth); the divergent parts (prompt vars, policy, parse, recovery)
+   are already first-class parameters. → `04-capability-agent-template.md`.
 
 2. **Pull the OpenAI-only pricing knowledge out of a hardcoded `if`-ladder.**
    `usage-ledger.ts:71` knows three model families inline and silently returns

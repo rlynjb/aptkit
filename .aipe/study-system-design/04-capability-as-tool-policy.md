@@ -98,7 +98,7 @@ That's the whole mechanism. The interesting part isn't the filter — it's *wher
 
 **The registry executes, the policy gates.** The `ToolRegistry` is a `Map<name, handler>` — `callTool(name, args)` does an O(1) lookup and runs the handler (measuring duration, checking the abort signal). The split is the point: the *registry* knows how to run every tool; the *policy* decides which ones an agent was offered. The bridge: it's the difference between a route handler existing (registry) and a user's role being allowed to hit it (policy). The boundary condition: the registry doesn't enforce the policy — enforcement happens by *omission*, upstream, by never putting the schema in front of the model. The model can only request tools it was shown.
 
-**All five agents are read-only.** Every agent's `allowedTools` is a list of `list_*` / `get_*` / `execute_analytics_*` reads (`context.md`: "per-agent read-only allowlists"). The one near-exception, `rubric-improvement`, includes `save_judgment` and `generate_next_scenario` — which is exactly why its blast radius (and the missing replay coverage, audit red-flag 3) matters more. The read-only default means a misbehaving model can read the workspace but can't mutate it.
+**The agents are read-only.** Every agent's `allowedTools` is a list of `list_*` / `get_*` / `execute_analytics_*` reads (`context.md`: "per-agent read-only allowlists"). The one near-exception, `rubric-improvement`, includes `save_judgment` and `generate_next_scenario` — which is exactly why its blast radius (and the missing replay coverage, audit red-flag 4) matters more. The newest agent, `rag-query`, is the tightest case of all: its policy grants exactly one tool, `search_knowledge_base` (`packages/agents/rag-query/src/rag-query-agent.ts:15-18`) — the same least-privilege mechanism taken to its minimum. The read-only default means a misbehaving model can read the workspace but can't mutate it.
 
 #### Move 2 variant — the load-bearing skeleton
 
@@ -246,11 +246,11 @@ Anchor: `tool-policy.ts:17` (filter happens before the loop), `tool-registry.ts:
 1. **Reconstruct.** Write `filterToolsForPolicy` from memory — the Set, the filter-by-name, the projection. Check against `tool-policy.ts:11-23`.
 2. **Explain.** Where is the policy *enforced* — in the registry's `callTool`, or before the loop? Why does that distinction matter? (Hint: `tool-registry.ts:56` does no policy check.)
 3. **Apply.** You add a new `delete_segment` tool to the catalog. Which agents can now call it, and what's the minimum change to grant it to exactly one agent? (Answer: none can, until you add `'delete_segment'` to one policy's `allowedTools`.)
-4. **Defend.** The `rubric-improvement` agent has `save_judgment` in its grant (`rubric-improvement-agent.ts:15-25`) and no `replay:promoted` coverage (audit red-flag 3). Argue why that combination is the one to worry about.
+4. **Defend.** The `rubric-improvement` agent has `save_judgment` in its grant (`rubric-improvement-agent.ts:15-25`) and no `replay:promoted` coverage (audit red-flag 4). Argue why that combination is the one to worry about.
 
 ## See also
 
 - `02-bounded-agent-loop.md` — the loop that receives the filtered `toolSchemas`.
 - `05-multi-agent-pipeline.md` — three agents with three grants, composed.
-- `audit.md` lens 1 (the policy as a trust boundary), red-flag 3 (rubric-improvement's wider grant).
+- `audit.md` lens 1 (the policy as a trust boundary), red-flag 4 (rubric-improvement's wider grant).
 - study-security (when generated) — prompt-injection and the read-only convention.

@@ -154,6 +154,43 @@ loop. It does up to 2 attempts; on the second it *appends a strict suffix* to th
 user message ("Return ONLY valid JSON — no prose, no markdown fences"). Same
 philosophy — don't trust, validate, retry once — different mechanism.
 
+**The weak-model variant — Gemma tool-call emulation.** There's a third flavor of
+this same kernel, and it's the most extreme one because the "structured output"
+being coaxed is a *tool call* and the model is a small local Gemma running on
+Ollama, which has no native `tools` array. So the provider does structured-output
+coaxing entirely through prompt text: `buildSystemText` renders every tool's name,
+description, and JSON input-schema into the SYSTEM prompt, then issues the contract
+— "When a tool is needed, respond with ONLY a single JSON object, no prose:
+`{"tool": "<tool name>", "arguments": { ... }}`. Otherwise, answer directly." This
+is tool-use-via-prompting: the same ask-defensively-validate-retry shape from
+above, except what you're parsing is a tool call. The extractor is `parseToolCall`
+(which leans on `parseAgentJson`), the validator checks `tool` is a string and
+`arguments` is an object, and the recovery turn appends a `RETRY_NUDGE` —
+"Your previous reply was not a valid tool call. Respond with ONLY a single JSON
+object..." — for up to `maxToolCallAttempts` (default 2). **Breaks if missing:** a
+weak model wraps its tool call in prose or botches the JSON, you get no call, and
+the agent loop stalls. The clever part: it only retries when the text *looks like*
+a botched tool call (`looksLikeToolAttempt` — a `{` is the tell). Plain prose is
+treated as a real answer, not a parse failure, so a Gemma that legitimately decides
+to answer in words doesn't get nagged into a retry it shouldn't run.
+
+```
+  Gemma tool-call emulation — coax a tool call through the system prompt
+
+  ┌─ buildSystemText: render tools INTO system text ──────────────┐
+  │ "You can call: <name/desc/input_schema as JSON> ...           │
+  │  respond with ONLY {"tool":...,"arguments":{...}}"             │
+  └───────────────────────────┬───────────────────────────────────┘
+                            │ Ollama /api/chat (no native tools[])
+                            ▼
+        raw text ──► parseToolCall ──► {name, input}? ──► tool_use block
+                            │ null
+                            ▼
+              looksLikeToolAttempt('{' present)?
+                  yes → append RETRY_NUDGE, retry (≤ maxToolCallAttempts)
+                  no  → it's a real prose answer → return as text
+```
+
 #### Move 3 — the principle
 
 "Use JSON mode" is the blog-post answer. The production answer is: ask for JSON
@@ -161,7 +198,11 @@ philosophy — don't trust, validate, retry once — different mechanism.
 have a recovery turn **and** fall back to a safe empty value. AptKit does four of
 those five; the one it skips (provider-enforced schema mode) would make the
 extractor's job easier but doesn't remove the need to validate. The validator is
-the source of truth — never the prompt.
+the source of truth — never the prompt. And when the provider can't enforce a
+schema *at all* — a local Gemma with no native tool support — the entire contract
+collapses into prompt text and a parse-validate-nudge loop. Same kernel, harder
+mode: the weaker the model and the thinner the provider API, the more of the
+structured-output guarantee you carry in your own code.
 
 ## Primary diagram
 
@@ -194,7 +235,9 @@ The full structured-output path for the recommendation agent.
 
 **Use cases.** Recommendation, diagnostic, and monitoring agents all return
 typed objects through this path. The rubric judge uses the `generateStructured`
-retry variant instead.
+retry variant instead. The Gemma provider uses the *tool-call emulation* variant
+— rendering tools into the system prompt and parsing a JSON tool call back out —
+because Ollama-hosted Gemma has no native `tools` array.
 
 The extractor — two strategies, fence then substring scan:
 
@@ -270,6 +313,55 @@ The retry variant used by the rubric judge — strict suffix on attempt 2:
            strictly more constrained than the first. That's the cheap reliability buy.
 ```
 
+The tool-call emulation — tools rendered into the SYSTEM prompt, JSON call parsed
+back out, RETRY_NUDGE on failure (the weak-local-model path):
+
+```
+  packages/providers/gemma/src/gemma-provider.ts  (lines 35–37, 133–165)
+
+  const RETRY_NUDGE =
+    'Your previous reply was not a valid tool call. Respond with ONLY a single
+     JSON object: {"tool": "<tool name>", "arguments": { ...arguments... }}';
+  ...
+  function buildSystemText(request: ModelRequest): string {
+    if (request.tools?.length) {
+      const rendered = request.tools.map((tool) => JSON.stringify({
+        name: tool.name, description: tool.description ?? '',
+        input_schema: tool.inputSchema }, null, 2)).join('\n\n');   ← schema → prompt
+      parts.push([ 'You can call the following tools:', rendered,
+        'When a tool is needed, respond with ONLY a single JSON object, no prose:',
+        '{"tool": "<tool name>", "arguments": { ...arguments... }}',
+        'Otherwise, answer the user directly in natural language.' ].join('\n'));
+    }
+        │
+        └─ this IS the structured-output contract for a model with no native tools:
+           it lives entirely in prompt text. The schema is rendered, not enforced.
+```
+
+And the parse-validate-nudge loop that consumes it — note the retry only fires on
+a *botched* tool call, never on legitimate prose:
+
+```
+  packages/providers/gemma/src/gemma-provider.ts  (lines 62–91, 168–187)
+
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const messages = attempt === 0
+      ? baseMessages
+      : [...baseMessages, { role: 'user', content: RETRY_NUDGE }];  ← corrective nudge
+    raw = (await this.chat({ ... })).message?.content ?? '';
+    if (wantsTool) {
+      const call = parseToolCall(raw);                  ← extract + validate the call
+      if (call) return this.toResponse([{ type: 'tool_use', ... }], ...);
+      if (looksLikeToolAttempt(raw)) continue;          ← retry ONLY if it tried & failed
+    }
+    break;                                              ← plain prose = a real answer
+  }
+        │
+        └─ looksLikeToolAttempt ('{' present) is what stops the loop from nagging a
+           model that legitimately chose to answer in words. Without it, every prose
+           answer would burn a retry. maxToolCallAttempts (default 2) caps the cost.
+```
+
 ## Elaborate
 
 The defensive parse is the right call *because* AptKit is provider-neutral: it
@@ -278,6 +370,18 @@ schema modes differ in syntax and guarantees across vendors, so coding to any on
 of them would couple the core to a vendor. JSON-in-fence + validate is the lowest
 common denominator that works everywhere. The cost: you carry the extractor and
 must validate every field by hand.
+
+The Gemma provider is that lowest-common-denominator stance taken to its limit. A
+local Gemma over Ollama has no `tools` parameter at all, so there's nothing to
+enforce — the provider renders the tool schemas into the system prompt and parses a
+JSON tool call back out itself (the "outbound half of tool-call emulation," per the
+source comment). This is the same bet as JSON-in-fence, one rung weaker: where the
+hosted providers at least guarantee valid JSON, Gemma guarantees nothing, so the
+provider adds a `RETRY_NUDGE` corrective turn. The lesson generalizes: structured
+output is a *spectrum* of who-enforces-the-shape, from provider-strict schema mode
+at one end to "you render the contract as prose and parse the model's best effort"
+at the other. AptKit lives near the prose end on purpose — it keeps the core
+provider-neutral down to a model that runs on your laptop.
 
 The honest weakness: provider tool-calling-for-output (or strict `response_format`)
 would cut the schema-fail rate at the source and you could drop strategy-2 of the
@@ -315,6 +419,18 @@ throws. The fix is extraction that survives both — the fence regex at
 `json-output.ts:8`. Add `\nbe concise` to a prompt relying on strict JSON and
 you'll see it the same day.
 
+**Q: How do you get a tool call out of a model with no tool API (a local Gemma)?**
+You emulate it in prompt text. Render every tool's name, description, and
+input-schema into the system prompt, then demand a single JSON object
+`{"tool":...,"arguments":{...}}` and nothing else (`buildSystemText` at
+`gemma-provider.ts:133`). Parse the reply, validate that `tool` is a string and
+`arguments` is an object, and on a botched attempt append a corrective
+`RETRY_NUDGE` and try again (up to `maxToolCallAttempts`). The trick that keeps it
+sane: only retry when the text *looks* like a failed tool call (`{` present) —
+treat plain prose as a legitimate answer, not a parse miss.
+Anchor: "`buildSystemText` renders schemas into the system prompt;
+`parseToolCall` + `RETRY_NUDGE` recover at `gemma-provider.ts:78`."
+
 **Q: Why strip the tools on the final turn?**
 So the model can't ask for another query — it's forced to emit the answer.
 `forceFinal ? undefined : toolSchemas` at `run-agent-loop.ts:106`. Without it a
@@ -339,3 +455,4 @@ produces the JSON.
 - [05-eval-driven-iteration.md](05-eval-driven-iteration.md) — where you'd watch the schema-fail rate.
 - [07-output-mode-mismatch.md](07-output-mode-mismatch.md) — prose vs JSON, declared per capability.
 - [09-chain-of-thought.md](09-chain-of-thought.md) — reasoning as a JSON field, not free prose.
+- [12-prompt-injection-defense.md](12-prompt-injection-defense.md) — output schema (and tool-call emulation) as a cage on free text.

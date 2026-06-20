@@ -1,8 +1,8 @@
 # 03 — B-tree, hash, and secondary indexes
 
-**Subtitle:** Index structures / B-tree vs hash / secondary indexes —
-*Industry standard* (taught), *analog: the filename sort is the only index*
-(in-repo)
+**Subtitle:** Index structures / B-tree vs hash / secondary / ANN indexes —
+*Industry standard* (taught), *analogs: the filename sort (on disk) and a
+linear cosine scan in `InMemoryVectorStore` (in memory)* (in-repo)
 
 ---
 
@@ -137,7 +137,57 @@ with id X in O(1)." The closest the repo gets is the `FixtureModelProvider`
 serving responses by an integer `index` (`fixture-provider.ts:13`) — a
 direct array-offset lookup, which is the degenerate case of a hash index
 (perfect hashing by position). But that's over an in-memory array, not the
-on-disk artifacts.
+on-disk artifacts. The new `InMemoryVectorStore` *does* hold a true hash index
+for point lookups — its chunks live in a `Map<string, VectorChunk>`
+(`in-memory-vector-store.ts:11`), so `upsert` replacing an id is an O(1) hash
+write. But that hash is only used for upsert dedup, never for read: the read
+path (`search`) ignores the `Map`'s keys entirely and scans all values.
+
+**The vector "index" that is really a full scan (the new one).** This is the
+load-bearing addition. `@aptkit/retrieval`'s `InMemoryVectorStore.search`
+(`in-memory-vector-store.ts:25-33`) answers a similarity query — "give me the k
+chunks closest to this query vector" — and the way it does it is the entire
+lesson of this file in miniature. It computes `cosineSimilarity` against
+*every* stored chunk, pushes them all into an array, sorts descending by score,
+and slices the top k. That is `ORDER BY similarity LIMIT k` executed as a
+**sequential scan with a sort** — no index assist at all. The right structure
+for this query is an **ANN index** (Approximate Nearest Neighbor), of which
+**HNSW** (Hierarchical Navigable Small World) is the standard: a multi-layer
+graph you greedily walk to land near the answer in `O(log N)` hops instead of
+touching all N vectors.
+
+```
+  scan (what aptkit does)  vs  HNSW ANN index (what a real store does)
+
+  query vector q, N stored chunks, dimension d
+
+  InMemoryVectorStore.search:
+    for each of N chunks:  score = cosine(q, chunk)   ← touch ALL N, O(N·d)
+    sort N scores                                     ← O(N log N)
+    slice top-k                                       ← O(k)
+    total: O(N·d + N log N)  — linear in corpus size
+
+  HNSW (buffr's PgVectorStore, "using hnsw"):
+            ┌── top layer (few nodes, long hops) ──┐
+            │   enter ──► greedy-walk toward q       │
+            └────────────────┬─────────────────────┘
+                 descend to denser layer, repeat
+            ┌── base layer (all nodes, short hops) ─┐
+            │   land in q's neighborhood, return k   │
+            └───────────────────────────────────────┘
+    total: ~O(log N) nodes visited — sub-linear, the whole point of an index
+```
+
+What breaks without the ANN index: nothing, until the corpus grows. At a few
+hundred chunks the scan is microseconds and an index would be pure overhead —
+which is exactly why the in-memory store skips it. The trigger to need HNSW is
+"the corpus is large enough that touching every vector per query hurts," and
+that trigger is met in the **buffr** repo, not here:
+`buffr/sql/001_agents_schema.sql:28-29` builds a real HNSW index
+(`using hnsw (embedding vector_cosine_ops)`) and `buffr/src/pg-vector-store.ts:67-78`
+queries it with pgvector's `<=>` cosine-distance operator behind the *same*
+`VectorStore` contract aptkit defines. The adapter is swappable; the index
+lives in the durable store.
 
 ### Move 3 — the principle
 
@@ -223,6 +273,29 @@ a subset reads all and filters.
           response (file 08), not how on-disk artifacts are found.
 ```
 
+**The vector "index" = a full scan** — `packages/retrieval/src/in-memory-vector-store.ts:25-33`:
+
+```
+  async search(vector, k) {
+    this.assertDimension(vector, 'query vector');  ← integrity guard: a wrong-length
+                                                      query throws (ranking would be
+                                                      garbage otherwise)
+    const hits = [];
+    for (const chunk of this.chunks.values()) {    ← SCAN: touch EVERY chunk —
+      hits.push({ id: chunk.id,                       no index narrows it, O(N)
+        score: cosineSimilarity(vector, chunk.vector),← O(d) per chunk → O(N·d) total
+        meta: chunk.meta });
+    }
+    hits.sort((a, b) => b.score - a.score);        ← ORDER BY similarity DESC, O(N log N)
+    return hits.slice(0, Math.max(0, k));          ← LIMIT k
+  }
+       │
+       └─ the Map<id> buys O(1) UPSERT dedup, but read ignores its keys and
+          scans all values. This is the exact query an ANN index (HNSW) exists
+          to make sub-linear — buffr's PgVectorStore does, behind this same
+          contract. Here it's a deliberate full scan: correct while N is small.
+```
+
 ---
 
 ## Elaborate
@@ -238,11 +311,21 @@ and one ordering, which is correct while N is small and time-ordering is the
 only query. The trigger to add a real index: you find yourself parsing every
 artifact to answer "which runs match attribute X," and N is no longer small.
 
-Rein has shipped the real version of this elsewhere: AdvntrCue runs an ANN
-index (pgvector) over embeddings in Postgres — a genuine secondary index
-structure built for similarity lookup. That's the contrast that sharpens the
-point: AptKit deliberately has *no* such structure because its query is just
-"newest first."
+The repo now holds *two* "index" stories at once, and the contrast is the
+lesson. On disk: one ordering encoded into a filename, everything else a scan.
+In memory: the new `InMemoryVectorStore` is a similarity store whose "index" is
+a linear cosine scan — deliberately no ANN structure, because at a few hundred
+chunks a scan beats the overhead of building and walking an HNSW graph. The
+genuine ANN version of the *same* `VectorStore` contract ships in the **buffr**
+repo: `buffr/sql/001_agents_schema.sql:28-29` declares
+`create index ... using hnsw (embedding vector_cosine_ops)` and
+`buffr/src/pg-vector-store.ts` queries it with pgvector. So aptkit teaches the
+naive scan and the contract; buffr supplies the real index behind that contract.
+That boundary is the whole adaptability argument: the pipeline code never names
+a store, so swapping the scan for HNSW is a one-line wiring change and zero
+pipeline change. The trigger to make that swap is corpus size — the same
+"queries you actually run × N grew large" rule, applied to similarity search
+instead of attribute lookup.
 
 ---
 
@@ -284,6 +367,10 @@ load-bearing on the filename format."
 ## See also
 
 - `02-records-pages-and-storage-layout.md` — why a scan reads the whole record
-- `04-query-planning-and-execution.md` — the scan-and-filter "plan" and N+1
+- `04-query-planning-and-execution.md` — the scan-and-filter "plan", the N+1,
+  and the cosine top-k scan as a query execution path
 - `08-replication-and-read-consistency.md` — the in-memory cursor as a lookup
-- `study-data-modeling` → the `createdAt`/`capabilityId` fields the index uses
+- `09-database-systems-red-flags-audit.md` — the vector store's no-durability
+  / linear-scan risk, ranked
+- `study-data-modeling` → the `createdAt`/`capabilityId` fields the index uses,
+  and the `VectorChunk` shape

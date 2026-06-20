@@ -313,6 +313,16 @@ per-caller scoping" is the API-gateway shape. The win is that adding an agent
 doesn't touch the registry, and adding a tool doesn't touch the agents —
 `filterToolsForPolicy` is the only coupling, and it's pure data.
 
+**Adjacent — emulating tool-calling for a model that has none.** Everything above
+assumes the provider speaks `tool_use` natively. The `rag-query` capability runs
+on a *local Gemma* that doesn't — Ollama's `/api/chat` has no tools parameter. So
+the `GemmaModelProvider` renders the tool schemas into the system prompt as JSON
+instructions and parses the model's `{"tool":…,"arguments":…}` reply back into a
+synthetic `tool_use` block (with a bounded retry on malformed JSON). The loop's
+contract is unchanged; the emulation is quarantined in the provider. This is the
+weak-model variant of the same seam — see
+`../02-agentic-retrieval/04-agentic-rag-over-vector-search.md`.
+
 **Adjacent — why the seam is the safety boundary.** Because the harness runs the
 tool (not the model), the harness can enforce read-only-ness, timing,
 cancellation, and the policy. All of `05-guardrails-and-control.md` hangs off
@@ -390,5 +400,7 @@ own safety.
   kernel (the EXECUTE bone)
 - `../agent-patterns-in-this-codebase.md` — the tool-gating row in the patterns
   table
+- `../02-agentic-retrieval/04-agentic-rag-over-vector-search.md` — tool-call
+  *emulation* for a weak local model (Gemma has no native tools)
 - `.aipe/study-ai-engineering/04-agents-and-tool-use/` — tool-calling mechanics
   from first principles

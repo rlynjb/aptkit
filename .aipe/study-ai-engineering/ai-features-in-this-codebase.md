@@ -1,16 +1,27 @@
 # How This Codebase Uses AI
 
 AptKit is a library of reusable AI-agent capabilities. It does not run a single
-mega-prompt; it ships five distinct AI features, each one a *capability* —
+mega-prompt; it ships six distinct AI features, each one a *capability* —
 a prompt package plus a least-privilege tool policy plus an agent-loop config plus
 a validator. They are provider-neutral: every one calls the `ModelProvider.complete()`
 contract, never a vendor SDK directly.
 
-Three of the five form a pipeline — **monitor → diagnose → recommend**: the
+Three of the six form a pipeline — **monitor → diagnose → recommend**: the
 anomaly-monitoring agent detects what changed, the diagnostic-investigation agent
 tests hypotheses for why, and the recommendation agent proposes what to do. The
-query agent answers free-form questions. The rubric-improvement agent scores a
-subject against a rubric and names the next action.
+query agent answers free-form questions over analytics tools. The rubric-improvement
+agent scores a subject against a rubric and names the next action. The newest,
+**rag-query**, is the vector-RAG capstone: it answers questions grounded in an
+indexed knowledge base via a `search_knowledge_base` tool, and it's the one
+feature designed to run **zero-cloud** — local Gemma2:9b + local nomic embeddings,
+both over Ollama.
+
+A sharp contrast worth naming up front: query-agent and rag-query are *both*
+question-answering agents, but they ground differently. query-agent does **agentic
+retrieval over exact analytics tools** (no vectors — it calls a metric endpoint).
+rag-query does **vector retrieval over a prose corpus** (embed → cosine search →
+cite). The choice between them is the above-threshold rule in
+[03-retrieval-and-rag/11-rag.md](./03-retrieval-and-rag/11-rag.md).
 
 ## AI features
 
@@ -21,6 +32,7 @@ subject against a rubric and names the next action.
 | diagnostic-investigation-agent | Hypothesis-tested diagnosis (bounded loop) | "Why did this happen" is an investigation, not a lookup — the agent proposes hypotheses and tests each against tool evidence before concluding |
 | recommendation-agent | Diagnosis → ≤3 grounded actions (recommender shape) | Actions must be grounded in a real diagnosis and framed in a fixed taxonomy; bounding to 3 forces prioritization instead of a wishlist |
 | rubric-improvement-agent | LLM-as-judge rubric scoring → weakest dimension + next action | Quality is multi-dimensional; a structured rubric makes the judgment auditable and reduces it to one highest-leverage fix |
+| rag-query-agent | Vector RAG: `search_knowledge_base` tool over an in-memory pipeline, inside a bounded loop → grounded, cited answer | The answer lives in a private prose corpus the model wasn't trained on; retrieve-ground-cite (with a search-only tool policy) keeps it from hallucinating, and local Gemma + nomic make it run with zero cloud |
 
 ## Prompt shapes (structure, not full text)
 
@@ -28,6 +40,7 @@ subject against a rubric and names the next action.
 - **anomaly-monitoring-agent** — system prompt = role + `{schema}` + a `{categories}` checklist (each with warning/critical % thresholds); user = "run the checklist, return a JSON array of anomalies or `[]`."
 - **recommendation-agent** — system prompt = role + action taxonomy + hard rules + the `{diagnosis}` JSON + `{schema}`; user = "propose recommendations, return the JSON array." Output capped at 3, no `id` field (assigned post-validation).
 - **rubric-improvement-agent** — system prompt = rubric definition + the exact output shape; user = context + subject. Output = `{judgment, weakestDimension, nextAction, nextDrill?}`.
+- **rag-query-agent** — system prompt = optional injected profile (`me.md`) + "always call `search_knowledge_base` first, ground every answer in the retrieved chunks, cite their sources, say so plainly if the KB doesn't cover it"; user = the question. Model calls the search tool, then a `synthesisInstruction` forces a concise answer citing the retrieved sources.
 
 ## Per-feature specs
 
@@ -81,7 +94,18 @@ subject against a rubric and names the next action.
 - **Failure modes:** parse failure → recovery turn (re-states completed tool evidence, asks for the exact JSON shape); still unparseable → throws `'rubric improvement output was not parseable'`; verdict/score outside rubric bounds → rejected by `createRubricJudgmentValidator` (score must fall within the dimension's scale; verdict must be an allowed verdict).
 - **Eval set:** validated by the rubric judge's own validator (`createRubricJudgmentValidator`, `packages/evals/src/rubric-judge.ts`). Note: this agent has **no `replay:promoted` script wired into the root pipeline** (the other agents do — see `.aipe/project/context.md`).
 
-## The eval seam (shared by all five)
+### rag-query-agent
+
+- **File:** `packages/agents/rag-query/src/rag-query-agent.ts` (`@aptkit/agent-rag-query`, capability id `rag-query-agent`). Retrieval pipeline + tool in `@aptkit/retrieval`; profile injection in `@aptkit/context` (`injectProfile`).
+- **Inputs (typed):** `answer(question: string, runOptions?: {signal?})`. Constructed with `{model: ModelProvider, tools: ToolRegistry (holding search_knowledge_base), profile?: string, prompt?: string, trace?}`.
+- **Outputs (typed):** `Promise<string>` — a grounded, source-citing answer, or `FALLBACK_ANSWER` ("I couldn't find anything in the knowledge base to answer that.") when the loop produces nothing.
+- **Model + provider:** designed for a **local** `GemmaModelProvider` (`gemma2:9b` over Ollama) wrapped in `ContextWindowGuardedProvider` — but any `ModelProvider` works (the contract is vendor-neutral, so a cloud adapter swaps in unchanged). Embeddings via `OllamaEmbeddingProvider` (nomic-embed-text, 768-dim).
+- **Token cost per call:** `runAgentLoop` with `maxTurns 6`, `maxToolCalls 4`, plus a forced synthesis turn. Local Gemma is zero per-token cost (after hardware); the same pricing caveat applies if a cloud provider is swapped in.
+- **Failure modes:** weak local model emits a malformed JSON tool call → the Gemma adapter's parse-retry nudges it (`gemma-provider.ts`); model passes `top_k: 1` and starves retrieval → the tool's `minTopK` floor backstops it; nothing retrieved or empty synthesis → `FALLBACK_ANSWER`; budget exhaustion → forced synthesis turn citing whatever was retrieved.
+- **Tool policy:** `ragQueryToolPolicy` — least privilege, allows **only** `search_knowledge_base`. The agent cannot do anything but search and answer.
+- **Eval set:** retrieval quality is measured by `scorePrecisionAtK` / `scoreRecallAtK` (`packages/evals/src/precision-at-k.ts`) over `pipeline.query` ids (already wired in `packages/agents/rag-query/test/rag-query-agent.test.ts`). The durable corpus + live precision@k run live in the **buffr** repo. See [05-evals-and-observability/05-precision-at-k.md](./05-evals-and-observability/05-precision-at-k.md).
+
+## The eval seam (shared by the analytics + rubric features)
 
 Live run → replay artifact (`artifacts/replays/*.json`) → eval (structural-diff /
 `detection-scorer` / `rubric-judge`) → promote to fixture

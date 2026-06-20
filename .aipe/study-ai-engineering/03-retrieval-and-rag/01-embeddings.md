@@ -7,35 +7,37 @@ vectors · *Industry standard*
 
 Embeddings are the foundation the whole rest of this section stands on. Every
 later concept — chunking, vector DBs, hybrid search, reranking, RAG — assumes
-you can turn a piece of text into a vector and compare two vectors. AptKit does
-not do this anywhere yet, so picture where it *would* sit: at the very front of
-a retrieval layer feeding the prompt-context seam.
+you can turn a piece of text into a vector and compare two vectors. AptKit now
+ships exactly this: `OllamaEmbeddingProvider` is the front door of the retrieval
+layer, and `cosineSimilarity` inside `InMemoryVectorStore` is the comparison.
 
 ```
-  Zoom out — where embeddings would live in AptKit
+  Zoom out — where embeddings live in AptKit (packages/retrieval)
 
-  ┌─ (new) Retrieval layer — packages/retrieval ─────────────────────┐
-  │  ★ embed(text) → number[]  ←── THIS CONCEPT                       │
-  │       │                                                          │
+  ┌─ Retrieval layer — packages/retrieval (REAL) ────────────────────┐
+  │  ★ OllamaEmbeddingProvider.embed(texts) → number[][] (768-dim)    │
+  │       │                                  ←── THIS CONCEPT         │
   │       ▼                                                          │
-  │  store vector in an index  ──►  search by similarity at query    │
+  │  InMemoryVectorStore.upsert(vectors)  ──►  .search(q, k) via      │
+  │                                            cosineSimilarity       │
   └──────────────────────────────────┬────────────────────────────────┘
-                                      │  top-k chunks (strings)
-  ┌─ Context layer (packages/context) ▼────────────────────────────────┐
-  │  schemaSummary() + retrieved-chunks block ──► system prompt         │
+                                      │  ranked chunks (id, score, meta)
+  ┌─ Tool boundary (search_knowledge_base) ▼────────────────────────────┐
+  │  pipeline.query() called as a tool mid-loop                         │
   └──────────────────────────────────┬────────────────────────────────┘
                                       │
   ┌─ Runtime layer (packages/runtime) ▼────────────────────────────────┐
-  │  runAgentLoop / generateStructured ──► ModelProvider.complete()     │
+  │  runAgentLoop ──► ModelProvider.complete() (Gemma / Anthropic)      │
   └─────────────────────────────────────────────────────────────────────┘
 ```
 
 Zoom in: an **embedding** is a function that maps text to a fixed-length list of
-floats — say 1536 of them — such that texts with *similar meaning* land *close
-together* in that high-dimensional space. You ran this in AdvntrCue: a chunk
-went in, a 1536-dim vector came out, pgvector stored it, and a query vector
-found its neighbours. The concept is "meaning becomes geometry." Distance is
-similarity.
+floats — here **768** of them (nomic-embed-text) — such that texts with *similar
+meaning* land *close together* in that high-dimensional space. You ran the cloud
+version in AdvntrCue: a chunk went in, a 1536-dim OpenAI vector came out, pgvector
+stored it, a query vector found its neighbours. AptKit is the local-first mirror:
+nomic instead of OpenAI, 768 instead of 1536, in-memory instead of pgvector. The
+concept is identical — "meaning becomes geometry." Distance is similarity.
 
 ## Structure pass
 
@@ -187,14 +189,51 @@ The full path, index-time and query-time in one frame.
 
 ## Implementation in codebase
 
-**Not yet implemented in AptKit.** There is no `embed()` function, no vector
-type, and nothing imports an embedding model anywhere in the repo. The closest
-*shape* is `schemaSummary()` in `packages/context/src/workspace-summary.ts` —
-also a deterministic text transform — but it flattens structured workspace
-metadata into a prompt string; it does not produce vectors or compare anything by
-similarity. If embeddings were added, the `embed()` function would be the front
-door of a new `packages/retrieval` package, and its output would feed an index
-the context layer reads from before rendering the prompt.
+**Use cases.** The `rag-query` agent embeds your knowledge-base documents at index
+time and embeds each query at search time, so a question can find a semantically
+related passage even when they share no words. Tests embed with an injected
+transport (deterministic vectors, no live Ollama); the live demo embeds with real
+nomic over Ollama.
+
+**The embed transform**, `packages/retrieval/src/ollama-embedding-provider.ts:38-58`:
+
+```
+  packages/retrieval/src/ollama-embedding-provider.ts  (lines 38-58)
+
+  export class OllamaEmbeddingProvider implements EmbeddingProvider {
+    readonly id = 'nomic-embed-text';
+    readonly dimension = 768;               ← fixed per model — the one-way door
+    ...
+    async embed(texts, options) {
+      options?.signal?.throwIfAborted();    ← cancellation before any work
+      return this.embedTransport({ model, texts, ... });  ← one batch call to Ollama
+    }
+  }
+       │
+       └─ embed() is the front door. `dimension = 768` is declared, not inferred,
+          so a wiring that pairs this with a non-768 store fails loudly at
+          construction (see pipeline.ts assertWiring), never silently corrupts ranking.
+```
+
+**The comparison**, `packages/retrieval/src/in-memory-vector-store.ts:46-57` — the
+`cosineSimilarity` Move 2 described, in real code:
+
+```
+  packages/retrieval/src/in-memory-vector-store.ts  (lines 46-57)
+
+  let dot = 0, magA = 0, magB = 0;
+  for (let i = 0; i < a.length; i += 1) {
+    dot  += a[i]! * b[i]!;          ← dot product
+    magA += a[i]! * a[i]!;          ← |a|²
+    magB += b[i]! * b[i]!;          ← |b|²
+  }
+  const denom = Math.sqrt(magA) * Math.sqrt(magB);
+  return denom === 0 ? 0 : dot / denom;   ← 0 for a zero vector → avoids NaN
+       │
+       └─ This store does NOT pre-normalize, so it divides by the magnitudes
+          every comparison (the full cosine, not the dot-product shortcut). Fine
+          at in-memory scale; a pgvector backend would normalize + index instead.
+```
 
 ## Elaborate
 
@@ -219,27 +258,43 @@ contrasts embeddings with term-matching.
 ## Project exercises
 
 *Provenance: Phase 2A — Retrieval foundations (C2.x). No `aieng-curriculum.md`
-present; IDs are by-phase convention. **Case B — embeddings are not implemented;
-this exercise is the buildable first brick.***
+present; IDs are by-phase convention. **Case A — embeddings now ship
+(`OllamaEmbeddingProvider` + `cosineSimilarity`); these exercises deepen them.***
 
-### Exercise — an embed-and-compare primitive
+### Exercise — a second embedding adapter (prove the seam holds)
 
 - **Exercise ID:** `[B2A.1]` Phase 2A, embeddings concept
-- **What to build:** A new `packages/retrieval` package exporting
-  `embed(text: string): Promise<number[]>` (call OpenAI `text-embedding-3-small`
-  behind the existing provider-key env pattern) and a pure
-  `cosineSimilarity(a, b): number`. Add a tiny demo script that embeds three
-  workspace event names from a `WorkspaceDescriptor` and prints their pairwise
-  similarities.
-- **Why it earns its place:** It introduces the missing primitive every other
-  retrieval concept needs, while respecting AptKit's provider-neutral boundary
-  (the embedder is an adapter, exactly like `ModelProvider`).
-- **Files to touch:** `packages/retrieval/src/embed.ts`,
-  `packages/retrieval/src/cosine.ts`, `packages/retrieval/test/cosine.test.ts`,
-  `packages/retrieval/package.json`.
-- **Done when:** A unit test proves `cosineSimilarity` returns ~1.0 for identical
-  vectors, ~0.0 for orthogonal ones, and the demo prints higher similarity for
-  two related event names than for an unrelated pair.
+- **What to build:** A second `EmbeddingProvider` — e.g. an
+  `OpenAIEmbeddingProvider` (`text-embedding-3-small`, 1536-dim) behind the
+  existing provider-key env pattern — implementing the same
+  `{ id, dimension, embed() }` contract as `OllamaEmbeddingProvider`. Wire it into
+  a pipeline and confirm `assertWiring` rejects pairing a 1536-dim embedder with
+  the 768-dim store.
+- **Why it earns its place:** It proves the embedding *vendor* is an adapter
+  exactly like `ModelProvider` — and it makes the dimension one-way-door concrete
+  by triggering the mismatch throw on purpose.
+- **Files to touch:** `packages/retrieval/src/openai-embedding-provider.ts`,
+  `packages/retrieval/test/openai-embedding-provider.test.ts`.
+- **Done when:** A test proves the new provider satisfies the contract (with an
+  injected transport, no live API), and a second test proves
+  `createRetrievalPipeline` throws the dimension-mismatch error when the embedder
+  and store disagree.
+- **Estimated effort:** `1–4hr`
+
+### Exercise — normalize-once to earn the dot-product shortcut
+
+- **Exercise ID:** `[B2A.2]` Phase 2A, embeddings (cosine optimization)
+- **What to build:** Add an opt-in `normalize` to `InMemoryVectorStore` that
+  unit-normalizes vectors at `upsert` and the query vector at `search`, then
+  replaces the full cosine with a plain dot product (Move 2, Step 2). Keep the
+  existing zero-vector guard.
+- **Why it earns its place:** It's the textbook "normalize then dot" optimization
+  against the repo's actual `cosineSimilarity`, and it forces you to prove the
+  ranking is identical before and after.
+- **Files to touch:** `packages/retrieval/src/in-memory-vector-store.ts`,
+  `packages/retrieval/test/in-memory-vector-store.test.ts`.
+- **Done when:** A test proves normalized-dot ranking matches full-cosine ranking
+  on the same corpus, and a micro-benchmark shows fewer ops per comparison.
 - **Estimated effort:** `1–4hr`
 
 ## Interview defense
@@ -272,20 +327,23 @@ but cheaper to compute."
 ## Validate
 
 - **Reconstruct:** From memory, write the two-line embed-then-compare pipeline:
-  `embed(text) → vector`, `cosine(a,b) = dot(â, b̂)`. No AptKit file to check —
-  it doesn't exist yet; that's the point.
+  `embed(text) → vector`, `cosine(a,b) = dot(a,b) / (|a||b|)`. Check against
+  `in-memory-vector-store.ts:46-57`.
 - **Explain:** Why can't you compare a 1536-dim vector from one model with a
   768-dim vector from another? (Different coordinate systems; the axes don't mean
-  the same thing, and the dimensions don't even line up.)
-- **Apply:** You embed the event name `product_viewed` and the customer property
-  `last_purchase_category`. You expect them weakly related. Where would these
-  strings come from in AptKit today? (`WorkspaceDescriptor.events[].name` and
-  `WorkspaceDescriptor.customerProperties` —
-  `packages/context/src/workspace-descriptor.ts:1-28`. Today they're flattened by
-  `schemaSummary`, never embedded.)
-- **Defend:** Why normalize before storing? (So query-time similarity is a single
-  dot product instead of a divide-by-magnitudes every comparison — cheaper at
-  scale, identical result.)
+  the same thing, the dimensions don't even line up. In AptKit this is enforced:
+  `assertWiring` in `pipeline.ts:22-29` throws before any indexing if the
+  embedder's `dimension` ≠ the store's.)
+- **Apply:** You index a doc and query it; the top hit's `score` is 0.0 even
+  though the doc clearly matches. What's the most likely bug? (A zero-magnitude
+  vector — `cosineSimilarity` returns 0 for it by design to avoid NaN,
+  `in-memory-vector-store.ts:56`. Check the embedder actually returned a vector,
+  not `[]`.)
+- **Defend:** AptKit's store does *not* normalize and divides by magnitudes every
+  comparison. Why is that fine here, and what changes at scale? (At in-memory
+  corpus sizes the divide is negligible; at pgvector scale you normalize once at
+  index time and use an indexed dot product so search is sub-linear, not a full
+  scan.)
 
 ## See also
 

@@ -213,5 +213,6 @@ Anchor: *the secret scan is the data-exposure constraint a database can't give y
 - `03-versioned-artifact-schema.md` — the `schemaVersion === 1` rule lives in this layer.
 - `04-fixture-promotion-lifecycle.md` — promotion is gated by `assertReplayArtifactShape`.
 - `02-tagged-union-event-log.md` — the discriminant this layer dispatches on.
+- `06-vector-store-row-model.md` — the contrast partner: this layer enforces invariants asynchronously when run; the corpus dimension check enforces its one invariant synchronously at write time, with a throw.
 - `audit.md` — Lens 4 (transactions and integrity) — the load-bearing finding.
 - `study-software-design` → information-hiding; `study-testing` — the eval semantics; `study-security` → secret handling (the `findSecretLikeString` guard).

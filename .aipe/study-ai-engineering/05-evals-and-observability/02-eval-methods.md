@@ -18,11 +18,15 @@ methods sit relative to the outputs they score.
                                    │  scored by one (or more) rungs
   ┌─ Method ladder (@aptkit/evals) ─▼───────────────────────────────┐
   │  exact      structural-diff.ts   (cheap, deterministic)         │
-  │  fuzzy/     detection-scorer.ts  ← ★ precision/recall-style ★   │ ← we are here
-  │  precision  rubric-judge.ts      (LLM-as-judge, see 03)          │
-  │  LLM-judge  [pairwise — NOT shipped]                            │
-  │  human      [review gate before promotion — see 01]            │
+  │  fuzzy/     detection-scorer.ts  ← precision/recall over a set  │ ← we are here
+  │  precision  precision-at-k.ts    ← ★ ranked-retrieval RULER ★   │
+  │  LLM-judge  rubric-judge.ts      (LLM-as-judge, see 03)          │
+  │  human      [pairwise — NOT shipped] · [review gate — see 01]   │
   └──────────────────────────────────────────────────────────────────┘
+
+  Two deterministic precision/recall scorers, two targets: detection-scorer
+  grades a SET of detections (categorical); precision-at-k grades a RANKED
+  retrieval list (order-aware). Both are free pure functions below the seam.
 ```
 
 Zoom in: you already grade things on a ladder of effort without thinking about
@@ -341,6 +345,15 @@ Every rung you can keep below the seam is a rung that never lies to you. That's
 why `03` exists — once you're forced above the seam, you have to actively defend
 against the judge being wrong.
 
+A note on the newest scorer: `scoreDetections` grades an unordered *set* of
+detections, but a retriever returns a *ranked list* where order matters — so the
+RAG stack added a sibling deterministic scorer, `scorePrecisionAtK` /
+`scoreRecallAtK` (`packages/evals/src/precision-at-k.ts`). Same below-the-seam
+property (pure, free, deterministic), different shape: it answers "of the top-k
+retrieved ids, what fraction are relevant" and is the RULER that makes "don't add
+reranking until you measure" executable. Full treatment in
+[05-precision-at-k.md](05-precision-at-k.md).
+
 Adjacent: the sets these methods score
 ([01-eval-set-types.md](01-eval-set-types.md)); the bias defense for rung 4
 ([03-llm-as-judge-bias.md](03-llm-as-judge-bias.md)); the artifacts the replay
@@ -449,6 +462,7 @@ score — so over-flagging is invisible to the current formula."
 
 - [01-eval-set-types.md](01-eval-set-types.md) — the sets these methods score
 - [03-llm-as-judge-bias.md](03-llm-as-judge-bias.md) — defending rung 4 against bias
+- [05-precision-at-k.md](05-precision-at-k.md) — the ranked-retrieval scorer that measures the RAG retriever
 - [04-llm-observability.md](04-llm-observability.md) — running these methods over replay artifacts
 - [../04-agents-and-tool-use/03-react-pattern.md](../04-agents-and-tool-use/03-react-pattern.md) — the loop whose outputs get scored
 - [../../study-prompt-engineering/05-eval-driven-iteration.md](../../study-prompt-engineering/05-eval-driven-iteration.md) — iterating prompts against these scores

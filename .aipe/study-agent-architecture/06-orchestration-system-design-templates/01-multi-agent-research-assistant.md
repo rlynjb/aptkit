@@ -96,11 +96,16 @@
   `.answer(question, { intent })`) is a single-agent agentic-retrieval loop over
   ~35 read-only analytics tools — that is exactly *one worker*, over *one source
   family*. It does the agentic-RAG half well: it tool-calls against analytics
-  APIs (not vector retrieval — there are no embeddings or vector DB in this repo)
-  inside the bounded `runAgentLoop`. What's missing is the entire coordination
-  layer: there is no supervisor decomposing the question, no fan-out to parallel
-  workers, and no citations/provenance attached to the answer. So the worker
-  primitive exists; the research-assistant *topology* does not.
+  APIs inside the bounded `runAgentLoop`. (The sixth capability, `rag-query`,
+  does the *vector-retrieval* half — embed → ANN → ground → cite over a real
+  store, with citations attached — and is the closest thing in the repo to a
+  research-assistant worker: see
+  `../02-agentic-retrieval/04-agentic-rag-over-vector-search.md`.) What's missing
+  is the entire coordination layer: there is no supervisor decomposing the
+  question, no fan-out to parallel workers, and no merge across sources. So two
+  worker primitives exist (analytics tool-calling and vector RAG); the
+  research-assistant *topology* that fans out and synthesizes across them does
+  not.
 
 - **How to make it apply:**
   Add a supervisor capability that decomposes a question into sub-questions, then

@@ -17,6 +17,7 @@ This is your home turf (7+ years Vue/React). No on-ramp. The files below lead wi
    - **`04-hand-rolled-router.md`** — routing as a single `useState<StudioView>` switch in `App()`. No react-router. Why that's the right call here.
    - **`05-fixture-provider-mode-switch.md`** — the fixture→anthropic→openai mode state machine and the provider-availability gating that rides on it.
    - **`06-replay-artifact-hook.md`** — `useReplayArtifacts`, the generic hook that owns the save→load→promote server-state lifecycle.
+   - **`07-static-demo-gated-ui.md`** — the `STATIC_DEMO` build flag that ships the same bundle to a live dev server and a static GitHub Pages demo, gating every backend-touching button and effect.
 
 ## Cross-links to neighboring guides
 

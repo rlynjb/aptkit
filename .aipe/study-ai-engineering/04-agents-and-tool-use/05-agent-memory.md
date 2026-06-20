@@ -24,17 +24,25 @@ first and not the second, and being honest about that line is the whole lesson.
   └───────────────────────────────┬────────────────────────────────┘
                                    │ (no arrow out to a store)
   ┌─ Long-term memory layer ───────▼────────────────────────────────┐
-  │  ✗ NOT PRESENT — no vector DB, no retrieval, no persistence      │
+  │  ✗ NO agent MEMORY — nothing persists or is written back across   │
+  │    runs. (The retrieval PRIMITIVE now exists — @aptkit/retrieval  │
+  │    + the rag-query agent search a doc corpus — but that's RAG     │
+  │    over external docs, not the agent recalling its OWN past runs.)│
   └──────────────────────────────────────────────────────────────────┘
 ```
 
 Zoom in: **short-term memory** is the in-context message history — it's automatic,
 bounded by the context window, and gone the moment the run ends. **Long-term
 memory** is anything retrieved from outside the window — a vector store, a
-database of past runs, a knowledge base — fetched and injected on demand. The
-question this file answers: what does an AptKit agent actually remember, and where
-does that stop? Answer: it remembers everything *within a single run* and nothing
-*across* runs.
+database of past runs, a knowledge base — fetched and injected on demand. Here's
+the sharp distinction now that aptkit ships vector RAG: the rag-query agent *does*
+retrieve from a vector store, but it retrieves over an **external document
+corpus**, not over the agent's **own conversation history**. Long-term *agent
+memory* means the agent remembers what *it* did/learned across runs — and that
+write-back-and-recall loop is what's still absent. The question this file answers:
+what does an AptKit agent remember about *itself*, and where does that stop?
+Answer: everything *within a single run*, nothing *across* runs — even though the
+retrieval machinery to fix that now exists in the repo.
 
 ## Structure pass
 

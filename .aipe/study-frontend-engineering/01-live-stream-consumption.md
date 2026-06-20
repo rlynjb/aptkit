@@ -213,7 +213,7 @@ A streamed response is just a `fetch` whose body resolves many times instead of 
 
 ### Use cases
 
-Reached for exactly when a workspace runs an agent against a **live provider** (anthropic/openai), not a fixture. `startReplay` branches: fixture mode runs locally in the browser and returns a finished result; provider mode calls `runServer`, which is the streaming path (`AgentReplayShell.tsx:117-119`). So the stream consumer fires when you click "Run Anthropic" or "Run OpenAI" in Recommendation, Monitoring, Diagnostic, Query, or Rubric Improvement — five of the six workspaces, each via its own `runServer*` wrapper in `api.ts`.
+Reached for exactly when a workspace runs an agent against a **live provider** (anthropic/openai), not a fixture. `startReplay` branches: fixture mode runs locally in the browser and returns a finished result; provider mode calls `runServer`, which is the streaming path (`AgentReplayShell.tsx:118-120`). So the stream consumer fires when you click "Run Anthropic" or "Run OpenAI" in Recommendation, Monitoring, Diagnostic, Query, or Rubric Improvement — five of the six workspaces, each via its own `runServer*` wrapper in `api.ts`.
 
 ### Code, line by line
 
@@ -324,7 +324,7 @@ EventSource is GET-only; the replay needs a POST body (`fixtureId`, `mode`). Web
 1. **Reconstruct:** from memory, write `responseBodyChunks` and the dispatch loop. Must include `releaseLock` in `finally` and the `finalPayload` null-check. (`api.ts:169-180, 126-166`)
 2. **Explain:** why is `runReplayStream` parameterized with a `mapResult` callback rather than returning the raw payload? (Each agent's result shape differs — `toReplayResult` vs `toMonitoringReplayResult` at `api.ts:107, 95` — so the consumer is generic and the caller supplies the shaping.)
 3. **Apply:** a malformed line arrives mid-stream. Trace what happens. (`record.ok === false` → synthetic warning event via `onEvent` → `continue`; the run survives, the warning shows in the trace panel — `api.ts:139-147`.)
-4. **Defend:** the server crashes after emitting 3 events but before the result line. What does the user see? (Three trace events painted, then the loop ends with `finalPayload === null`, the `throw` fires, `startReplay`'s catch sets `error`, and the workspace shows the error state — `AgentReplayShell.tsx:126-127`.)
+4. **Defend:** the server crashes after emitting 3 events but before the result line. What does the user see? (Three trace events painted, then the loop ends with `finalPayload === null`, the `throw` fires, `startReplay`'s catch sets `error`, and the workspace shows the error state — `AgentReplayShell.tsx:127-128`.)
 
 ## See also
 

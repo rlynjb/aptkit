@@ -151,6 +151,21 @@ flushing can lose the artifact, or worse, leave a *truncated* file that
                           A real WAL fsyncs the log to close this gap.
 ```
 
+**The store with NO durability boundary at all (the vector store).** The
+filesystem's durability is *late* (no fsync) but it exists — bytes do reach
+disk. The new `InMemoryVectorStore` has no durability boundary whatsoever: its
+chunks live in a `Map` (`packages/retrieval/src/in-memory-vector-store.ts:11`)
+that is gone the instant the process exits. There's nothing to fsync because
+nothing is ever written anywhere. "Recovery" is not crash recovery — it's
+**re-indexing the whole corpus from source**, because the index *is* the only
+copy and it's volatile. That's an acceptable contract for a from-scratch
+in-memory pipeline (re-embedding a handful of docs is cheap), and it's the
+sharpest possible illustration of the durability spectrum: filesystem =
+durable-but-late, vector store = not durable at all, and the durable end of the
+spectrum (Postgres + WAL + fsync) lives in buffr's `PgVectorStore`, behind the
+same `VectorStore` contract. Trigger to need it: re-embedding the corpus on
+every restart becomes too slow or too expensive.
+
 **Backup and restore — git.** The only durability that survives losing the
 machine is git: `artifacts/replays/` and the promoted fixtures are committed
 to the repo. "Restore" is `git checkout`. This is real but coarse — it

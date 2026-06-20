@@ -1,8 +1,9 @@
 # 05 — Transactions, isolation, and anomalies
 
 **Subtitle:** ACID / isolation levels / read-write anomalies — *Industry
-standard* (taught), *status: not yet exercised; analog: single-file write +
-read-time validation* (in-repo)
+standard* (taught), *status: mostly not yet exercised; analogs: single-file
+write + read-time validation, plus the vector store's non-atomic multi-chunk
+upsert* (in-repo)
 
 ---
 
@@ -149,15 +150,37 @@ append-only-new-file pattern sidesteps all three — you can't lose an update to
 a file nobody updates in place. That's not isolation; it's avoiding the
 situation isolation manages.
 
+**The one multi-record write that lacks atomicity (the vector store).** The
+filesystem story above is "one file per write, so no transaction is needed."
+The new `InMemoryVectorStore.upsert` breaks that pattern: it writes *many*
+chunks in one call, looping `this.chunks.set(...)` with no transaction around
+the loop (`packages/retrieval/src/in-memory-vector-store.ts:18-23`). It also
+*mutates in place* — upsert replaces an existing id (the
+"upsert-replaces-rather-than-duplicates" test at
+`test/in-memory-vector-store.test.ts:37-44` proves it). So this is the repo's
+first write that *could* leave a half-applied state: if chunk 3 of 5 throws a
+dimension mismatch, chunks 1–2 are already in the `Map`. The blast radius is
+small — the store is in-memory and the corpus is rebuildable by re-indexing —
+so it's a real-but-bounded atomicity gap, not a corruption risk. The version
+that wraps the same multi-chunk upsert in a true `begin/commit/rollback` lives
+in the **buffr** repo (`buffr/src/pg-vector-store.ts:40-64`), not aptkit: a
+mid-loop throw there rolls the whole batch back. That contrast is the lesson —
+the moment the corpus stops being cheaply rebuildable, you want buffr's
+transactional store behind the same `VectorStore` contract.
+
 ### Move 3 — the principle
 
-Transactions and isolation are the price of *mutable, shared* state. AptKit
-pays nothing because its state is *immutable and unshared per record* — write
-once, never update, unique filenames. The generalizable rule: **if you make
-every write produce a new immutable record instead of mutating an existing
-one, you delete an entire class of concurrency bugs without a single lock or
-transaction.** The cost is that you can't express "update this thing" — and
-the moment a feature needs that, you've signed up for transactions.
+Transactions and isolation are the price of *mutable, shared* state. AptKit's
+*filesystem* pays nothing because its state is *immutable and unshared per
+record* — write once, never update, unique filenames. The new vector store is
+the exception that proves the rule: it does a multi-chunk, in-place-by-id write
+with no transaction, so it inherits exactly the partial-write exposure the
+filesystem path avoided — bounded only by being in-memory and rebuildable. The
+generalizable rule: **if you make every write produce a new immutable record,
+you delete a class of concurrency bugs for free; the moment one write touches
+many records or updates in place, you've signed up for a transaction.** When
+that moment is load-bearing rather than rebuildable, buffr's PgVectorStore
+supplies the transaction behind the unchanged contract.
 
 ---
 

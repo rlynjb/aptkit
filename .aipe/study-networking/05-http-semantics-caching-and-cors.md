@@ -24,7 +24,7 @@ HTTP rides on top of TCP (and TLS on connection 2). It's the layer where methods
 
 ## Zoom in — narrow to the concept
 
-This is the one networking layer where the repo writes real, opinionated code — but only on connection 1. The middleware picks methods (POST for actions, GET for reads), returns status codes (405 for the wrong method, 400 for errors), sets content types (`application/json` vs `application/x-ndjson`), and disables caching on the stream. CORS is the dog that doesn't bark: same-origin means there's no cross-origin story at all. On connection 2, all HTTP semantics belong to the SDK.
+This is the networking layer where the repo writes real, opinionated code — historically only on connection 1, and now on connection 3 too. On connection 1 the middleware picks methods (POST for actions, GET for reads), returns status codes (405 for the wrong method, 400 for errors), sets content types (`application/json` vs `application/x-ndjson`), and disables caching on the stream. On connection 3 (the new Ollama `fetch`) the repo also authors HTTP semantics — it chooses POST, sets `content-type: application/json`, and *consumes* the response status itself (`if (!res.ok) throw` — `gemma-provider.ts:210`, `ollama-embedding-provider.ts:69`), which is the status-handling the SDK did invisibly on connection 2. CORS is the dog that doesn't bark: same-origin means there's no cross-origin story at all. On connection 2, all HTTP semantics belong to the SDK.
 
 ## The structure pass
 
@@ -167,6 +167,30 @@ The full HTTP-semantics picture on connection 1, both directions.
 **Error-as-body on the stream vs 400 on non-stream.** Stream errors: `vite.config.ts:910-914` writes `{type:'error'}` into the open body (status is already 200). Non-stream errors: e.g. `vite.config.ts:359-361` sets `res.statusCode = 400` and sends `{error}`. The split is the direct consequence of "you can't change the status after the first chunk."
 
 **Same-origin fetches, no CORS.** `apps/studio/src/api.ts` — every `fetch` uses a relative path (`'/api/model-status'`, `'/api/replays'`, the streaming endpoints). No `Origin` mismatch, so the browser never issues a preflight.
+
+**Connection 3 — the repo authors request method + status handling on the wire to Ollama.** `packages/providers/gemma/src/gemma-provider.ts:204-213`:
+
+```
+  gemma-provider.ts  (defaultHttpTransport, lines 204–213)
+
+  const res = await fetch(`${base}/api/chat`, {
+    method: 'POST',                              ← repo picks the verb (body + side effect)
+    headers: { 'content-type': 'application/json' },  ← repo sets the request content-type
+    body: JSON.stringify(payload),
+    ...(signal ? { signal } : {}),
+  });
+  if (!res.ok) {                                 ← repo CONSUMES the status itself
+    throw new Error(`ollama HTTP ${res.status}: ${await res.text()}`);  ← non-2xx → throw
+  }
+  return (await res.json()) as OllamaChatResponse;  ← repo parses the body
+       │
+       └─ this is the HTTP-semantics work the SDK did invisibly on connection 2:
+          choose method, set content-type, branch on status, parse JSON. On
+          connection 3 it's repo code line by line. (No streaming here — Ollama
+          is called with stream:false, so it's one request → one JSON body.)
+```
+
+The embedder mirrors this against `/api/embed` (`ollama-embedding-provider.ts:63-73`), including the same `if (!res.ok) throw` status branch. Note these are non-streaming on the wire — `stream: false` in the payload (`gemma-provider.ts:72`) — so unlike connection 1's NDJSON, connection 3 is an ordinary one-shot request/response with a normal status line the repo reads directly.
 
 ## Elaborate
 

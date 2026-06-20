@@ -1,14 +1,17 @@
 # 02 — Agentic Retrieval
 
-> Retrieval in AptKit is **tool-calling over workspace analytics APIs**, driven
-> by a loop the agent controls. There are **no embeddings, no vector DB, no ANN,
-> no chunking** in this codebase. When this sub-section says "retrieval," it
-> means: the model calls a read-only analytics tool (`execute_analytics_eql`,
-> `get_metric_timeseries`, `get_segments`, `get_event_segmentation`,
-> `get_anomaly_context`, …), looks at what came back, and decides what to call
-> next — until it has enough to answer. That decide-and-query-again behavior is
-> exactly what "agentic retrieval" names. The *source* is just structured
-> analytics endpoints instead of a similarity index.
+> Retrieval in AptKit now comes in **two flavors**, both driven by a loop the
+> agent controls. **(1) Tool-calling over workspace analytics APIs** — the
+> original three agents (monitoring, diagnostic, query) call read-only analytics
+> tools (`execute_analytics_eql`, `get_metric_timeseries`, `get_segments`, …),
+> read what came back, and decide what to call next. **(2) Real vector RAG** —
+> the `@aptkit/agent-rag-query` capability (file 04) embeds a corpus with
+> `nomic-embed-text`, ANN-searches an in-memory store, and grounds + cites the
+> answer, driven by a *local Gemma* with no native tool-calling. Flavor (1) has
+> no embeddings or vector store; flavor (2) is textbook RAG. Both share the
+> identical decide-and-query-again control loop — that loop is what "agentic
+> retrieval" names, regardless of whether the source is an analytics endpoint or
+> a similarity index.
 
 ## Why this is its own sub-section
 
@@ -56,31 +59,43 @@ rather than a standalone component.
 
 ```
   01-agentic-rag.md ──────► the loop: query tool → evaluate → query again → synthesize
-        │                   monitoring + diagnostic agents ARE this
+        │                   monitoring + diagnostic agents ARE this (analytics source)
         ▼
   02-self-corrective-rag.md ─► the relevance-grader pattern
         │                   NOT a separate component here; diagnostic
         │                   hypothesis-testing is the closest honest analog
         ▼
   03-retrieval-routing.md ─► route the query to the right source
-                            here: model picks the right TOOL among ~35,
-                            one source type, no multi-source router
+        │                   here: model picks the right TOOL among ~35,
+        │                   one source type, no multi-source router
+        ▼
+  04-agentic-rag-over-vector-search.md ─► the SAME loop over a real vector store
+                            @aptkit/agent-rag-query: embed→ANN→cite, driven by a
+                            local Gemma with tool-call EMULATION (no native tools)
 ```
 
 1. **`01-agentic-rag.md`** — the core. The driven loop, anchored to the
-   monitoring scan and the diagnostic investigation. Read this first; 02 and 03
-   are variations on it.
+   monitoring scan and the diagnostic investigation (analytics source). Read this
+   first; 02, 03, and 04 are variations on it.
 2. **`02-self-corrective-rag.md`** — the relevance-grading idea (CRAG/Self-RAG).
    Honest treatment: AptKit has no standalone grader. The diagnostic agent's
    `supported`/`reasoning` per-hypothesis evaluation is the nearest analog.
 3. **`03-retrieval-routing.md`** — picking the source. AptKit routes *within one
    source type* by tool selection; the coverage gate pre-filters which retrieval
    tasks are even runnable before any tokens are spent.
+4. **`04-agentic-rag-over-vector-search.md`** — the same loop over a *real
+   similarity index*. The `@aptkit/agent-rag-query` capability does textbook RAG
+   (embed, ANN, ground, cite) but the brain is a weak local Gemma, so the
+   provider *emulates* tool-calling. This is where "no vector retrieval anywhere"
+   stopped being true.
 
 ## What lives elsewhere
 
-- **All vector-retrieval mechanics** — embeddings, chunking, vector DBs, hybrid
-  search, GraphRAG, reranking: `.aipe/study-ai-engineering/03-retrieval-and-rag/`.
+- **All vector-retrieval mechanics** — embeddings, chunking, the in-memory
+  cosine store, hybrid search, GraphRAG, reranking:
+  `.aipe/study-ai-engineering/03-retrieval-and-rag/`. File 04 *uses* a real
+  vector store (`@aptkit/retrieval`) but covers only the agent's control loop
+  over it; the store/chunker/embedder internals are ai-engineering's partition.
   This sub-section cross-references that material; it does not re-teach it.
 - **The ReAct pattern** the loop implements:
   `.aipe/study-ai-engineering/04-agents-and-tool-use/03-react-pattern.md`.

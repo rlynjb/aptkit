@@ -1,7 +1,8 @@
 # Security overview — one page
 
-Before any lens, the whole picture. AptKit has exactly one trust boundary
-that matters, two assets worth protecting, and four controls that guard
+Before any lens, the whole picture. AptKit's trust story centers on the model
+boundary — now in two flavors, keyed cloud and no-auth local Gemma — plus the
+publish boundary, two assets worth protecting, and five controls that guard
 them. Everything else in a standard security checklist is `not yet
 exercised` because the repo has no surface for it — and saying so plainly is
 half the audit.
@@ -23,7 +24,9 @@ reach, or tamper with?
   └──────────────────────────────────────┬──────────────────────────┘
                                           │  request (system+messages+tools)
   ┌─ Model provider (UNTRUSTED) ──────────▼──────────────────────────┐
-  │  Anthropic / OpenAI — returns text + tool_use blocks             │
+  │  Anthropic / OpenAI (keyed, TLS) — returns text + tool_use       │
+  │  Gemma / Ollama (LOCAL, no key, plain HTTP) — tool calls PARSED  │
+  │  from prose; transport unauthenticated (★ new boundary ★)        │
   │  this output is NOT trusted: it's parsed, validated, gated       │
   └──────────────────────────────────────┬──────────────────────────┘
                                           │  NDJSON trace (no secrets)
@@ -41,14 +44,16 @@ reach, or tamper with?
 
 - **API keys** (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, plus their `_MODEL`
   names) — live only in `.env`, gitignored. Compromise = someone runs up your
-  provider bill or impersonates you to the provider.
+  provider bill or impersonates you to the provider. The local Gemma/Ollama
+  path carries **no key** — a different trust profile that trades key-leak risk
+  for an unauthenticated-transport risk (see control 5 below).
 - **Artifacts and fixtures** — JSON recorded from real runs
   (`artifacts/replays/*.json`, `packages/agents/*/fixtures/`). Committed to
   git and **inlined into the published npm bundle** via `bundledDependencies`.
   Compromise = a stray secret or sensitive workspace datum ships to the
   public registry.
 
-## The four controls (the Pass-2 pattern files)
+## The five controls (the Pass-2 pattern files)
 
 | Control | Guards | Where |
 | --- | --- | --- |
@@ -56,6 +61,7 @@ reach, or tamper with?
 | Secret-scan guard | artifact/fixture data-exposure | `02-secret-scan-guard.md` |
 | Server-side key boundary | key confidentiality + path traversal | `03-server-side-key-boundary.md` |
 | Validated output gate | untrusted model output | `04-validated-model-output-gate.md` |
+| Local-model tool-call boundary | model-driven dispatch over a no-auth local transport | `05-local-model-tool-call-trust-boundary.md` |
 
 ## What's deliberately out of scope
 

@@ -130,9 +130,14 @@ The boundary condition in detection scoring: the `unexpected` partition. After m
   top-10 of ≤10 anomalies →        top-k where k ≪ n and n is LARGE
   full sort already wins           (top 10 of 100,000) → quickselect
                                    O(n) avg, or a size-k heap O(n log k)
+  ── retrieval is the FIRST place this trigger gets close ──
+  search() sorts ALL n chunks      a corpus of thousands of chunks,
+  then slices top-5: fine while    topK=5 → sorting all n to keep 5 is
+  n is a handful of docs           wasteful → size-k heap O(n log k),
+                                   or skip the scan entirely (ANN, see 05)
 ```
 
-The honest read: AptKit sorts the replay filenames (`replay-runner.ts:43`) purely for *deterministic iteration order*, then walks all of them linearly to eval — it never *searches* that sorted list, so binary search has nothing to do. And every top-k here is on a tiny collection, so a full sort beats both quickselect and a heap on simplicity with no measurable cost. The triggers are the same scale triggers from `01`: a large sorted index searched by key (→ binary search, or really a database index), or top-k where k ≪ n on a large n (→ quickselect or heap).
+The honest read: AptKit sorts the replay filenames (`replay-runner.ts:43`) purely for *deterministic iteration order*, then walks all of them linearly to eval — it never *searches* that sorted list, so binary search still has nothing to do. The top-k story is the one that moved. Anomaly ranking is top-10 of ≤10, so a full sort wins forever. But `InMemoryVectorStore.search` sorts *all* n chunks to return topK (default 5), and the moment a corpus grows past a handful of documents, that's exactly the k ≪ n, large-n shape where a size-k heap (O(n log k)) beats the full O(n log n) sort — and where skipping the linear scan altogether with an ANN index beats both. So the quickselect/heap trigger is no longer purely hypothetical: retrieval is the first place in the repo where it has something real to bite on. It just hasn't bitten yet because the store is in-memory with a tiny corpus. The triggers stay the scale triggers from `01`: a large sorted index searched by key (→ binary search, or really a database index), or top-k where k ≪ n on a large n (→ heap or quickselect, or an ANN index for retrieval specifically).
 
 ### Move 3 — the principle
 
@@ -162,7 +167,7 @@ The three exercised patterns in one frame, with the two absent ones.
 
 ## Implementation in codebase
 
-**Use cases.** The severity sort + slice runs at the end of every anomaly-monitoring run to produce a ranked, capped output. Detection matching runs in eval scoring against expected categories/metrics/scopes. Coverage classify runs pre-model. The replay filename sort runs whenever a batch eval lists artifacts.
+**Use cases.** The severity sort + slice runs at the end of every anomaly-monitoring run to produce a ranked, capped output. The cosine-score sort + slice runs on every `InMemoryVectorStore.search` — i.e. every RAG query — to return the top-k most-similar chunks. Detection matching runs in eval scoring against expected categories/metrics/scopes. Coverage classify runs pre-model. The replay filename sort runs whenever a batch eval lists artifacts.
 
 The comparator sort + top-k slice — `packages/agents/anomaly-monitoring/src/monitoring-agent.ts` (lines 35, 86–88):
 
@@ -180,6 +185,29 @@ The comparator sort + top-k slice — `packages/agents/anomaly-monitoring/src/mo
           [...parsed] copy avoids mutating the parsed array in place. slice(0,10)
           is top-k by full sort: correct because n is small, a heap would be overkill.
 ```
+
+The second top-k — cosine-score ranking in retrieval — `packages/retrieval/src/in-memory-vector-store.ts` (lines 25–57):
+
+```
+  async search(vector: number[], k: number): Promise<VectorHit[]> {
+    this.assertDimension(vector, 'query vector');
+    const hits: VectorHit[] = [];
+    for (const chunk of this.chunks.values()) {                  ← line 28: LINEAR SCAN, every chunk
+      hits.push({ id: chunk.id, score: cosineSimilarity(vector, chunk.vector), meta: chunk.meta });
+    }                                                            ←   derive the sort key per chunk: O(d) each
+    hits.sort((a, b) => b.score - a.score);                      ← line 31: comparator sort, score DESC
+    return hits.slice(0, Math.max(0, k));                        ← line 32: top-k slice (Math.max guards k<0)
+  }
+       │
+       └─ same sort-and-slice shape as the anomaly ranking, but the derived key is a
+          NUMERIC cosine score, not a table lookup. Total cost: O(n·d) to score every
+          one of n chunks at d dimensions, then O(n log n) to sort. This is brute-force
+          (exact) nearest-neighbor — it always returns the true top-k, paying a full
+          scan to do it. The Math.max(0, k) is the boundary guard: a negative k slices
+          to empty instead of throwing.
+```
+
+And `cosineSimilarity` (`:46-57`) is the derived-key function — one O(d) pass accumulating `dot`, `magA`, `magB`, then `dot / (√magA · √magB)`, returning 0 when a vector has zero magnitude so the score is never `NaN`. This is the only place AptKit ranks by a *computed numeric score* rather than a lookup-table rank or a string comparison — see `01` for why O(n·d) is the cost that actually scales here, and `05` for the ANN/HNSW index that replaces this scan once n is large.
 
 Linear match + the matched/missed/unexpected split — `packages/evals/src/detection-scorer.ts` (lines 51–82):
 
@@ -269,10 +297,14 @@ Anchor: *the top-k shortcut pays off only when k ≪ n and n is large — neithe
 
 **Defend the decision.** Someone wants the anomaly ranking to use quickselect "for O(n) performance." Defend the sort-and-slice. (Answer: quickselect's O(n) average beats O(n log n) only at large n; here n ≤ 10, so log n is ~3 — the asymptotic win is invisible and quickselect adds partitioning complexity and a worst case. The full sort is simpler, stable, and free at this size. Premature optimization.)
 
+**Apply to retrieval.** `InMemoryVectorStore.search` (`in-memory-vector-store.ts:25-33`) scores every chunk with cosine, sorts all of them, then slices the top-5. Two questions: (a) why is the full sort fine *now*, and (b) what's the first thing you'd change as the corpus grows — the sort, or the scan? (Answer: (a) a few documents chunk to a handful of vectors, so sorting all to keep 5 is free. (b) Change the *scan* first, not the sort — the O(n·d) scoring of every vector is what dominates at scale, and the fix is an ANN index (HNSW) that skips most vectors, not a heap that merely makes the keep-top-5 step O(n log k). A size-k heap is the smaller, second optimization; the linear scan is the real bottleneck. See `05` for the HNSW graph index.)
+
 ## See also
 
 - `01-complexity-and-cost-models.md` — why "small n" makes these O(n log n) / O(n) operations effectively free.
 - `02-arrays-strings-and-hash-maps.md` — the `Set` that makes the `unexpected` membership check O(1), and the linear scans' hash-lookup complement.
-- `03-stacks-queues-deques-and-heaps.md` — the heap that top-k *would* use if k ≪ n and n were large.
+- `03-stacks-queues-deques-and-heaps.md` — the heap that top-k *would* use if k ≪ n and n were large (retrieval is the first place that gets close).
 - `04-trees-tries-and-balanced-indexes.md` — the balanced index binary search needs but the repo lacks.
-- `study-ai-engineering` (neighboring guide) — detection scoring as an eval metric, viewed as AI evaluation rather than set arithmetic.
+- `05-graphs-and-traversals.md` — the HNSW *graph* index that replaces retrieval's linear-scan k-NN at scale (the bigger optimization above a heap).
+- `02-arrays-strings-and-hash-maps.md` — `cosineSimilarity` as the derived sort key, and the chunker that produces the vectors this file ranks.
+- `study-ai-engineering` (neighboring guide) — detection scoring and precision@k as eval metrics, viewed as AI evaluation rather than set arithmetic.

@@ -72,7 +72,7 @@ Strategy in one line: **fetch server lists into state on mount; after every muta
 
 #### Part A — the loaders are memoized callbacks
 
-`refreshReplayHistory` is a `useCallback` over `[loadSavedReplays]` (`useReplayArtifacts.ts:63-73`), and a `useEffect` calls it whenever its identity changes (`:75-77`). Because the workspace passes a stable `loadSavedReplays` function, the loader is stable and the effect fires once on mount. Same pattern for `refreshPromotedFixtures`.
+`refreshReplayHistory` is a `useCallback` over `[loadSavedReplays]` (`useReplayArtifacts.ts:63-74`), and a `useEffect` calls it whenever its identity changes (`:76-79`). Because the workspace passes a stable `loadSavedReplays` function, the loader is stable and the effect fires once on mount. Same pattern for `refreshPromotedFixtures`.
 
 What breaks if the loader weren't memoized: the `useEffect` dependency would change every render, looping the fetch. The `useCallback` is what makes "fetch on mount" actually mean once.
 
@@ -94,9 +94,10 @@ What breaks without the `finally`: a thrown load would leave `loading` stuck tru
 #### Part C — save: mutate, stamp the result, then invalidate
 
 ```
-  saveCurrentReplay (useReplayArtifacts.ts:95-110)
+  saveCurrentReplay (useReplayArtifacts.ts:98-117)
 
   if not replay: return                       // nothing to save
+  if STATIC_DEMO: setSaveError(NOTE); return  // Pages build has no backend (§07)
   setSaving(true); setSaveError(null)
   try:
      artifact = buildArtifact(fixture, replay, mode, model)  // shape it
@@ -115,8 +116,9 @@ What breaks without stamping `savedPath` back: the Review/Promote panel couldn't
 #### Part D — promote: mutate, then invalidate the *other* list
 
 ```
-  promoteSavedReplay (useReplayArtifacts.ts:112-125)
+  promoteSavedReplay (useReplayArtifacts.ts:119-136)
 
+  if STATIC_DEMO: setHistoryError(NOTE); return  // Pages build has no backend (§07)
   setPromotingPath(path); setHistoryError(null); setPromoteResult(null)
   try:
      result = await promoteReplay(path)        // POST: artifact → promoted fixture
@@ -126,7 +128,7 @@ What breaks without stamping `savedPath` back: the Review/Promote panel couldn't
   finally: setPromotingPath(null)
 ```
 
-`promotingPath` holds the *path being promoted* (not a boolean) so the UI can disable exactly that row's button while leaving others clickable (`recommendation-panels.tsx:237`). That's a small but real "which item is busy" pattern — a boolean would disable all rows.
+`promotingPath` holds the *path being promoted* (not a boolean) so the UI can disable exactly that row's button while leaving others clickable (`recommendation-panels.tsx:240`). That's a small but real "which item is busy" pattern — a boolean would disable all rows. Both mutations also short-circuit on the `STATIC_DEMO` build flag — in the static Pages demo they set a "local dev only" note instead of POSTing to an absent backend (`07-static-demo-gated-ui.md`).
 
 #### Part E — the reset-on-context-change effect and the resolved review path
 
@@ -201,7 +203,7 @@ Server state held in the client is a cache, and a cache needs an invalidation ru
 ```
 
 ```
-  apps/studio/src/useReplayArtifacts.ts:95-110  — save: mutate then invalidate
+  apps/studio/src/useReplayArtifacts.ts:98-117  — save: mutate then invalidate
 
   const saveCurrentReplay = React.useCallback(async () => {
     if (!replay) return;
@@ -223,7 +225,7 @@ Server state held in the client is a cache, and a cache needs an invalidation ru
 ```
 
 ```
-  apps/studio/src/useReplayArtifacts.ts:112-125  — promote: per-item busy flag
+  apps/studio/src/useReplayArtifacts.ts:119-136  — promote: per-item busy flag
 
   const promoteSavedReplay = React.useCallback(async (path: string) => {
     setPromotingPath(path);                ← store WHICH path is busy (not a boolean)
@@ -242,7 +244,7 @@ Server state held in the client is a cache, and a cache needs an invalidation ru
 ```
 
 ```
-  apps/studio/src/useReplayArtifacts.ts:127-129  — resolved review target
+  apps/studio/src/useReplayArtifacts.ts:138-140  — resolved review target
 
   const latestReviewPath = replay?.savedPath              ← current run, if saved
     ?? selectedReviewPath                                 ← else explicit selection
@@ -266,19 +268,19 @@ Manual invalidation. The hook fetches `savedReplays` into state on mount; `saveC
 ```
   save → POST → setReplay({…savedPath}) → await refreshReplayHistory (invalidate)
 ```
-Anchor: `useReplayArtifacts.ts:95-110`.
+Anchor: `useReplayArtifacts.ts:98-117`.
 
 **Q: Why is the promote busy-flag a path, not a boolean?**
 So the UI disables exactly the row being promoted, not every row. `promotingPath` holds the in-flight path; each row checks `promotingPath === reviewPath`. A boolean would freeze the whole list.
 
-Anchor: `useReplayArtifacts.ts:113`, used at `recommendation-panels.tsx:237`.
+Anchor: `useReplayArtifacts.ts:119`, used at `recommendation-panels.tsx:237`.
 
 **Q: Why not React Query?**
 Two queries per workspace, single user, fresh sessions — its caching, dedup, and background refetch would be unused. The hand-rolled hook borrows the good parts (granular busy state, mutate-then-invalidate). I'd reach for SWR/React Query once there were more queries or a second client that could race.
 
 ## Validate
 
-1. **Reconstruct:** write `saveCurrentReplay` from memory — the saving flag, build, POST, stamp-back, invalidate, finally. (`useReplayArtifacts.ts:95-110`)
+1. **Reconstruct:** write `saveCurrentReplay` from memory — the saving flag, build, POST, stamp-back, invalidate, finally. (`useReplayArtifacts.ts:98-117`)
 2. **Explain:** why is each `refresh*` wrapped in `useCallback` and called from a `useEffect`? (Stable identity → the mount effect fires once instead of looping — `:63-77`.)
 3. **Apply:** the same hook serves Recommendation (recommendations) and Monitoring (anomalies). What differs between the two call sites? (Only the injected loaders/builders/promoters and the pinned generics — the hook body is identical: `RecommendationWorkspace.tsx:87` vs `MonitoringWorkspace.tsx:90`.)
 4. **Defend:** you switch `promotingPath` to a boolean `promoting`. What regresses in the UI? (Promoting one row disables every row's Promote button instead of just the active one — `recommendation-panels.tsx:237`.)

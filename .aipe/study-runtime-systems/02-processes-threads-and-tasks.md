@@ -138,7 +138,9 @@ In single-threaded JS, "concurrency" is the count of suspended-at-await tasks, a
 
 ## Implementation in codebase
 
-**Use cases.** This model is reached for every time the agent loop runs a turn (sequential tools), every time a script batch-replays fixtures (sequential loop), and every time you ask "can I speed this up by parallelizing?" (you can, with the Phase B trade).
+**Use cases.** This model is reached for every time the agent loop runs a turn (sequential tools), every time a script batch-replays fixtures (sequential loop), every time the RAG `ask` CLI indexes its corpus (`for (const doc of CORPUS) await pipeline.index(doc)` — one doc at a time), and every time you ask "can I speed this up by parallelizing?" (you can, with the Phase B trade).
+
+The RAG indexer is a clean illustration of the sequential-vs-batched distinction. Docs index serially, but *within* one doc the chunks embed in a single batched call — `indexDocument` builds the whole chunk array, then `await embedder.embed(texts)` once (`packages/retrieval/src/pipeline.ts:39-46`). So the batching boundary is "one HTTP round-trip per document," not "one per chunk." That's the right granularity: the embed transport already accepts an array, so chunk-level batching is free, while doc-level stays serial for the same deterministic-order reason the tool loop does.
 
 **Code side by side.**
 

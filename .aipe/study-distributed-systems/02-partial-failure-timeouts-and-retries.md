@@ -1,9 +1,13 @@
 # 02 — Partial failure, timeouts, retries, backoff
 
 **Industry name(s):** partial failure handling / failover / retry-with-backoff /
-fail-fast. **Type:** Industry standard.
+fail-fast / retry-on-parse. **Type:** Industry standard.
 
-This is the one file that genuinely lives in this repo. Read it slowly.
+This is the one file that genuinely lives in this repo. Read it slowly. It now
+covers three real resilience patterns: **fail-fast** (context guard),
+**failover** (the fallback chain), and **same-target retry-on-parse** (the Gemma
+provider's tool-call nudge loop) — and two flavors of the failure they defend
+against: cloud HTTPS errors and local Ollama-process errors.
 
 ## Zoom out, then zoom in
 
@@ -17,23 +21,27 @@ code that runs when node B (the provider) misbehaves.
   ┌─ Service layer (your process) ──────────────────────────────┐
   │  runAgentLoop ── signal.throwIfAborted() ── bounded turns     │
   └─────────────────────────────┬────────────────────────────────┘
-                               │ complete()
+                               │ complete() / embed()
   ┌─ Provider boundary ─────────▼────────────────────────────────┐
-  │  ★ ContextGuard (fail-fast)  → Fallback (failover) ★          │ ← we are here
-  │  Anthropic adapter   OpenAI adapter                           │
-  └─────────────────────────────┬────────────────────────────────┘
-                               │ HTTPS — can timeout / 429 / 5xx
-  ┌─ External provider ─────────▼────────────────────────────────┐
-  │  api.anthropic.com   api.openai.com                           │
-  └───────────────────────────────────────────────────────────────┘
+  │  ★ ContextGuard (fail-fast) → Fallback (failover) ★           │ ← we are here
+  │  Anthropic · OpenAI adapters    Gemma (retry-on-parse) · embed │
+  └──────────────┬───────────────────────────────┬────────────────┘
+       HTTPS — timeout/429/5xx │        HTTP localhost — down/loading │
+  ┌─ Cloud provider ─▼────────┐  ┌─ Local Ollama process ─▼──────────┐
+  │  api.anthropic.com / openai │  │  :11434 — ECONNREFUSED / 404 / slow│
+  └─────────────────────────────┘  └────────────────────────────────────┘
 ```
 
 Zoom in: **partial failure** is the defining problem of distributed systems.
 In a single function call, it either returns or throws — two outcomes. Across a
-network, there's a third: *you don't know.* The request might have succeeded on
-the other side while your connection died. AptKit's answer to "node B is
-misbehaving" is two patterns: **fail-fast** (don't even make a call that's
-doomed) and **failover** (when one provider fails, try the next).
+network (even a localhost socket), there's a third: *you don't know.* The
+request might have succeeded on the other side while your connection died.
+AptKit's answer to "an external service is misbehaving" is three patterns:
+**fail-fast** (don't even make a call that's doomed), **failover** (when one
+provider fails, try the next), and **retry-on-parse** (when a local model
+fumbles the response *format*, nudge it and ask once more). The first two guard
+against transport failure; the third guards against a weak model's bad output —
+a failure mode the cloud SDKs hide but a raw Ollama call exposes.
 
 ## Structure pass — layers, axis, seams
 
@@ -182,12 +190,56 @@ helpfully fail over to the next provider — the caller said stop. So abort erro
 bypass classification entirely and rethrow. This is the seam where in-process
 cancellation (runtime-systems' concern) meets failover (this guide's concern).
 
+**Step 4.5 — retry-on-parse: the one same-target retry in the repo.** Bridge
+from the agent loop's JSON re-prompt (`03`): when the model returns malformed
+output, you don't fail over — you ask the *same* model again with a corrective
+nudge. The Gemma provider does exactly this for tool-call emulation. Gemma2:9b
+has no native tool-calling, so the provider renders the tools into the system
+prompt and asks for a JSON tool call. If the reply is a *botched* one — it looks
+like an attempt (contains a `{`) but doesn't parse — the provider appends a
+`RETRY_NUDGE` and asks again, up to `maxToolCallAttempts` (default 2).
+
+```
+  Retry-on-parse — the kernel (same target, bounded, format-only)
+
+  for attempt in 0..maxAttempts:
+    reply = ollama.chat(messages + (attempt>0 ? RETRY_NUDGE : []))
+    call  = parseToolCall(reply)
+    ├─ parsed ok        → return tool_use(call)      ◄── success exits
+    ├─ looksLikeAttempt → continue (nudge & retry)   ◄── botched JSON → one more try
+    └─ plain prose      → break (it's a real answer, NOT an error)
+  give up → return text(reply)                       ◄── graceful: raw text, no throw
+```
+
+Three parts make this the pattern, each load-bearing:
+
+- **The bound (`maxToolCallAttempts`).** Without it, a model that *never* emits
+  valid JSON loops forever. The cap is the same instinct as the agent loop's
+  `maxTurns` — every retry loop against an unreliable producer needs a ceiling.
+- **The `looksLikeToolAttempt` gate.** This is the part people get wrong. You
+  only retry if the model *tried and failed* to call a tool (a stray `{`). Plain
+  prose is a *real answer*, not an error — retrying it would nag the model into
+  garbage. Distinguishing "fumbled the format" from "chose to answer directly"
+  is the whole subtlety.
+- **The graceful give-up.** After `maxAttempts`, it returns the raw text instead
+  of throwing. A weak local model degrading to a plain answer beats crashing the
+  run.
+
+Why this is *not* failover and *not* a network retry: the network call
+succeeded — Ollama answered. The failure is *semantic* (wrong format), and the
+fix is to re-ask the same node with better instructions. This is the resilience
+pattern the cloud SDKs give you for free (Anthropic emits structured
+`tool_use` natively) and that a raw local model forces you to build yourself.
+
 **Step 5 — backoff and jitter: the missing hardening.** Here's the honest part.
-AptKit's failover has **no delay between attempts** — it tries provider 2
+AptKit's *failover* has **no delay between attempts** — it tries provider 2
 immediately after provider 1 fails. There's no exponential backoff, no jitter,
-no retry of the *same* provider. That's fine for a two-provider failover (you're
-switching nodes, not hammering one), but it means the foundation below is
-`not yet exercised`:
+and no retry of the same provider *on a transport error*. (The Gemma
+retry-on-parse loop from Step 4.5 retries the same target, but on a *parse*
+failure after a successful response — not a network error, so it needs no
+backoff: the node isn't overloaded, it just answered badly.) For a two-provider
+failover that's fine — you're switching nodes, not hammering one — but it means
+the transport-level foundation below is `not yet exercised`:
 
 ```
   Exponential backoff with jitter — the textbook pattern (NOT in AptKit)
@@ -209,12 +261,14 @@ should name the gap out loud.
 ### Move 3 — the principle
 
 Partial failure is the only thing that makes a network call different from a
-local one, and there are exactly two honest responses: **don't make the call if
-it's doomed** (fail-fast) and **have a plan B when it fails anyway** (failover or
-retry). AptKit does both at the one boundary that needs them. The discipline
-that scales beyond this repo: *classify your errors* — "transient, retry" vs
-"permanent, give up" is the decision that separates a resilient system from one
-that retries itself into the ground.
+local one, and there are a small number of honest responses: **don't make the
+call if it's doomed** (fail-fast), **have a plan B when it fails anyway**
+(failover), and **re-ask the same node when it answered but answered wrong**
+(retry-on-parse). AptKit does all three at the boundaries that need them. The
+discipline that scales beyond this repo: *classify your failures* — not just
+"transient vs permanent" for transport (failover), but "transport failed" vs
+"the response is unusable" (retry-on-parse). Conflating the two is how systems
+fail over on a parse bug, or nag a healthy node into garbage.
 
 ## Primary diagram
 
@@ -254,9 +308,14 @@ classification and abort passthrough.
 
 **Use cases.** The fallback chain is reached for whenever a run is configured
 with more than one provider — the production posture where Anthropic is primary
-and OpenAI is the backup. The context guard wraps a local/cheap provider so a
-too-large prompt is rejected before wasting a call. Both run inside every agent
-that uses the composed provider stack.
+and OpenAI is the backup, or where a local Gemma is primary and a cloud provider
+is the safety net behind it (`provider-gemma`'s README spells out exactly this
+composition: guard the local model, then put it behind the fallback chain). The
+context guard wraps a local/cheap provider so a too-large prompt is rejected
+before wasting a call — load-bearing for Gemma, whose ~8k context is small and
+easy to overrun (`ask.ts:52` wraps it at `maxTokens: 8192`). The Gemma
+retry-on-parse loop runs on every tool-calling turn against a local model. All
+three run inside the RAG query agent.
 
 **The failover loop, line by line.**
 
@@ -326,19 +385,71 @@ that uses the composed provider stack.
           deterministic check that prevents a remote, expensive, certain failure.
 ```
 
+**The retry-on-parse loop, line by line.**
+
+```
+  packages/providers/gemma/src/gemma-provider.ts  (lines 62-91)
+
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {  ← bounded retry
+    request.signal?.throwIfAborted();          ← cancellation wins, every iteration
+    const messages = attempt === 0             ← first try: plain messages
+      ? baseMessages
+      : [...baseMessages, { role: 'user', content: RETRY_NUDGE }];  ← retry: + nudge
+    lastResponse = await this.chat({ ... });   ← the network call to Ollama
+    raw = lastResponse.message?.content ?? '';
+    if (wantsTool) {
+      const call = parseToolCall(raw);         ← try to decode a tool call
+      if (call) return this.toResponse([tool_use], ...);  ← SUCCESS exits the loop
+      if (looksLikeToolAttempt(raw)) continue; ← botched JSON ('{')? nudge & retry
+    }
+    break;                                     ← plain prose = real answer, stop
+  }
+  return this.toResponse([{ type: 'text', text: raw }], ...);  ← graceful give-up
+       │
+       └─ the looksLikeToolAttempt gate at :86 is load-bearing: without it, a
+          plain-prose answer ("It is sunny in Paris.") would be retried as if it
+          were a failure, nagging the model. With it, only a fumbled tool call
+          (a stray '{') triggers the nudge. "Format wrong" vs "chose prose" is
+          the distinction the whole loop hinges on.
+```
+
+**The Ollama edge — where the local partial failure surfaces.**
+
+```
+  packages/providers/gemma/src/gemma-provider.ts:201-215
+  packages/retrieval/src/ollama-embedding-provider.ts:60-75   (same shape)
+
+  const res = await fetch(`${base}/api/chat`, { ... });  ← localhost socket call
+  if (!res.ok) {                                          ← Ollama answered non-2xx?
+    throw new Error(`ollama HTTP ${res.status}: ${await res.text()}`);
+  }                                                       ← 404 (model not pulled),
+                                                            500 (mid-load) → throw
+       │
+       └─ if Ollama isn't running at all, `fetch` itself rejects (ECONNREFUSED)
+          before this line — that rejection propagates up identically. Either way
+          the error reaches the fallback chain, which can fail over to a cloud
+          provider. A localhost dependency is still a partial-failure source.
+```
+
 **Where backoff/timeout would live, and why they don't (yet).** The Anthropic
 adapter (`packages/providers/anthropic/src/anthropic-provider.ts:28-39`) passes
 `request.signal` straight to `client.messages.create(...)` and sets no explicit
 timeout or `maxRetries` — it relies on the **SDK's built-in retry/timeout
-defaults**, which AptKit doesn't override. So:
+defaults**, which AptKit doesn't override. The Ollama edges have *no* SDK and
+*no* explicit timeout at all — a hung Ollama call is bounded only by
+`AbortSignal` and the loop's `maxTurns`, never a per-call deadline. So:
 
-- **Explicit timeout:** `not yet exercised` at AptKit's layer (delegated to the
-  SDK). *Trigger: needing a tighter deadline than the SDK default, e.g. a UI
-  that must respond in 2s.*
+- **Explicit timeout:** `not yet exercised` at AptKit's layer — delegated to the
+  SDK for cloud, *absent entirely* for the Ollama edges (no SDK, no default).
+  *Trigger: needing a tighter deadline than the SDK default, e.g. a UI that must
+  respond in 2s, or capping a slow first-token from a cold local model.*
 - **Backoff + jitter:** `not yet exercised`. *Trigger: retrying the same
-  provider on a transient error instead of switching nodes.*
-- **Same-provider retry:** `not yet exercised`. *Trigger: a single-provider
-  deployment where there's no second node to fail over to.*
+  provider on a transient transport error instead of switching nodes.*
+- **Same-target *transport* retry:** `not yet exercised`. The Gemma
+  retry-on-parse loop (Step 4.5) retries the same target on a *parse* failure,
+  but no path retries a node on a *network* failure. *Trigger: a single-provider
+  deployment where there's no second node to fail over to, so a transient 429/503
+  must be retried in place.*
 
 ## Elaborate
 
@@ -387,6 +498,26 @@ jitter to avoid a thundering herd. That's the trigger."
   fail BACK (retry node)    → backoff + jitter    ← the trigger for adding it
 ```
 
+**Q: "You have a retry loop in the Gemma provider AND a fallback chain. Aren't
+those the same thing?"**
+
+"No — they defend against different failures. The fallback chain handles
+*transport* failure: a provider threw, so try a different node. The Gemma loop
+handles *semantic* failure: the call succeeded, Ollama answered, but the answer
+was a malformed tool call — so I re-ask the *same* node with a corrective nudge.
+Different failure, different fix. The tell is that the Gemma retry needs no
+backoff: the node isn't overloaded, it just fumbled the format."
+
+```
+  transport failed → fallback chain → switch to a different node
+  response unusable → Gemma loop     → re-ask the SAME node, nudged
+                                       (bounded by maxToolCallAttempts)
+```
+
+Anchor: "`gemma-provider.ts:62-91`. The load-bearing detail is the
+`looksLikeToolAttempt` gate at :86 — I only retry a *fumbled* tool call, never a
+plain-prose answer, because prose is a real answer, not an error."
+
 ## Validate
 
 1. **Reconstruct:** Write the failover loop's kernel from memory — the four
@@ -398,11 +529,22 @@ jitter to avoid a thundering herd. That's the trigger."
    inject instead?
 4. **Defend:** Argue for sequential failover over parallel hedged requests for
    this repo, naming the cost you accept (`fallback-provider.ts:50-86`).
+5. **Apply:** Ollama is stopped while a RAG run is mid-question. Trace what
+   throws and where (`ollama-embedding-provider.ts:60-75`), and explain how the
+   fallback chain can — or can't — recover, depending on whether the failure is
+   on the embed edge or the chat edge.
+6. **Defend:** Why does the Gemma retry-on-parse loop (`gemma-provider.ts:62-91`)
+   need *no* backoff, while a same-provider transport retry would? Tie it to
+   *what* failed in each case.
 
 ## See also
 
-- `01-distributed-system-map.md` — the seam where these handlers sit.
+- `01-distributed-system-map.md` — the seam where these handlers sit (now three
+  nodes: your process, cloud, and the local Ollama process).
 - `03-idempotency-deduplication-and-delivery-semantics.md` — what makes a retry
-  *safe* to perform.
-- `study-networking` — what timeouts and 5xx mean on the wire.
+  *safe* to perform (the Gemma nudge-retry is safe because chat is read-only).
+- `study-networking` — what timeouts and 5xx mean on the wire (and the localhost
+  HTTP hop to Ollama).
 - `study-runtime-systems` — `AbortSignal` and bounded work.
+- `study-ai-engineering` / `study-agent-architecture` — the RAG pipeline and
+  tool-call emulation these failures sit inside.

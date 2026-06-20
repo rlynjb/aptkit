@@ -33,6 +33,12 @@ and how it recovers when something breaks).
 - **[06-error-recovery.md](06-error-recovery.md)** — The failure-mode table:
   what the loop handles (tool error, budget exhaustion, unparseable output,
   provider failure) and what it doesn't (per-tool timeout, repeated-tool loops).
+- **[07-emulated-tool-calling.md](07-emulated-tool-calling.md)** — ★ NEW. How a
+  model with **no native tools API** (local Gemma2:9b) gets tool-use anyway:
+  render the tools into the system prompt, demand a JSON tool call, parse it back
+  into a `tool_use` block, and retry with a corrective nudge if it's malformed.
+  This is where a weak local model's tool loop actually stalls — and what makes
+  the rag-query agent's `search_knowledge_base` call work on Gemma.
 
 ## Reading order
 
@@ -42,4 +48,5 @@ and how it recovers when something breaks).
         → 04 (which tools, locked down how?)
         → 05 (what does it remember?)
         → 06 (what happens when it breaks?)
+        → 07 (tool-use when the model has no tools API — local Gemma)
 ```
