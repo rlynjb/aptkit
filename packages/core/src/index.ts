@@ -4,6 +4,9 @@ export * from '@aptkit/context';
 export * from '@aptkit/prompts';
 export * from '@aptkit/evals';
 export * from '@aptkit/workflows';
+export * from '@aptkit/retrieval';
+export * from '@aptkit/provider-gemma';
+export * from '@aptkit/provider-local';
 export * from '@aptkit/agent-recommendation';
 export {
   ANOMALY_MONITORING_CAPABILITY_ID,
@@ -60,3 +63,12 @@ export type {
   RubricImprovementResult,
   RubricJudgment as ImprovementRubricJudgment,
 } from '@aptkit/agent-rubric-improvement';
+export {
+  RAG_QUERY_CAPABILITY_ID,
+  RagQueryAgent,
+  ragQueryToolPolicy,
+} from '@aptkit/agent-rag-query';
+export type {
+  RagQueryAgentOptions,
+  RagQueryRunOptions,
+} from '@aptkit/agent-rag-query';

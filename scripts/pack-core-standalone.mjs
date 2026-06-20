@@ -19,6 +19,10 @@ const packageSpecs = [
   { workspace: '@aptkit/agent-query', tarball: 'aptkit-agent-query-0.0.0.tgz' },
   { workspace: '@aptkit/agent-recommendation', tarball: 'aptkit-agent-recommendation-0.0.0.tgz' },
   { workspace: '@aptkit/agent-rubric-improvement', tarball: 'aptkit-agent-rubric-improvement-0.0.0.tgz' },
+  { workspace: '@aptkit/retrieval', tarball: 'aptkit-retrieval-0.0.0.tgz' },
+  { workspace: '@aptkit/provider-gemma', tarball: 'aptkit-provider-gemma-0.0.0.tgz' },
+  { workspace: '@aptkit/provider-local', tarball: 'aptkit-provider-local-0.0.0.tgz' },
+  { workspace: '@aptkit/agent-rag-query', tarball: 'aptkit-agent-rag-query-0.0.0.tgz' },
 ];
 
 await mkdir(packDir, { recursive: true });
