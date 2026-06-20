@@ -29,10 +29,27 @@ const DEFAULT_TOP_K = 5;
  * returns only the ranked payload — the registry's `callTool` records the
  * `durationMs` (its `ToolCallResult` convention in `@aptkit/tools`).
  */
-export function createSearchKnowledgeBaseTool(pipeline: RetrievalPipeline): {
+export type SearchKnowledgeBaseToolOptions = {
+  /** top_k used when the caller omits one. Default 5. */
+  defaultTopK?: number;
+  /**
+   * Lower bound on top_k, applied even when the model asks for fewer. Default 1
+   * (no floor). Set above 1 to stop a weak local model from starving its own
+   * retrieval by passing top_k: 1 — the cause of multi-part-question misses.
+   */
+  minTopK?: number;
+};
+
+export function createSearchKnowledgeBaseTool(
+  pipeline: RetrievalPipeline,
+  options: SearchKnowledgeBaseToolOptions = {},
+): {
   definition: ToolDefinition;
   handler: ToolHandler;
 } {
+  const defaultTopK = options.defaultTopK ?? DEFAULT_TOP_K;
+  const minTopK = Math.max(1, options.minTopK ?? 1);
+
   const definition: ToolDefinition = {
     name: SEARCH_KNOWLEDGE_BASE_TOOL_NAME,
     description:
@@ -60,7 +77,8 @@ export function createSearchKnowledgeBaseTool(pipeline: RetrievalPipeline): {
 
   const handler: ToolHandler = async (args): Promise<SearchKnowledgeBaseOutput> => {
     const query = typeof args.query === 'string' ? args.query : '';
-    const topK = typeof args.top_k === 'number' && args.top_k > 0 ? args.top_k : DEFAULT_TOP_K;
+    const requestedTopK = typeof args.top_k === 'number' && args.top_k > 0 ? args.top_k : defaultTopK;
+    const topK = Math.max(requestedTopK, minTopK);
     const filter =
       args.filter && typeof args.filter === 'object' && !Array.isArray(args.filter)
         ? (args.filter as Record<string, unknown>)

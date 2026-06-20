@@ -43,7 +43,9 @@ async function main(): Promise<void> {
   process.stdout.write(`Indexing ${CORPUS.length} documents...\n`);
   for (const doc of CORPUS) await pipeline.index(doc);
 
-  const tool = createSearchKnowledgeBaseTool(pipeline);
+  // Floor top_k: Gemma tends to under-fetch (top_k: 1), starving multi-part
+  // questions. minTopK keeps retrieval honest regardless of what the model asks.
+  const tool = createSearchKnowledgeBaseTool(pipeline, { minTopK: 4 });
   const tools = new InMemoryToolRegistry([tool.definition], { [tool.definition.name]: tool.handler });
 
   // A — local Gemma, guarded against its ~8k context window.

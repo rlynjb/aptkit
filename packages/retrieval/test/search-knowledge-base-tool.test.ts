@@ -74,6 +74,20 @@ test('tool honors top_k', async () => {
   assert.equal(payload.results.length, 1);
 });
 
+test('tool floors top_k to minTopK so a weak model cannot starve retrieval', async () => {
+  const pipeline = await seededPipeline(); // 2 chunks indexed
+  const { definition, handler } = createSearchKnowledgeBaseTool(pipeline, { minTopK: 2 });
+  const registry = new InMemoryToolRegistry([definition], { [definition.name]: handler });
+
+  // Model under-fetches with top_k: 1; the floor lifts it back to 2.
+  const { result } = await registry.callTool(SEARCH_KNOWLEDGE_BASE_TOOL_NAME, {
+    query: 'anything',
+    top_k: 1,
+  });
+  const payload = result as { results: unknown[] };
+  assert.equal(payload.results.length, 2);
+});
+
 test('tool honors a meta filter', async () => {
   const pipeline = await seededPipeline();
   const { definition, handler } = createSearchKnowledgeBaseTool(pipeline);
