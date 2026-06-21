@@ -7,8 +7,13 @@ import { QueryWorkspace } from './QueryWorkspace';
 import { RubricImprovementWorkspace } from './RubricImprovementWorkspace';
 import { CapabilitiesWorkspace } from './CapabilitiesWorkspace';
 import { StudioHome } from './StudioHome';
+import { DocPage } from './DocPage';
 import type { StudioView } from './types';
+import coreApiMarkdown from '../../../docs/core-api.md?raw';
+import userGuideMarkdown from '../../../docs/studio.md?raw';
 import './styles.css';
+
+const REPO_DOCS = 'https://github.com/rlynjb/aptkit/blob/main/docs';
 
 function App() {
   const [view, setView] = React.useState<StudioView>('home');
@@ -35,6 +40,28 @@ function App() {
 
   if (view === 'capabilities') {
     return <CapabilitiesWorkspace onHome={() => setView('home')} />;
+  }
+
+  if (view === 'api-docs') {
+    return (
+      <DocPage
+        title="API Reference"
+        markdown={coreApiMarkdown}
+        sourceHref={`${REPO_DOCS}/core-api.md`}
+        onHome={() => setView('home')}
+      />
+    );
+  }
+
+  if (view === 'user-guide') {
+    return (
+      <DocPage
+        title="Studio User Guide"
+        markdown={userGuideMarkdown}
+        sourceHref={`${REPO_DOCS}/studio.md`}
+        onHome={() => setView('home')}
+      />
+    );
   }
 
   return <StudioHome onOpen={setView} />;

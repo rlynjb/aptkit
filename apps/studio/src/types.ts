@@ -147,7 +147,9 @@ export type StudioView =
   | 'diagnostic'
   | 'query'
   | 'rubric-improvement'
-  | 'capabilities';
+  | 'capabilities'
+  | 'api-docs'
+  | 'user-guide';
 
 export type ProviderStatus = Record<ReplayMode, { available: boolean; model: string }>;
 
