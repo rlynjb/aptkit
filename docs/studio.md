@@ -10,6 +10,16 @@ npm run dev:studio
 
 Vite prints the local URL. If `5173` is already in use, it automatically chooses the next available port.
 
+## Home & in-app docs
+
+The landing screen is the **Capability Gallery** — Studio's home. Its header has links you can open without leaving Studio:
+
+- **API Reference** — the `@rlynjb/aptkit-core` API docs, rendered in-app from [`core-api.md`](core-api.md).
+- **User Guide** — *Reading & Evaluating Output*, rendered in-app from [`studio-guide.md`](studio-guide.md): how to read a run's output, trace, and eval, and judge quality.
+- **npm** / **GitHub** — the published package and the repo.
+
+The doc pages are rendered from the `docs/*.md` files via Vite's `?raw` import, so they're inlined into the build and also work in the static GitHub Pages demo (no backend).
+
 ## Studio Pages
 
 ### Recommendation Agent
@@ -67,6 +77,12 @@ Use this page to check:
 - history tool usage before final structured output
 - next action and optional next drill output
 - trace and eval status
+
+### RAG Query Agent — not yet a Studio page
+
+The RAG query agent (`@aptkit/agent-rag-query`) is a newer capability: it retrieves from a vector store and answers grounded, cited questions, typically with a local model (Gemma via Ollama). It runs in the terminal and in the **buffr** companion runtime against a real corpus — it does **not** have a Studio replay page yet, because Studio's pages replay fixtures over the analytics workspace, while RAG needs a live embedding/vector-store pipeline.
+
+When it gets a page, it will drop into the same `AgentReplayShell` as the others. Until then, evaluate it with its `precision@k` / `recall@k` retrieval scorers and faithfulness judging — see [`studio-evaluation.md`](studio-evaluation.md) and the buffr `eval` CLI.
 
 ### Runtime & Eval Utilities
 
