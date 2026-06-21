@@ -11,14 +11,16 @@ published as [`@rlynjb/aptkit-core`](https://www.npmjs.com/package/@rlynjb/aptki
   runtime, providers (local-first Gemma/Ollama), retrieval/RAG, tools, prompts/context, evals,
   and the six prebuilt agents.
 
-## For evaluating output quality
+## For reading & evaluating output quality
 
-- **[studio-evaluation.md](studio-evaluation.md)** — using **AptKit Studio** to evaluate agent
-  output quality: the replay-centric loop (live run → artifact → eval → promote → deterministic
-  replay), reading a run's output/trace/eval, the eval methods (structural-diff,
-  detection-scorer, rubric-judge / LLM-as-judge, precision@k / recall@k), fixture-vs-live drift,
-  and promoting a good run to a correctness baseline.
-- **[studio.md](studio.md)** — general Studio UI tour (panels, replay shell, the static demo).
+- **[studio-guide.md](studio-guide.md)** — **Reading & evaluating Studio output** (viewer-oriented,
+  no local setup). How to read a run's output / trace / eval, the difference between structural and
+  quality checks, judging quality in order (shape → grounding → substance), and fixture-vs-live
+  comparison. This is the in-Studio "User Guide" page.
+- **[studio-evaluation.md](studio-evaluation.md)** — the **hands-on** evaluation workflow: the
+  replay loop, the replay-artifact JSON, the exact eval functions (structural-diff,
+  detection-scorer, rubric-judge / LLM-as-judge, precision@k / recall@k), and promoting baselines.
+- **[studio.md](studio.md)** — running Studio locally + the general UI tour.
 
 ## Background & operations
 
