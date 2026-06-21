@@ -3,10 +3,12 @@ import { DiagnosticInvestigationAgent, FixtureModelProvider as DiagnosticFixture
 import { FixtureModelProvider as QueryFixtureModelProvider, QueryAgent, validateQueryAnswer } from '@aptkit/agent-query';
 import { RecommendationAgent, FixtureModelProvider } from '@aptkit/agent-recommendation';
 import { FixtureModelProvider as RubricImprovementFixtureModelProvider, RubricImprovementAgent, validateRubricImprovementResult } from '@aptkit/agent-rubric-improvement';
-import { assertRecommendationShape } from '@aptkit/evals';
+import { RagQueryAgent } from '@aptkit/agent-rag-query';
+import { assertRecommendationShape, scorePrecisionAtK, scoreRecallAtK } from '@aptkit/evals';
+import { createRetrievalPipeline, createSearchKnowledgeBaseTool, InMemoryVectorStore, type EmbeddingProvider } from '@aptkit/retrieval';
 import type { CapabilityEvent } from '@aptkit/runtime';
 import { InMemoryToolRegistry, type ToolHandler } from '@aptkit/tools';
-import type { DiagnosticFixture, DiagnosticReplayResult, MonitoringFixture, MonitoringReplayResult, QueryFixture, QueryReplayResult, RecommendationFixture, ReplayResult, RubricImprovementFixture, RubricImprovementReplayResult } from './types';
+import type { DiagnosticFixture, DiagnosticReplayResult, MonitoringFixture, MonitoringReplayResult, QueryFixture, QueryReplayResult, RagQueryFixture, RagQueryReplayResult, RagRetrievedChunk, RecommendationFixture, ReplayResult, RubricImprovementFixture, RubricImprovementReplayResult } from './types';
 
 export function runFixtureReplay(fixture: RecommendationFixture): Promise<ReplayResult> {
   const startedAt = performance.now();
@@ -139,6 +141,90 @@ export function runQueryFixtureReplay(fixture: QueryFixture): Promise<QueryRepla
       durationMs: Math.round(performance.now() - startedAt),
     };
   });
+}
+
+const RAG_EMBED_DIM = 64;
+
+/** Deterministic in-browser embedder (keyword-hash) — no Ollama needed for fixture replay. */
+function makeFixtureEmbedder(): EmbeddingProvider {
+  return {
+    id: 'fixture-embed',
+    dimension: RAG_EMBED_DIM,
+    async embed(texts: string[]): Promise<number[][]> {
+      return texts.map((text) => {
+        const vector = new Array<number>(RAG_EMBED_DIM).fill(0);
+        for (const word of text.toLowerCase().split(/\W+/).filter(Boolean)) {
+          let hash = 0;
+          for (const ch of word) hash = (hash * 31 + ch.charCodeAt(0)) >>> 0;
+          vector[hash % RAG_EMBED_DIM] += 1;
+        }
+        return vector;
+      });
+    },
+  };
+}
+
+export async function runRagQueryFixtureReplay(fixture: RagQueryFixture): Promise<RagQueryReplayResult> {
+  const startedAt = performance.now();
+
+  // Real retrieval pipeline, deterministic in the browser: fake embedder + in-memory store.
+  const embedder = makeFixtureEmbedder();
+  const store = new InMemoryVectorStore(RAG_EMBED_DIM);
+  const pipeline = createRetrievalPipeline({ embedder, store });
+  for (const doc of fixture.corpus) {
+    await pipeline.index({ id: doc.id, text: doc.text });
+  }
+  const tool = createSearchKnowledgeBaseTool(pipeline, { minTopK: 3 });
+  const tools = new InMemoryToolRegistry([tool.definition], { [tool.definition.name]: tool.handler });
+
+  // Recorded Gemma responses (tool_use, then the grounded answer) replay the loop.
+  const model = new QueryFixtureModelProvider(fixture.modelResponses);
+  const trace: CapabilityEvent[] = [];
+  const agent = new RagQueryAgent({
+    model,
+    tools,
+    profile: fixture.profile,
+    trace: { emit: (event) => trace.push(event) },
+  });
+
+  const answer = await agent.answer(fixture.question);
+
+  // The chunks the agent actually retrieved, read back from the search tool_call_end.
+  const toolEnd = trace.find(
+    (event): event is Extract<CapabilityEvent, { type: 'tool_call_end' }> => event.type === 'tool_call_end',
+  );
+  const rawResult = toolEnd?.result;
+  const retrieved: RagRetrievedChunk[] =
+    rawResult && typeof rawResult === 'object' && Array.isArray((rawResult as { results?: unknown }).results)
+      ? (rawResult as { results: RagRetrievedChunk[] }).results
+      : [];
+
+  const retrievedDocIds = [...new Set(retrieved.map((hit) => String(hit.meta?.docId ?? hit.id)))];
+  const relevant = new Set(fixture.relevant);
+  const recallK = Math.max(retrievedDocIds.length, fixture.relevant.length || 1);
+  const precisionAt1 = scorePrecisionAtK(retrievedDocIds, relevant, 1).score;
+  const recallAtK = scoreRecallAtK(retrievedDocIds, relevant, recallK).score;
+
+  const issues: string[] = [];
+  if (!answer.trim()) issues.push('answer: agent produced no answer');
+  if (precisionAt1 < 1) issues.push('retrieval: top chunk is not in the relevant set');
+  if (recallAtK < 1) issues.push('retrieval: not all relevant docs were retrieved');
+
+  return {
+    question: fixture.question,
+    answer,
+    retrieved,
+    retrievedDocIds,
+    precisionAt1,
+    recallAtK,
+    recallK,
+    relevant: fixture.relevant,
+    trace,
+    modelTurns: model.requests.length,
+    durationMs: Math.round(performance.now() - startedAt),
+    evalOk: issues.length === 0,
+    issues,
+  };
 }
 
 export function runRubricImprovementFixtureReplay(

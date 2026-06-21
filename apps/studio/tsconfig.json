@@ -19,10 +19,13 @@
     { "path": "../../packages/agents/anomaly-monitoring" },
     { "path": "../../packages/agents/diagnostic-investigation" },
     { "path": "../../packages/agents/query" },
+    { "path": "../../packages/agents/rag-query" },
     { "path": "../../packages/agents/recommendation" },
     { "path": "../../packages/agents/rubric-improvement" },
+    { "path": "../../packages/retrieval" },
     { "path": "../../packages/providers/anthropic" },
     { "path": "../../packages/providers/fallback" },
+    { "path": "../../packages/providers/gemma" },
     { "path": "../../packages/providers/local" },
     { "path": "../../packages/providers/openai" }
   ],

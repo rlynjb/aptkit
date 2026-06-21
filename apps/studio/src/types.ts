@@ -147,9 +147,43 @@ export type StudioView =
   | 'diagnostic'
   | 'query'
   | 'rubric-improvement'
+  | 'rag-query'
   | 'capabilities'
   | 'api-docs'
   | 'user-guide';
+
+export type RagQueryFixture = {
+  id: string;
+  description: string;
+  question: string;
+  profile?: string;
+  corpus: { id: string; text: string }[];
+  relevant: string[];
+  modelResponses: ModelResponse[];
+};
+
+export type RagRetrievedChunk = {
+  id: string;
+  score: number;
+  citation: string;
+  meta: Record<string, unknown>;
+};
+
+export type RagQueryReplayResult = {
+  question: string;
+  answer: string;
+  retrieved: RagRetrievedChunk[];
+  retrievedDocIds: string[];
+  precisionAt1: number;
+  recallAtK: number;
+  recallK: number;
+  relevant: string[];
+  trace: CapabilityEvent[];
+  modelTurns: number;
+  durationMs: number;
+  evalOk: boolean;
+  issues: string[];
+};
 
 export type ProviderStatus = Record<ReplayMode, { available: boolean; model: string }>;
 

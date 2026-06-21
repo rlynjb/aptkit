@@ -78,11 +78,18 @@ Use this page to check:
 - next action and optional next drill output
 - trace and eval status
 
-### RAG Query Agent — not yet a Studio page
+### RAG Query Agent
 
-The RAG query agent (`@aptkit/agent-rag-query`) is a newer capability: it retrieves from a vector store and answers grounded, cited questions, typically with a local model (Gemma via Ollama). It runs in the terminal and in the **buffr** companion runtime against a real corpus — it does **not** have a Studio replay page yet, because Studio's pages replay fixtures over the analytics workspace, while RAG needs a live embedding/vector-store pipeline.
+Replays the RAG query agent (`@aptkit/agent-rag-query`) over a small in-browser knowledge base — fully deterministic, no Ollama or backend needed.
 
-When it gets a page, it will drop into the same `AgentReplayShell` as the others. Until then, evaluate it with its `precision@k` / `recall@k` retrieval scorers and faithfulness judging — see [`studio-evaluation.md`](studio-evaluation.md) and the buffr `eval` CLI.
+Use this page to check:
+
+- the agent calling `search_knowledge_base`, the retrieved chunks (relevant ones highlighted), and the grounded, cited answer
+- **retrieval quality** scored live: `precision@1` and `recall@k` over a labeled relevant set
+- trace events (the search tool call + the synthesis turn) and eval status
+- pick between fixtures (a two-part question, a single-source question) from the selector
+
+Under the hood the retrieval pipeline runs in the browser: a deterministic keyword-hash embedder + `InMemoryVectorStore` index the fixture corpus, and recorded Gemma responses replay the tool-call → answer loop. For a *live* run against a real vector store (pgvector) and a real model, see the **buffr** companion runtime ([`studio-evaluation.md`](studio-evaluation.md) covers the eval side).
 
 ### Runtime & Eval Utilities
 

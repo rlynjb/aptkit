@@ -5,6 +5,7 @@ import { MonitoringWorkspace } from './MonitoringWorkspace';
 import { DiagnosticWorkspace } from './DiagnosticWorkspace';
 import { QueryWorkspace } from './QueryWorkspace';
 import { RubricImprovementWorkspace } from './RubricImprovementWorkspace';
+import { RagQueryWorkspace } from './RagQueryWorkspace';
 import { CapabilitiesWorkspace } from './CapabilitiesWorkspace';
 import { StudioHome } from './StudioHome';
 import { DocPage } from './DocPage';
@@ -36,6 +37,10 @@ function App() {
 
   if (view === 'rubric-improvement') {
     return <RubricImprovementWorkspace onHome={() => setView('home')} />;
+  }
+
+  if (view === 'rag-query') {
+    return <RagQueryWorkspace onHome={() => setView('home')} />;
   }
 
   if (view === 'capabilities') {

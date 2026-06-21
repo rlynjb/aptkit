@@ -1,7 +1,8 @@
 import React from 'react';
-import { Activity, BookOpen, BookText, Boxes, CircleDollarSign, Github, MessageSquareText, Package, Play, Scale, SearchCheck } from 'lucide-react';
+import { Activity, BookOpen, BookText, Boxes, CircleDollarSign, Database, Github, MessageSquareText, Package, Play, Scale, SearchCheck } from 'lucide-react';
 import { ECOMMERCE_ANOMALY_CATEGORIES, coverageReport, schemaCapabilities } from '@aptkit/agent-anomaly-monitoring';
 import { diagnosticFixtures, fixtures, monitoringFixtures, queryFixtures, rubricImprovementFixtures } from './fixtures';
+import { ragQueryFixtures } from './rag-query-fixtures';
 import type { StudioView } from './types';
 
 export function StudioHome({ onOpen }: { onOpen: (view: StudioView) => void }) {
@@ -109,6 +110,18 @@ export function StudioHome({ onOpen }: { onOpen: (view: StudioView) => void }) {
             'Agentic improvement loop',
           ]}
           onOpen={() => onOpen('rubric-improvement')}
+        />
+        <CapabilityCard
+          icon={<Database size={20} />}
+          title="RAG Query Agent"
+          status="Fixture ready"
+          summary="Retrieve from an in-memory knowledge base and answer grounded, cited questions, scored with precision@k / recall@k."
+          details={[
+            `${ragQueryFixtures.length} fixtures`,
+            'Embed → cosine search → cite',
+            'Deterministic in-browser RAG',
+          ]}
+          onOpen={() => onOpen('rag-query')}
         />
         <CapabilityCard
           icon={<Boxes size={20} />}
