@@ -82,7 +82,7 @@ type ModelProvider = {
 };
 ```
 
-It is a `type`, not an `interface`. `id` and `defaultModel` are part of the contract alongside `complete`.
+The seam every model plugs into: `complete()` takes a `ModelRequest` (system prompt, messages, advertised tools) and returns a `ModelResponse` whose `content` is the provider-neutral content blocks (§4). Implement it to swap in any chat model. It is a `type`, not an `interface`. `id` and `defaultModel` are part of the contract alongside `complete`.
 
 ### `VectorStore` — `packages/retrieval/src/contracts.ts`
 
@@ -94,6 +94,8 @@ type VectorStore = {
 };
 ```
 
+Stores embedded chunks and retrieves them: `upsert` writes vectors, `search` ranks the stored chunks by similarity to a query vector and returns the top `k`. Implement it to back retrieval with a real vector database.
+
 ### `EmbeddingProvider` — `packages/retrieval/src/contracts.ts`
 
 ```ts
@@ -103,6 +105,8 @@ type EmbeddingProvider = {
   embed(texts: string[]): Promise<number[][]>;
 };
 ```
+
+Turns text into vectors. Its `dimension` must match the `VectorStore`'s `dimension` — `createRetrievalPipeline` throws on mismatch. Implement it to swap the embedding model.
 
 ### `ToolRegistry` — `packages/tools/src/tool-registry.ts`
 
@@ -117,7 +121,7 @@ type ToolRegistry = {
 };
 ```
 
-`InMemoryToolRegistry` is the bundled implementation (§7).
+Lists and executes the tools an agent may call: `listTools` advertises the catalog to the model, `callTool` runs one by name. Implement it to source tools from anywhere (e.g. an MCP server). `InMemoryToolRegistry` is the bundled implementation (§7).
 
 ---
 
@@ -126,6 +130,8 @@ type ToolRegistry = {
 `packages/runtime/src/`. The agent execution kernel.
 
 ### Model wire types — `model-provider.ts`
+
+The provider-neutral message and content-block format. Every provider maps its own API to and from these types, so agents and the loop never depend on a vendor SDK. A `ModelMessage` carries either plain text or an array of content blocks; `tool_use` blocks are what the model emits to call a tool, `tool_result` blocks feed the result back on the next user turn.
 
 ```ts
 type ModelTextBlock      = { type: 'text'; text: string };
@@ -156,7 +162,7 @@ type ModelResponse = { content: ModelContentBlock[]; usage?: ModelUsage; model?:
 
 ### `runAgentLoop` — `run-agent-loop.ts`
 
-The tool-calling loop used by every prebuilt agent.
+The tool-calling loop used by every prebuilt agent. It drives the model↔tool conversation: it calls the model, executes any `tool_use` blocks the model emits, feeds the results back as a new turn, and repeats until the model stops emitting tool calls or the `maxTurns` / `maxToolCalls` budget is hit (the final turn drops the tools and, if set, appends `synthesisInstruction` to force an answer). If `parseResult` is supplied it parses the final text into `parsed`, optionally retrying once via `recoveryPrompt`.
 
 ```ts
 function runAgentLoop<T = null>(options: RunAgentLoopOptions<T>): Promise<AgentRunResult<T>>;
@@ -204,7 +210,7 @@ function buildSynthesisInstruction(middle: string): string;
 
 ### `generateStructured` — `structured-generation.ts`
 
-One-shot validated JSON generation with retry (no tool loop).
+One-shot validated JSON generation with retry, and no tool loop. Use it when you want a single structured object from the model (not a multi-step tool conversation): it calls the model, runs `validate` on the parsed output, and re-prompts up to `retry.maxAttempts` times when validation fails.
 
 ```ts
 function generateStructured<T>(options: GenerateStructuredOptions<T>):
@@ -239,6 +245,8 @@ function parseAgentJson(text: string): unknown;                       // strips 
 function parseValidatedJson<T>(text: string, validate: JsonValidator<T>): JsonValidation<T>;
 ```
 
+`parseAgentJson` pulls JSON out of messy model output: it prefers a fenced ```json block, else scans for the first `{`/`[` to the last `}`/`]`, and throws if nothing parses. `parseValidatedJson` chains that into a `JsonValidator`, returning a typed `{ ok }` result instead of throwing.
+
 ### Trace events — `events.ts`
 
 ```ts
@@ -253,7 +261,7 @@ type CapabilityEvent =
 type CapabilityTraceSink = { emit(event: CapabilityEvent): void };
 ```
 
-Pass any object with an `emit` method as `trace` to a provider, agent, or `runAgentLoop` to capture the run.
+The observable event stream of a run: the loop, providers, and agents emit `step`, `tool_call_start` / `tool_call_end`, `model_usage`, `warning`, and `error` events as they execute. Collect them to log, replay, or compute cost/usage. Pass any object with an `emit` method as `trace` to a provider, agent, or `runAgentLoop` to capture the run.
 
 ### Cost & usage — `usage-ledger.ts`
 
@@ -268,7 +276,7 @@ function pricingForModel(provider: string, modelName: string): UsagePricing | un
 function formatCost(costEstimate: CostEstimate | undefined): string;
 ```
 
-`summarizeUsage` sums `model_usage` events from a trace. `pricingForModel` / `estimateCost` only carry a built-in price table for `provider === 'openai'` (gpt-4.1 family) and return `undefined` otherwise — local Gemma runs report token counts but no dollar cost.
+Turn a trace into token totals and (where priced) a dollar estimate: roll the run's `model_usage` events into a summary, look up per-model pricing, derive a cost, and format it for display. `summarizeUsage` sums `model_usage` events from a trace. `pricingForModel` / `estimateCost` only carry a built-in price table for `provider === 'openai'` (gpt-4.1 family) and return `undefined` otherwise — local Gemma runs report token counts but no dollar cost.
 
 ---
 
@@ -335,7 +343,7 @@ On overflow `complete` emits a `warning` trace event and throws `ContextWindowEx
 
 ## 6. Retrieval (RAG)
 
-`packages/retrieval/src/`.
+`packages/retrieval/src/`. Wires an `EmbeddingProvider` and a `VectorStore` into the two RAG paths: **index** (chunk a document → embed each chunk → upsert) and **query** (embed the query → search the store → return ranked hits).
 
 ### Pipeline — `pipeline.ts`
 
@@ -373,6 +381,8 @@ class InMemoryVectorStore implements VectorStore {
 }
 ```
 
+The bundled `VectorStore`: keeps chunks in process memory and ranks `search` by cosine similarity. No persistence — good for development, tests, and small in-process corpora; swap in a real store for production.
+
 ### Embedding provider — `ollama-embedding-provider.ts`
 
 ```ts
@@ -390,9 +400,11 @@ type OllamaEmbeddingProviderOptions = {
 };
 ```
 
-Requires a running Ollama with the embedding model pulled. `id` and `dimension` are fixed (768).
+The bundled `EmbeddingProvider`: embeds text locally via Ollama's `nomic-embed-text` model. Requires a running Ollama with the embedding model pulled. `id` and `dimension` are fixed (768).
 
 ### `search_knowledge_base` tool — `search-knowledge-base-tool.ts`
+
+Wraps a pipeline's query path as a callable tool so an agent can retrieve from the knowledge base mid-conversation. `createSearchKnowledgeBaseTool` returns a `definition` (the schema the model sees) plus a `handler` (runs `pipeline.query`).
 
 ```ts
 const SEARCH_KNOWLEDGE_BASE_TOOL_NAME = 'search_knowledge_base';
@@ -411,6 +423,8 @@ type SearchKnowledgeBaseToolOptions = {
 Effective `topK = max(requestedTopK, max(1, minTopK ?? 1))`. Register the returned `definition` + `handler` in a `ToolRegistry` (§7) and pass that registry to an agent.
 
 ### Chunker — `chunker.ts`
+
+Splits a document's text into overlapping windows (default 512 chars, 64-char overlap) before embedding, so each chunk is small enough to embed and retrieve independently. Used by the pipeline's `index` path.
 
 ```ts
 const CHUNK_SIZE = 512;
@@ -436,6 +450,8 @@ class InMemoryToolRegistry implements ToolRegistry {
 }
 ```
 
+The bundled `ToolRegistry`: construct it with an array of tool definitions and a name→handler map, then hand it to an agent. `callTool` looks up the handler by name, runs it, and returns the result with its duration.
+
 ### Policy — `tool-policy.ts`
 
 ```ts
@@ -444,9 +460,11 @@ type ToolPolicy = { capabilityId: string; allowedTools: readonly string[] };
 function filterToolsForPolicy(allTools: readonly ToolDefinition[], policy: ToolPolicy): ModelTool[];
 ```
 
-Each prebuilt agent exports a `*ToolPolicy` (§10). Use `filterToolsForPolicy` to whittle a broad tool catalog down to the set an agent is allowed to call.
+Least-privilege allowlisting: a `ToolPolicy` names the tools a capability is permitted to use, and `filterToolsForPolicy` whittles a broad tool catalog down to that allowlist before the schemas are advertised to the model. Each prebuilt agent exports a `*ToolPolicy` (§10).
 
 ### Coverage helpers — `coverage-gate.ts`
+
+Decide which capabilities are actually runnable given a workspace's schema, before spending model tokens. `schemaCapabilities` derives the set of available tokens (event names, `event.property`, `catalog:name`) from a descriptor; `coverageReport` classifies each requirement against that set as `full`, `limited`, or `unavailable` (listing what's `missing`).
 
 ```ts
 function schemaCapabilities(source: CapabilityDescriptorSource): Set<string>;
@@ -462,6 +480,8 @@ function coverageReport(
 
 ### Prompts — `packages/prompts/src/`
 
+`renderPromptTemplate` does token substitution: it replaces `{name}` placeholders in a template string with the matching values. A `PromptPackage` bundles a versioned system prompt (plus optional compact variant), its variables, and worked examples for one capability.
+
 ```ts
 function renderPromptTemplate(template: string, variables: Record<string, string>): string;  // substitutes {name} tokens
 
@@ -476,6 +496,8 @@ Per-agent prompt packages exported (each a `PromptPackage`): `queryPromptPackage
 
 ### Context — `packages/context/src/`
 
+`injectProfile` prepends (or appends) a user profile — e.g. a `me.md` — into a system prompt under an optional heading, so an agent answers with the person in mind; it is pure string-in/string-out and leaves `{placeholder}` tokens intact for later rendering. `schemaSummary` renders a `WorkspaceDescriptor` into prompt-ready text (project totals, top events with properties, customer properties, data horizon) for the analytics agents.
+
 ```ts
 function injectProfile(systemTemplate: string, profileText: string, opts?: {
   position?: 'start' | 'end';   // default 'start'
@@ -485,7 +507,7 @@ function injectProfile(systemTemplate: string, profileText: string, opts?: {
 function schemaSummary(workspace: WorkspaceDescriptor, options?: WorkspaceSummaryOptions): string;
 ```
 
-`WorkspaceDescriptor` (required by the four analytics agents) — `workspace-descriptor.ts`:
+`WorkspaceDescriptor` (required by the four analytics agents) — `workspace-descriptor.ts`. A compact snapshot of an analytics project's schema and scale (its events and their properties, customer properties, catalogs, totals, and data window) that the agents summarize into the prompt and gate coverage against:
 
 ```ts
 type WorkspaceDescriptor = {
@@ -509,6 +531,8 @@ type WorkspaceDescriptor = {
 
 ### Retrieval scoring — `precision-at-k.ts`
 
+Measure ranked-retrieval quality against a known relevant set. precision@k = fraction of the top-k retrieved ids that are relevant; recall@k = fraction of all relevant ids that appear in the top-k. (`ok` reports whether the metric is well-formed, not a pass/fail threshold.)
+
 ```ts
 type RetrievalScoreResult = { ok: boolean; score: number; matched: number; total: number };
 function scorePrecisionAtK(retrievedIds: readonly string[], relevantIds: ReadonlySet<string>, k: number): RetrievalScoreResult;
@@ -518,6 +542,8 @@ function scoreRecallAtK(retrievedIds: readonly string[], relevantIds: ReadonlySe
 `relevantIds` is a `ReadonlySet<string>`, not an array.
 
 ### LLM rubric judge — `rubric-judge.ts`
+
+LLM-as-judge: scores an output's faithfulness/quality against a `RubricDefinition` (per-dimension scales, checks, verdict rules) by prompting a model for structured scores. Use it to grade generated text where a structural diff can't capture quality.
 
 ```ts
 class RubricJudge {
@@ -532,6 +558,8 @@ function createRubricJudgmentValidator(rubric: RubricDefinition): (value: unknow
 `RubricJudgeInput = { subject: string; context?: Record<string, string> }`. A `RubricJudgment` carries per-dimension scores, an optional checks map, a `verdict`, and a `fix`.
 
 ### Structural diff — `structural-diff.ts`
+
+Checks an output's shape and required fields against declarative rules (a path is required, equals a value, is a number within tolerance, has a given array count, contains text, or includes an item) and returns the issues. Use it to assert deterministic structure without an LLM.
 
 ```ts
 type StructuralDiffRule =
@@ -548,6 +576,8 @@ function evaluateStructuralDiff(value: unknown, rules: readonly StructuralDiffRu
 
 ### Detection scoring — `detection-scorer.ts`
 
+Scores categorical detections (e.g. anomalies) against expectations — required categories, metrics, scopes, severities, and count bounds — reporting what matched, was missed, or was unexpected, plus a fractional `score`. Use it to measure precision/recall of an agent's detections.
+
 ```ts
 type DetectionScoreResult = { ok: boolean; score: number; matched: string[]; missed: string[]; unexpected: string[]; issues: StructuralIssue[] };
 function scoreDetections(detections: readonly DetectionLike[], expectations?: DetectionExpectations): DetectionScoreResult;
@@ -555,7 +585,7 @@ function scoreDetections(detections: readonly DetectionLike[], expectations?: De
 
 ### Shape assertions — `assertions.ts`
 
-Each takes `(output: unknown)` and returns `EvalAssertionResult` (`{ name; ok; issues }`), synchronously:
+Ready-made structural checks for each agent's output (and for replay artifacts): they assert the expected required fields and shape so a malformed result fails loudly. Each takes `(output: unknown)` and returns `EvalAssertionResult` (`{ name; ok; issues }`), synchronously:
 
 `assertRecommendationShape`, `assertAnomalyShape`, `assertQueryAnswerShape`, `assertDiagnosticShape`, `assertReplayArtifactShape`, `assertCapabilityReplayArtifactShape`, `assertMonitoringReplayArtifactShape`, `assertDiagnosticReplayArtifactShape`, `assertQueryReplayArtifactShape`.
 
@@ -581,6 +611,7 @@ Each agent also exports a matching tool policy: `ragQueryToolPolicy`, `queryTool
 ### Per-agent detail
 
 **`RagQueryAgent`** — `packages/agents/rag-query/src/rag-query-agent.ts`
+Answers a free-form question by retrieving from the knowledge base (via `search_knowledge_base`) and grounding the reply in the retrieved chunks.
 ```ts
 type RagQueryAgentOptions = { model: ModelProvider; tools: ToolRegistry; profile?: string; prompt?: string; trace?: CapabilityTraceSink };
 type RagQueryRunOptions   = { signal?: AbortSignal };
@@ -589,6 +620,7 @@ new RagQueryAgent(options).answer(question: string, runOptions?: RagQueryRunOpti
 `profile` (e.g. a `me.md`) is injected into the system prompt under heading "# About the person you are assisting". Allowed tool: `search_knowledge_base`.
 
 **`QueryAgent`** — `packages/agents/query/src/query-agent.ts`
+Answers a free-form analytics question about a workspace, calling read-only analytics tools to gather data; an optional `intent` biases it toward monitoring, diagnostic, or recommendation framing.
 ```ts
 type QueryAgentOptions = { model: ModelProvider; tools: ToolRegistry; workspace: WorkspaceDescriptor; trace?: CapabilityTraceSink; prompt?: string };
 type QueryRunOptions   = { intent?: QueryIntent; signal?: AbortSignal };   // QueryIntent: 'monitoring'|'diagnostic'|'recommendation', default 'diagnostic'
@@ -597,6 +629,7 @@ new QueryAgent(options).answer(question: string, runOptions?: QueryRunOptions): 
 Helpers: `classifyIntent(model, query, opts?)`, `parseIntent(raw)`, `validateQueryAnswer(answer)`.
 
 **`RecommendationAgent`** — `packages/agents/recommendation/src/recommendation-agent.ts`
+Given an anomaly and its diagnosis, proposes up to three concrete next actions drawn from an action taxonomy.
 ```ts
 type RecommendationAgentOptions = { model; tools; workspace; actionTaxonomy?; trace?; idGenerator?: () => string; prompt? };
 new RecommendationAgent(options).propose(anomaly: Anomaly, diagnosis: Diagnosis, runOptions?): Promise<Recommendation[]>;  // ≤3 items
@@ -604,6 +637,7 @@ new RecommendationAgent(options).propose(anomaly: Anomaly, diagnosis: Diagnosis,
 Validators: `isRecommendationArray`, `tryParseRecommendations`. (No `validateRecommendation`.)
 
 **`AnomalyMonitoringAgent`** — `packages/agents/anomaly-monitoring/src/monitoring-agent.ts`
+Scans a workspace across anomaly categories and returns the detected anomalies, severity-sorted and capped at ten.
 ```ts
 type MonitoringAgentOptions = { model; tools; workspace; categories?: readonly AnomalyCategory[]; trace?; prompt? };  // default ECOMMERCE_ANOMALY_CATEGORIES
 new AnomalyMonitoringAgent(options).scan(runOptions?): Promise<Anomaly[]>;   // severity-sorted, ≤10
@@ -611,6 +645,7 @@ new AnomalyMonitoringAgent(options).scan(runOptions?): Promise<Anomaly[]>;   // 
 Note: class is `AnomalyMonitoringAgent` but its options type is `MonitoringAgentOptions`. Exports `ECOMMERCE_ANOMALY_CATEGORIES`, `runnableCategories`, `formatCategoryChecklist`, `validateAnomalies`, `tryParseAnomalies`.
 
 **`DiagnosticInvestigationAgent`** — `packages/agents/diagnostic-investigation/src/diagnostic-agent.ts`
+Investigates a given anomaly by gathering evidence through analytics tools and returns a `Diagnosis` (conclusion, evidence, hypotheses, confidence).
 ```ts
 type DiagnosticAgentOptions = { model; tools; workspace; trace?; prompt? };  // options type is DiagnosticAgentOptions
 new DiagnosticInvestigationAgent(options).investigate(anomaly: Anomaly, runOptions?): Promise<Diagnosis>;
@@ -619,6 +654,7 @@ function diagnosisConfidence(diagnosis: Diagnosis): 'high' | 'medium' | 'low';
 Validators: `validateDiagnosis`, `tryParseDiagnosis`.
 
 **`RubricImprovementAgent`** — `packages/agents/rubric-improvement/src/rubric-improvement-agent.ts`
+Judges a subject against a rubric, then returns the judgment plus the weakest dimension, a suggested next action, and an optional follow-up drill.
 ```ts
 type RubricImprovementAgentOptions = { model; tools; rubric: RubricDefinition; trace?; toolPolicy?: ToolPolicy; prompt? };
 type RubricImprovementInput  = { subject: string; context?: Record<string, string> };
