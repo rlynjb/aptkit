@@ -33,6 +33,13 @@ button {
   padding: 24px;
 }
 
+/* Home matches the reincodes layout: a centered 720px column. Doc pages and
+   workspaces keep the full-width shell with their own inner max-widths. */
+.shellNarrow {
+  max-width: 720px;
+  margin: 0 auto;
+}
+
 .topbar {
   display: flex;
   align-items: center;
@@ -43,6 +50,8 @@ button {
 
 .topbarLinks {
   display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   align-items: center;
   gap: 8px;
 }
@@ -474,13 +483,11 @@ h1 {
 .capabilityGrid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 16px;
-  max-width: 1280px;
+  gap: 12px;
 }
 
 .packageList {
   margin-top: 28px;
-  max-width: 1280px;
 }
 
 .packageListHeader {
@@ -559,10 +566,9 @@ h1 {
 
 .capabilityCard {
   display: grid;
-  gap: 16px;
+  gap: 10px;
   align-content: start;
-  min-height: 300px;
-  padding: 18px;
+  padding: 12px;
   border: 1px solid #313131;
   border-radius: 8px;
   background: #121212;
@@ -590,10 +596,10 @@ h1 {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 42px;
-  height: 42px;
+  width: 32px;
+  height: 32px;
   border: 1px solid #2d2d2d;
-  border-radius: 8px;
+  border-radius: 7px;
   background: #1a1a1a;
   color: #c3c3c3;
 }
@@ -601,12 +607,12 @@ h1 {
 .capabilityCardHeader span {
   display: inline-flex;
   align-items: center;
-  min-height: 24px;
-  padding: 0 8px;
+  min-height: 20px;
+  padding: 0 7px;
   border-radius: 999px;
   background: #232323;
   color: #c3c3c3;
-  font-size: 12px;
+  font-size: 10.5px;
   font-weight: 800;
   text-transform: uppercase;
 }
@@ -614,7 +620,7 @@ h1 {
 .capabilityCard h2 {
   margin: 0;
   color: #a78bfa;
-  font-size: 22px;
+  font-size: 15px;
   line-height: 1.2;
   letter-spacing: 0;
 }
@@ -622,23 +628,22 @@ h1 {
 .capabilityCard p {
   margin: 0;
   color: #bbbbbb;
-  font-size: 14px;
-  line-height: 1.55;
+  font-size: 12.5px;
+  line-height: 1.45;
 }
 
 .capabilityStats {
   display: grid;
-  gap: 8px;
+  gap: 6px;
 }
 
 .capabilityStats strong {
-  min-height: 38px;
-  padding: 10px;
+  padding: 5px 8px;
   border: 1px solid #2a2a2a;
   border-radius: 6px;
   background: #161616;
   color: #bbbbbb;
-  font-size: 13px;
+  font-size: 11px;
   font-weight: 750;
 }
 

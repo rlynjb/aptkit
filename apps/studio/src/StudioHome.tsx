@@ -65,7 +65,7 @@ export function StudioHome({ onOpen }: { onOpen: (view: StudioView, anchor?: str
   const limitedCoverage = monitoringCoverage.filter((item) => item.coverage === 'limited').length;
 
   return (
-    <main className="shell">
+    <main className="shell shellNarrow">
       <header className="topbar">
         <div>
           <p className="eyebrow">AptKit Studio</p>
