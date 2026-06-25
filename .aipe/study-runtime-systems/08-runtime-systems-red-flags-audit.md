@@ -15,8 +15,9 @@ The ranked execution-model risks in AptKit, most consequential first. Each is gr
   ┌─ Streaming layer ────────▼───────────────────────────────────┐
   │  read backpressure ✓     write backpressure ✗               │ ← R1
   └──────────────────────────┬───────────────────────────────────┘
-  ┌─ Retrieval layer ────────▼───────────────────────────────────┐
-  │  sync cosine scan (unbounded) · embed cancel not wired       │ ← R6, R7
+  ┌─ Retrieval / memory layer ─▼─────────────────────────────────┐
+  │  sync cosine scan (unbounded) · embed+recall cancel not wired │ ← R6, R7
+  │  memory counter Map: unbounded in-process, restart-ephemeral  │ ← R8
   └──────────────────────────┬───────────────────────────────────┘
   ┌─ Concurrency layer ──────▼───────────────────────────────────┐
   │  serial tools (latency) · filesystem last-write-wins         │ ← R2, R4
@@ -36,7 +37,8 @@ Zoom in: an execution-model risk is a place where the runtime behaves badly unde
   R6 sync cosine scan     large corpus (when used) × frozen loop     → MED
   R2 serial tool calls    every multi-tool turn    × per-run latency → MED
   R3 no per-call timeout  hung provider (rare-ish) × one hung run    → MED
-  R7 embed cancel gap     abort mid-embed (rare)   × one orphan req  → LOW
+  R7 embed+recall cancel  abort mid-embed (rare)   × one orphan req  → LOW
+  R8 memory counter Map   long-running process     × slow leak       → LOW
   R4 fs last-write-wins   same-second collision    × one file        → LOW
   R5 client trace heap    huge trace in browser    × one tab         → LOW
 ```
@@ -83,15 +85,25 @@ Zoom in: an execution-model risk is a place where the runtime behaves badly unde
 
 **The move.** Compose a deadline into the existing signal: `AbortSignal.timeout(ms)` merged with the caller's signal at the top of the loop. Zero new plumbing — every layer already accepts and honors an `AbortSignal`. See `07` Phase B.
 
-### R7 — The agent's AbortSignal never reaches the embedding call (LOW)
+### R7 — The agent's AbortSignal never reaches the embedding or memory-recall call (LOW)
 
-**Observed.** `OllamaEmbeddingProvider.embed` accepts an `AbortSignal` and threads it to the socket (`packages/retrieval/src/ollama-embedding-provider.ts:50-57`), but `pipeline.query` calls `embed([query])` with no options (`packages/retrieval/src/pipeline.ts:56`), so the agent's signal — which reaches the model call correctly — is dropped at the pipeline seam and never reaches the query embedding.
+**Observed.** Two instances of the same gap. (a) `OllamaEmbeddingProvider.embed` accepts an `AbortSignal` and threads it to the socket (`packages/retrieval/src/ollama-embedding-provider.ts:50-57`), but `pipeline.query` calls `embed([query])` with no options (`packages/retrieval/src/pipeline.ts:56`), so the agent's signal — which reaches the model call correctly — is dropped at the pipeline seam. (b) `@aptkit/memory` is the *worse* of the two: `recall(query, k?)` and `remember(turn)` take no signal argument at all (`packages/memory/src/conversation-memory.ts:36-38`), so there's no seam to thread one through — and the `search_memory` handler calls `await memory.recall(query, topK)` signal-less (`packages/memory/src/memory-tool.ts:52`). Both the `embed([query])` and `store.search(...)` inside `recall` run with no signal.
 
-**Trigger and blast radius.** Abort a RAG run while it's embedding the query: the model call tears down, but the in-flight embedding HTTP request to localhost Ollama runs to completion as an orphan. Blast radius is one orphaned localhost request that finishes unwatched — small, hence LOW.
+**Trigger and blast radius.** Abort a RAG or memory-recall run while it's embedding: the model call tears down, but the in-flight HTTP request to localhost Ollama (or a slow `PgVectorStore` search) runs to completion as an orphan. Blast radius is one orphaned request that finishes unwatched — small, hence LOW.
 
-**Inference vs observed.** Observed: the provider accepts a signal; the pipeline doesn't pass one. Inferred: an abort mid-embed leaves the request running (the provider's `throwIfAborted` only fires if a signal is supplied).
+**Inference vs observed.** Observed: the embed provider accepts a signal but the pipeline doesn't pass one; the memory contract has no signal parameter at all. Inferred: an abort mid-embed leaves the request running (the provider's `throwIfAborted` only fires if a signal is supplied; memory has no checkpoint at all).
 
-**The move.** One-line fix: thread `signal` through `RetrievalPipeline.query` → `embedder.embed(texts, { signal })`. The provider half is already built correctly; only the pipeline wiring is missing. See `07`.
+**The move.** RAG side: one-line fix, thread `signal` through `RetrievalPipeline.query` → `embedder.embed(texts, { signal })` — the provider half is already built correctly. Memory side: slightly larger — add a `{ signal }` option to the `ConversationMemory` contract first, then thread it into `embed`/`search`. See `07`.
+
+### R8 — The memory counter Map is unbounded in-process state, lost on restart (LOW)
+
+**Observed.** `createConversationMemory` closes over `const counters = new Map<string, number>()` (`packages/memory/src/conversation-memory.ts:71`) that persists across `remember` calls to mint distinct ids per conversation (`memory:${conversationId}:${n}`). One entry per distinct `conversationId`, never evicted; the read-modify-write is atomic (synchronous, before the `await store.upsert` — no race, see `04`).
+
+**Trigger and blast radius.** Two distinct problems, both LOW. *Leak:* a long-running process that serves many conversations grows the `Map` without bound — one entry per conversation, forever, until restart. For a dev server this is negligible; for a long-lived production process it's a slow leak. *Durability:* the counter is in-process only, so a restart resets every conversation's `n` to 0 — a post-restart `remember` for a pre-existing conversation would mint `memory:conv:0` again and `upsert` over the first stored turn. Blast radius is one overwritten memory row (or unbounded process memory over a very long uptime).
+
+**Inference vs observed.** Observed: the `Map` never evicts and is closure-local (not persisted). Inferred: restart causes id reuse and a same-id upsert overwrite (the store's `upsert` is last-write-wins on id).
+
+**The move.** Accept it for the demo (single short-lived process, few conversations). If memory ever runs in a long-lived process: derive `n` from a durable source instead of an in-process counter — e.g. count existing rows for the conversation in the store, or use a content/UUID-based id that doesn't depend on a per-process counter. That removes both the leak and the restart-collision in one change. See `04`, `05`.
 
 ### R4 — Filesystem writes are last-write-wins with no lock (LOW)
 
@@ -151,7 +163,8 @@ Runtime-systems mechanisms absent from the repo (not risks — just untouched te
 
 - `00-overview.md` — the same findings in the overview's ranked list.
 - `06-filesystem-streams-and-resource-lifecycle.md` — R1, R4 in depth.
-- `07-backpressure-bounded-work-and-cancellation.md` — R3, R7, the nested Gemma loop, and the clean bounds/cancellation.
-- `03-event-loop-and-async-io.md` — R6 (the unbounded synchronous cosine scan) in depth.
+- `07-backpressure-bounded-work-and-cancellation.md` — R3, R7 (both embed + memory-recall signal gaps), the nested Gemma loop, and the clean bounds/cancellation.
+- `04-shared-state-races-and-synchronization.md` — R8 (the memory counter `Map`) as state, and why it's not a race.
+- `03-event-loop-and-async-io.md` — R6 (the unbounded synchronous cosine scan) and memory's bounded sync filter in depth.
 - `02-processes-threads-and-tasks.md` — R2 in depth.
 - `.aipe/study-performance-engineering/` *(when generated)* — measuring R1/R2/R3 under load.

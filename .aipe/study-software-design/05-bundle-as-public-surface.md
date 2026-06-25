@@ -4,12 +4,14 @@
 information hiding at the package level.
 **Type:** Industry standard.
 
-> **Updated: 2026-06-20** — the internal package count grew: `core/index.ts`
-> now re-exports fifteen internal `@aptkit/*` packages (added `@aptkit/retrieval`,
-> `@aptkit/provider-gemma`, and the `@aptkit/agent-rag-query` agent). The
-> *pattern* is unchanged — one facade hiding N packages — only N moved. The
-> teaching below holds; read "eleven" as "fifteen and counting." That the count
-> can grow without changing the public import path is the point of this file.
+> **Updated: 2026-06-24** — the internal package count grew again to **16**:
+> `core/index.ts` now also re-exports `@aptkit/memory` (`export * from
+> '@aptkit/memory'`, `core/index.ts:8`), on top of the earlier `@aptkit/retrieval`,
+> `@aptkit/provider-gemma`, and `@aptkit/agent-rag-query`. The *pattern* is
+> unchanged — one facade hiding N packages — only N moved (now 16, `bundled
+> count: 16` in `core/package.json`, v0.4.1). The teaching below holds; read
+> "eleven"/"fifteen" as "sixteen and counting." That the count can grow without
+> changing the public import path is the point of this file.
 
 ---
 

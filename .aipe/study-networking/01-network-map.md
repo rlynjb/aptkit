@@ -190,6 +190,8 @@ The full map, both boundaries, both directions, every hop labelled.
           (ollama-embedding-provider.ts:60-74)
 ```
 
+`@aptkit/memory` (`conversation-memory.ts`) adds a second caller of that B3 embed transport without adding a third boundary. It imports only *types* from `@aptkit/retrieval` (`conversation-memory.ts:1`) and never opens a socket itself — `remember` and `recall` each call the injected `embedder.embed([...])` once (`conversation-memory.ts:76,90`), which is `OllamaEmbeddingProvider`'s same `/api/embed` POST. So the map stays three boundaries; memory just rides the existing embed wire.
+
 ## Elaborate
 
 This two-boundary shape is the default for a "thin server in front of an LLM" app, and you've shipped its cousin: in AdvntrCue, the Next.js serverless function is the equivalent of the Node middleware here, the OpenAI call is boundary 2, and the streaming response back to the Next.js client is boundary 1. The difference is that AdvntrCue's boundary 1 is a deployed HTTPS endpoint with real origins; AptKit's is a localhost dev server. Same topology, different trust posture — which is exactly why the trust axis (above) is the right lens for this map.

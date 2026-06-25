@@ -66,10 +66,20 @@ And two more, the closest things to engine internals:
   — the genuine storage engine. `upsert` is an INSERT/UPSERT into a
   `Map<id, VectorChunk>`; `search(vector, k)` is a `SELECT ... ORDER BY
   similarity LIMIT k` executed as a linear scan + sort. No disk, no
-  transaction, no ANN index. The durable counterpart behind the same
-  `VectorStore` contract is buffr's `PgVectorStore` (Postgres + pgvector +
-  HNSW + `begin/commit/rollback`) — a separate repo, noted here only to mark
-  the boundary.
+  transaction, no ANN index, no metadata index. The durable counterpart behind
+  the same `VectorStore` contract is buffr's `PgVectorStore` (Postgres +
+  pgvector + HNSW + `begin/commit/rollback`) — a separate repo, noted here only
+  to mark the boundary.
+
+- **`@aptkit/memory`** (`packages/memory/src/conversation-memory.ts`) — a
+  *second consumer* of that same engine. Stores conversational exchanges as
+  vectors tagged `meta.kind = 'memory'` and recalls them by similarity. Because
+  the `VectorStore` contract has no metadata predicate, `recall` *over-fetches
+  then filters by `kind`* (`fetchK = max(k*4, 20)`, then
+  `filter(kind==='memory').slice(0, k)`) — the textbook "no secondary index →
+  over-read then filter in the application" pattern. It's the sharpest
+  query-execution lesson in the repo: a logical partition (`kind`) with no index
+  behind it. Detail in `04` and `03`.
 
 ## Reading order
 
@@ -77,8 +87,8 @@ And two more, the closest things to engine internals:
   00-overview.md                          the map + ranked findings + what's missing
   01-database-systems-map.md              datastore map, "query" paths, durability boundary
   02-records-pages-and-storage-layout.md  the JSON-file-as-record cost model
-  03-btree-hash-and-secondary-indexes.md  filename sort + the vector store's linear-scan "index" vs HNSW
-  04-query-planning-and-execution.md      readdir-scan-filter + the cosine top-k query plan
+  03-btree-hash-and-secondary-indexes.md  filename sort + the vector store's linear-scan "index" vs HNSW + the missing `kind` index
+  04-query-planning-and-execution.md      readdir-scan-filter + the cosine top-k query plan + over-fetch-then-filter
   05-transactions-isolation-and-anomalies.md  no txn on the filesystem; the vector store's non-atomic upsert
   06-locks-mvcc-and-concurrency-control.md     no locks; append-only sidesteps it
   07-wal-durability-and-recovery.md       fsync, torn writes, promotion-as-commit

@@ -156,7 +156,7 @@ The three structures in one frame, from model output back to dispatch.
 
 ## Implementation in codebase
 
-**Use cases.** The `Map` registry is hit on every single tool call the model makes — across all five agents. The policy `Set` filter runs once per agent setup to scope what the model sees. The JSON scan runs on every agent's final answer (and on `parseValidatedJson` for structured results). Coverage `Set` checks run pre-model to skip tasks that can't succeed. Newer: the fixed-window chunker runs on every document indexed into the retrieval pipeline, and the precision@k/recall@k `Set` scorers run when evaluating ranked retrieval quality.
+**Use cases.** The `Map` registry is hit on every single tool call the model makes — across all five agents. The policy `Set` filter runs once per agent setup to scope what the model sees. The JSON scan runs on every agent's final answer (and on `parseValidatedJson` for structured results). Coverage `Set` checks run pre-model to skip tasks that can't succeed. Newer: the fixed-window chunker runs on every document indexed into the retrieval pipeline, the precision@k/recall@k `Set` scorers run when evaluating ranked retrieval quality, and `@aptkit/memory`'s per-conversation counter `Map` is touched on every `remember` to mint a collision-free id.
 
 The `Map` dispatch — `packages/tools/src/tool-registry.ts` (lines 34, 50–64):
 
@@ -276,6 +276,26 @@ The bounded string scan — `packages/runtime/src/json-output.ts` (lines 7–28)
           k≤0, empty result (precision), or empty relevant set (recall) — a 0-denominator.
 ```
 
+**New Map work — the per-conversation counter** — `packages/memory/src/conversation-memory.ts` (lines 71, 78–84). Same hash-map-keyed-by-id machine as the tool registry, but used for a different job: a *monotonic sequence per key*. Memory ids must never collide, even when the same conversation remembers many turns, so each conversation gets its own counter.
+
+```
+  const counters = new Map<string, number>();          ← line 71: conversationId → next sequence number
+  ...
+  const n = counters.get(turn.conversationId) ?? 0;     ← line 78: current count (0 if first turn)
+  counters.set(turn.conversationId, n + 1);             ← line 79: bump it for next time
+  await store.upsert([{
+    id: `${kind}:${turn.conversationId}:${n}`,           ← line 82: id = kind:conversation:sequence
+    vector, meta: { kind, conversationId, text },
+  }]);
+       │
+       └─ the Map keys by conversationId so two conversations never share a counter — their ids
+          can't collide even at the same n. The `?? 0` is the first-turn default; the read-then-
+          write-back is the bump. Drop the Map and reuse one global counter and you'd still get
+          unique ids, but you'd serialize all conversations onto one number — the per-key Map keeps
+          each conversation's ids self-contained (kind:conv-A:0, kind:conv-A:1, kind:conv-B:0, …).
+          This is a hash map used as a namespaced sequence generator, not a lookup table.
+```
+
 ## Elaborate
 
 Hash maps and sets are the workhorses of practical computing — average O(1) by trading space and a hash function for the linear scan. The catch they hide is collisions: two keys hashing to the same bucket degrade to a list walk, worst-case O(n). JavaScript's `Map`/`Set` handle this in the engine, so you don't manage it — but it's why "O(1) average" is the honest claim, not "O(1) always." This is the same tradeoff your `reincodes` work avoided by building *ordered* structures (BST gives O(log n) guaranteed, no collision risk, but loses O(1)) — hash vs tree is the classic unordered-fast vs ordered-guaranteed split.
@@ -323,7 +343,7 @@ Anchor: *it locates, it doesn't validate — delegating correctness to JSON.pars
 
 - `01-complexity-and-cost-models.md` — why these O(1)/O(n) costs round to free here.
 - `04-trees-tries-and-balanced-indexes.md` — `getPath`'s dotted-path walk, the structured cousin of these lookups, and why no trie exists.
-- `06-sorting-searching-and-selection.md` — the cosine-score top-k that ranks retrieval hits (the chunks this file's chunker produces, scored by the precision@k/recall@k this file walks).
+- `06-sorting-searching-and-selection.md` — the cosine-score top-k that ranks retrieval hits (the chunks this file's chunker produces, scored by the precision@k/recall@k this file walks), and the over-fetch-then-filter-then-slice in memory's `recall` that pairs with the counter `Map` above.
 - `05-graphs-and-traversals.md` — the ANN/HNSW graph index that replaces retrieval's linear scan once the chunk corpus grows large.
 - `05-graphs-and-traversals.md` — how the coverage `Set` checks are the seam where a real graph *would* appear.
 - `06-sorting-searching-and-selection.md` — the linear scans (classify, match) that complement these hash lookups.

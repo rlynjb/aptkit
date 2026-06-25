@@ -2,7 +2,7 @@
 
 The frontend layer of this repo is exactly one app: `apps/studio` — a React 18 + Vite preview/replay UI for the agent capabilities packaged in the monorepo. There is no other frontend. So this guide is a deep read of one well-shaped SPA, not a survey of many surfaces.
 
-What makes Studio worth studying is not the framework choices (vanilla React 18, hooks, CSS-in-file) — those are the boring, correct defaults. What's worth studying is the **handful of patterns it leans on hard**: consuming a chunked NDJSON response in the browser and painting trace events live, a hand-rolled `useState` router, one generic `AgentReplayShell` composed across six panels via render props, and a stale-run guard that keeps an interleaved stream from corrupting the UI.
+What makes Studio worth studying is not the framework choices (vanilla React 18, hooks, CSS-in-file) — those are the boring, correct defaults. What's worth studying is the **handful of patterns it leans on hard**: consuming a chunked NDJSON response in the browser and painting trace events live, a hand-rolled `useState` router, one generic `AgentReplayShell` composed across panels via render props, a stale-run guard that keeps an interleaved stream from corrupting the UI, and — newest — a real retrieval pipeline run *deterministically in the browser*, plus in-app docs that inline markdown at build time so they survive a backend-less static deploy.
 
 This is your home turf (7+ years Vue/React). No on-ramp. The files below lead with what's non-obvious in *this* repo.
 
@@ -18,6 +18,8 @@ This is your home turf (7+ years Vue/React). No on-ramp. The files below lead wi
    - **`05-fixture-provider-mode-switch.md`** — the fixture→anthropic→openai mode state machine and the provider-availability gating that rides on it.
    - **`06-replay-artifact-hook.md`** — `useReplayArtifacts`, the generic hook that owns the save→load→promote server-state lifecycle.
    - **`07-static-demo-gated-ui.md`** — the `STATIC_DEMO` build flag that ships the same bundle to a live dev server and a static GitHub Pages demo, gating every backend-touching button and effect.
+   - **`08-build-time-markdown-docs.md`** — `DocPage`: `docs/*.md` imported via Vite `?raw` (inlined at build, no fetch), compiled by `react-markdown`, with a github-slugger TOC whose `#slug` anchors match `rehype-slug` heading ids. Works in the static Pages build.
+   - **`09-deterministic-in-browser-rag.md`** — `RagQueryWorkspace`: a real `@aptkit/retrieval` pipeline (fake embedder + `InMemoryVectorStore` + `search_knowledge_base` tool) running entirely in the browser, recorded Gemma responses driving the loop, scored live with precision@k / recall@k. The custom-page-vs-shell split.
 
 ## Cross-links to neighboring guides
 

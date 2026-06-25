@@ -8,7 +8,7 @@ layers, where depth lives, and where it doesn't.
 
   ┌─ Public surface ──────────────────────────────────────────────┐
   │  packages/core  →  @rlynjb/aptkit-core  (pure re-exports)      │
-  │  one bundle, 11 packages inlined. The compatibility contract.  │
+  │  one bundle, 16 packages inlined (v0.4.1). The compat contract.│
   └───────────────────────────────┬────────────────────────────────┘
                                   │ re-exports
   ┌─ Capabilities (agents) ───────▼────────────────────────────────┐
@@ -19,9 +19,10 @@ layers, where depth lives, and where it doesn't.
                                   │ compose
   ┌─ Building blocks ─────────────▼────────────────────────────────┐
   │  prompts (data) · tools (registry+policy) · evals (rules) ·    │
-  │  workflows · context (injectProfile) · retrieval (RAG)         │
-  │  retrieval: EmbeddingProvider + VectorStore = ModelProvider's  │
-  │  deep-module shape, reused twice  → 06                         │
+  │  workflows · context (injectProfile) · retrieval (RAG) ·       │
+  │  memory (episodic, over retrieval's contracts)                 │
+  │  retrieval + memory: EmbeddingProvider + VectorStore =         │
+  │  ModelProvider's deep-module shape, reused 3×  → 06, 07        │
   └───────────────────────────────┬────────────────────────────────┘
                                   │ depend on
   ┌─ Foundation (runtime) ────────▼────────────────────────────────┐
@@ -57,6 +58,10 @@ interface. Here's the repo, best to worst.
   Embedding/VectorStore  3 members each hide HTTP + cosine + dim check;
                          ModelProvider's shape, reused twice  → 06
                          packages/retrieval/src/contracts.ts:22
+  ConversationMemory     2 methods hide embed + tagged upsert + over-
+                         fetch-then-filter recall; SAME contracts as 06,
+                         injected store, db-agnostic  → 07
+                         packages/memory/src/conversation-memory.ts:60
   GemmaModelProvider     3-member ModelProvider; body emulates tool
                          calls Gemma can't do natively  → 06
                          packages/providers/gemma/src/gemma-provider.ts:39
@@ -80,9 +85,12 @@ interface. Here's the repo, best to worst.
 ## The one-sentence verdict
 
 **AptKit's foundation is deep and its capability layer is shallow.** The
-runtime contracts (`ModelProvider`, `runAgentLoop`, `structural-diff`, and now
-the retrieval `EmbeddingProvider`/`VectorStore` pair) are textbook deep modules
-— narrow interfaces hiding real behaviour. The six agent classes are the
+runtime contracts (`ModelProvider`, `runAgentLoop`, `structural-diff`, the
+retrieval `EmbeddingProvider`/`VectorStore` pair, and now `ConversationMemory`
+over those same two contracts) are textbook deep modules — narrow interfaces
+hiding real behaviour. The narrow-contract-over-large-body move now appears
+*three* independent times (provider, retrieval, memory): a confirmed house
+style. The six agent classes are the
 opposite: each re-implements the same constructor +
 `listTools → filterToolsForPolicy → renderPromptTemplate → runAgentLoop →
 parse` skeleton, so the duplication that the monorepo extraction was supposed

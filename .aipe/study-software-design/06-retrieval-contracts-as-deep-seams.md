@@ -438,6 +438,10 @@ model.
 
 - `01-model-provider-deep-module.md` — the original deep-module move this file
   reuses; read it first.
+- `07-conversation-memory-deep-module.md` — the *same* `EmbeddingProvider`/
+  `VectorStore` contracts reused a third time for episodic memory; the
+  over-fetch-then-filter trick this file's search tool uses reappears there as a
+  named workaround for the contract's missing metadata filter.
 - `02-provider-decorator-stack.md` — the wrappers over `ModelProvider`; Gemma is
   a *peer adapter* to those, with an unusually large emulation body.
 - `05-bundle-as-public-surface.md` — `@aptkit/retrieval` and `@aptkit/provider-gemma`

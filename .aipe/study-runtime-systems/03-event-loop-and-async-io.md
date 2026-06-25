@@ -120,6 +120,8 @@ You know that `fetch()` returns a Promise and your `.then`/`await` runs "later,"
 
 The new RAG code adds the *first* synchronous span whose cost scales with data, not with a fixed bound: `InMemoryVectorStore.search` walks every stored chunk and runs `cosineSimilarity` — an O(N·dim) dot-product loop — entirely on the JS thread before it returns, then sorts (`in-memory-vector-store.ts:25-33`, `:46-57`). For the 3-doc demo corpus this is microseconds. But there's no `await` inside that scan: index a large corpus and a single `search` call freezes the loop for the whole linear scan. It's unbounded by design — the `dimension` is fixed (768) but the chunk *count* is not. This is the one place in the repo where corpus growth turns a cheap span into a loop-blocking one; the fix is the `PgVectorStore` drop-in the contract already anticipates (the scan moves into Postgres, off the JS thread). See `05`, `08`.
 
+`@aptkit/memory`'s `recall` is the same async-I/O-then-sync-filter shape, no new loop. It does `await embedder.embed([query])` then `await store.search(...)` — two yields — followed by a *synchronous* `.filter(kind).slice(k).map(...)` span over the over-fetched hits (`conversation-memory.ts:89-105`). That trailing filter is a third consumer of this pattern (after the RAG query path and the agent loop), and it's bounded the friendly way: the scan is over `fetchK = max(k*4, 20)` hits, not the whole corpus, so unlike the cosine scan above its sync span is fixed-size by construction — the over-fetch caps it. The cancellation half is *not* handled, though: neither `embed` nor `search` here receives a signal (see `07`).
+
 ### Move 3 — the principle
 
 The event loop converts "waiting on I/O" from a thread-blocking cost into free time, by doing the waiting in the kernel and resuming you via a queue. The single rule that keeps it healthy — never block the thread with long synchronous work — is the one thing you must hold in your head when writing for it. AptKit obeys it by keeping synchronous spans tiny and pushing all the slow work (model calls, tool I/O, file reads) behind `await`.
@@ -242,5 +244,6 @@ Answer: "Running other ready work. The await suspends the function and returns t
 
 - `01-runtime-map.md` — the loop's place in the topology.
 - `06-filesystem-streams-and-resource-lifecycle.md` — the streaming half, and where backpressure is/isn't.
-- `07-backpressure-bounded-work-and-cancellation.md` — bounding the synchronous + awaited work.
+- `07-backpressure-bounded-work-and-cancellation.md` — bounding the synchronous + awaited work, and the memory recall signal gap.
+- `04-shared-state-races-and-synchronization.md` — `@aptkit/memory`'s counter `Map`, the new cross-call mutable state.
 - `.aipe/study-networking/` *(when generated)* — what happens beneath the awaited socket I/O.

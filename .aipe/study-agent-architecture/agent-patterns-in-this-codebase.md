@@ -107,9 +107,15 @@ templates.
 - **No supervisor-worker, fan-out, debate, swarm, or graph.** Five independent
   loops, period. Single-agent hasn't hit a quality ceiling that would justify
   the 2-5x coordination tax of going multi-agent.
-- **No persistent memory.** State lives in the `messages` array for the
-  duration of one `runAgentLoop` call and is gone when the run returns. No
-  episodic or long-term tier.
+- **No agent here wires memory — but the engine ships.** The six agents'
+  state lives in the `messages` array for one `runAgentLoop` call and is gone when
+  the run returns. The repo *does* ship an episodic-memory engine —
+  `@aptkit/memory` (`createConversationMemory`: `remember`/`recall` as RAG over
+  past exchanges; `createMemoryTool` → a `search_memory` tool) — but no capability
+  in `packages/agents/*` constructs or calls it. Granting it is one entry in a
+  `ToolPolicy.allowedTools` allowlist through the same kernel; the loop that wires
+  it (chat CLI, durable `PgVectorStore`) lives in buffr. See
+  `04-agent-infrastructure/02-agent-memory-tiers.md`.
 - **Vector retrieval now exists — in one capability.** Five agents do
   "retrieval" as tool-calling over workspace analytics APIs
   (`execute_analytics_eql`, `get_metric_timeseries`, etc.) with no embeddings.

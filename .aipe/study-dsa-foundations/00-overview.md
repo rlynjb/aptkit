@@ -6,6 +6,8 @@ AptKit is a small set of data structures used well, not a large set used badly. 
 
 The one shift since the first pass: `@aptkit/retrieval` adds a *from-scratch RAG pipeline* that exercises three DSA primitives the rest of the kit never reached for — **cosine similarity** (a dot-product over float vectors with magnitude normalization), **linear-scan nearest-neighbor** (score every chunk, sort, take top-k), and **fixed-size character chunking** (a sliding window with overlap). Plus `packages/evals/precision-at-k.ts` adds **precision@k / recall@k** as `Set`-membership scoring. None of this is large-scale yet (the store is an in-memory `Map`), but it moves a few "not yet exercised" items closer to live — most importantly the linear-scan → ANN/HNSW tradeoff, which the code now explicitly gestures at instead of being purely hypothetical.
 
+Newest delta: `@aptkit/memory` (`packages/memory/src/conversation-memory.ts`) layers *episodic memory* over the exact same cosine k-NN — no new algorithm, but one new **selection twist**. The `VectorStore.search` contract (`packages/retrieval/src/contracts.ts:33-37`) is `(vector, k)` only — **no metadata filter** — so `recall` can't filter-then-rank. Instead it **over-fetches** `fetchK = max(k*4, 20)` candidates, **filters** them by a `kind` predicate, then **slices** to `k`: fetch a wider window, post-filter, truncate. It also keeps a per-conversation counter `Map` for collision-free id generation. Both reuse structures already in this guide (the cosine sort+slice top-k, the hash map) — they're a variant, not a new chapter.
+
 Here is the whole repo as one DSA picture before we zoom into any single structure.
 
 ```
@@ -34,6 +36,12 @@ Here is the whole repo as one DSA picture before we zoom into any single structu
   │  cosineSimilarity: dot-product / (‖a‖·‖b‖)  over float vectors    │
   │  InMemoryVectorStore.search: linear scan + sort + slice (top-k)   │
   │  ← linear scan O(n·d) is where an ANN/HNSW index would slot in    │
+  └───────────────────────────┬───────────────────────────────────────┘
+                              │ memory reuses search()
+  ┌─ Memory (@aptkit/memory) ─▼───────────────────────────────────────┐
+  │  recall: over-fetch max(k*4,20) → filter by kind → slice(0,k)     │
+  │  (post-filtered top-k: no metadata filter on search, so over-rank)│
+  │  remember: Map<conversationId, counter> for collision-free ids    │
   └───────────────────────────────────────────────────────────────────┘
 ```
 
@@ -56,6 +64,10 @@ These are ordered by how much they shape the codebase, not alphabetically.
 **6. Cosine similarity is the repo's first and only numeric vector algorithm.** `in-memory-vector-store.ts:46-57` computes a dot product plus two squared-magnitudes in one O(d) pass, then divides by the product of norms (with a zero-denominator guard returning 0 to avoid `NaN`). Every retrieval hit's score comes from this one function. It's the foundation under the entire RAG ranking, and the `search` method's overall cost — score every stored chunk, then sort — is **O(n·d + n log n)**: a linear scan over n chunks at d dimensions. This is the textbook brute-force nearest-neighbor, and it's exactly the cost the contracts are designed to swap out for an ANN index later. → `06-sorting-searching-and-selection.md`, with the scale tradeoff in `05-graphs-and-traversals.md`.
 
 **7. Fixed-window chunking and precision@k/recall@k are new string-and-set work.** `chunker.ts:16-31` slides a `512`-char window with a `64`-char overlap across a document (`step = size - overlap`), a classic windowing algorithm with an off-by-one-able termination (`start + size >= text.length` breaks the loop). And `evals/src/precision-at-k.ts:27-78` scores ranked retrieval with `Set` membership — `countDistinctHits` builds a `seen` set over the top-k so a relevant id counted once, with denominators that differ between precision (`min(k, retrieved)`) and recall (`|relevant|`). → chunking and the `Set` scoring both land in `02-arrays-strings-and-hash-maps.md`.
+
+**8. Memory's `recall` is over-fetch-then-filter-then-slice — a post-filtered top-k.** `conversation-memory.ts:94-98` can't filter-then-rank because the `VectorStore.search` contract (`contracts.ts:33-37`) takes only `(vector, k)` — no metadata predicate. So it over-ranks: `fetchK = Math.max(k * 4, 20)` pulls a wider window of candidates, `.filter(h => h.meta?.kind === kind)` drops rows that aren't memory (a shared store can interleave documents above them), then `.slice(0, k)` truncates to the asked-for count. The `k*4`-or-`20` is a *margin* so the post-filter still yields k even when most of the window is the wrong kind. This is the canonical "select more than you need, post-filter, truncate" selection pattern. → `06-sorting-searching-and-selection.md`.
+
+**9. A per-conversation counter `Map` generates collision-free memory ids.** `conversation-memory.ts:71` holds `counters = new Map<string, number>()`; each `remember` does `counters.get(conversationId) ?? 0`, builds the id `${kind}:${conversationId}:${n}`, then writes back `n + 1`. It's the same hash-map-keyed-by-id machine as the tool registry, used here as a monotonic per-key sequence so repeated turns in one conversation never collide. → `02-arrays-strings-and-hash-maps.md`.
 
 ## The `not yet exercised` list — and when each would matter here
 

@@ -4,7 +4,7 @@ The question this guide answers: **does the data's shape match how it's actually
 
 Before anything else, the honest verdict: **AptKit has no SQL/relational database.** No ORM, no migrations, no foreign keys, no SQL DDL. So if you came here for "show me the schema and the migration files," there are none, and you should not pretend otherwise in an interview.
 
-But "no relational database" is not "no data model." AptKit has a data model that is *type-shaped*, *file/stream-shaped*, and — since `@aptkit/retrieval` landed — *store-shaped*. The `@aptkit/retrieval` package adds the repo's first genuine corpus: a vector store that models a corpus as `(id, vector, meta)` rows you `upsert` and `search` (in-memory now, the same shape as pgvector). That's covered in `06-vector-store-row-model.md`. Four things carry the modeling weight:
+But "no relational database" is not "no data model." AptKit has a data model that is *type-shaped*, *file/stream-shaped*, and — since `@aptkit/retrieval` landed — *store-shaped*. The `@aptkit/retrieval` package adds the repo's first genuine corpus: a vector store that models a corpus as `(id, vector, meta)` rows you `upsert` and `search` (in-memory now, the same shape as pgvector). That's covered in `06-vector-store-row-model.md`. And `@aptkit/memory` now puts a *second kind of row* — a remembered conversation turn — into that **same store**, told apart from documents only by a `kind` tag: a logical partition over one physical collection. That's `07-memory-row-model.md`, and it's the richest data-modeling case in the repo. Four things carry the modeling weight:
 
 ```
   AptKit's data model — where the schema actually lives
@@ -28,9 +28,11 @@ But "no relational database" is not "no data model." AptKit has a data model tha
   │      normally enforce (NOT NULL, type, required path)       │
   └──────────────────────────────────────────────────────────────┘
 
-  ┌─ STORE schema (in-memory rows) ─────────────────────────────┐
+  ┌─ STORE schema (in-memory rows — TWO kinds, ONE store) ──────┐
   │  VectorChunk { id, vector, meta } / VectorHit { id,score,…} │
-  │      packages/retrieval — the repo's first row-shaped model │
+  │      packages/retrieval — document rows  "<docId>#<i>"      │
+  │      packages/memory    — memory rows    "memory:<cid>:<n>" │
+  │      meta.kind = the soft partition splitting the two       │
   │      dimension = the first WRITE-time CHECK constraint      │
   └──────────────────────────────────────────────────────────────┘
 ```
@@ -41,7 +43,7 @@ The TypeScript compiler is the schema enforcer at write time; `packages/evals` i
 
 This guide is data **shape**. Two neighbors own the things it does not:
 
-- **vs `study-system-design`** — "should AptKit use Postgres? shard by tenant? add a replica? move the vector store to pgvector + an ANN index?" is *architecture* and lives there. "This artifact is shaped wrong / this read-model duplicates a fact / this corpus row should be `(id, vector, meta)`" is *shape* and lives here. AptKit's storage choices (flat JSON files on disk; an in-memory `Map` for the corpus) are system-design calls; the *shape* of what goes in them is this guide.
+- **vs `study-system-design`** — "should AptKit use Postgres? shard by tenant? add a replica? move the vector store to pgvector + an ANN index? *where* should the memory/document partition filter run — client over-fetch or SQL `WHERE`?" is *architecture* and lives there. "This artifact is shaped wrong / this read-model duplicates a fact / this corpus row should be `(id, vector, meta)` / memory and documents should be told apart by a `kind` tag" is *shape* and lives here. AptKit's storage choices (flat JSON files on disk; an in-memory `Map` for the corpus, shared by documents and memory) are system-design calls; the *shape* of what goes in them is this guide.
 - **vs `study-software-design`** — normalization is information-hiding for data: one fact, one home, no duplication. That principle is taught in `study-software-design`'s information-hiding concept; this guide *applies* it to the data (and finds a real duplication, see `02-tagged-union-event-log.md` and the audit) rather than re-teaching the principle.
 
 ## Reading order
@@ -57,6 +59,7 @@ This guide is data **shape**. Two neighbors own the things it does not:
 | `03-versioned-artifact-schema.md` | versioned artifact schema | `schemaVersion: 1` on replay artifacts — the migration story, made explicit |
 | `04-fixture-promotion-lifecycle.md` | fixture promotion lifecycle | live run → artifact → promoted fixture — a data-lifecycle / versioning pattern |
 | `05-structural-diff-integrity.md` | structural-diff integrity | `assertions.ts` + `structural-diff.ts` — the integrity-constraint layer over the artifacts |
-| `06-vector-store-row-model.md` | vector-store row model | `@aptkit/retrieval`'s `VectorChunk`/`VectorHit` — the repo's first store-shaped model: `(id, vector, meta)` rows, deterministic ids, soft docId linkage, dimension-as-invariant |
+| `06-vector-store-row-model.md` | vector-store row model | `@aptkit/retrieval`'s `VectorChunk`/`VectorHit` — the repo's first store-shaped model: `(id, vector, meta)` rows, deterministic ids `"<docId>#<i>"`, soft docId linkage, dimension-as-invariant |
+| `07-memory-row-model.md` | memory row model | `@aptkit/memory`'s remembered turns — a *second* row kind in the SAME store: composite id `"memory:<convId>:<n>"`, the `kind` discriminator as a soft partition, over-fetch-then-filter recall forced by no metadata index |
 
 Each pattern file uses the full concept template: zoom out → structure pass → how it works → implementation in the real code → interview defense → validate.

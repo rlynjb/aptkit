@@ -17,12 +17,12 @@ The "router" is the top of the tree and nothing more than one piece of state in 
   │            ★ THIS CONCEPT ★                                │
   │      view==='home'        → <StudioHome onOpen={setView}/> │
   │      view==='recommendation' → <RecommendationWorkspace …/>│
-  │      … 5 more branches …                                   │
+  │      … 8 more branches …                                   │
   │  (no URL, no history, no react-router)                     │
   └────────────────────────────────────────────────────────────┘
 ```
 
-The question: **how does a 7-view single-user dev tool switch screens without a router library?** You already know `react-router` and what it buys (URL sync, history, nested routes, lazy boundaries). The interesting thing here is the *choice not to use it* — and why that's correct for this app rather than lazy.
+The question: **how does a 10-view single-user dev tool switch screens without a router library?** You already know `react-router` and what it buys (URL sync, history, nested routes, lazy boundaries). The interesting thing here is the *choice not to use it* — and why that's correct for this app rather than lazy.
 
 ## Structure pass
 
@@ -71,13 +71,13 @@ Strategy in one line: **`view` is an enum in state; navigation is `setView`; ren
 
 #### Part A — the view enum as the route table
 
-`StudioView` is a string union (`types.ts:143-150`): `'home' | 'recommendation' | 'monitoring' | 'diagnostic' | 'query' | 'rubric-improvement' | 'capabilities'`. This *is* the route table — the compiler enforces that `setView` only ever receives a known view, which a string-based URL router can't do without runtime parsing.
+`StudioView` is a ten-member string union (`types.ts:143-153`): `'home' | 'recommendation' | 'monitoring' | 'diagnostic' | 'query' | 'rubric-improvement' | 'rag-query' | 'capabilities' | 'api-docs' | 'user-guide'`. This *is* the route table — the compiler enforces that `setView` only ever receives a known view, which a string-based URL router can't do without runtime parsing. The last two members (`api-docs` / `user-guide`) are doc routes, and they're the one place a single component serves *two* routes: both branches render `<DocPage>` with a different markdown prop (`main.tsx:50-70`) — the route distinguishes content, not component.
 
 What breaks without the union (if `view` were `string`): typos like `setView('reccomendation')` would compile and silently fall through to the `home` default. The union turns the route set into a compile-time contract.
 
 #### Part B — navigation as prop-passed setters
 
-Down-navigation: `StudioHome` receives `onOpen: (view) => void` and each card calls `onOpen('recommendation')` (`StudioHome.tsx:35`). Up-navigation: every workspace receives `onHome: () => void` wired to `() => setView('home')` (`main.tsx:17`). There's no navigation *object* threaded through context — just two callback props.
+Down-navigation: `StudioHome` receives `onOpen: (view) => void` and each card calls `onOpen('recommendation')` (`StudioHome.tsx:64`). Up-navigation: every workspace receives `onHome: () => void` wired to `() => setView('home')` (`main.tsx:23`). There's no navigation *object* threaded through context — just two callback props.
 
 ```
   navigation wiring (pseudocode)
@@ -91,13 +91,13 @@ What breaks without passing `onHome` everywhere: a workspace would have no way b
 
 #### Part C — the render branch with a default
 
-`App()` is a sequence of `if (view === X) return <X/>` ending in a fallback `return <StudioHome/>` (`main.tsx:16-40`). The fallback is the "404 → home" of this router: any unhandled view lands on home. Because the input is a typed enum, the fallback is only reachable for `'home'` itself — not a real 404, just the base case.
+`App()` is a sequence of `if (view === X) return <X/>` ending in a fallback `return <StudioHome/>` (`main.tsx:22-72`). The fallback is the "404 → home" of this router: any unhandled view lands on home. Because the input is a typed enum, the fallback is only reachable for `'home'` itself — not a real 404, just the base case.
 
 What breaks if you forgot the fallback: a missing branch would render `undefined`, a blank screen. The trailing `return <StudioHome/>` guarantees something always renders.
 
 #### Part D — the HMR root guard (a related platform detail)
 
-Not strictly routing, but it lives in the same file and matters for the SPA mount: `window.__aptkitStudioRoot ??= createRoot(...)` (`main.tsx:43-44`). Vite hot-reloads `main.tsx` on edit; without stashing the root on `window`, each reload would call `createRoot` again on the same DOM node, which React warns about and which can double-mount. The `??=` makes root creation idempotent across HMR.
+Not strictly routing, but it lives in the same file and matters for the SPA mount: `window.__aptkitStudioRoot ??= createRoot(...)` (`main.tsx:75-76`). Vite hot-reloads `main.tsx` on edit; without stashing the root on `window`, each reload would call `createRoot` again on the same DOM node, which React warns about and which can double-mount. The `??=` makes root creation idempotent across HMR.
 
 ### Move 2.5 — current vs future state
 
@@ -110,9 +110,11 @@ Not strictly routing, but it lives in the same file and matters for the SPA moun
   refresh → home                   refresh → same workspace
 
   migration cost: tiny. Add a useEffect that reads/writes
-  location.hash and a popstate listener. The 7 branches in App()
+  location.hash and a popstate listener. The 10 branches in App()
   DON'T change — only the source of `view` does.
 ```
+
+One nuance the doc routes add: `DocPage` already does fragment-based intra-page navigation. Its TOC renders `#slug` anchor links (`DocPage.tsx:71`) matched to `rehype-slug` heading ids, so jumping within a long doc already uses `location.hash` for *scroll position*. That's orthogonal to the view router — the hash addresses a heading inside the current view, not the view itself — but it means the codebase already touches the exact API (`location.hash`) a future view-router upgrade would lean on.
 
 The takeaway is what *doesn't* change: the entire view-switch stays; you'd only swap where `view` is read from. That's the payoff of keeping the router this thin — upgrading it later is additive, not a rewrite.
 
@@ -130,14 +132,16 @@ A router is a function from location to view; the location can be a URL or a loc
     ┌──────────────►│ StudioHome│◄──────────────┐
     │               └────┬─────┘                │
     │      onOpen(view)  │ (one card → one view)│
-    │   ┌────────┬───────┼────────┬─────────┬───┴────┐
-    │   ▼        ▼       ▼        ▼         ▼        ▼
-    │ recommend monitor diagnos  query   rubric   capabilities
-    │ Workspace Workspace …       …       …        Workspace
-    └───┴────────┴───────┴────────┴─────────┴───────┘
-        every workspace's onHome ──► back to 'home'
+    │   ┌──────┬──────┬──────┬──────┬──────┬──────┬──────┬──────┐
+    │   ▼      ▼      ▼      ▼      ▼      ▼      ▼      ▼      ▼
+    │ recommend mon  diag  query rubric rag-  capabil api-   user-
+    │ Workspace                         query ities   docs   guide
+    │                                   WS            └─ DocPage ─┘
+    └───┴──────┴──────┴──────┴──────┴──────┴──────┴──── onHome ──┘
+        every page's onHome ──► back to 'home'
 
-  source of truth: useState<StudioView> in App()  (main.tsx:14)
+  source of truth: useState<StudioView> in App()  (main.tsx:20)
+  10 views · api-docs + user-guide both render DocPage
   no URL · no history · no back-button · fallback = home
 ```
 
@@ -150,35 +154,37 @@ Every screen transition in Studio. Open a capability from the gallery → `onOpe
 ### Code, line by line
 
 ```
-  apps/studio/src/main.tsx:13-41  — the whole router
+  apps/studio/src/main.tsx:19-73  — the whole router
 
   function App() {
     const [view, setView] = React.useState<StudioView>('home');  ← the route table = state
 
     if (view === 'recommendation')
       return <RecommendationWorkspace onHome={() => setView('home')} />;  ← up-nav prop
-    if (view === 'monitoring')
-      return <MonitoringWorkspace onHome={() => setView('home')} />;
-    if (view === 'diagnostic')
-      return <DiagnosticWorkspace onHome={() => setView('home')} />;
-    if (view === 'query')
-      return <QueryWorkspace onHome={() => setView('home')} />;
-    if (view === 'rubric-improvement')
-      return <RubricImprovementWorkspace onHome={() => setView('home')} />;
-    if (view === 'capabilities')
-      return <CapabilitiesWorkspace onHome={() => setView('home')} />;
+    if (view === 'monitoring')      return <MonitoringWorkspace …/>;
+    if (view === 'diagnostic')      return <DiagnosticWorkspace …/>;
+    if (view === 'query')           return <QueryWorkspace …/>;
+    if (view === 'rubric-improvement') return <RubricImprovementWorkspace …/>;
+    if (view === 'rag-query')       return <RagQueryWorkspace …/>;   ← custom page, not the shell
+    if (view === 'capabilities')    return <CapabilitiesWorkspace …/>;
+    if (view === 'api-docs')                                         ← same component,
+      return <DocPage title="API Reference" markdown={coreApiMarkdown} …/>;
+    if (view === 'user-guide')                                       ← different markdown prop
+      return <DocPage title="Studio Guide …" markdown={userGuideMarkdown} …/>;
 
     return <StudioHome onOpen={setView} />;   ← default branch = 'home'; setView IS the navigate()
   }
        │
        └─ no Routes, no <Link>, no useNavigate. The string-union type on
-          `view` (types.ts:143) is the compile-time route table; the
+          `view` (types.ts:143-153) is the compile-time route table; the
           trailing return is the fallback. setView passed directly as
-          onOpen means a card click is one setState.
+          onOpen means a card click is one setState. The two doc branches
+          prove a route is just "(condition → element)" — one component,
+          two routes, the markdown prop is the only difference.
 ```
 
 ```
-  apps/studio/src/main.tsx:43-45  — idempotent SPA mount (HMR-safe)
+  apps/studio/src/main.tsx:75-77  — idempotent SPA mount (HMR-safe)
 
   const rootHost = window as Window & { __aptkitStudioRoot?: … };
   rootHost.__aptkitStudioRoot ??= createRoot(document.getElementById('root')!);  ← create once
@@ -191,9 +197,9 @@ Every screen transition in Studio. Open a capability from the gallery → `onOpe
 ```
   apps/studio/src/StudioHome.tsx:7,35  — down-navigation from the gallery
 
-  export function StudioHome({ onOpen }: { onOpen: (view: StudioView) => void }) {
+  export function StudioHome({ onOpen }: { onOpen: (view: StudioView) => void }) {  ← StudioHome.tsx:8
     …
-    <CapabilityCard … onOpen={() => onOpen('recommendation')} />   ← card → setView
+    <CapabilityCard … onOpen={() => onOpen('recommendation')} />   ← :64  card → setView
 ```
 
 ## Elaborate
@@ -210,17 +216,17 @@ Studio is a single-user dev tool, launched fresh each session, with no requireme
 ```
   view: enum (useState) → if/return branches → fallback 'home'
 ```
-Anchor: `main.tsx:13-41`, type at `types.ts:143-150`.
+Anchor: `main.tsx:19-73`, type at `types.ts:143-153`.
 
 **Q: What did you give up, and what's the upgrade cost?**
-Deep-linking, back-button, refresh-survival. The upgrade is cheap and additive: derive `view` from `location.hash`, add a `popstate` listener, write the hash on navigate. The seven render branches don't change — only the source of `view` does. Keeping the router thin is what keeps that migration small.
+Deep-linking, back-button, refresh-survival. The upgrade is cheap and additive: derive `view` from `location.hash`, add a `popstate` listener, write the hash on navigate. The ten render branches don't change — only the source of `view` does. Keeping the router thin is what keeps that migration small.
 
 **Q: How is this not just a typo waiting to happen?**
 The `StudioView` union makes `setView('reccomendation')` a compile error. A string-URL router would only catch that at runtime. The type *is* the route table.
 
 ## Validate
 
-1. **Reconstruct:** write `App()` from memory — the `useState<StudioView>`, the branch chain, the fallback. (`main.tsx:13-41`)
+1. **Reconstruct:** write `App()` from memory — the `useState<StudioView>`, the branch chain, the fallback. (`main.tsx:19-73`)
 2. **Explain:** why is `view` a string union rather than a plain `string`, and what does that catch? (Compile-time route validity; typo'd `setView` calls fail to compile — `types.ts:143`.)
 3. **Apply:** make Monitoring deep-linkable at `#/monitoring`. What changes, what doesn't? (Add a hash-read effect + `popstate` listener feeding `setView`, and write hash on navigate; the seven branches are untouched.)
 4. **Defend:** a teammate says "just add react-router, it's standard." Argue the call. (No addressing requirement, single user, fresh sessions; the dependency and URL contract buy nothing here, and the enum gives compile-time route safety react-router can't.)

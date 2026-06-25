@@ -51,6 +51,13 @@ Concretely:
   agent emits this same stream — `rag-query-agent.ts:66-80` passes `trace` straight
   through `runAgentLoop`, so a retrieval call is observable as `tool_call_start.args`
   (the query + filter the model chose) and `tool_call_end.result` (the ranked chunks).
+  The `@aptkit/memory` `search_memory` tool (`memory-tool.ts:34-60`) is the same shape:
+  the loop emits `tool_call_start`/`end` for *any* registered tool by name
+  (`run-agent-loop.ts:147-179`), so a `recall` is observable identically — args = the
+  recall query, result = the recalled exchanges. *Inference:* `search_memory` is exported
+  and registry-tested (`packages/memory/test/memory-tool.test.ts:28-31`) but **not yet
+  wired into any agent loop**, so no real run emits it today; the observability is
+  guaranteed by construction the moment it is wired, not by an existing trace.
 - **At the provider boundary:** `fallback-provider.ts:77-84` and
   `context-window-guard.ts:61-67` emit `warning` events explaining degradation.
 - **At the run boundary:** the replay artifact (`artifacts/replays/*.json`) captures the
@@ -272,9 +279,17 @@ the only evidence is the trace's separately-captured `tool_call_start.args` /
 `tool_call_end.result`. There is no `warning` emitted when a tool call returns empty,
 so a debugger who isn't already reading the trace has no breadcrumb. The two specific
 holes are now patched (`matchesFilter` ignores unknown keys, `minTopK` floors `top_k`),
-but the *pattern* — silent empties with no proactive signal — is the standing risk. Fix
-when it bites again: emit a `warning` when a retrieval tool returns zero hits on a
-non-empty corpus. → `08-retrieval-miss-diagnosis.md`.
+but the *pattern* — silent empties with no proactive signal — is the standing risk, and
+`@aptkit/memory` is the newest instance of it. `ConversationMemory.recall` returns `[]`
+from two silent sources at `conversation-memory.ts:89-106`: an embedder that yields no
+vector (`:91`) and — the sharper one — the **kind-filter-after-over-fetch** (`:94-97`),
+which over-fetches `max(k*4, 20)` rows then keeps only `meta.kind === kind`. On a store
+that mixes memory with documents, the top `fetchK` can be all documents, so the filter
+removes everything and `search_memory` returns `[]` even when relevant memory exists
+deeper in the ranking — a memory MISS that, from the agent's side, is indistinguishable
+from "this user has no memory." No `warning` fires. Same class, same forensic-only
+signal, same fix-shape: emit a `warning` when a retrieval *or recall* tool returns zero
+hits on a non-empty source. → `08-retrieval-miss-diagnosis.md`.
 
 **2. No per-run correlation ID on events (medium).**
 Events carry `capabilityId` but no run/request ID (`events.ts:1-24`). In-memory and

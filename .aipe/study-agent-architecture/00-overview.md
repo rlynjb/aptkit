@@ -7,9 +7,12 @@ One page to put the whole thing on the map before you open any concept file.
 AptKit is a **single-agent codebase**. Six capabilities, each one ReAct-style
 loop with tools, a tool policy, a prompt package, a loop budget, and a
 validator. There is no autonomous planner choosing which agent runs, no
-supervisor delegating to workers, no agent spawning sub-agents, and no
-long-term memory store. (Trajectory persistence and a multi-device "body" are
-deferred to a separate repo — not present here.) The sixth capability,
+supervisor delegating to workers, and no agent spawning sub-agents. The repo now
+*ships* an episodic-memory engine (`@aptkit/memory`: `remember`/`recall` + a
+`search_memory` tool), but no capability here wires it into a loop — the
+conversational runtime that does, with a durable `PgVectorStore`, lives in the
+buffr repo. (Trajectory persistence and a multi-device "body" are deferred to that
+separate repo — not present here.) The sixth capability,
 `rag-query`, is the same single-agent shape pointed at a *real vector store* and
 driven by a local Gemma; it is the first agentic-RAG-over-similarity-index
 capability in the repo. Where the spec's multi-agent topologies show up at

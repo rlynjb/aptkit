@@ -2,21 +2,21 @@
 
 ## Rendering mode, in one sentence
 
-Studio is a **client-rendered SPA**: a single `createRoot().render()` in `apps/studio/src/main.tsx:44-45`, no SSR, no hydration, no router library — React 18 + Vite, all rendering happens in the browser after the bundle loads.
+Studio is a **client-rendered SPA**: a single `createRoot().render()` in `apps/studio/src/main.tsx:76-77`, no SSR, no hydration, no router library — React 18 + Vite, all rendering happens in the browser after the bundle loads.
 
 That's the whole story for rendering. The interesting part is everything downstream of the first paint: how server work streams back into the UI.
 
 ## The component tree
 
-The app is shallow and wide. One root, a `useState` switch picking one of seven views, and below each workspace a three-column panel layout. Five of the six workspaces are driven by **the same generic shell**.
+The app is shallow and wide. One root, a `useState` switch picking one of ten views, and below each workspace a three-column panel layout. **Five of the six agent workspaces** are driven by **the same generic shell**; three pages (`CapabilitiesWorkspace`, `RagQueryWorkspace`, `DocPage`) sit off-shell on purpose.
 
 ```
   Studio component tree (apps/studio/src)
 
   ┌─ UI layer (browser, client-rendered) ───────────────────────────┐
   │                                                                  │
-  │  App()                          main.tsx:13   useState<StudioView>│
-  │   │  (hand-rolled router — §04)                                  │
+  │  App()                          main.tsx:19   useState<StudioView>│
+  │   │  (hand-rolled router — §04, 10 views)                        │
   │   ├─ StudioHome ────────────────  StudioHome.tsx   gallery cards  │
   │   │                                                              │
   │   ├─ RecommendationWorkspace ─┐                                  │
@@ -26,21 +26,25 @@ The app is shallow and wide. One root, a `useState` switch picking one of seven 
   │   ├─ RubricImprovementWorkspace┘    │                            │
   │   │                                  ├─ metricItems(ctx)  slot    │
   │   │                                  └─ renderPanels(ctx) slot    │
-  │   │                                       │                       │
   │   │                                       ├─ Panel / Metric       │
   │   │                                       ├─ TracePanel  §01       │
   │   │                                       ├─ EvalPanel            │
   │   │                                       ├─ ProviderStatusPanel  │
   │   │                                       └─ ReviewPanel / History │
   │   │                                          (useReplayArtifacts §06)│
-  │   │                                                              │
-  │   └─ CapabilitiesWorkspace ──── (the one that does NOT use the   │
-  │                                   shell — runs 4 previews in      │
-  │                                   Promise.all, CapabilitiesWorkspace.tsx:118)│
+  │   │  ── off-shell pages (own layout, reuse leaf panels) ──        │
+  │   ├─ CapabilitiesWorkspace ──── 4 previews in Promise.all         │
+  │   │                              (CapabilitiesWorkspace.tsx:118)  │
+  │   ├─ RagQueryWorkspace ──────── in-browser RAG replay  §09        │
+  │   │                              (RagQueryWorkspace.tsx:8) reuses  │
+  │   │                              Panel/Metric/TracePanel/EvalPanel │
+  │   └─ DocPage ────────────────── api-docs + user-guide  §08        │
+  │                                  (DocPage.tsx:30) react-markdown   │
+  │                                  over a ?raw build-time string     │
   └──────────────────────────────────────────────────────────────────┘
 ```
 
-Note the asymmetry: `CapabilitiesWorkspace` is the odd one out. It doesn't replay an agent against a fixture/provider mode, so it skips the shell entirely and runs four utility previews in parallel. That's the right call — forcing it into the shell's `F/M/R` generics would have been abstraction for its own sake.
+Note the asymmetry: three pages skip the shell. The rule is simple — **a page uses the shell only if it replays one agent against a fixture/provider mode.** `CapabilitiesWorkspace` runs four utility previews in `Promise.all` (no single agent). `RagQueryWorkspace` replays a fixture but has no anthropic/openai mode axis — it runs a *deterministic in-browser* RAG pipeline (§09). `DocPage` renders markdown, no agent at all (§08). All three reuse the shell's *leaf* presentational components (`Panel`, `Metric`, `TracePanel`, `EvalPanel`) without inheriting its `F/M/R` run-lifecycle generics. Sharing the leaves while skipping the shell is the correct boundary, not abstraction for its own sake.
 
 ## The data flow that matters: stream → state → render
 
@@ -88,15 +92,18 @@ There is no Redux, no Zustand, no Context store. State is entirely **local compo
 ```
   State ownership (who owns what)
 
-  App                 view: StudioView          (the router)
-   └ AgentReplayShell  selectedFixtureId, mode, providerStatus,
-                       replay, liveTrace, running, runId, error
-                       runCounter (ref, not state — §02)
-      └ *Panels        comparison state (workspace-local)
-         └ useReplayArtifacts  savedReplays, promotedFixtures,
-                               saving, promoting, selectedReviewPath
-                               (server-state-as-client-state — §06)
-      └ TracePanel     filter: 'all'|'model'|'tools'|'warnings' (UI-only)
+  App                 view: StudioView          (the router, 10 views)
+   ├ AgentReplayShell  selectedFixtureId, mode, providerStatus,
+   │                   replay, liveTrace, running, runId, error
+   │                   runCounter (ref, not state — §02)
+   │   └ *Panels        comparison state (workspace-local)
+   │      └ useReplayArtifacts  savedReplays, promotedFixtures,
+   │                            saving, promoting, selectedReviewPath
+   │                            (server-state-as-client-state — §06)
+   │      └ TracePanel  filter: 'all'|'model'|'tools'|'warnings' (UI-only)
+   ├ RagQueryWorkspace  selectedId, result, running, error, runId
+   │                    (one in-browser run → one setResult — §09)
+   └ DocPage            toc (useMemo over the ?raw markdown — §08)
 ```
 
 Server state (saved replays, promoted fixtures, provider availability) is fetched imperatively in `useEffect`, stored in `useState`, and manually re-fetched after mutations. No cache library. That's a deliberate fit for a single-user dev tool — covered in `audit.md` lens 4.
@@ -113,4 +120,8 @@ One build-mode wrinkle rides on top of all this network state: Studio ships in t
 
 SSR / RSC, react-router, any state library (Redux/Zustand/Jotai), React Query / SWR, CSS framework / CSS Modules / CSS-in-JS, route-level code-splitting, dark mode / theming tokens, and a deliberate accessibility pass are all **not yet exercised**. Most are correct omissions for a single-user local dev tool; `audit.md` lens 8 ranks the few that actually bite.
 
-One more honest note about scope: the repo grew a new **`rag-query` agent** (`packages/agents/rag-query`) plus a retrieval package and a Gemma provider in the most recent work, but that capability has **no Studio page yet** — there's no `RagQueryWorkspace`, no fixtures wired into `vite.config.ts`, no card on `StudioHome`. It's **not yet exercised in the UI**. When it gets a Studio surface it will almost certainly drop into the same `AgentReplayShell` the other five agents share (`03-shared-replay-shell.md`), so this guide's patterns already cover it — there's just nothing frontend to study about it today.
+## Two new surfaces this session
+
+The `rag-query` agent now **has a Studio page** — and it took a different shape than this guide previously predicted. Rather than dropping into `AgentReplayShell`, `RagQueryWorkspace` (`RagQueryWorkspace.tsx`) is a **custom page** running a *deterministic in-browser RAG replay*: a keyword-hash fake embedder plus `InMemoryVectorStore` index a fixture corpus client-side, recorded Gemma responses drive the search→answer loop, and the page shows the answer, retrieved chunks (relevant ones highlighted), live precision@k / recall@k, the trace, and the eval. It skips the shell because it has no provider-mode axis. This is the first place Studio runs real `@aptkit/retrieval` + `@aptkit/evals` logic *in the browser*. Full walk: `09-deterministic-in-browser-rag.md`.
+
+Studio also grew **in-app documentation pages**. `DocPage` (`DocPage.tsx`) renders `docs/*.md` through `react-markdown` + `remark-gfm` + `rehype-slug`, with a sticky github-slugger table-of-contents sidebar. The markdown is imported via Vite's `?raw` suffix (`main.tsx:13-14`), so it **inlines into the static bundle** — which is exactly why the docs work in the `STATIC_DEMO` GitHub Pages build with no backend to fetch from. Full walk: `08-build-time-markdown-docs.md`.

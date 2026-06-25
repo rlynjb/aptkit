@@ -38,6 +38,11 @@ repo exercises.
    - **08-embedding-batch-and-topk-floor.md** — embeddings batch a whole
      document into one round-trip; the `minTopK` floor stops a weak local
      model (Gemma) from starving its own retrieval by asking for `top_k: 1`.
+   - **09-memory-recall-overfetch.md** — `@aptkit/memory`'s episodic recall on
+     the same vector store: it over-fetches `max(k*4, 20)` rows to filter by
+     `kind` client-side (no metadata filter on the contract), grows unbounded
+     with no eviction, and puts an unbatched embed on the write path —
+     amplifying the file-07 linear scan three ways.
 
 ## What's honestly absent
 
@@ -45,9 +50,11 @@ No model-response cache (the biggest unclaimed lever), no latency SLO or
 percentile tracking, no CPU/memory profiling, no *model* request batching
 (embeddings ARE batched), no indexed/ANN vector search here (the in-memory
 store is a flat scan; buffr's HNSW-indexed pgvector is the contracted
-drop-in), no real backpressure, no bundle-size budget. The overview and
-audit name when each would start to matter. The repo's perf model is
-tokens-and-turns; these gaps are about traffic and scale it doesn't yet have.
+drop-in), no metadata filter on the `VectorStore` contract (which is why
+memory recall over-fetches), no memory eviction/TTL/summarization, no real
+backpressure, no bundle-size budget. The overview and audit name when each
+would start to matter. The repo's perf model is tokens-and-turns; these gaps
+are about traffic and scale it doesn't yet have.
 
 ## Cross-links to neighbor guides
 

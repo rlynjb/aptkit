@@ -27,6 +27,10 @@ lives in four places:
 - `packages/providers/gemma/src/*` — tool-call *emulation* for a local model
   with no native tool API: tools rendered into the system prompt, a JSON tool
   call parsed back out, a `RETRY_NUDGE` corrective turn on a botched parse.
+- `packages/memory/src/*` — episodic conversation memory. Two prompt-relevant
+  pieces: `defaultFormat(turn)` is a turn-format-as-prompt-template (the shape of
+  what gets embedded and re-injected on recall), and the `search_memory` tool
+  *description* is a when-to-recall steering prompt. Both covered in 01.
 
 This is prompts-as-versioned-code with a parse-and-retry boundary. Hosted
 structured output is JSON-in-fence parsed defensively, not `response_format`;

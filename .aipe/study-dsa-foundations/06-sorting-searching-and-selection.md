@@ -1,16 +1,21 @@
 # 06 — Sorting, Searching, and Selection
 
-**Industry name(s):** Comparator sort, linear search, classification scan, top-k selection (sort-and-slice), binary search, partitioning / quickselect. Type label: Language-agnostic foundation.
+**Industry name(s):** Comparator sort, linear search, classification scan, top-k selection (sort-and-slice), over-fetch-then-filter-then-slice (post-filtered top-k / windowed selection), binary search, partitioning / quickselect. Type label: Language-agnostic foundation.
 
 ## Zoom out, then zoom in
 
-Sorting and searching are the everyday algorithms, and AptKit uses the everyday subset: comparator `sort` to rank, `slice` to cap (top-k), and linear scans to classify and match. What it does *not* use is the asymptotically clever subset — binary search and partition-based selection (quickselect) — because its inputs are tiny and mostly unsorted, so the clever versions buy nothing. This file walks the three exercised patterns and is precise about why the two absent ones are absent.
+Sorting and searching are the everyday algorithms, and AptKit uses the everyday subset: comparator `sort` to rank, `slice` to cap (top-k), and linear scans to classify and match. What it does *not* use is the asymptotically clever subset — binary search and partition-based selection (quickselect) — because its inputs are tiny and mostly unsorted, so the clever versions buy nothing. This file walks the exercised patterns and is precise about why the two absent ones are absent. The newest addition is a *fourth* exercised pattern: `@aptkit/memory`'s `recall` does **over-fetch-then-filter-then-slice** — it ranks a wider window than it needs, post-filters by a predicate, then truncates to k. That's a top-k variant forced by a contract that can't filter during the search itself.
 
 ```
   Zoom out — ordering and lookup in AptKit
 
   ┌─ Agent layer ────────────────────────────────────────┐
   │  anomaly ranking: sort(by severity desc) + slice(0,10)│ ← top-k via full sort
+  └───────────────────────────┬───────────────────────────┘
+                              │
+  ┌─ Retrieval / memory layer ▼───────────────────────────┐
+  │  search: cosine score → sort desc → slice(0,k)        │ ← top-k via full sort
+  │  recall: over-fetch max(k*4,20) → filter → slice(0,k) │ ← post-filtered top-k
   └───────────────────────────┬───────────────────────────┘
                               │
   ┌─ Evals / context layer ───▼───────────────────────────┐
@@ -27,7 +32,7 @@ Sorting and searching are the everyday algorithms, and AptKit uses the everyday 
   └────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: a comparator sort orders a list by a key you derive (O(n log n)); a linear search/classify touches every element once (O(n)); top-k by sort-and-slice orders everything then takes a prefix (O(n log n), fine when n is small). Binary search is the O(log n) lookup that *requires sorted input*, and quickselect is the O(n)-average way to get top-k *without* full sorting — both win only at scale AptKit doesn't have.
+Zoom in: a comparator sort orders a list by a key you derive (O(n log n)); a linear search/classify touches every element once (O(n)); top-k by sort-and-slice orders everything then takes a prefix (O(n log n), fine when n is small). Over-fetch-then-filter-then-slice is top-k with a twist — when you can't filter *during* the ranking, you rank a wider window (fetch more than k), filter that window by a predicate, then truncate to k; the over-fetch is a margin so the filter still leaves you k survivors. Binary search is the O(log n) lookup that *requires sorted input*, and quickselect is the O(n)-average way to get top-k *without* full sorting — both win only at scale AptKit doesn't have.
 
 ## Structure pass
 
@@ -41,6 +46,8 @@ Zoom in: a comparator sort orders a list by a key you derive (O(n log n)); a lin
   comparator sort   produces order   touches all, O(n log n)
   linear classify   needs no order   touches all once, O(n)
   top-k (sort+slice)produces order, then takes prefix, O(n log n)
+  over-fetch+filter produces order on a WIDER window, filters, takes prefix
+  +slice            (post-filtered top-k — fetchK > k as a margin)
   binary search     REQUIRES order   touches log n   ← absent
   quickselect       needs no order   touches ~n avg  ← absent (top-k shortcut)
 
@@ -100,6 +107,27 @@ The load-bearing detail: sorting by a *derived numeric key* via a lookup table i
 
 The alternative — a size-k heap (O(n log k)) or quickselect (O(n) average) — wins only when k ≪ n and n is large. Here k=10 and n is rarely above 10, so the full sort is both simpler and effectively free. Picking sort-and-slice here is the *correct* choice, not a lazy one.
 
+**Over-fetch-then-filter-then-slice — top-k when you can't filter during the search.** Bridge from a SQL `WHERE … ORDER BY … LIMIT k`: there, the database filters *first*, then ranks the survivors, then caps. Now take that away. Imagine the only query you're allowed is "give me the k nearest, no WHERE clause" — you can rank, but you can't say "only memory rows." That's exactly `@aptkit/memory`'s situation: the `VectorStore.search` contract is `(vector, k)` with no metadata predicate, and the memory rows may share a store with documents, so a plain `search(vector, k)` could come back full of documents and zero memories. The fix is to *rank a wider window than you need, filter that window, then truncate*: over-fetch `fetchK = max(k*4, 20)`, drop the non-memory rows, take the first k that survive.
+
+```
+  Over-fetch → filter → slice — post-filtered top-k
+
+  want k=5 memory rows, but search can't filter by kind
+       │
+       ▼ search(vector, fetchK = max(5*4, 20) = 20)   ← rank a WIDER window
+  ranked 20: [doc doc MEM doc MEM MEM doc MEM doc MEM ...]
+       │ .filter(h => h.meta.kind === "memory")        ← drop the wrong kind
+       ▼
+  survivors (in rank order): [MEM MEM MEM MEM MEM ...]
+       │ .slice(0, 5)                                  ← truncate to k
+       ▼
+  top-5 memories            the extra 15 fetched were the MARGIN
+```
+
+The load-bearing part is the *margin* — why `k*4`-or-`20` and not just `k`. If you fetched exactly k and the top-k were all documents, you'd filter down to zero memories and return nothing, even though relevant memories sat at rank k+1. Over-fetching a multiple of k (here 4×) gives the filter room: as long as at least k of the first `fetchK` ranked rows are memories, you still return a full k. The `max(…, 20)` floor handles small k — at k=1, `k*4=4` is too thin a margin, so it clamps up to a 20-row window. Drop the over-fetch and the method silently under-returns whenever documents crowd the top of the ranking; that's the bug the margin prevents.
+
+And here's the honest boundary condition: this is *best-effort*, not exact. If memories are genuinely sparse — fewer than k memory rows exist in the entire top-`fetchK` window — you get back fewer than k, and there's no second fetch to backfill. You're trading exactness for a single round-trip. The real fix is a metadata filter pushed *into* the index (a `WHERE kind = 'memory'` the store evaluates while ranking), which is precisely what a `PgVectorStore` with a `meta` column would add — see the contract seam below. Until then, over-fetch-then-filter is the right call: it's one search call, it's correct whenever memories aren't pathologically rare in the top window, and it needs nothing the `(vector, k)` contract doesn't already give.
+
 **Linear search and classify — matching and gating.** Bridge from `.some`/`.filter`: detection scoring asks, for each required category/metric/scope, "is there *any* detection matching it?" — a linear `.some` per requirement. Coverage classification scans each requirement and labels it full/limited/unavailable. Both touch every element once, O(n), with no sorting because no ordering is needed — only presence.
 
 ```
@@ -153,6 +181,11 @@ The three exercised patterns in one frame, with the two absent ones.
   ┌─ EXERCISED ─────────────────────────────────────────┐
   │  RANK:    severityRank table → sort desc → slice(0,10)│
   │           (top-k via full sort, n small)              │
+  │  RANK:    cosine score → sort desc → slice(0,k)        │
+  │           (retrieval top-k, brute-force k-NN)          │
+  │  SELECT:  search(fetchK=max(k*4,20)) → filter kind →   │
+  │           slice(0,k)  (memory recall: post-filtered    │
+  │           top-k, over-fetch is the margin)             │
   │  MATCH:   required.some(matches) → matched/missed     │
   │           + unexpected via Set → 3-way split (linear) │
   │  CLASSIFY:scan requirements → full/limited/unavailable│
@@ -167,7 +200,7 @@ The three exercised patterns in one frame, with the two absent ones.
 
 ## Implementation in codebase
 
-**Use cases.** The severity sort + slice runs at the end of every anomaly-monitoring run to produce a ranked, capped output. The cosine-score sort + slice runs on every `InMemoryVectorStore.search` — i.e. every RAG query — to return the top-k most-similar chunks. Detection matching runs in eval scoring against expected categories/metrics/scopes. Coverage classify runs pre-model. The replay filename sort runs whenever a batch eval lists artifacts.
+**Use cases.** The severity sort + slice runs at the end of every anomaly-monitoring run to produce a ranked, capped output. The cosine-score sort + slice runs on every `InMemoryVectorStore.search` — i.e. every RAG query — to return the top-k most-similar chunks. The over-fetch-then-filter-then-slice runs on every `ConversationMemory.recall` — when an agent pulls relevant past exchanges out of a (possibly shared) vector store. Detection matching runs in eval scoring against expected categories/metrics/scopes. Coverage classify runs pre-model. The replay filename sort runs whenever a batch eval lists artifacts.
 
 The comparator sort + top-k slice — `packages/agents/anomaly-monitoring/src/monitoring-agent.ts` (lines 35, 86–88):
 
@@ -208,6 +241,34 @@ The second top-k — cosine-score ranking in retrieval — `packages/retrieval/s
 ```
 
 And `cosineSimilarity` (`:46-57`) is the derived-key function — one O(d) pass accumulating `dot`, `magA`, `magB`, then `dot / (√magA · √magB)`, returning 0 when a vector has zero magnitude so the score is never `NaN`. This is the only place AptKit ranks by a *computed numeric score* rather than a lookup-table rank or a string comparison — see `01` for why O(n·d) is the cost that actually scales here, and `05` for the ANN/HNSW index that replaces this scan once n is large.
+
+The post-filtered top-k — `recall` over a possibly-shared store — `packages/memory/src/conversation-memory.ts` (lines 89–106), with the contract it works around at `packages/retrieval/src/contracts.ts` (lines 33–37):
+
+```
+  // contracts.ts:33-37 — the constraint:
+  search(vector: number[], k: number): Promise<VectorHit[]>;   ← (vector, k) only — NO metadata filter
+
+  // conversation-memory.ts:89-106 — the workaround:
+  async recall(query, k = 5): Promise<MemoryHit[]> {
+    const [vector] = await embedder.embed([query]);
+    if (!vector) return [];
+    const fetchK = Math.max(k * 4, 20);              ← line 94: over-fetch a WIDER window (the margin)
+    const hits = await store.search(vector, fetchK); ← rank fetchK candidates, not k
+    return hits
+      .filter((h) => h.meta?.kind === kind)          ← line 97: drop rows that aren't memory
+      .slice(0, k)                                    ← line 98: truncate to the asked-for k
+      .map((h) => ({ id: h.id, score: h.score, text: ..., conversationId: ... }));
+  }
+       │
+       └─ the order is the whole lesson: over-fetch → filter → slice. search() can't take a
+          "kind === memory" predicate, so recall ranks fetchK = max(k*4, 20) rows and filters
+          AFTER. The k*4 multiple is the margin: if the top k were all documents, fetching only k
+          would filter to zero; the wider window leaves room for k survivors. The max(…, 20) floor
+          stops the margin going too thin at small k. It's best-effort, not exact — if fewer than k
+          memories sit in the top-fetchK window, recall returns fewer than k with no backfill. The
+          exact fix is a metadata filter pushed INTO the store (a pgvector WHERE kind='memory'),
+          which the (vector, k) contract deliberately doesn't expose yet.
+```
 
 Linear match + the matched/missed/unexpected split — `packages/evals/src/detection-scorer.ts` (lines 51–82):
 
@@ -276,6 +337,17 @@ Because nothing maintains a sorted collection that it searches by key. The one s
 
 Anchor: *binary search needs a searched sorted index — the repo sorts for order, never to search, so it never qualifies.*
 
+**Q: "Memory's `recall` over-fetches `max(k*4, 20)` then filters down to k. Why not just fetch k?"**
+
+Because the vector store's `search` is `(vector, k)` with no metadata filter, and memory rows can share a store with documents. If I fetched exactly k and the top k were all documents, the `kind === 'memory'` filter would leave me zero results even though relevant memories sat just below. So I over-fetch a wider window — `k*4`, floored at 20 — rank that, filter, then slice to k. The over-fetch is a *margin*: as long as at least k of the top `fetchK` ranked rows are memories, I still return a full k. It's best-effort, not exact — if memories are pathologically sparse in that window I under-return — and the real fix is pushing the filter into the index, which a pgvector store would do.
+
+```
+  fetch k only   → top-k all docs → filter → ZERO memories (bug)
+  fetch k*4 (20) → filter → slice(0,k) → k survivors (margin saves it)
+```
+
+Anchor: *the over-fetch is the margin that survives the post-filter — fetch exactly k and a crowded top truncates you to nothing.*
+
 **Q: "When would you replace the sort-and-slice with quickselect or a heap?"**
 
 When top-k has k ≪ n and n is large — top 10 of 100,000. Then a size-k heap (O(n log k)) or quickselect (O(n) average) beats the full O(n log n) sort meaningfully. Here k=10 and n is rarely above 10, so the full sort is simpler and effectively free. I'd switch only when a profiler showed the sort mattering, which it won't at this scale.
@@ -297,6 +369,8 @@ Anchor: *the top-k shortcut pays off only when k ≪ n and n is large — neithe
 
 **Defend the decision.** Someone wants the anomaly ranking to use quickselect "for O(n) performance." Defend the sort-and-slice. (Answer: quickselect's O(n) average beats O(n log n) only at large n; here n ≤ 10, so log n is ~3 — the asymptotic win is invisible and quickselect adds partitioning complexity and a worst case. The full sort is simpler, stable, and free at this size. Premature optimization.)
 
+**Apply to memory recall.** `ConversationMemory.recall` (`conversation-memory.ts:89-106`) over-fetches `max(k*4, 20)`, filters by `kind`, then slices to k. Two questions: (a) what concrete bug does the over-fetch prevent, and (b) when does this post-filter approach *still* fail, and what's the exact fix? (Answer: (a) without the margin, a top-k crowded with documents filters down to fewer than k — or zero — memories, silently under-returning. (b) it still fails when genuine memories are sparser than k inside the top-`fetchK` window; there's no backfill fetch, so you get < k. The exact fix is a metadata predicate pushed into the store — a pgvector `WHERE kind='memory'` evaluated during ranking — which the `(vector, k)` contract doesn't yet expose.)
+
 **Apply to retrieval.** `InMemoryVectorStore.search` (`in-memory-vector-store.ts:25-33`) scores every chunk with cosine, sorts all of them, then slices the top-5. Two questions: (a) why is the full sort fine *now*, and (b) what's the first thing you'd change as the corpus grows — the sort, or the scan? (Answer: (a) a few documents chunk to a handful of vectors, so sorting all to keep 5 is free. (b) Change the *scan* first, not the sort — the O(n·d) scoring of every vector is what dominates at scale, and the fix is an ANN index (HNSW) that skips most vectors, not a heap that merely makes the keep-top-5 step O(n log k). A size-k heap is the smaller, second optimization; the linear scan is the real bottleneck. See `05` for the HNSW graph index.)
 
 ## See also
@@ -306,5 +380,5 @@ Anchor: *the top-k shortcut pays off only when k ≪ n and n is large — neithe
 - `03-stacks-queues-deques-and-heaps.md` — the heap that top-k *would* use if k ≪ n and n were large (retrieval is the first place that gets close).
 - `04-trees-tries-and-balanced-indexes.md` — the balanced index binary search needs but the repo lacks.
 - `05-graphs-and-traversals.md` — the HNSW *graph* index that replaces retrieval's linear-scan k-NN at scale (the bigger optimization above a heap).
-- `02-arrays-strings-and-hash-maps.md` — `cosineSimilarity` as the derived sort key, and the chunker that produces the vectors this file ranks.
-- `study-ai-engineering` (neighboring guide) — detection scoring and precision@k as eval metrics, viewed as AI evaluation rather than set arithmetic.
+- `02-arrays-strings-and-hash-maps.md` — `cosineSimilarity` as the derived sort key, the chunker that produces the vectors this file ranks, and memory's per-conversation counter `Map` that pairs with `recall`'s post-filtered selection.
+- `study-ai-engineering` (neighboring guide) — detection scoring and precision@k as eval metrics, and `@aptkit/memory`'s recall as episodic-memory retrieval, viewed as AI mechanics rather than selection arithmetic.

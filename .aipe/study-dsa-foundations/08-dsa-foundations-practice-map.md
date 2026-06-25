@@ -4,7 +4,7 @@
 
 ## Zoom out, then zoom in
 
-This is the audit's verdict turned into a plan. You've read what AptKit exercises (maps, sets, discriminated unions, linear scans, round-robin, comparator sorts — and now, in `@aptkit/retrieval`, cosine similarity, linear-scan k-NN, fixed-window chunking, and precision@k/recall@k set scoring) and what it doesn't (trees, heaps, graphs as traversal, binary search, DP). This file ranks what to *practice* — and the ranking is deliberately inverted from a textbook. Sharpen the exercised concepts first, because those are the ones you can defend with *this* repo's code in an interview. Keep the missing foundations warm second, leaning on your `reincodes` work, because AptKit gives you nowhere to anchor them.
+This is the audit's verdict turned into a plan. You've read what AptKit exercises (maps, sets, discriminated unions, linear scans, round-robin, comparator sorts — and now, in `@aptkit/retrieval`, cosine similarity, linear-scan k-NN, fixed-window chunking, and precision@k/recall@k set scoring; and in `@aptkit/memory`, over-fetch-then-filter-then-slice selection and a per-conversation counter `Map`) and what it doesn't (trees, heaps, graphs as traversal, binary search, DP). This file ranks what to *practice* — and the ranking is deliberately inverted from a textbook. Sharpen the exercised concepts first, because those are the ones you can defend with *this* repo's code in an interview. Keep the missing foundations warm second, leaning on your `reincodes` work, because AptKit gives you nowhere to anchor them.
 
 ```
   Zoom out — the practice map's two tiers
@@ -14,6 +14,7 @@ This is the audit's verdict turned into a plan. You've read what AptKit exercise
   │  bounded JSON scan · comparator-sort top-k            │
   │  round-robin scheduling · cost-as-token-budget        │
   │  cosine k-NN + chunking + precision@k (retrieval) ←new│
+  │  over-fetch→filter→slice + counter Map (memory)   ←new│
   └───────────────────────────┬───────────────────────────┘
                               │ then
   ┌─ TIER 2: not yet in AptKit (defend with reincodes) ───┐
@@ -40,6 +41,8 @@ Zoom in: Tier 1 is where you have a *live* code anchor — you can pull up `tool
   cosine k-NN + top-k     YES  in-memory-vector-store.ts:25,46  ← new
   fixed-window chunking   YES  retrieval/chunker.ts:16          ← new
   precision@k/recall@k    YES  evals/precision-at-k.ts:47,68    ← new
+  over-fetch+filter+slice YES  conversation-memory.ts:94-98     ← new
+  counter Map (id gen)    YES  conversation-memory.ts:71,78     ← new
   ──────────────────────────────────────────────────────────
   heap / PQ               NO   reincodes PriorityQueue.ts
   binary search           NO   (none — practice cold)
@@ -97,9 +100,13 @@ You know the spaced-repetition idea from `dryrun` — practice the things you'll
   8. chunking + precision@k   retrieval/chunker.ts:16,
                               evals/precision-at-k.ts:47
      story: sliding window + overlap; Set-membership scoring
+  9. over-fetch+filter+slice  conversation-memory.ts:94-98     ← new
+     story: post-filtered top-k; can't filter in search(), so
+            over-fetch max(k*4,20), filter kind, slice k;
+            the over-fetch IS the margin; counter Map for ids
 ```
 
-The rehearsal target for each: a 60-second walk that names the structure, the file, the load-bearing line, and the boundary condition. Concept `1` and `2` are the two to nail cold — they're the repo's substrate, and "walk me through tool dispatch / the allowlist" is the most likely DSA-flavored question this codebase invites. Concept `7` is the new high-value one: it's the only place AptKit does numeric vector DSA, and "you built a vector store from scratch — what's the cost, and when does it break?" (O(n·d) scan → ANN/HNSW) is the strongest *scale-tradeoff* story the repo now hands you.
+The rehearsal target for each: a 60-second walk that names the structure, the file, the load-bearing line, and the boundary condition. Concept `1` and `2` are the two to nail cold — they're the repo's substrate, and "walk me through tool dispatch / the allowlist" is the most likely DSA-flavored question this codebase invites. Concept `7` is the new high-value one: it's the only place AptKit does numeric vector DSA, and "you built a vector store from scratch — what's the cost, and when does it break?" (O(n·d) scan → ANN/HNSW) is the strongest *scale-tradeoff* story the repo now hands you. Concept `9` is the new *systems-judgment* story: "you can only query `(vector, k)` with no metadata filter — how do you return k of one kind?" The over-fetch margin (`max(k*4, 20)`) and its best-effort failure mode (under-returns when the kind is sparse) is the signal that you reason about contracts and selection, not just call `sort`.
 
 **Tier 2 — not yet exercised, defend with `reincodes` (keep warm second).** No AptKit anchor, so the story is "built it elsewhere + here's the trigger." Ranked by how likely AptKit is to actually grow it (which is also how natural the "when it'd appear here" story is).
 
@@ -180,6 +187,8 @@ The Tier 1 anchor map (open these to rehearse):
   cosine k-NN          in-memory-vector-store.ts:25,46  scan + cosine + sort + slice
   chunking             retrieval/chunker.ts:16,25   window slide, step = size−overlap
   precision@k          evals/precision-at-k.ts:27,47  countDistinctHits over a Set
+  over-fetch+filter    conversation-memory.ts:94-98  fetchK=max(k*4,20) → filter → slice(0,k)
+  counter Map (id gen) conversation-memory.ts:71,78  Map<convId,n> → kind:conv:n
        │
        └─ each row is a 60-second interview answer waiting to be rehearsed.
           the file:line IS the anchor — "let me show you" beats "I know that."

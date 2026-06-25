@@ -48,6 +48,16 @@ standard checklist simply doesn't apply.
   user-profile (`me.md`) text into the system prompt
   (`rag-query-agent.ts:55`), and retrieved knowledge-base chunks flow back as
   tool results — both are untrusted-content channels into the prompt.
+- **Recalled conversation memory** — the *newest* surface. `@aptkit/memory`
+  (`packages/memory/src/conversation-memory.ts`) stores a past user
+  question + assistant answer as a vector row and `recall`s the most-similar
+  ones back into a *future* request. The replayed text is untrusted (it's what
+  a past user typed, or an answer steered by injected content), and on the
+  shared-store path it re-enters through the same `search_knowledge_base` tool
+  the agent already trusts as grounding. Not wired into any aptkit agent yet;
+  live only in buffr's chat session
+  (`/Users/rein/Public/buffr/src/session.ts:53,66`). → deep walk in
+  `06-conversation-memory-trust-surface.md`.
 - **Fixtures / artifacts on disk** — JSON read by the Studio server and the
   eval scripts. Trusted as developer-authored, but they're also the
   data-*exit* surface (lens 5).
@@ -106,6 +116,18 @@ injection**, and the defense is **output validation**, not input scrubbing.
   the *output* side: the model can only call read-only tools (lens 7), its
   output is parsed and schema-validated before it's trusted as data (lens 3 →
   `04-validated-model-output-gate.md`), and the loop is turn-bounded.
+
+- **Persistent prompt injection via conversation memory** — *new, NOT bounded
+  by those mitigations*. The above defenses bound an injection to a single
+  turn. `@aptkit/memory` removes that bound: `remember` embeds a past
+  question/answer and `recall` replays the most-similar one into a *future,
+  unrelated* request — possibly a different session, since buffr persists to
+  Postgres. An instruction injected in turn N can therefore resurface at turn
+  N+k. The output gate and read-only allowlist limit *what* a recalled
+  injection can do, not *that* it gets replayed. The engine filters recalled
+  rows only by `kind` — never by `conversationId`
+  (`packages/memory/src/conversation-memory.ts:96-98`). → deep walk in
+  `06-conversation-memory-trust-surface.md`.
 
 - **LLM-controlled query shaping** — *present, newly hardened*. The
   `search_knowledge_base` tool lets the model pass a `top_k` and a `filter`
@@ -208,6 +230,18 @@ PII in a workspace metric. There's no field-level redaction of workspace data
 either — a `WorkspaceDescriptor` with real customer numbers flows into a
 prompt and can echo into the artifact's `answer`/`recommendations`.
 
+**The new retention surface — conversation memory.** `@aptkit/memory` stores
+every remembered exchange as the **raw** user question + assistant answer
+verbatim, with no TTL, no eviction, and no redaction in the engine
+(`packages/memory/src/conversation-memory.ts:44-46,84`). In buffr these rows
+persist indefinitely in Postgres (`agents.chunks`,
+`/Users/rein/Public/buffr/sql/001_agents_schema.sql:14-25`). Two consequences:
+(a) a user who types a token or PII creates a durable, embeddable, recallable
+copy of it; (b) the secret-scan guard above runs over **replay artifacts**,
+not over memory rows — so a secret a user types is captured by `remember`
+*without ever passing the scan*. → deep walk in
+`06-conversation-memory-trust-surface.md`.
+
 **Red flag check** — response returns more than the caller is entitled to:
 there's no API caller to over-serve, but the *publish* is the over-serve.
 Verbose errors: the Studio middleware returns `error.message` to the local
@@ -249,7 +283,9 @@ exist.
 ## 7. LLM and agent security
 
 This is the lens with the most live surface, and the repo's design here is
-genuinely good — with one sharp edge worth naming.
+genuinely good — with two sharp edges worth naming: the Gemma prose-parsed
+dispatch (below) and the new conversation-memory recall channel, which is the
+single highest-leverage addition this run.
 
 - **Tool/permission scope:** each capability ships a `ToolPolicy` allowlist;
   `filterToolsForPolicy` reduces the full registry catalog to only the schemas
@@ -301,9 +337,29 @@ genuinely good — with one sharp edge worth naming.
   (`search-knowledge-base-tool.ts:51,81,101-106`). This is the one place the
   repo treats a *model-controlled tool argument* as hostile and shapes its
   effect defensively. → lens 3.
+- **Conversation memory as an untrusted recall channel:** the sharpest new
+  LLM-security surface. `recall` feeds past user/assistant text back into a
+  later context, and in buffr's wiring memory shares the document store, so it
+  surfaces through the *same* `search_knowledge_base` tool the agent trusts as
+  grounding (`/Users/rein/Public/buffr/src/session.ts:43,51,53`). The tool
+  passes hit `text` through to the model with no provenance marker
+  (`search-knowledge-base-tool.ts:110-116`), so a past user's words can be
+  cited as a knowledge-base fact — trust-level blur. The engine's only filter
+  is `kind`; it never scopes by `conversationId`
+  (`conversation-memory.ts:96-98`), so within one `app_id` every
+  conversation's memory is recallable by every other, and isolation rests
+  entirely on the store's `WHERE app_id` clause
+  (`/Users/rein/Public/buffr/src/pg-vector-store.ts:74`) — there is **no RLS**
+  in the schema (`001_agents_schema.sql` defines `app_id` columns + a plain
+  index, no row-level-security policy). Same shape as the retrieval `app_id`
+  isolation story: enforced by an app-code filter, not the DB. → deep walk in
+  `06-conversation-memory-trust-surface.md`.
 - **Data exfiltration through tool calls:** bounded — read-only tools can't
   write out, the loop caps tool calls (`run-agent-loop.ts:101`) and tool
-  results are truncated to 16K chars (`run-agent-loop.ts:52`).
+  results are truncated to 16K chars (`run-agent-loop.ts:52`). Memory does
+  *not* add a write-out path (the `search_memory` tool is read-only), but it
+  does add a *persistence* path: anything a user types is durably stored and
+  re-readable later (lens 5).
 
 **Red flag check** — agent whose tool set exceeds its task: `rubric-improvement`
 is the only one with write access, and it needs it (saving a judgment is the
@@ -328,6 +384,10 @@ Consolidated checklist against this repo. `fires` = a real exposure here;
 | Tool allowlist enforced only by omission | **fires** | `tool-registry.ts:56`, `run-agent-loop.ts:159` | medium | re-check policy in `callTool` |
 | Model names tool via parsed prose (Gemma) | **fires (by design)** | `gemma-provider.ts:168` | medium | fail-closed parse mitigates; add policy re-check in `callTool` |
 | Unauthenticated/plaintext local-model transport | **fires (latent)** | `gemma-provider.ts:201`, `ollama-embedding-provider.ts:60` | low (loopback) / high (off-loopback) | bind Ollama to loopback or add a shared token before non-local `host` |
+| Persistent prompt injection via recalled memory | **fires (latent, buffr)** | `conversation-memory.ts:89-98` (recall replays past turns; no conversation/turn scoping) | high | mark memory provenance + scope recall; mitigations bound effect, not replay |
+| Memory rows bypass the secret-scan | **fires (latent, buffr)** | `conversation-memory.ts:84` stores raw Q/A; scan only covers replay artifacts | medium | run `findSecretLikeString` over the formatted turn before upsert |
+| Shared-store memory cited as a document fact | **fires (by design, buffr)** | `session.ts:53` shares store; `search-knowledge-base-tool.ts:110` no provenance marker | medium | label memory hits as user-authored / lower-trust |
+| Cross-conversation memory leak (no RLS) | **fires (latent)** | recall ignores `conversationId`; `app_id` isolation is a `WHERE` clause, no RLS (`001_agents_schema.sql`) | low (single app_id) / high (multi-tenant) | scope recall + add RLS before multi-tenant |
 | Hallucinated model filter wipes retrieval | does not fire | guarded at `search-knowledge-base-tool.ts:101-106` (fail-open) | — | — |
 | Mutating tool in an agent grant | **fires (by design)** | `rubric-improvement-agent.ts:22` (`save_judgment`) | low | document it as the one write-capable capability |
 | Raw user input into prompt | fires (mitigated) | `query-agent.ts:92` | low | output gate + read-only tools already mitigate |

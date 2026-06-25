@@ -76,9 +76,12 @@ produced. Guardrails (05) bound the whole thing so it can't run away or do harm.
   tool-result truncation. The superset that prompt, RAG, memory, and tool
   outputs are all subsets of.
 - **[02-agent-memory-tiers.md](02-agent-memory-tiers.md)** — working / episodic /
-  long-term. AptKit has the **working tier only** (`messages[]`, gone on
-  return). Honest about the two it does not have, and why the rubric agent's
-  history tools are a *host-provided tool*, not an AptKit memory store.
+  long-term. The six agents here **run the working tier only** (`messages[]`, gone
+  on return), but the repo now **ships an episodic-memory engine** —
+  `@aptkit/memory` (`remember`/`recall` as RAG over past exchanges) + a
+  `search_memory` tool — that no agent in this repo wires; the conversational loop
+  that does, with a durable `PgVectorStore`, lives in buffr. The load-bearing
+  distinction is engine-shipped vs loop-wired.
 - **[03-tool-calling-and-mcp.md](03-tool-calling-and-mcp.md)** — `ToolRegistry` +
   `ToolPolicy` + `filterToolsForPolicy` + the `ToolExecutor` seam. Direct
   provider-neutral tool schemas, **not MCP**. The registry IS the gateway-style

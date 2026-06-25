@@ -13,12 +13,17 @@ model's responses once, replay them forever, and assert on the replay. That seam
 is what makes this repo worth a testing study.
 
 The recent RAG / personal-agent packages (a Gemma provider, a retrieval stack, a
-profile injector, a precision@k metric, a `rag-query` agent) push this further with
-a **second, finer isolation seam**: inject the HTTP transport *inside* a provider
-so the provider's own decode logic runs against recorded bytes with no live Ollama.
+profile injector, a precision@k metric, a `rag-query` agent, and `@aptkit/memory`)
+push this further with a **second, finer isolation seam**: inject the HTTP transport
+*inside* a provider — or the vector store *inside* the engine — so the real decode /
+recall logic runs against recorded bytes and an in-memory store, with no live Ollama.
 That's `06-injectable-transport.md` — the new pattern, sitting one layer below the
-replay seam. (The vector store's pg integration tests, DATABASE_URL-gated, live in
-a separate repo, buffr, and are out of scope here.)
+replay seam. `@aptkit/memory` is the latest instance: its store is injected, so the
+remember→recall round-trip, the kind-filter on a shared store, the dimension guard,
+and the `search_memory` tool are all tested with `InMemoryVectorStore` + a fake
+embedder (`packages/memory/test/`, 5 cases). (The vector store's pg integration
+tests, DATABASE_URL-gated, live in a separate repo, buffr, and are out of scope
+here.)
 
 ## The seam that organizes everything
 

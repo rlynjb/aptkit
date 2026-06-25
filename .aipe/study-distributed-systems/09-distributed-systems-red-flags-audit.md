@@ -156,6 +156,40 @@ forward-looking flag for when `InMemoryVectorStore` becomes a persistent
 the corpus by embedding model so a dimension change triggers a backfill rather
 than a silent empty-result regression.
 
+### R7 — memory's id counter is in-process; durable store + restart = id collision (LOW today, INFERENCE)
+
+**Evidence:** `packages/memory/src/conversation-memory.ts:71,78-79` — ids are
+minted from a per-conversation counter `Map` held in process:
+`const n = counters.get(turn.conversationId) ?? 0; ... id = \`${kind}:${turn.conversationId}:${n}\``.
+The counter is rebuilt empty on every process start.
+
+**The risk:** the id-uniqueness invariant rests entirely on a single,
+never-restarted process owning the counter. The store is injected
+(`:18-31,60-61`), and with the durable `PgVectorStore` (in `buffr`,
+`/Users/rein/Public/buffr/src/pg-vector-store.ts`) the rows outlive the process
+while the counter does not. **Inference:** resume the *same* `conversationId`
+after a restart and `remember` mints `memory:<convId>:0` again, and
+`store.upsert` (`:80-86`) **overwrites the persisted turn 0** — the earlier
+exchange is silently lost. This cannot bite in aptkit today: aptkit only wires
+`InMemoryVectorStore` (`conversation-memory.test.ts:27`), where the counter and
+the rows die together, so the id space resets cleanly. It's flagged as a
+forward-looking correctness hazard for the durable wiring in `buffr`.
+
+```
+  R7 — counter resets, durable rows don't (inference)
+
+  before restart:  remember c1 → memory:c1:0, memory:c1:1  (persisted in pg)
+  ── restart ──     counter Map emptied; pg rows survive
+  after restart:   remember c1 → memory:c1:0  → UPSERT overwrites original turn 0
+```
+
+**The fix when triggered:** don't derive ids from in-process state. Either count
+existing rows for the conversation in the store before assigning `n`, or use a
+content hash / uuid id so the id never depends on a counter that a restart can
+reset. (The narrower contract gap: the `VectorStore`
+contract — `packages/retrieval/src/contracts.ts:33-37` — has no "next sequence"
+primitive, so the engine can't ask the store for a safe `n` today.)
+
 ## The non-findings — deliberately absent
 
 These are the risks a checklist would expect that AptKit *correctly* doesn't
@@ -186,17 +220,24 @@ audit:
   R4  AbortError detected by name string       LOW      fallback-provider.ts:92-95
   R5  ledger pricing OpenAI-gpt-4.1 only       INFO     usage-ledger.ts:71-78
   R6  embedding-dim one-way door (handled well) LOW      pipeline.ts:22-29
+  R7  memory id counter ephemeral (durable→collide) LOW† conversation-memory.ts:71
 
   * LOW today; becomes MEDIUM the instant same-provider retry is added.
   R3 is LOW for cloud (SDK default) but MEDIUM for the Ollama edges (no timeout).
+  † LOW + inference: harmless with the in-memory store (the only one aptkit
+    wires); becomes a real id-collision bug if a durable PgVectorStore (buffr)
+    resumes the same conversation after a restart.
 ```
 
 The verdict: **for a single-process library, the partial-failure handling at the
 external-service boundaries is sound.** The fallback chain, fail-fast guard,
 bounded loop, retry-on-parse, and abort passthrough are the right primitives. R1
 is the one finding worth acting on now (inject real error classification); R3 on
-the Ollama edges (no timeout) is the next. The rest are latent gaps whose
-triggers are clearly named — and most of the distributed-systems checklist
+the Ollama edges (no timeout) is the next. R7 (the memory id counter) is the most
+interesting *new* entry: it's harmless in aptkit but is exactly the kind of
+single-process assumption that breaks when state goes durable — worth fixing
+*before* the `buffr` durable wiring lands, not after. The rest are latent gaps
+whose triggers are clearly named — and most of the distributed-systems checklist
 correctly doesn't apply, because the system is one process talking to external
 services, not a multi-node system. The coordination plane that would change that
 verdict is deferred to `buffr`.
@@ -225,8 +266,9 @@ and not bolt on machinery for failures that can't occur."
 
 ## Validate
 
-1. **Reconstruct:** List the five findings ranked, with the one that's actionable
-   today.
+1. **Reconstruct:** List the seven findings ranked, with the one that's
+   actionable today — and name which one is an inference that can't bite aptkit
+   as-shipped.
 2. **Explain:** Why is R1 (`fallback-provider.ts:44`) a real cost/latency risk
    even though the chain "works"?
 3. **Apply:** A teammate adds same-provider retry to handle 429s. Which finding
@@ -240,4 +282,6 @@ and not bolt on machinery for failures that can't occur."
 - `02-partial-failure-timeouts-and-retries.md` — R1–R4 in depth.
 - `03-idempotency-deduplication-and-delivery-semantics.md` — R5 (the ledger) and
   why retries are safe/unsafe.
+- `04-consistency-models-and-staleness.md` — R7 (the memory id counter) as a
+  durability/consistency seam, in depth.
 - `study-networking` — what timeouts and 5xx mean on the wire (R3).

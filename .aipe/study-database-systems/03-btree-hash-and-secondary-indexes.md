@@ -132,6 +132,38 @@ without a secondary index: every by-attribute query is a full scan. This is
 `capabilityId`/`provider`/`fixture` often enough that scanning all of them
 hurts."
 
+**The missing secondary index, the in-memory case: `kind`.** The vector store
+has the *same* gap, and it's now load-bearing because `@aptkit/memory` depends
+on it. Memory rows are written tagged `meta.kind = 'memory'`
+(`packages/memory/src/conversation-memory.ts:84`) so they're distinguishable
+from document chunks when both share one collection. But the `VectorStore`
+contract (`packages/retrieval/src/contracts.ts:33-37`) has *no metadata index
+and no metadata predicate* — `search(vector, k)` cannot say "only rows where
+`kind='memory'`." So `kind` is a **logical partition with no index behind it**:
+a column you'd want to filter on, stored, but un-indexed and un-pushdownable.
+The consequence shows up in `04` as over-fetch-then-filter — recall reads a
+wider window and filters in the application, because the engine can't narrow the
+scan to the partition. What breaks without a `kind` index: a shared memory+doc
+collection where documents outnumber memory rows can push the real memory
+matches past the fetch window — a silent under-return. The trigger to add a
+real indexed metadata filter is exactly that shared, skewed collection.
+
+```
+  the `kind` partition has no index — so the filter can't be pushed down
+
+  one collection, two row types tagged by meta.kind:
+
+   [ doc ][ doc ][ mem ][ doc ][ mem ][ doc ][ doc ][ mem ] ...
+                   ▲             ▲                   ▲
+                   └─ want only these, but no index on `kind` ─┘
+
+  in-memory (aptkit):  search(vector, k) → returns BOTH types interleaved
+                       → recall over-fetches, filters kind==='memory' in app
+  postgres (buffr):    where app_id = $2 → app partition IS pushed down ✓
+                       but NO `where kind = ...` → kind still filtered post-scan
+  the fix (neither):   an index on `kind` + a pushed-down predicate
+```
+
 **The missing point-lookup (hash) index.** There's no "fetch the artifact
 with id X in O(1)." The closest the repo gets is the `FixtureModelProvider`
 serving responses by an integer `index` (`fixture-provider.ts:13`) — a
@@ -327,6 +359,21 @@ pipeline change. The trigger to make that swap is corpus size — the same
 "queries you actually run × N grew large" rule, applied to similarity search
 instead of attribute lookup.
 
+There's a second index gap worth separating from the ANN one: the *metadata*
+index. The ANN index is about *ranking* faster (sub-linear nearest-neighbor);
+a metadata index is about *filtering* a subset before you rank. `@aptkit/memory`
+needs the second — top-k *where `kind='memory'`* — and neither store provides
+it. buffr's `PgVectorStore` is the proof the pushdown shape works: it pushes
+`where app_id = $2` into the scan so ranking never touches another app's rows
+(`/Users/rein/Public/buffr/src/pg-vector-store.ts`). But it stops there — there's
+no `where kind = ...` and no index on `kind`. So even the durable store would
+over-fetch on `kind` for a shared memory+doc collection today. The indexed
+metadata filter is the one piece of real-database machinery that *neither* repo
+ships — the ANN index lives in buffr, the metadata-`kind` index lives nowhere.
+That's the honest state: aptkit's in-memory store has no ANN index and no
+metadata index; buffr adds the ANN index and an `app_id` pushdown but still no
+`kind` index.
+
 ---
 
 ## Interview defense
@@ -368,7 +415,8 @@ load-bearing on the filename format."
 
 - `02-records-pages-and-storage-layout.md` — why a scan reads the whole record
 - `04-query-planning-and-execution.md` — the scan-and-filter "plan", the N+1,
-  and the cosine top-k scan as a query execution path
+  the cosine top-k scan, and over-fetch-then-filter (the `kind` predicate that
+  can't be pushed down)
 - `08-replication-and-read-consistency.md` — the in-memory cursor as a lookup
 - `09-database-systems-red-flags-audit.md` — the vector store's no-durability
   / linear-scan risk, ranked

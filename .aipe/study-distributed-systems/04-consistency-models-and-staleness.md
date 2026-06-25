@@ -108,6 +108,39 @@ This is a real (if humble) distributed-systems choice: trade bandwidth for the
 total elimination of distributed state. It's why there's no session affinity, no
 sticky routing, no "did the provider remember my context" problem.
 
+**The one real durability seam (new): memory's injected store.** `@aptkit/memory`
+is the first place a piece of state's *durability* is a choice rather than a
+constant. The same `remember`/`recall` logic
+(`packages/memory/src/conversation-memory.ts:73-107`) runs over an ephemeral
+`InMemoryVectorStore` (dies on exit) or a durable `PgVectorStore` (survives
+restarts, in `buffr`). With the ephemeral store the consistency story is
+unchanged — one copy, dies with the process. With the *durable* store, a new
+hazard appears that isn't a stale-read problem but an **id-collision** one:
+
+```
+  The counter-vs-durable-store mismatch (inference)
+
+  in-process counter Map      durable store (PgVectorStore, in buffr)
+  (resets to 0 on restart)     (rows for convId 'c1' already persisted)
+        │                              │
+  restart →  counter['c1'] = 0         rows: memory:c1:0, memory:c1:1 exist
+        │                              │
+  resume 'c1', remember() ──► id = memory:c1:0  ──► UPSERT collides → overwrites
+                                                      the original turn 0 silently
+```
+
+The counter (`conversation-memory.ts:71,78-79`) is **ephemeral state assuming a
+single, never-restarted process**: ids are unique only because one in-process
+`Map` hands them out monotonically. Resume the same conversation against a store
+that *remembers* the old rows and the id-generation invariant breaks — the new
+turn 0 overwrites the persisted turn 0. **This is an inference, not an observed
+bug: aptkit only ever wires the in-memory store, where counter and rows die
+together, so the mismatch can't occur here. It becomes real only in `buffr`, the
+moment a durable store is paired with a resumable conversationId across a
+restart.** The fix is to derive `n` from the store (count existing rows for the
+conversation) or use a content/uuid id instead of an in-process counter — see
+`09` R7.
+
 **The absences (`not yet exercised`):**
 
 - **Stale reads / eventual consistency:** none. *Trigger: a read replica or a
@@ -208,6 +241,10 @@ replica, I'd inherit read-your-writes as a real concern. That's the trigger."
    consistency problem appears, and what's the cheapest acceptable model?
 4. **Defend:** Argue that "consistency by resend" is the right call here, naming
    the cost it pays (`run-agent-loop.ts:103-109`).
+5. **Apply (new):** `@aptkit/memory`'s id counter resets on restart
+   (`conversation-memory.ts:71`). Explain why that's harmless with the in-memory
+   store but an id-collision hazard once a durable `PgVectorStore` resumes the
+   same conversation post-restart. What's the cheapest fix?
 
 ## See also
 

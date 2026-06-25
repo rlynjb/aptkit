@@ -65,6 +65,18 @@ cite sources, say so if not found"; 12) and a prepended user **profile** injecte
 by `injectProfile` (`packages/context/src/profile-injector.ts:25`) before
 rendering (the persona section of the anatomy; 01).
 
+A third addition, **`@aptkit/memory`**, adds two prompt-template surfaces without
+changing the path. `defaultFormat(turn)`
+(`packages/memory/src/conversation-memory.ts:44`) is a turn-format-as-template:
+it renders one Q/A exchange into the single string that is *both* embedded and
+re-injected on recall (`Past exchange — user asked: "<q>"...`). And the
+`search_memory` tool **description**
+(`packages/memory/src/memory-tool.ts:36`) is a when-to-recall steering prompt —
+its "Use when the answer may depend on something discussed earlier" sentence
+steers tool selection, in contrast to `search_knowledge_base`'s when-clause-free
+description (`packages/retrieval/src/search-knowledge-base-tool.ts:55`). Both
+covered in 01.
+
 ## What's load-bearing here
 
 Three mechanics carry the weight, and they're the ones to look at first:

@@ -147,12 +147,19 @@ re-indexing the corpus.
 **Ownership.** Every piece of state in AptKit is owned by domain 1 and lives in
 memory or on the local filesystem: the `messages` array in the loop, the
 `toolCalls` records, the trace events, the replay artifacts in
-`artifacts/replays/`, and the embedded chunks in `InMemoryVectorStore`. The
-providers own *nothing* of yours between calls — each `complete()`/`embed()` is
-stateless from your side; you re-send the full message history every turn and
-re-send the text to embed every call. Ollama holds the loaded model weights, but
-no per-request state of yours. That stateless-per-call design is why there's no
-consistency problem to solve (covered in `04`).
+`artifacts/replays/`, the embedded chunks in `InMemoryVectorStore`, and — new
+with `@aptkit/memory` — both the episodic-memory vectors (when wired to the
+in-memory store) and the per-conversation **id counter `Map`**
+(`packages/memory/src/conversation-memory.ts:71`) that mints `memory:<convId>:<n>`
+ids. That counter is the one piece of state that's *interestingly* in-process:
+it's ephemeral (resets on restart) and it silently assumes a *single* process
+mints ids for a given conversation — fine while the store is also ephemeral,
+load-bearing the moment the store becomes durable (see `04`/`09`). The providers
+own *nothing* of yours between calls — each `complete()`/`embed()` is stateless
+from your side; you re-send the full message history every turn and re-send the
+text to embed every call. Ollama holds the loaded model weights, but no
+per-request state of yours. That stateless-per-call design is why there's no
+consistency problem to solve at the *provider* boundary (covered in `04`).
 
 **The messages.** A small, fixed set crosses the boundaries: a `ModelRequest`
 out → `ModelResponse` back on the chat edge, and `string[]` (texts) out →
@@ -251,10 +258,14 @@ embed calls at index time. Both depend on the same external process being up.
   *trigger: extracting the agent loop into its own service that Studio calls
   over HTTP.* (Ollama is a node, but it's not *your* component — it's a
   dependency.)
-- No *durable* datastore node → *trigger: swapping `InMemoryVectorStore` for the
-  planned `PgVectorStore` against a hosted Postgres — that adds a fourth node
-  with real persistence and its own partial-failure surface. This is deferred to
-  the `buffr` repo (`docs/personal-agent-packages.md:81-86`).*
+- No *durable* datastore node → *trigger: injecting `PgVectorStore` (which
+  already exists in `buffr` at `/Users/rein/Public/buffr/src/pg-vector-store.ts`)
+  into `createConversationMemory` or the retrieval pipeline in place of
+  `InMemoryVectorStore` — that adds a fourth node with real persistence and its
+  own partial-failure surface, and turns the in-process memory id counter
+  (`packages/memory/src/conversation-memory.ts:71`) into a correctness hazard
+  across restarts (`04`/`09`). aptkit ships the contract; the durable store and
+  this wiring live in `buffr` (`docs/personal-agent-packages.md:81-86`).*
 - No queue/broker node → *trigger: making agent runs async with a producer and
   a separate consumer.*
 

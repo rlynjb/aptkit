@@ -38,6 +38,14 @@ the dominant cost; it widens the picture. The two patterns worth a file:
 the O(n·d) linear vector scan (**07**) and embedding batching + the top-k
 floor (**08**).
 
+**Also new: `@aptkit/memory`** (`packages/memory/src/conversation-memory.ts`)
+— episodic memory built on the same `VectorStore`. It doesn't add a new cost
+*class*; it *amplifies* the linear scan (lens 4) three ways: `recall`
+over-fetches `max(k*4, 20)` rows then filters client-side because the
+contract has no metadata filter; memory grows unbounded with no eviction;
+and `remember` puts an embedding round-trip on the write path. The amplifier
+gets its own file: **09**.
+
 The lenses below are walked in order. Where a lens finds nothing, it
 says `not yet exercised` and names when it would start to matter.
 
@@ -185,9 +193,27 @@ contract) replaces it with a sub-linear ANN walk.
 
 → The linear scan and its HNSW contrast get a file: **07-linear-vector-scan.md**.
 
+**Episodic memory amplifies that same scan.** `@aptkit/memory`'s `recall`
+runs the store's `search` with `fetchK = Math.max(k * 4, 20)` and then
+filters the hits to `meta.kind === kind` client-side
+(`packages/memory/src/conversation-memory.ts:94-98`). So to return k memory
+rows it scores, sorts, and transfers up to **4× (or ≥20)** rows — pure
+amplification of the O(n·d) scan, because the `VectorStore` contract is
+`search(vector, k)` with no `where` clause to push the `kind` filter down
+(`packages/retrieval/src/contracts.ts:33-37`). On top of that, memory **grows
+without bound**: every `remember` appends a row and there is no eviction, TTL,
+or summarization anywhere in the package (`conversation-memory.ts:74-87`). In
+a *shared* store the memory rows pile up alongside documents and inflate the
+n that every query — document or memory — scans. Today the row counts are
+tiny (the tests store 1–2 rows) so this is sub-ms; it's an amplifier on the
+finding-7 baseline that becomes real over a long conversation history.
+
+→ The over-fetch + unbounded-growth pattern gets a file: **09-memory-recall-overfetch.md**.
+
 CPU/memory profiling under load is **not yet exercised** and won't
-matter until a non-model path proves hot — the vector scan is the first
-candidate, but only at a corpus size the repo doesn't yet reach.
+matter until a non-model path proves hot — the vector scan (amplified by
+memory over-fetch and growth) is the first candidate, but only at a corpus
+size the repo doesn't yet reach.
 
 ## 5. io-network-and-database-bottlenecks
 
@@ -227,6 +253,20 @@ real database hop joins the picture — `study-database-systems` owns that.
 
 → Embedding batching is covered in **08-embedding-batch-and-topk-floor.md**.
 
+**Memory adds an embedding round-trip to the *write* path.** Before
+`@aptkit/memory`, the embed call only happened on retrieval (indexing a
+document, then querying it). Now `remember` embeds the formatted exchange on
+every store (`packages/memory/src/conversation-memory.ts:75-76`) and `recall`
+embeds the query (`:90-91`) — so a "remember this turn, then recall later"
+loop is *two* embedding hops, one of them on the write path. And unlike
+indexing (which batches a whole document's chunks into one `embed(texts[])`
+call), `remember` embeds **one exchange at a time** — `embedder.embed([text])`
+with a single-element array — so there's no batching to amortize the per-call
+HTTP cost across turns. With the local Ollama embedder this is sub-ms and $0;
+it matters the moment the embedder is a paid API.
+
+→ The write-path embed cost is covered in **09-memory-recall-overfetch.md**.
+
 Filesystem I/O (reading fixtures, listing replay artifacts in
 `replay-runner.ts:31-44`) is sequential and unbounded in count, but
 runs at dev/CI time over small directories, so it's not a bottleneck.
@@ -265,6 +305,15 @@ cost. *Model* request batching is still **not yet exercised**: each agent
 turn is one `complete()` call, no coalescing, no provider batch APIs
 (OpenAI `/v1/batch`, Anthropic Message Batches). → see
 **08-embedding-batch-and-topk-floor.md**.
+
+**Memory `recall` is the *anti*-pattern here: over-fetch, not batch.** Where
+embedding batching shrinks N round-trips to one, memory recall does the
+opposite to row reads — it fetches `max(k*4, 20)` rows to return k
+(`conversation-memory.ts:94-95`) because the `VectorStore` contract can't push
+the `kind` filter into the scan. It's a read-amplification tax paid on every
+recall, the mirror image of batching: a missing filter forcing extra work
+rather than a present batch removing it. The fix is to teach the contract a
+metadata predicate so the store filters server-side — see lens 4 and **09**.
 
 **One retrieval-depth knob: the top-k floor.** `minTopK` clamps the model's
 requested `top_k` *up* to a floor (`search-knowledge-base-tool.ts:51,
@@ -376,7 +425,35 @@ embedding round-trips (`ollama-embedding-provider.ts:50-74`) emit no
 Ollama embedder, cost is genuinely $0 so this is moot — but if the embedder
 swaps to a paid API (OpenAI embeddings), per-embed cost would be invisible.
 Acceptable while embeddings are local; the move is to emit usage for the
-embed path the moment a paid embedder is wired.
+embed path the moment a paid embedder is wired. The write-path embed in
+`remember` (red flag #8) widens this surface.
+
+**8. Memory `recall` over-fetches 4×/≥20 and memory grows unbounded.**
+Evidence: `recall` reads `fetchK = Math.max(k * 4, 20)` rows then filters to
+`meta.kind === kind` in JS (`conversation-memory.ts:94-98`), and `remember`
+only appends — no eviction, TTL, or summarization in the package
+(`:74-87`). Root cause: the `VectorStore` contract is `search(vector, k)` with
+no metadata predicate (`contracts.ts:33-37`), so the `kind` filter can't be
+pushed into the scan. Consequence: each recall scores/sorts/transfers up to 4×
+(or ≥20) the rows it returns, and in a *shared* store the unbounded memory
+rows inflate the n that every query scans — both amplifying the O(n·d) cost
+(red flag #6). Acceptable today (tiny row counts, sub-ms) and the natural
+first cut; it becomes real over a long-lived conversation history. The move:
+add a metadata filter to the `VectorStore` contract (buffr already pushes a
+`where app_id` scope at the DB — `buffr/src/pg-vector-store.ts:74` — so the
+shape is proven; it just needs a `kind` predicate), and cap/evict/summarize
+memory rows. → **09**.
+
+**9. `remember` puts a non-batched embedding round-trip on the write path.**
+Evidence: `remember` calls `embedder.embed([text])` per exchange
+(`conversation-memory.ts:75-76`) — one HTTP hop per remembered turn, with a
+single-element array so there's no batching, unlike document indexing which
+batches a whole doc's chunks (`ollama-embedding-provider.ts:50-74`).
+Consequence: a remember-then-recall loop is two embed hops, one now on the
+write path; with a paid embedder each remembered turn carries an unbatched,
+unmetered embed cost. Acceptable while the embedder is local ($0); the move is
+to batch deferred remembers and meter the embed path (ties to red flag #7).
+→ **09**.
 
 ---
 
@@ -395,7 +472,9 @@ embed path the moment a paid embedder is wired.
   pre-flight guard that avoids paying for a doomed hop.
 - **study-database-systems** — owns pgvector and the HNSW index mechanics
   (in buffr) that the in-memory linear scan is the exact-search baseline
-  for; this guide owns the O(n·d) cost contract and when to cross the seam.
+  for, plus predicate pushdown / ANN-with-`WHERE`; this guide owns the O(n·d)
+  cost contract, when to cross the seam, and the read-amplification tax memory
+  recall pays for the missing metadata filter (**09**).
 - **study-ai-engineering** — owns the RAG retrieval-quality story
   (precision@k/recall@k, chunking strategy); this guide reads those scores
   as a *baseline instrument* for a chunking or top-k perf change.

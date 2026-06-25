@@ -158,7 +158,7 @@ Profile injection (`packages/context/src/profile-injector.ts:25-38`) is pure str
 
 ### Move 3 — the principle
 
-The whole RAG capability adds zero new architectural *machinery*. It reuses three seams the repo already had — the tool contract, the agent loop, the tool policy — and adds two new ones (`EmbeddingProvider`, `VectorStore`) that are *the same shape* as `ModelProvider`: a narrow interface, a swappable adapter behind it, a vendor name that never leaks upward. When you find yourself adding a capability and the new code is mostly *contracts and wiring* rather than new control flow, that's the sign the existing seams were the right ones.
+The whole RAG capability adds zero new architectural *machinery*. It reuses three seams the repo already had — the tool contract, the agent loop, the tool policy — and adds two new ones (`EmbeddingProvider`, `VectorStore`) that are *the same shape* as `ModelProvider`: a narrow interface, a swappable adapter behind it, a vendor name that never leaks upward. When you find yourself adding a capability and the new code is mostly *contracts and wiring* rather than new control flow, that's the sign the existing seams were the right ones. The proof landed shortly after: `@aptkit/memory` became a *second consumer* of these exact two seams with no new infrastructure at all (`10-memory-store-topology.md`) — one consumer could be a coincidence; two is the boundary generalizing.
 
 ---
 
@@ -297,6 +297,7 @@ The agent loop gains a capability without gaining a concept. **Anchor: RAG adds 
 - `01-provider-abstraction.md` — the `ModelProvider` seam this pattern mirrors twice.
 - `04-capability-as-tool-policy.md` — the tool/registry/policy boundary retrieval plugs into.
 - `02-bounded-agent-loop.md` — the loop that drives the `search_knowledge_base` call.
-- `08-monorepo-bundle-boundary.md` — `@aptkit/retrieval` and `@aptkit/agent-rag-query` are two of the 15 bundled packages.
+- `08-monorepo-bundle-boundary.md` — `@aptkit/retrieval` and `@aptkit/agent-rag-query` are two of the 16 bundled packages.
+- `10-memory-store-topology.md` — `@aptkit/memory` is the *second consumer* of these two seams; read it for the proof the boundary generalizes.
 - `audit.md` lenses 1, 2 — where retrieval shows up in the boundary and flow inventory.
 - `.aipe/study-ai-engineering/` · `.aipe/study-agent-architecture/` — retrieval *quality* and agentic-retrieval reasoning (this guide owns the architectural seam only).

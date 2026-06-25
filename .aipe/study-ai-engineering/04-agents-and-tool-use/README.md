@@ -28,8 +28,9 @@ and how it recovers when something breaks).
   least-privilege tool allowlists. The provider only ever *sees* the tools a
   capability is allowed to call. Plus pre-model coverage gating.
 - **[05-agent-memory.md](05-agent-memory.md)** — Short-term (the in-context
-  `messages` array) vs long-term (retrieved). AptKit has only short-term — and
-  that honesty is the lesson.
+  `messages` array, automatic, live) vs long-term (`@aptkit/memory` — RAG over past
+  exchanges, shipped + tested but not yet auto-called by an aptkit loop; the
+  mechanics live in `../03-retrieval-and-rag/13-conversation-memory.md`).
 - **[06-error-recovery.md](06-error-recovery.md)** — The failure-mode table:
   what the loop handles (tool error, budget exhaustion, unparseable output,
   provider failure) and what it doesn't (per-tool timeout, repeated-tool loops).

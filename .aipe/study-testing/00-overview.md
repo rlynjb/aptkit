@@ -11,17 +11,18 @@ replay. Everything else hangs off it.
 
   ┌─ E2E (Playwright, port 4187) ────────────────────────────┐
   │  tests/studio/studio-smoke.spec.ts                       │  7 tests
-  │  cards navigate · fixture run bumps counter · panels show │  1 file
+  │  6 cards navigate · fixture run bumps counter · panels    │  1 file
+  │  show — RAG card NOT covered (gap, see audit lens 4)      │
   └───────────────────────────────────────────────────────────┘
   ┌─ Integration (fixture replay through the real agent) ────┐
   │  packages/agents/*/scripts/replay-fixture.ts             │  4 of 6
   │  FixtureModelProvider → runAgentLoop → assert shape+text  │  agents
   └───────────────────────────────────────────────────────────┘
   ┌─ Unit (node --test on built dist) ───────────────────────┐
-  │  28 *.test.ts files, ~123 cases                          │  the base
+  │  30 *.test.ts files, ~128 cases                          │  the base
   │  evals · runtime · tools · context · prompts · workflows  │
-  │  providers (incl. gemma) · retrieval · agents (incl.      │
-  │  rag-query) · core re-export surface                      │
+  │  providers (incl. gemma) · retrieval · memory · agents    │
+  │  (incl. rag-query) · core re-export surface               │
   └───────────────────────────────────────────────────────────┘
 ```
 
@@ -73,6 +74,12 @@ is `03-promote-to-fixture-baseline.md`.
   studying → `06-injectable-transport.md`. The RAG packages also carry the repo's
   strongest error/boundary coverage (dimension guards, the minTopK floor, the
   hallucinated-filter case, precision@k not-well-formed branches).
+- **`@aptkit/memory` is fully tested at the same injectable-store seam.** Five cases
+  across two files (`packages/memory/test/`) drive the remember→recall round-trip,
+  the kind-filter on a shared store, the dimension guard, and the `search_memory`
+  tool through a real registry — all against `InMemoryVectorStore` + a deterministic
+  fake embedder, no live Ollama. The store is injected, so the exact logic that runs
+  with a `PgVectorStore` in production is what the tests exercise.
 
 **Thin / missing (full detail in `audit.md`):**
 - `runAgentLoop` — the bounded agent loop, the single most load-bearing function
@@ -82,6 +89,10 @@ is `03-promote-to-fixture-baseline.md`.
   no promoted baseline** — two agents left out of the regression loop.
 - **No CI test gate.** The only workflow is `publish-core.yml`; it does not run
   `npm test`, `eval:replays`, or the Playwright smoke. Tests are local-only.
+- **The new Studio RAG card is not smoked.** `RagQueryWorkspace` (the in-browser
+  deterministic RAG runner, `agent-runners.ts:167`) is wired into the gallery but is
+  absent from the Playwright `pages` list — the smoke covers six cards, not it. One
+  missing card entry + one fixture-run case closes it (audit lens 4).
 - Error/edge coverage is uneven by area: the runtime/provider layer and the new
   RAG packages test their failure branches well; the *legacy* agents
   (recommendation/monitoring/diagnostic/query) mostly test the happy path.

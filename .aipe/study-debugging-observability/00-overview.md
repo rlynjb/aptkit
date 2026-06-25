@@ -103,7 +103,10 @@ tolerance on the side under control (`matchesFilter` ignores unknown keys,
 `search-knowledge-base-tool.ts:101-106`) and locked it with a regression test
 (`:105-117`). This is the local-incident loop run end to end, and the one bug class
 worth fixing structurally: empty results leave no proactive signal, only trace evidence.
-→ `08-retrieval-miss-diagnosis.md`.
+The `@aptkit/memory` `search_memory` tool is the same class — a recall that comes back
+`[]` from the kind-filter-after-over-fetch (`conversation-memory.ts:94-97`) looks
+identical to "no memory exists," and it's observable via the *same* trace events once an
+agent wires the tool. → `08-retrieval-miss-diagnosis.md`.
 
 ## What's `not yet exercised`
 
@@ -137,7 +140,11 @@ infrastructure above — so the `not yet exercised` list stands. The one genuine
 structural gap it exposed is **no proactive signal on silent empty results**: a
 zero-hit retrieval logs nothing, leaving only forensic trace evidence (see `audit.md`
 red-flag 1). `not yet exercised` as a proactive guard; a `warning` on zero-hit
-retrieval would close it.
+retrieval would close it. The later `@aptkit/memory` package widened this same class
+without changing the verdict — `search_memory`'s `recall` can return `[]` from its
+kind-filter-after-over-fetch (`conversation-memory.ts:89-106`), a memory MISS that is
+the same silent empty with the same forensic-only signal (the tool is exported and
+tested but `not yet wired` into any agent loop).
 
 The takeaway: AptKit over-indexes on the parts that matter for an LLM system you're
 *debugging by hand* — full-fidelity traces, deterministic replay, derived

@@ -4,21 +4,26 @@ The risk map, not the coverage percentage. Each lens is walked against the real
 suite with `file:line` grounding. Lenses that find nothing get `not yet exercised`
 with a buildable target. Worst-first inside each lens.
 
-The inventory of what exists: **28 `*.test.ts` files, ~123 `node --test` cases**, one
+The inventory of what exists: **30 `*.test.ts` files, ~128 `node --test` cases**, one
 Playwright spec (7 tests), four agent fixture-replay scripts, and the eval seam in
 `packages/evals/`. Runner is Node's built-in test runner over built `dist` — no
 jest, no vitest. Confirmed: every package `test` script is
-`npm run build && node --test dist/test/*.test.js`.
+`npm run build && node --test dist/test/*.test.js`, including the new
+`@aptkit/memory` package (`packages/memory/package.json:21`).
 
 The recent growth is the **personal-agent / RAG packages** — a Gemma provider, an
-in-memory retrieval stack, a profile injector, a precision@k metric, and a
-`rag-query` agent. They were built test-first, and they introduce a *second*
+in-memory retrieval stack, a profile injector, a precision@k metric, a
+`rag-query` agent, and now `@aptkit/memory` (retrieval-based episodic conversation
+memory). They were built test-first, and they introduce a *second*
 isolation seam below the existing provider seam: the **injectable transport** —
 inject the HTTP call inside a provider so its real decode logic runs against
 recorded bytes with no live Ollama. That's significant enough to earn its own
-pattern file → `06-injectable-transport.md`. The pg integration tests for the
-vector store (DATABASE_URL-gated) live in a separate repo (buffr) and are out of
-scope here.
+pattern file → `06-injectable-transport.md`. The new memory tests reuse the *same*
+injectable seam at the store layer — `InMemoryVectorStore` + a deterministic fake
+`EmbeddingProvider` — so the whole remember→recall round-trip is reproducible with
+no live Ollama (`packages/memory/test/conversation-memory.test.ts:9`). The pg
+integration tests for the vector store (DATABASE_URL-gated) live in a separate repo
+(buffr) and are out of scope here.
 
 ---
 
@@ -69,6 +74,42 @@ each layer with an injected fake (no live Ollama):
   filter key absent from all chunks is ignored, not allowed to zero out results,
   `:105`), and `filterToolsForPolicy` selectability.
 
+**Well-tested — conversation memory (`packages/memory/`).** New package, episodic
+retrieval-based memory (`remember`/`recall` over an injected embedder + vector store).
+Tested at the same injectable seam as retrieval — `InMemoryVectorStore` + a
+deterministic dim-4 fake `EmbeddingProvider` keyed off keyword presence, so cosine
+ranking is exact and the tests can't flake (`conversation-memory.test.ts:9`). Five
+cases across two files, each pinning a real boundary:
+- **remember→recall round-trip from a paraphrased query** — store two exchanges,
+  recall with a *different* phrasing (`'which editor do I prefer'` vs the stored
+  `'what editor do I use'`), assert the neovim row ranks first and carries its
+  `conversationId` (`conversation-memory.test.ts:26`).
+- **the kind-filter on a SHARED store** — the seam that makes memory safe to mix into
+  the document corpus. Pre-seed the store with a foreign document chunk (no `kind`
+  tag), remember one exchange, recall, and assert *every* hit's id starts with
+  `memory:` — proving the over-fetch-then-filter logic
+  (`conversation-memory.ts:97`) keeps document rows out of recall even when search
+  itself has no metadata filter (`conversation-memory.test.ts:38`).
+- **the dimension guard** — `createConversationMemory` throws when the embedder's
+  dimension (4) disagrees with the store's (768), at construction
+  (`conversation-memory.test.ts:51`, guarding `conversation-memory.ts:62`). Same
+  wiring-bug-caught-early discipline as the retrieval pipeline's guard.
+- **custom format + kind** — a non-default `kind:'episode'` and `format` produce the
+  expected id (`episode:c9:0`) and rendered text, confirming the namespacing is
+  driven by the option, not hard-coded (`conversation-memory.test.ts:56`).
+- **the `search_memory` tool through a registry** — `createMemoryTool` wires into a
+  real `InMemoryToolRegistry` and is called by name; asserts the recalled neovim row
+  comes back in the `memories` payload (`memory-tool.test.ts:20`). Mirrors the
+  `search-knowledge-base-tool` registry round-trip — the tool layer is tested the
+  same way the document tool is.
+
+What's NOT yet exercised in memory: no per-conversation counter collision test (the
+`counters` map at `conversation-memory.ts:71` is exercised only implicitly via the
+`:0` suffix in the custom-kind case), no empty-store recall returning `[]`, and the
+`recall` `k`-slice/over-fetch math (`fetchK = max(k*4, 20)`,
+`conversation-memory.ts:94`) is not driven with enough rows to prove the slice
+actually trims. Low risk — buildable targets, not bugs.
+
 **Tested — context + the rag-query agent.** `profile-injector.test.ts` (6 cases)
 covers start/end placement, heading adjacency, and that the injected result still
 renders via `renderPromptTemplate` with placeholders intact (`:61`).
@@ -111,9 +152,10 @@ is tested only by accident of its callers. Close that one gap first.
 ## 2. test-design-and-levels
 
 The pyramid, as-built — and it's the right shape. See `00-overview.md` for the
-diagram. Wide unit base (~123 cases across 28 files), thin integration band
+diagram. Wide unit base (~128 cases across 30 files), thin integration band
 (4 fixture-replay scripts), one E2E cap (7 Playwright tests). No inversion — the
-RAG packages grew the base, not the cap.
+RAG and memory packages grew the base, not the cap. (Note the cap did *not* grow
+with the new RAG Studio card — see the smoke gap in lens 4.)
 
 **Mocking is honest, not over-done.** The agent tests don't mock the agent — they
 inject a fake `ModelProvider` at the one real seam and run the *actual* agent loop,
@@ -193,8 +235,10 @@ an injected one in tests (`gemma-provider.test.ts:30`,
 function, so no test opens a socket to Ollama — the provider decode runs for real
 against frozen bytes. The retrieval embedders in the higher-level tests are
 deterministic keyword/hash fakes (`pipeline.test.ts:18`,
-`rag-query-agent.test.ts:22`), so the whole index→query→rank→answer path is
-reproducible. → deep walk in `06-injectable-transport.md`.
+`rag-query-agent.test.ts:22`), and the memory tests use the same kind of fake
+(`conversation-memory.test.ts:9` — a keyword-keyed dim-4 embedder), so the whole
+index/remember→query/recall→rank→answer path is reproducible with no live Ollama.
+→ deep walk in `06-injectable-transport.md`.
 
 **Time and ordering are handled.** Where a timestamp is needed, the artifact carries
 an explicit ISO `createdAt` that the eval validates with `Date.parse`
@@ -215,6 +259,25 @@ with a 30s timeout (`playwright.studio.config.ts:15`). If the build is cold, tha
 boot can race the timeout on a slow machine. Low frequency, real possibility.
 - **The move:** if it ever flakes, raise the `webServer.timeout` and pre-build the
   Studio app in CI before the smoke step.
+
+**Smoke gap — the new RAG card isn't smoked.** Studio gained a `RagQueryWorkspace`
+card backed by a deterministic-in-browser RAG runner (`runRagQueryFixtureReplay` in
+`apps/studio/src/agent-runners.ts:167` — a *real* retrieval pipeline with the fake
+embedder + `InMemoryVectorStore` + a recorded Gemma response replayed through the
+loop), wired into the gallery (`apps/studio/src/main.tsx`,
+`apps/studio/src/RagQueryWorkspace.tsx:21`). The Playwright spec does NOT cover it:
+its `pages` list enumerates six cards
+(`tests/studio/studio-smoke.spec.ts:3`) — recommendation, monitoring, diagnostic,
+query, rubric-improvement, runtime-utilities — and there's no RAG (or memory) entry,
+no `grep` hit for `rag`/`Rag`/`RAG`/`memory` anywhere in the spec. So the one Studio
+card that runs a full retrieval+agent path in the browser is the one card with no
+E2E assertion that it still opens, runs its fixture, bumps the counter, and renders
+its answer panel. Honest read: **not yet exercised.**
+- **The move:** add a `{ card: 'RAG Query Agent', heading: '…' }` entry to the
+  `pages` array (covers the open/navigate path) plus one fixture-run case mirroring
+  the Query test (`studio-smoke.spec.ts:71`) — click Run, poll the counter, assert
+  the Answer panel renders. The runner is already deterministic, so the test is
+  cheap; nobody added the card to the list.
 
 → Determinism is the headline strength of this suite. The fixture replay is the
 mechanism; `01-replay-as-test.md` is the deep dive.
@@ -262,6 +325,12 @@ the runtime/provider layer, thin in the agents.
   - the Gemma provider gives up cleanly after `maxToolCallAttempts` and returns raw
     text instead of looping forever on un-parseable JSON
     (`gemma-provider.test.ts:96`), and rejects a pre-aborted signal (`:126`).
+  - **conversation memory** mirrors the same discipline: the dimension guard throws
+    at construction when embedder ≠ store (`conversation-memory.test.ts:51`), and the
+    kind-filter boundary is tested directly — recall over a store that *also* holds a
+    foreign document chunk returns only `memory:`-prefixed rows
+    (`conversation-memory.test.ts:38`), proving the over-fetch-then-filter doesn't
+    leak documents into recall.
 
 **Thin error coverage — the agents.** The agent unit tests assert the happy path
 (valid model output → valid recommendation/answer/diagnosis). What's NOT tested:
@@ -308,7 +377,12 @@ the new packages cut a seam one layer lower: inject the HTTP `chat`/`embed`
 transport, run the *real* provider decode against recorded bytes. This is how the
 single hardest piece of the RAG work — messy-blob→`tool_use` decoding — gets
 direct coverage without a live Ollama (`gemma-provider.test.ts:29`). →
-`06-injectable-transport.md`.
+`06-injectable-transport.md`. The same injectable-store seam shows up once more in
+`@aptkit/memory`: the engine's store is *injected*, so the remember→recall logic is
+tested against `InMemoryVectorStore` + a fake embedder and is dimension-, kind-, and
+ranking-correct with zero live calls (`conversation-memory.test.ts:9`). Production
+swaps in a `PgVectorStore`; the logic under test is identical
+(`conversation-memory.ts:48`).
 
 **Level 2 — structural shape assertions, not string equality.** You can't assert an
 LLM's prose equals a fixed string. So the eval asserts *shape*: required paths
@@ -369,6 +443,8 @@ Consolidated checklist against this repo. ✓ = clean, ✗ = present, ⚠ = part
   ✓  LLM seam untested at the boundary     — no; Gemma decode tested at the wire
                                              via injectable transport (06-…)
   ✓  Live-network flakiness in unit tests  — no; transports injected, no Ollama call
+  ⚠  New UI card unsmoked                  — YES; RagQueryWorkspace card has no
+                                             Playwright entry (smoke covers 6 cards)
 ```
 
 ### ✗ No CI test gate — the highest-leverage fix
@@ -403,6 +479,14 @@ is the one agent without a deterministic quality-regression baseline.
 `package.json`. So like `rubric-improvement`, the newest agent has a unit test but
 no frozen golden-master baseline. It's the natural next promotion target now that
 the unit test exists; mirror the query agent's `replay-fixture.ts`.
+
+### ⚠ Studio's RAG card is not in the smoke gate (new)
+
+The Playwright `pages` list smokes six cards (`studio-smoke.spec.ts:3`); the new
+`RagQueryWorkspace` (`apps/studio/src/RagQueryWorkspace.tsx`, runner
+`agent-runners.ts:167`) isn't one of them. Same fix shape as any missing card: add
+the entry plus one fixture-run case. See lens 4 → "Smoke gap." Distinct from the
+agent-package gaps below — this is a UI E2E gap, not a fixture-replay gap.
 
 ### ✗ runAgentLoop untested — see lens 1.
 

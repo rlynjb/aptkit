@@ -163,6 +163,65 @@ person without re-reading the whole prompt.
         │  THEN renderPromptTemplate fills any {var} holes (order matters)
 ```
 
+**Recalled memory — a turn-format template that becomes injected context.**
+There's a section the prompt author doesn't write by hand but still controls the
+wording of: a *remembered exchange*. When the agent recalls a past turn, that
+turn arrives back in context as a tool result — and what it reads like is set by
+a template, `defaultFormat(turn)`, that renders one Q/A pair into a single string:
+`Past exchange — user asked: "<q>"` then `assistant answered: "<a>"`. That same
+string is what got *embedded* when the turn was first remembered, so the template
+is load-bearing twice: it shapes what the vector index matches against, and it
+shapes what the model reads when the memory comes back. **Breaks if missing:**
+embed the raw answer with no `user asked:` framing and a recall surfaces a bare
+sentence with no signal that it's a prior exchange — the model can't tell history
+from a fresh instruction, and your retrieval matches on answer-text alone (a
+follow-up phrased like the *question* won't match an answer-only embedding).
+
+```
+  Turn-format template — same string, two jobs
+
+  remember(turn):                         recall(query):
+  ┌─ format(turn) ────────────────┐       ┌─ search returns the meta.text ─┐
+  │ Past exchange — user asked:   │       │ same formatted string, now an  │
+  │ "<q>"                         │       │ injected tool result the model │
+  │ assistant answered: "<a>"     │ ──┐   │ reads as recalled context      │
+  └───────────────┬───────────────┘   │   └────────────────────────────────┘
+                  │ embed             │                ▲
+                  ▼                   └─ stored as meta.text ─┘
+            vector indexed            (embedded form == recalled form)
+```
+
+**The `search_memory` description — a when-to-recall steering prompt.** Tool
+*descriptions* are prompt too: they're the text the model reads to decide whether
+to call a tool. `search_memory`'s description is one steering sentence past the
+factual part — `"Search past conversation exchanges with this user for ones
+relevant to a query. Use when the answer may depend on something discussed
+earlier."` That second sentence isn't documentation; it's an instruction aimed at
+tool *selection*. Contrast it with the sibling retrieval tool: `search_knowledge_
+base` says only `"Search the indexed knowledge base ... and return ranked chunks
+with citations."` — it describes WHAT it does, with no when-to-use clause. The
+two descriptions partition the model's choice: knowledge-base for "what's in the
+docs," memory for "what did we say before." **Breaks if missing:** drop the "use
+when..." sentence and the model either never recalls (treats memory as inert) or
+recalls on every turn (wastes a tool call and pollutes context). The wording is
+the steering. (The retrieval *mechanics* — over-fetch-then-filter, the kind tag —
+are the AI-engineering guide's; the agent's *decision* to call the tool is
+agent-architecture's; the wording of the description that steers that decision is
+this file's.)
+
+```
+  Two tool descriptions partition one decision
+
+  ┌─ search_knowledge_base ──────────────┐   ┌─ search_memory ───────────────────┐
+  │ "...indexed knowledge base ...        │   │ "...past conversation exchanges... │
+  │  ranked chunks with citations."       │   │  Use when the answer may depend   │
+  │  (WHAT it does — no when-clause)       │   │  on something discussed earlier." │
+  └───────────────────────────────────────┘   │  (WHAT + an explicit WHEN-clause) │
+            ▲ model reaches here for           └───────────────────────────────────┘
+              "what's in the docs"                        ▲ model reaches here for
+                                                            "what did we say before"
+```
+
 #### Move 3 — the principle
 
 One job per section, named explicitly. The reason this matters isn't tidiness —
@@ -197,7 +256,10 @@ The full anatomy, assembled, as `runAgentLoop` sees it.
 **Use cases.** Every one of the agents assembles a prompt this way. The cleanest
 example is the recommendation agent, which injects three context variables and a
 constant output contract. The rag-query agent adds a fifth section — a prepended
-user profile — via `injectProfile`.
+user profile — via `injectProfile`. The memory package adds two more
+prompt-template surfaces: `defaultFormat` (the wording of a remembered exchange,
+embedded once and re-injected on recall) and the `search_memory` tool description
+(the when-to-recall steering sentence the model reads to decide whether to look).
 
 The `PromptPackage` type defines the envelope — the system string plus its
 declared variables and examples:
@@ -298,6 +360,39 @@ template, *then* rendered, so the order (inject → render) is preserved:
            and the persona swappable without an fs dependency in the prompt layer.
 ```
 
+The `defaultFormat` template renders one remembered exchange — and this exact
+string is what gets embedded *and* what comes back on recall:
+
+```
+  packages/memory/src/conversation-memory.ts  (lines 44–46)
+
+  function defaultFormat(turn: MemoryTurn): string {
+    return `Past exchange — user asked: "${turn.question}"\n` +
+           `assistant answered: "${turn.answer}"`;   ← the turn-as-prompt template
+  }
+       │
+       └─ remember() embeds format(turn) and stores it as meta.text (line 75, 84);
+          recall() returns that same meta.text (line 102). The wording is load-
+          bearing twice: it's the embedded form AND the recalled-context form.
+          Override it via opts.format (line 28/68) and you change both at once.
+```
+
+The `search_memory` tool *description* is the when-to-recall steering prompt —
+note the second sentence is an instruction about tool selection, not docs:
+
+```
+  packages/memory/src/memory-tool.ts  (lines 36–38)
+
+  description:
+    'Search past conversation exchanges with this user for ones relevant to a ' +
+    'query. Use when the answer may depend on something discussed earlier.',
+       │
+       └─ "Use when..." steers the model to recall only when history is relevant.
+          Contrast search-knowledge-base-tool.ts:55 — "...indexed knowledge base
+          ... ranked chunks with citations." — WHAT only, no when-clause. The two
+          descriptions split the model's choice between docs and memory.
+```
+
 ## Elaborate
 
 The four-section split is the oldest stable convention in production prompting —
@@ -353,6 +448,31 @@ placeholder inside the profile would leak unrendered.
 Anchor: "`injectProfile(template, profile, {position:'start'})` then
 `renderPromptTemplate` at `rag-query-agent.ts:55`."
 
+**Q: A tool description is "just documentation" — why treat it as a prompt?**
+Because it's the text the model reads to *choose* the tool. `search_memory`'s
+description ends with "Use when the answer may depend on something discussed
+earlier" — a when-to-use instruction, not docs. Its sibling `search_knowledge_
+base` has no such clause. The two descriptions partition the model's choice
+between docs and memory; change the wording and you change recall behavior.
+
+```
+  ┌─ search_knowledge_base ─┐  contrast  ┌─ search_memory ──────────┐
+  │ WHAT only, no when-clause│ ═════════► │ WHAT + "Use when..." WHEN │
+  └──────────────────────────┘  (flips)   └───────────────────────────┘
+   describes ──────────────── steering axis ──────────── steers selection
+```
+Anchor: "the 'Use when...' sentence at `memory-tool.ts:38` is steering, not
+docs — `search-knowledge-base-tool.ts:55` has no when-clause."
+
+**Q: Where does a recalled memory's wording come from, and why does it matter twice?**
+From `defaultFormat(turn)` (`conversation-memory.ts:44`). The same formatted
+string is embedded when the turn is remembered and re-injected when it's recalled
+— so the template shapes both what the vector index matches and what the model
+reads back. Drop the `user asked:` framing and recall matches answer-text only,
+and the model can't tell history from a fresh instruction.
+Anchor: "format(turn) is embedded (line 75) and returned (line 102) — one
+template, two jobs."
+
 ## Validate
 
 - **Reconstruct:** Draw the four sections and label each constant / per-workspace
@@ -373,3 +493,5 @@ Anchor: "`injectProfile(template, profile, {position:'start'})` then
 - [03-prompts-as-code.md](03-prompts-as-code.md) — why the envelope carries id + version.
 - [08-few-shot.md](08-few-shot.md) — the examples section in depth.
 - [12-prompt-injection-defense.md](12-prompt-injection-defense.md) — the system/user split as a trust boundary; grounding/citation as anti-hallucination.
+- `../study-ai-engineering/` — the recall *mechanics* behind `defaultFormat` (embedding, over-fetch-then-filter, the kind tag).
+- `../study-agent-architecture/` — the agent's *decision* to call `search_memory` (tool selection, agentic recall control).

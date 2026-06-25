@@ -282,6 +282,9 @@ keeps the ranking total-ordered.
 
 ## See also
 
+- **09-memory-recall-overfetch.md** — episodic memory built on this same scan:
+  it over-fetches 4×/≥20 rows to filter by `kind` client-side and grows
+  unbounded, *amplifying* the O(n·d) cost this file establishes.
 - **08-embedding-batch-and-topk-floor.md** — the embed call that feeds this
   scan (batched) and the top-k floor that controls how many hits it returns.
 - **04-fixture-replay-as-zero-cost-path.md** — the same "cheap exact thing

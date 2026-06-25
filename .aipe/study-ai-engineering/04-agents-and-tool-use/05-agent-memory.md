@@ -1,4 +1,4 @@
-# Agent memory (short-term vs long-term — and which one you actually have)
+# Agent memory (short-term vs long-term — and where each one lives now)
 
 **Industry names:** conversation memory, working memory vs long-term / retrieval memory · *Industry standard*
 
@@ -7,12 +7,16 @@
 An agent "remembers" in exactly one way that's free: the conversation so far is in
 its context window. Everything it asked, every tool result it got back, the whole
 turn history — that's its short-term memory, and it lives in a single array. Any
-*other* kind of memory — recalling a fact from last week, looking something up in
-a vector store — is a separate retrieval system you have to build. AptKit has the
-first and not the second, and being honest about that line is the whole lesson.
+*other* kind of memory — recalling a fact from last week — is a separate retrieval
+system. The update worth leading with: **AptKit now ships that second system too.**
+`@aptkit/memory` (`createConversationMemory`) is retrieval-based long-term memory —
+embed an exchange, store it, recall it by similarity. So this file is no longer
+"we only have short-term"; it's "here are both layers, here's the seam between
+them, and here's which one is wired into the live agent loop vs. which one is a
+shipped-but-not-yet-auto-called engine."
 
 ```
-  Zoom out — where agent memory lives
+  Zoom out — where agent memory lives (BOTH layers now exist)
 
   ┌─ Agent layer ─────────────────────────────────────────────────┐
   │  builds the initial userPrompt + system                        │
@@ -22,40 +26,42 @@ first and not the second, and being honest about that line is the whole lesson.
   │  ★ messages: ModelMessage[]  ← the ENTIRE short-term memory ★    │ ← we are here
   │  grows each turn: assistant reply + tool results appended       │
   └───────────────────────────────┬────────────────────────────────┘
-                                   │ (no arrow out to a store)
-  ┌─ Long-term memory layer ───────▼────────────────────────────────┐
-  │  ✗ NO agent MEMORY — nothing persists or is written back across   │
-  │    runs. (The retrieval PRIMITIVE now exists — @aptkit/retrieval  │
-  │    + the rag-query agent search a doc corpus — but that's RAG     │
-  │    over external docs, not the agent recalling its OWN past runs.)│
+                                   │ remember(turn) / recall(query)  ← NEW seam
+  ┌─ Long-term memory layer (packages/memory) ─▼─────────────────────┐
+  │  ★ createConversationMemory: embed exchange → upsert tagged       │
+  │    'memory' → recall by similarity. RAG over the agent's OWN past.│
+  │  Shipped + unit-tested in aptkit; the runtime that calls          │
+  │  remember() per turn + the durable store live in buffr.           │
   └──────────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: **short-term memory** is the in-context message history — it's automatic,
-bounded by the context window, and gone the moment the run ends. **Long-term
-memory** is anything retrieved from outside the window — a vector store, a
-database of past runs, a knowledge base — fetched and injected on demand. Here's
-the sharp distinction now that aptkit ships vector RAG: the rag-query agent *does*
-retrieve from a vector store, but it retrieves over an **external document
-corpus**, not over the agent's **own conversation history**. Long-term *agent
-memory* means the agent remembers what *it* did/learned across runs — and that
-write-back-and-recall loop is what's still absent. The question this file answers:
-what does an AptKit agent remember about *itself*, and where does that stop?
-Answer: everything *within a single run*, nothing *across* runs — even though the
-retrieval machinery to fix that now exists in the repo.
+Zoom in: **short-term memory** is the in-context message history — automatic,
+bounded by the context window, gone the moment the run ends. **Long-term memory**
+is anything retrieved from outside the window — fetched and injected on demand.
+The sharp line now: short-term is *automatic* (the loop grows the `messages` array
+for free); long-term is a *system you call* (`remember` writes a row, `recall`
+searches for it). AptKit has both — but they're at different maturity. Short-term
+is live in every agent run. Long-term is shipped as an engine (`@aptkit/memory`,
+tested) but **not yet auto-called** by any aptkit agent loop; the runtime that
+invokes `remember` after each turn lives in buffr. The question this file answers:
+what does an AptKit agent remember about *itself*, where does short-term stop, and
+what does the new long-term engine add when you wire it in?
 
 ## Structure pass
 
-**Layers.** Two, and only one of them exists here. The *working-memory* layer (the
-`messages` array inside one run) and the *long-term* layer (retrieval across runs)
-— which AptKit does not build.
+**Layers.** Two, and **both** now exist — at different maturity. The
+*working-memory* layer (the `messages` array inside one run, live in every agent)
+and the *long-term* layer (`@aptkit/memory`, retrieval across runs — shipped and
+tested, but not yet auto-called by an aptkit loop).
 
 **Axis — lifecycle / how long does a memory live?** Trace it. A fact the model
 states this turn lives in `messages` for the rest of the run. The whole `messages`
-array lives exactly as long as the `runAgentLoop` call. After `return`, it's
-garbage-collected — the next run starts from an empty array. Nothing persists. So
-on the lifecycle axis there is a hard cliff at the end of the run, and no layer
-catches what falls off it.
+array lives exactly as long as the `runAgentLoop` call — after `return`, it's
+garbage-collected. That's the cliff. The long-term layer is what *catches* what
+falls off it: call `remember(turn)` before the run ends and that exchange becomes
+a durable vector row that `recall` can fetch in a future run. So on the lifecycle
+axis there are now two regimes — automatic-but-transient (the array) and
+durable-but-must-be-written (the memory store).
 
 ```
   One question — "how long does this memory survive?"
@@ -64,16 +70,19 @@ catches what falls off it.
   └──────────────────┘
   ┌─ within a run ───┐  → the whole `messages` array lives until return
   └──────────────────┘
-  ┌─ across runs ────┐  → NOTHING survives — array is GC'd, next run empty
-  └──────────────────┘
+  ┌─ across runs ────┐  → array is GC'd … UNLESS remember(turn) wrote it to
+  └──────────────────┘     the memory store, where recall() can fetch it later
 ```
 
-**Seams.** The one seam that *exists* is the append point inside the loop — where
-each turn's output and tool results get pushed onto `messages`. The seam that's
-*missing* is the retrieval boundary: there's no point where the agent reaches out
-to a store to recall something from before this run. That absence is deliberate
-and worth naming — adding long-term memory means adding that seam, which is the
-retrieval layer from section 03.
+**Seams.** Two now. The append point inside the loop — where each turn's output
+and tool results get pushed onto `messages` — is the short-term seam. The new
+seam is the **retrieval boundary**: `remember(turn)` on the way out (persist this
+exchange) and `recall(query)` on the way in (fetch relevant past exchanges). That
+seam used to be the named *absence*; `@aptkit/memory` fills it. Its *mechanics*
+(embed → store → similarity-search) are the retrieval lens —
+[../03-retrieval-and-rag/13-conversation-memory.md](../03-retrieval-and-rag/13-conversation-memory.md)
+owns that. This file owns the *taxonomy*: which layer is which, and that the
+loop's `messages` array is short-term only.
 
 ## How it works
 
@@ -144,25 +153,32 @@ free, it's paid for in input tokens on every call.
   cost note: array grows → input tokens grow → each turn costs more
 ```
 
-**What's NOT here: long-term memory.** Bridge from a cache or a database — a
-long-term memory agent would, on each new run, *retrieve* relevant past facts (from
-a vector store keyed by similarity, or a DB of prior diagnoses) and inject them
-into the prompt. AptKit does none of this. There's no embedding store, no
-persistence of past runs, no retrieval step. Each run is born blind to every run
-before it. Boundary condition (the honest one): if the same anomaly recurs next
-week, the agent re-investigates from scratch — it has no recollection that it ever
-saw it.
+**Long-term memory: now a separate system you call.** Bridge from a cache or a
+database — a long-term-memory agent, before or after a run, *retrieves* relevant
+past exchanges (from a vector store keyed by similarity) and injects them. AptKit
+now has the engine for this: `@aptkit/memory`'s `remember(turn)` embeds an
+exchange and stores it; `recall(query)` searches it back. The difference from
+short-term is the one to hold: short-term is *automatic* — the loop grows
+`messages` whether you ask it to or not. Long-term is *opt-in* — nothing is
+remembered unless you call `remember`, and nothing is recalled unless you call
+`recall`. Boundary condition (the honest one): no aptkit agent loop calls
+`remember` on its own *yet* — the engine is shipped and tested, but the runtime
+that invokes it per turn lives in buffr. So today, if the same anomaly recurs next
+week, the agent still re-investigates from scratch — not because the machinery is
+missing, but because it isn't wired into the loop in this repo.
 
 ```
-  Comparison — what AptKit has vs what it doesn't
+  Comparison — short-term (live) vs long-term (engine shipped, not auto-called)
 
-  SHORT-TERM (present)              LONG-TERM (absent)
+  SHORT-TERM (live in every run)   LONG-TERM (@aptkit/memory)
   ──────────────────────           ───────────────────────────
-  in-context messages[]            vector store / DB of past runs
-  automatic, free-ish              must build retrieval + storage
-  scoped to ONE run                spans runs, persists
+  in-context messages[]            vector store of past exchanges
+  AUTOMATIC, free-ish              OPT-IN: you call remember()/recall()
+  scoped to ONE run                spans runs, persists (when wired)
   GC'd at run end                  durable, queried by similarity
-  → run-agent-loop.ts:94           → would be the retrieval layer (§03)
+  → run-agent-loop.ts:94           → packages/memory/conversation-memory.ts
+                                     (mechanics: §03/13-conversation-memory.md;
+                                      the per-turn runtime lives in buffr)
 ```
 
 ### Move 3 — the principle
@@ -170,18 +186,22 @@ saw it.
 Be ruthlessly clear about which memory you have. Short-term memory is automatic and
 seductive — the model "just remembers" within a run — but it's bounded by the
 window, paid for in re-sent tokens, and erased at the run boundary. Long-term
-memory is a *separate system* (storage + retrieval + injection) that you build on
+memory is a *separate system* (storage + retrieval + injection) that you call on
 purpose, not something an agent grows by itself. Conflating the two is how teams
 ship an "agent that remembers" and discover it forgets everything the moment the
-request ends. AptKit has short-term only, and says so.
+request ends. AptKit now has both systems — but they're different in kind:
+short-term is wired into the loop and automatic; long-term (`@aptkit/memory`) is an
+engine you opt into by calling `remember`/`recall`, and the loop that calls it on
+every turn lives in buffr, not here.
 
 ## Primary diagram
 
-The full memory picture: one growing array per run, re-sent each turn, discarded at
-the end — with the long-term layer drawn as the explicit gap.
+The full memory picture: one growing array per run (short-term), and the separate
+opt-in store (`@aptkit/memory`) that catches what falls off the run-end cliff —
+drawn as built but not yet auto-called by the loop in this repo.
 
 ```
-  Agent memory — full picture (one layer present, one absent)
+  Agent memory — full picture (short-term live, long-term shipped-not-wired)
 
   ┌─ ONE RUN (runAgentLoop) ─────────────────────────────────────────┐
   │  messages = [user prompt]              ← short-term memory born    │
@@ -193,22 +213,27 @@ the end — with the long-term layer drawn as the explicit gap.
   │     │                                                             │
   │  return ──► messages GC'd               ← MEMORY CLIFF             │
   └────────────────────────────────────┬──────────────────────────────┘
-                                        │ (no retrieval, no write-back)
-  ┌─ LONG-TERM MEMORY (not built) ──────▼──────────────────────────────┐
-  │  ✗ vector store  ✗ past-run DB  ✗ retrieval  ✗ persistence         │
-  │  next run starts from an empty messages[] — blind to all prior runs│
+                  remember(turn) catches│it (opt-in; not auto-called in aptkit)
+  ┌─ LONG-TERM MEMORY (@aptkit/memory) ─▼──────────────────────────────┐
+  │  ✓ vector store of exchanges  ✓ recall by similarity  ✓ persistent │
+  │  remember: embed exchange → upsert tagged 'memory'                 │
+  │  recall:   embed query → search → filter kind → top-k             │
+  │  (engine + tests in aptkit; the per-turn runtime + durable store   │
+  │   in buffr — so today the loop above doesn't call it on its own)   │
   └──────────────────────────────────────────────────────────────────┘
 ```
 
 ## Implementation in codebase
 
 **Use cases.** Every agent run — monitor, diagnose, recommend, query — has exactly
-this memory: a `messages` array that accumulates the turn-by-turn investigation and
-vanishes when the run returns. The recommendation agent's *recovery turn* is the
-clearest tell that there's no persistence: when the final answer won't parse, it
-can't just "recall" the evidence — it has to *repackage* the tool-call results into
-a fresh prompt by hand, because the original `messages` array isn't a queryable
-memory, it's a transient local variable.
+this short-term memory: a `messages` array that accumulates the turn-by-turn
+investigation and vanishes when the run returns. The recommendation agent's
+*recovery turn* is the clearest tell that the loop doesn't reach for a queryable
+memory: when the final answer won't parse, it can't "recall" the evidence — it
+*repackages* the tool-call results into a fresh prompt by hand, because the
+`messages` array is a transient local variable, not a store. The long-term side
+now exists as `@aptkit/memory`, but no agent loop in this repo calls it on its own
+yet — so the loops still behave exactly as a short-term-only system would.
 
 **The entire short-term memory**, `packages/runtime/src/run-agent-loop.ts:94`:
 
@@ -227,11 +252,32 @@ memory, it's a transient local variable.
           runAgentLoop returns, `messages` goes out of scope and is GC'd.
 ```
 
-There is no `import` of any vector DB, embedding client, or persistence layer
-anywhere in the runtime — the absence is the design, not an oversight. Grep the
-runtime for a memory store and you find the message array and nothing else.
+There is no `import` of any vector DB, embedding client, or memory store inside the
+*runtime* — the loop is short-term only by design. The long-term engine lives in a
+separate package the runtime doesn't depend on:
 
-**The recovery turn proves there's no recall**,
+```
+  packages/memory/src/conversation-memory.ts  (lines 74-106) — the long-term layer
+
+  async remember(turn) {                              ← persist one exchange
+    const text   = format(turn);                      ← Q/A → embeddable line
+    const [vector] = await embedder.embed([text]);
+    await store.upsert([{ id: `memory:${turn.conversationId}:${n}`,
+      vector, meta: { kind: 'memory', conversationId, text } }]);  ← tagged row
+  }
+  async recall(query, k = 5) {                         ← fetch relevant past turns
+    const hits = await store.search(await embedder.embed([query])[0],
+                                    Math.max(k*4, 20));  ← over-fetch …
+    return hits.filter(h => h.meta?.kind === 'memory').slice(0, k);  ← … then filter
+  }
+       │
+       └─ this is the write-back-and-recall loop that used to be the named gap.
+          The mechanics (why over-fetch, the kind tag, shared-vs-dedicated store)
+          are the RETRIEVAL lens — ../03-retrieval-and-rag/13-conversation-memory.md.
+          What's still true: the agent LOOP doesn't call these yet (buffr does).
+```
+
+**The recovery turn proves the loop doesn't recall**,
 `packages/agents/recommendation/src/recommendation-agent.ts:103-124`:
 
 ```
@@ -243,9 +289,9 @@ runtime for a memory store and you find the message array and nothing else.
     .join('\n\n');
        │
        └─ to "remember" what it found, the recovery path manually rebuilds
-          the evidence string from the toolCalls records. If the agent had
-          a memory it could query, this hand-repackaging wouldn't exist —
-          it'd recall. It doesn't; it reconstructs from the run's records.
+          the evidence string from the toolCalls records. The memory engine
+          now exists, but this loop doesn't query it — it reconstructs from the
+          run's own records. Wiring recall in here is exactly the open exercise.
 ```
 
 ## Elaborate
@@ -253,22 +299,28 @@ runtime for a memory store and you find the message array and nothing else.
 The short-term/long-term split mirrors human cognition (working memory vs
 long-term memory) and the framework world has standard names for both: "conversation
 buffer" memory (the array) vs "vector store retriever" memory (the embedding DB).
-The genuinely hard part is always the long-term side — chunking, embedding,
-indexing, retrieval, relevance, and injecting recalled facts without blowing the
-window. That hard part *is RAG* (retrieval-augmented generation), and AptKit
-doesn't exercise it. Calling the message array "memory" is fine; calling it
-long-term memory is the mistake to avoid.
+The genuinely hard part is always the long-term side — embedding, indexing,
+retrieval, relevance, and injecting recalled facts without blowing the window. That
+hard part *is RAG* (retrieval-augmented generation) — and AptKit now *does* exercise
+it for memory: `@aptkit/memory` is RAG with the conversation as the corpus, ~100
+lines over the document-RAG contracts. Calling the message array "memory" is fine;
+calling it long-term memory is still the mistake to avoid — long-term is the
+separate `@aptkit/memory` system, not the array.
 
-The reason AptKit can get away with short-term only: its agents are single-shot
-investigations (scan, diagnose, recommend) where everything needed is fetchable via
-tools *within* the run. The moment you wanted "remember the merchant's preferences
-across sessions" or "don't re-flag an anomaly you already reported," you'd need the
-retrieval layer — and that's a section-03 (RAG) build, not an agent-loop tweak.
+Why the analytics agents can still get away with short-term only at runtime: they're
+single-shot investigations (scan, diagnose, recommend) where everything needed is
+fetchable via tools *within* the run. The moment you want "remember the merchant's
+preferences across sessions" or "don't re-flag an anomaly you already reported," you
+call `remember`/`recall` from `@aptkit/memory` — and that's now a wiring task
+(inject memory, call it around the loop), not a from-scratch retrieval build. The
+build is done; the integration into an aptkit loop is the remaining step (it's live
+in buffr).
 
-Adjacent concepts: the loop whose `messages` array *is* the memory
+Adjacent concepts: the loop whose `messages` array *is* the short-term memory
 (`03-react-pattern.md`), the context window that bounds how much short-term memory
-fits (`../02-context-and-prompts/01-context-window.md`), and the retrieval layer a
-long-term memory would need (section 03 — RAG).
+fits (`../02-context-and-prompts/01-context-window.md`), and the long-term engine's
+mechanics — RAG over past turns
+(`../03-retrieval-and-rag/13-conversation-memory.md`).
 
 ## Project exercises
 
@@ -291,50 +343,57 @@ present; IDs are by-phase convention.*
   growing linearly.
 - **Estimated effort:** `1–4hr`
 
-### Exercise — add long-term memory via the retrieval layer (Case B)
+### Exercise — wire @aptkit/memory into the monitor loop (Case A)
 
-- **Exercise ID:** `[B4.8]` Phase 4, long-term-memory concept (depends on §03 RAG)
-- **What to build:** A `PastAnomalyStore` that persists each run's reported
-  anomalies with an embedding, and a retrieval step that, before a new monitor run,
-  fetches similar prior anomalies and injects "already reported recently:" into the
-  prompt — so the agent stops re-flagging the same thing.
-- **Why it earns its place:** This is the honest gap: AptKit has no cross-run
-  memory. Building it correctly *requires* the retrieval layer (embed → store →
-  similarity query → inject) from section 03 — which is exactly why it's a Case B
-  exercise, not a loop tweak. Demonstrates you know long-term memory is a separate
-  system.
-- **Files to touch:** a new `packages/agents/anomaly-monitoring/src/past-store.ts`,
-  an embedding provider in `packages/providers/*`,
-  `packages/agents/anomaly-monitoring/src/monitoring-agent.ts` (inject recall),
-  matching tests.
+- **Exercise ID:** `[A4.8]` Phase 4, long-term-memory concept (uses `@aptkit/memory`)
+- **What to build:** Give the monitoring agent a `ConversationMemory` (from
+  `createConversationMemory`, a dedicated store). After each run, `remember` the
+  reported anomalies; before a new run, `recall` similar prior anomalies and inject
+  "already reported recently:" into the prompt — so the agent stops re-flagging the
+  same thing. No retrieval layer to build: the engine ships.
+- **Why it earns its place:** This is the gap closed. The hard part (embed → store →
+  similarity query → filter) is now `@aptkit/memory`; the remaining work is the
+  *integration* — inject memory, call `remember`/`recall` around the loop. It
+  demonstrates you understand long-term memory is a separate system you *call*, and
+  that wiring it is the last mile, not the whole build.
+- **Files to touch:** `packages/agents/anomaly-monitoring/src/monitoring-agent.ts`
+  (construct a `ConversationMemory`, call `remember` post-run and `recall`
+  pre-prompt), matching tests. Reuse `@aptkit/retrieval`'s embedder +
+  `InMemoryVectorStore`; no new provider.
 - **Done when:** Re-running the monitor on an unchanged workspace surfaces a
-  previously-reported anomaly as "already reported" instead of re-flagging it.
-- **Estimated effort:** `1–2 days`
+  previously-reported anomaly as "already reported" instead of re-flagging it, proven
+  by a test that fails if the `recall` injection is removed.
+- **Estimated effort:** `1–4hr`
 
 ## Interview defense
 
 **Q: Does your agent have memory?**
-"Short-term, yes; long-term, no — and the distinction is the whole answer:"
+"Both layers exist — and the distinction between them is the whole answer:"
 
 ```
-  short-term: messages[] — within ONE run, GC'd at the end (have it)
-  long-term:  vector store / past-run DB — across runs (DON'T have it)
+  short-term: messages[] — within ONE run, GC'd at the end (automatic, live)
+  long-term:  @aptkit/memory — embed exchange → store → recall by similarity
+              (opt-in: you call remember()/recall(); engine shipped + tested)
 ```
 
-"Short-term memory is just the `messages` array in `run-agent-loop.ts:94` — it
+"Short-term memory is the `messages` array in `run-agent-loop.ts:94` — it
 accumulates the turn history and gets re-sent every turn, which is why the model
-appears to remember within a run. The moment the run returns, it's gone. There's no
-vector store, no persistence, no retrieval — so each run starts blind to every prior
-run. If I needed cross-run memory I'd build the retrieval layer; that's RAG, not an
-agent-loop change."
-*Anchor: short-term is an array; long-term is a system you build on purpose.*
+appears to remember within a run. It's automatic and gone the moment the run
+returns. Long-term is a *separate system*: `@aptkit/memory`'s `remember`/`recall` —
+RAG with the conversation as the corpus. The honest nuance: the engine is shipped
+and unit-tested, but no aptkit agent loop calls it on its own yet — the runtime
+that invokes `remember` per turn lives in buffr. So at runtime in this repo the
+agents still behave short-term-only; the machinery to fix that is built and waiting
+to be wired."
+*Anchor: short-term is an automatic array; long-term is a system you call —
+@aptkit/memory is RAG over the conversation.*
 
-**Q: How do you know there's no long-term memory — couldn't it be implicit?**
+**Q: How do you know the loop has no recall today — couldn't it be implicit?**
 "The recovery turn is the proof. When the final answer won't parse, the agent
 *manually rebuilds* the evidence from the `toolCalls` records
-(`recommendation-agent.ts:108`). If it had a memory it could query, it would
+(`recommendation-agent.ts:108`). If the loop queried the memory engine it would
 recall, not reconstruct. Hand-repackaging the run's own records is what you do when
-there's no store to ask."
+the loop isn't calling a store — even though the store now exists in the repo."
 *Anchor: reconstruction-from-records is the fingerprint of having no recall.*
 
 ## Validate
@@ -346,17 +405,19 @@ there's no store to ask."
   one question? (Because the whole growing `messages` array is re-sent every turn —
   short-term memory is paid for in re-send; `run-agent-loop.ts:103-109`.)
 - **Apply:** The same revenue-drop anomaly happens two weeks running. Does the
-  monitor remember reporting it last time? (No — `messages` was GC'd at the end of
-  the first run; the second run starts from an empty array and re-flags it. Closing
-  that gap is exercise `[B4.8]`.)
-- **Defend:** Why is "add long-term memory" a section-03 RAG task and not a tweak to
-  `runAgentLoop`? (Because it needs storage + embedding + similarity retrieval +
-  injection — a whole retrieval layer the loop doesn't have a seam for; the loop
-  only knows the transient `messages` array.)
+  monitor remember reporting it last time? (Not today — `messages` was GC'd and no
+  loop calls `recall` yet. But the engine to fix it ships: wire `@aptkit/memory`'s
+  `remember`/`recall` into the loop — exercise `[A4.8]`.)
+- **Defend:** Is "add long-term memory" still a from-scratch RAG build? (No longer —
+  `@aptkit/memory` IS that RAG layer, ~100 lines over the document-RAG contracts.
+  What's left is *wiring*: inject the memory, call `remember` after the run and
+  `recall` before it. The loop only knows the transient `messages` array; the store
+  is a separate package it doesn't depend on yet.)
 
 ## See also
 
-- [03-react-pattern.md](03-react-pattern.md) — the loop whose `messages` array IS the memory
+- [03-react-pattern.md](03-react-pattern.md) — the loop whose `messages` array IS the short-term memory
 - [../02-context-and-prompts/01-context-window.md](../02-context-and-prompts/01-context-window.md) — the finite container short-term memory fills
 - [06-error-recovery.md](06-error-recovery.md) — the recovery turn that rebuilds evidence by hand
-- [../03-retrieval-and-rag/](../03-retrieval-and-rag/) — the retrieval layer a long-term memory needs
+- [../03-retrieval-and-rag/13-conversation-memory.md](../03-retrieval-and-rag/13-conversation-memory.md) — the long-term engine's mechanics: RAG over past turns
+- the **buffr** repo — the runtime that calls `remember` per turn + the durable memory store

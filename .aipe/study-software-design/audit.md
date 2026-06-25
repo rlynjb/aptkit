@@ -2,16 +2,20 @@
 
 Pass 1. One section per design lens. Every lens checked; where a principle
 has nothing to bite on, it says so. The deep walks for the significant
-patterns live in the Pass 2 files (`01`–`06`); this audit cross-links rather
+patterns live in the Pass 2 files (`01`–`07`); this audit cross-links rather
 than restating them.
 
 Source for every term: Ousterhout, *A Philosophy of Software Design*.
 
-> **Updated: 2026-06-20** — re-walked against `@aptkit/retrieval` (the RAG
-> package: `EmbeddingProvider`/`VectorStore` contracts, the `search_knowledge_base`
-> tool, the dimension one-way door) and `@aptkit/provider-gemma` (tool-call
-> emulation). Both are now re-exported by `@rlynjb/aptkit-core`. New deep walk:
-> `06-retrieval-contracts-as-deep-seams.md`.
+> **Updated: 2026-06-24** — re-walked against `@aptkit/memory` (the episodic
+> conversation-memory package: `createConversationMemory` over the SAME
+> `EmbeddingProvider`/`VectorStore` contracts as retrieval, an injected store, an
+> over-fetch-then-filter `recall`, and a `search_memory` tool mirroring
+> `search_knowledge_base`). Now re-exported by `@rlynjb/aptkit-core` (16 packages,
+> v0.4.1). New deep walk: `07-conversation-memory-deep-module.md`.
+>
+> Prior update (2026-06-20): `@aptkit/retrieval` and `@aptkit/provider-gemma` —
+> deep walk `06-retrieval-contracts-as-deep-seams.md`.
 
 ---
 
@@ -99,6 +103,19 @@ behind the same `ModelProvider` interface sits a whole tool-call *emulation*
 (no native tools array) the caller never sees — an unusually large body behind
 the standard narrow neck. → full walk in `06-retrieval-contracts-as-deep-seams.md`.
 
+**The deep-module move, a THIRD time — conversation memory.**
+`createConversationMemory` (`packages/memory/src/conversation-memory.ts:60`) is
+two methods (`remember`, `recall`) over a large hidden body — embedding, id
+namespacing, a tagged upsert, and an over-fetch-then-filter recall — depending on
+*nothing but* the same `EmbeddingProvider`/`VectorStore` contracts retrieval
+defined. The store is constructor-injected behind the contract, so the engine
+never names `PgVectorStore` or `InMemoryVectorStore` (`conversation-memory.ts:18-31`
+documents this explicitly). That's three independent uses of the narrow-contract-
+over-large-body move (`ModelProvider`, the retrieval pair, now memory) — the
+clearest possible confirmation it's a house style, not a one-off. The one new idea
+it adds is a *named workaround* for a missing contract capability, walked in Lens 3
+and `07`. → full walk in `07-conversation-memory-deep-module.md`.
+
 **The shallowest modules — the agent classes.** Take `QueryAgent`
 (`packages/agents/query/src/query-agent.ts:67-103`). The class body is:
 store a prompt in the constructor, then in `answer()` call `listTools`,
@@ -152,6 +169,23 @@ hiding done right vs. done wrong.
 (`fallback-provider.ts:28`). These string ids are a shared vocabulary spread
 across packages with no single enum. Minor, but it's a fact known in two
 modules that must agree.
+
+**Leak 4 (new) — the over-fetch-then-filter trick, now in two consumers.** The
+`VectorStore` contract (`packages/retrieval/src/contracts.ts:34`) has no metadata
+predicate — `search(vector, k)` ranks by cosine and returns the top `k`, nothing
+more. Two consumers need a filter the contract can't express, and both work around
+it the same way: over-fetch a wider net, then filter client-side.
+`search_knowledge_base` does `fetchK = filter ? topK * 4 : topK`
+(`search-knowledge-base-tool.ts:85`); `ConversationMemory.recall` does
+`fetchK = Math.max(k * 4, 20)` then `.filter(h => h.meta.kind === kind)`
+(`conversation-memory.ts:94-98`). **Same workaround, derived twice** — which is
+the textbook signal of a *missing capability in the contract*, not a coincidence.
+To its credit, the memory copy *names* the limitation in a comment at the exact
+line (`conversation-memory.ts:92-93`: "search itself cannot filter by metadata").
+The honest verdict: keep the workaround for now (widening `VectorStore` ripples
+into buffr's `PgVectorStore`, which also implements it), but a *third* consumer
+needing a predicate — multi-tenant `app_id` filtering is the obvious next one —
+is the trigger to deepen the contract with `search(vec, k, filter?)`. → `07`.
 
 **No temporal decomposition found.** The packages are split by responsibility
 (provider / loop / tools / evals), not by execution phase — there's no
@@ -329,6 +363,14 @@ severity. This is the actionable index.
 
   Same knowledge twice       YES     isAbortError written 3 ways (fallback,
                                     structured-gen, loop). One helper.
+                                    ALSO: over-fetch-then-filter derived twice
+                                    (search tool + memory.recall) to work around
+                                    VectorStore having no metadata filter. → 07
+
+  Missing contract capability YES    VectorStore.search has no predicate; two
+                                    consumers over-fetch + filter client-side.
+                                    Commented in memory; deepen contract on the
+                                    3rd consumer (e.g. app_id filter). → 07
 
   Special-case sprawl        MINOR   abort-error check (same as above).
 
@@ -367,4 +409,6 @@ Fix that one layer (`04`) and most of this table goes quiet.
 The deep walks: `01` (the deep module to copy), `02` (the decorator stack),
 `03` (rules-as-data, which also shows the fix for the pricing flag), `04`
 (the shallow-module fix), `05` (the public surface), `06` (the deep-module move
-reused for retrieval, plus the dimension fail-loud and the weak-caller defenses).
+reused for retrieval, plus the dimension fail-loud and the weak-caller defenses),
+`07` (the same move a third time for conversation memory, plus the named
+over-fetch-then-filter workaround for a `VectorStore` that can't filter).

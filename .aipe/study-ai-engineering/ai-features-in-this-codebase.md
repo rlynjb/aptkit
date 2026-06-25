@@ -23,6 +23,14 @@ rag-query does **vector retrieval over a prose corpus** (embed → cosine search
 cite). The choice between them is the above-threshold rule in
 [03-retrieval-and-rag/11-rag.md](./03-retrieval-and-rag/11-rag.md).
 
+Beyond the six agent features, AptKit ships one AI **library** worth calling out:
+`@aptkit/memory` — retrieval-based conversation memory that reuses rag-query's
+`EmbeddingProvider`+`VectorStore` contracts to embed and recall past exchanges (RAG
+over history). It's bundled in `@aptkit/core` and unit-tested, but it's an *engine*:
+no agent loop in this repo calls it on its own yet — the runtime that invokes
+`remember` per turn (and the durable store) live in **buffr**. Mechanics in
+[03-retrieval-and-rag/13-conversation-memory.md](./03-retrieval-and-rag/13-conversation-memory.md).
+
 ## AI features
 
 | Feature | Pattern used | Why this pattern |
@@ -104,6 +112,34 @@ cite). The choice between them is the above-threshold rule in
 - **Failure modes:** weak local model emits a malformed JSON tool call → the Gemma adapter's parse-retry nudges it (`gemma-provider.ts`); model passes `top_k: 1` and starves retrieval → the tool's `minTopK` floor backstops it; nothing retrieved or empty synthesis → `FALLBACK_ANSWER`; budget exhaustion → forced synthesis turn citing whatever was retrieved.
 - **Tool policy:** `ragQueryToolPolicy` — least privilege, allows **only** `search_knowledge_base`. The agent cannot do anything but search and answer.
 - **Eval set:** retrieval quality is measured by `scorePrecisionAtK` / `scoreRecallAtK` (`packages/evals/src/precision-at-k.ts`) over `pipeline.query` ids (already wired in `packages/agents/rag-query/test/rag-query-agent.test.ts`). The durable corpus + live precision@k run live in the **buffr** repo. See [05-evals-and-observability/05-precision-at-k.md](./05-evals-and-observability/05-precision-at-k.md).
+
+### conversation-memory (library, not an agent)
+
+- **File:** `packages/memory/src/conversation-memory.ts` (`@aptkit/memory`,
+  `createConversationMemory`); the dedicated-store tool in
+  `packages/memory/src/memory-tool.ts` (`createMemoryTool` → `search_memory`).
+- **Inputs (typed):** `createConversationMemory({ embedder: EmbeddingProvider, store:
+  VectorStore, format?, kind? })` → `{ remember(turn: {conversationId, question,
+  answer}), recall(query, k?) }`. Contracts reused verbatim from `@aptkit/retrieval`.
+- **Outputs (typed):** `remember` → `Promise<void>` (upserts a row tagged
+  `kind:'memory'`, id `memory:<convId>:<n>`); `recall` → `Promise<MemoryHit[]>`
+  (`{id, score, text, conversationId}`), over-fetching `max(k*4, 20)` then filtering
+  to `kind:'memory'` and slicing to `k`.
+- **Model + provider:** none directly — it's an embed-and-store engine. In practice
+  the same `OllamaEmbeddingProvider` (nomic, 768) + a `VectorStore`
+  (`InMemoryVectorStore` in tests, `PgVectorStore` in buffr). A dimension guard
+  throws at construction if `embedder.dimension !== store.dimension`.
+- **Store choice:** SHARED with the document store (memory surfaces via
+  `search_knowledge_base`) or DEDICATED (memory isolated behind `search_memory`).
+  The module is identical either way — the `store` is injected.
+- **Failure modes:** empty embedding → `remember` no-ops (never stores an
+  un-searchable row); shared store dominated by doc rows → over-fetch can starve
+  recall (fix: dedicated store); dimension mismatch → throws at construction.
+- **Eval set:** `packages/memory/test/conversation-memory.test.ts` +
+  `memory-tool.test.ts` — a deterministic fake embedder proves paraphrase recall,
+  the `kind` filter (foreign doc chunks excluded), the dimension throw, and a custom
+  `format`/`kind`. **Not yet exercised:** a live agent loop that calls it, and a
+  precision@k run over real memory rows (both buffr's scope).
 
 ## The eval seam (shared by the analytics + rubric features)
 

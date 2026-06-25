@@ -38,6 +38,16 @@ dominant cost; both are sub-millisecond-to-low-ms at the corpus sizes the
 repo runs. With a *local* Gemma model the turn is slower still — one
 observed `ask.ts` tool-call turn took ~7s (an anecdote, not a benchmark).
 
+`@aptkit/memory` (`conversation-memory.ts`) now layers *episodic memory*
+on the same vector store. It amplifies the linear-scan cost three ways:
+(1) `recall` **over-fetches** `fetchK = max(k*4, 20)` then filters
+client-side — so it scans and transfers up to 4× (or ≥20) rows to return k,
+because the `VectorStore` contract has no metadata filter; (2) memory
+**grows unbounded** — every `remember` adds a row with no eviction or TTL,
+so the already-O(n·d) scan degrades as memory accumulates alongside
+documents in a shared store; (3) `remember` now puts an embedding
+round-trip on the **write path**, not just the read path.
+
 If you read nothing else, read **01-turn-and-tool-budget.md** — the hard
 turn/tool ceiling is the load-bearing control that makes a run's worst-case
 cost a number you can write down before it starts.
@@ -91,6 +101,19 @@ cost a number you can write down before it starts.
    A local Gemma tool-call turn was observed at ~7s once — an anecdote, not
    a benchmark; the model turn dominates wall-clock. → **08**
 
+9. **Episodic memory amplifies the linear scan three ways.** `recall`
+   over-fetches `fetchK = max(k*4, 20)` then filters by `meta.kind`
+   client-side (`conversation-memory.ts:94-98`), reading up to 4× (or ≥20)
+   the rows it returns — because the `VectorStore` contract exposes no
+   metadata filter (`retrieval/src/contracts.ts:33-37`). Memory grows
+   unbounded — every `remember` adds a row, no eviction or TTL
+   (`conversation-memory.ts:74-87`) — so the O(n·d) scan (finding 7)
+   degrades as memory piles up alongside documents in a shared store. And
+   `remember` adds an embedding round-trip on the *write* path
+   (`conversation-memory.ts:75-76`), where before only `recall` paid one.
+   All sub-ms at today's row counts and still dwarfed by the model turn — an
+   amplifier on the finding-7 baseline, not a new dominant cost. → **09**
+
 ## `not yet exercised` lenses (and when each starts to matter)
 
 - **Model-response caching (prompt cache / response cache)** — none. The
@@ -106,6 +129,18 @@ cost a number you can write down before it starts.
 - **Indexed / ANN vector search** — none here; the in-memory store is a flat
   O(n·d) scan. Matters at large corpus size; the HNSW-indexed `PgVectorStore`
   in buffr is the proven drop-in behind the same contract. → **07**
+- **Indexed metadata filter on `search`** — none. The `VectorStore` contract
+  is `search(vector, k)` with no `where` clause (`contracts.ts:33-37`), which
+  is *why* `recall` over-fetches and filters client-side. buffr's
+  `PgVectorStore` pushes one scoping filter (`where app_id = $2`,
+  `buffr/src/pg-vector-store.ts:74`) into the DB, but it does **not** yet
+  filter by `kind` either — so even on Postgres a shared memory+document store
+  would over-fetch. Adding `meta->>'kind'` to the contract is the move that
+  kills the amplification. → **09**
+- **Memory eviction / TTL / summarization** — none; `remember` only appends
+  (`conversation-memory.ts:74-87`). Matters over a long-lived conversation
+  history where memory rows come to dominate the scan. The move: a row cap,
+  a time-window, or rolling summarization. → **09**
 - **Embedding-call cost metering** — the embed path emits no usage event.
   Moot while embeddings are local ($0); matters the moment a paid embedder
   is wired.
@@ -127,6 +162,8 @@ cost a number you can write down before it starts.
 7. **06-bounded-json-scan.md** — bounded recovery work.
 8. **07-linear-vector-scan.md** — the O(n·d) RAG search baseline vs HNSW.
 9. **08-embedding-batch-and-topk-floor.md** — embed batching + the top-k floor.
+10. **09-memory-recall-overfetch.md** — episodic memory: over-fetch, unbounded
+    growth, and the write-path embed cost on top of the finding-7 scan.
 
 ## Cross-links
 

@@ -179,8 +179,110 @@ then filtering in memory — a post-scan filter, not a pushed-down predicate.
   │  LIMIT k                                 │    top-k returned
   └─────────────────────────────────────────┘
 
-  the tool layer adds a POST-scan filter (over-fetch k×4, filter in memory) —
+  the consumers add a POST-scan filter (over-fetch, then filter in memory) —
   a predicate that a real planner would push into the index, here run after.
+```
+
+**Over-fetch-then-filter — the query-execution pattern with no index behind
+it.** This is the part worth memorizing, and there are now *two* consumers that
+do it, for the same reason: the `VectorStore` contract
+(`packages/retrieval/src/contracts.ts:33-37`) has exactly two reads — `upsert`
+and `search(vector, k)`. There is **no metadata predicate** in the contract,
+no `search(vector, k, where)`. So any consumer that needs "the top-k *of a
+subset*" cannot push the predicate into the scan. It has to **over-fetch a
+wider window, then filter client-side, then slice to k.** That's the classic
+"no secondary index → over-read then filter in the application" shape, and it's
+the same move you make in SQL when you `SELECT ... LIMIT 100` and filter in code
+because the column you want isn't indexed.
+
+```
+  over-fetch-then-filter — what you do when the predicate can't be pushed down
+
+  want: top-k WHERE kind='memory'        but contract = search(vector, k) only
+       │                                       (no metadata predicate)
+       ▼
+  ┌─ over-fetch ─────────────────────┐   fetchK = max(k·4, 20)   ← read WIDER
+  │  search(vector, fetchK)          │   hope the k you want survive the cut
+  └───────────────┬──────────────────┘
+                  ▼
+  ┌─ filter in app ──────────────────┐   keep rows where meta.kind === kind
+  │  hits.filter(predicate)          │   the predicate a real index would apply
+  └───────────────┬──────────────────┘   DURING the scan, applied AFTER it
+                  ▼
+  ┌─ slice ──────────────────────────┐   .slice(0, k)            ← trim to k
+  │  take first k survivors          │
+  └──────────────────────────────────┘
+
+  the gamble: if MORE than (fetchK − k) non-matching rows outrank your matches,
+  the real top-k falls outside the window and you under-return. Widening fetchK
+  trades read cost for recall — there's no index to make it exact.
+```
+
+The two consumers:
+
+  → **`search_knowledge_base` tool** (`search-knowledge-base-tool.ts:87-90`):
+    when the model passes an optional `filter`, the handler sets
+    `fetchK = topK * 4`, runs the query, then `hits.filter(matchesFilter).slice(0, topK)`.
+    Over-fetch 4×, filter on arbitrary metadata keys, trim.
+
+  → **`@aptkit/memory` recall** (`conversation-memory.ts:93-98`): a *second*,
+    newer consumer. Memory rows and document rows can share one collection
+    (the store is injected; the caller decides — `conversation-memory.ts:20-26`).
+    To recall only past exchanges, `recall` must filter to `meta.kind === 'memory'`.
+    With no `kind` index, it sets `fetchK = Math.max(k * 4, 20)`, searches, then
+    `hits.filter(h => h.meta?.kind === kind).slice(0, k)`. The `kind` tag is a
+    **logical partition with no index behind it** — a shared collection split by
+    a metadata flag the engine can't see.
+
+**Why the `kind` filter is the sharper case.** The tool's filter is optional and
+usually absent. Memory's filter is *structural*: every `recall` runs it, because
+memory's whole correctness depends on not returning a document where a past
+exchange should be. And the failure mode is quiet — if a shared store holds many
+documents that outrank the memory rows for a given query, the real memory matches
+can sit *below* the `fetchK` cutoff and never make it into the filtered set.
+`recall` then under-returns with no error. The `max(k*4, 20)` floor is the
+hedge: even for `k=5` it reads at least 20 to widen the window.
+
+```
+  the under-return failure (recall over a shared memory+doc store)
+
+  query "what did we decide about pricing?"   k = 5, fetchK = 20
+
+  search(vector, 20) returns, by score:
+    [ doc, doc, doc, doc, doc, doc, doc, doc, doc, doc,   ← 10 docs outrank
+      doc, doc, doc, doc, doc, doc, doc, doc, doc, mem ]  ← only 1 memory row
+                                                  ▲          in the window
+       filter kind==='memory' →  [ mem ]   →  returns 1, not 5
+       │
+       └─ the other 4 memory rows scored 21st+ and were never fetched.
+          no index on `kind` → the engine can't skip the docs → they eat the window.
+```
+
+**The pushdown that proves the fix exists.** buffr's `PgVectorStore.search`
+(`/Users/rein/Public/buffr/src/pg-vector-store.ts`) shows the right shape for
+*one* predicate: it pushes `where app_id = $2` into the SQL scan —
+`order by embedding <=> $1::vector limit $3` runs *after* the `where`, so the
+database never ranks rows from another app. That's a real pushed-down predicate
+against an indexed-ish column. But — and this is the honest part — buffr's
+`search` has **no `kind` predicate either**. Its `where` clause filters by
+`app_id` only. So a shared memory+doc store on Postgres *today* would still
+over-fetch on `kind`, because nobody pushed that predicate down. The
+indexed-metadata-filter (a `where meta->>'kind' = $4` with an index on it) is
+the **future/fix shape, not shipped** — in neither repo.
+
+```
+  pushdown: shipped for app_id, NOT shipped for kind (in either store)
+
+  in-memory (aptkit):   search(vector, k)            → NO predicate at all
+                        → over-fetch + filter in app for BOTH tool & memory
+
+  postgres (buffr):     where app_id = $2            → pushed down ✓ (proof it works)
+                        order by <=> limit k          → ranks only this app's rows
+                        ── but no `where kind = ...`  → a shared memory+doc store
+                           would STILL over-fetch on kind here
+
+  the fix (neither repo): where app_id=$2 and meta->>'kind'=$4   ← pushed-down
+                          + an index on (app_id, kind)            metadata filter
 ```
 
 ### Move 3 — the principle
@@ -189,9 +291,16 @@ Without a planner, your "query cost" is exactly the shape of the loop you
 wrote — there's nothing optimizing it behind your back, for better or worse.
 The promoted-fixture endpoints prove the danger: a listing that looks like
 cheap metadata is actually N agent runs because the only way to know a
-baseline's pass/fail is to recompute it. The generalizable rule: **when there's
-no engine to fold work into a set operation, every per-row cost is paid in
-full and serially — so watch what your "list" loop actually does per item.**
+baseline's pass/fail is to recompute it. And the over-fetch-then-filter pattern
+proves the other half: **a predicate the storage engine can't see is a
+predicate you pay to evaluate after you've already over-read.** When there's no
+index on the column you're filtering — `kind`, here — you fetch wider than you
+need, filter in the application, and gamble that your matches survived the cut.
+The generalizable rule: **when there's no engine to fold work into a set
+operation, every per-row cost is paid in full and serially, and every predicate
+the engine can't push down is paid as an over-read — so watch what your "list"
+loop does per item, and watch which filters happen after the scan instead of
+during it.**
 
 ---
 
@@ -223,7 +332,11 @@ full and serially — so watch what your "list" loop actually does per item.**
 **Use cases.** The cheap scan runs whenever Studio lists prior runs or the
 CLI evaluates the directory. The N+1 runs whenever Studio opens a
 promoted-fixtures panel — each of the four capabilities has its own endpoint,
-each re-running its agent per baseline file.
+each re-running its agent per baseline file. The over-fetch-then-filter runs in
+two places: whenever the model calls `search_knowledge_base` *with* a metadata
+`filter`, and on *every* `@aptkit/memory` `recall` — the latter always filters
+to `kind === 'memory'` because memory rows may share a collection with documents
+and the store can't filter by the `kind` tag.
 
 **The cheap scan** — `packages/evals/src/replay-runner.ts:81-94`:
 
@@ -290,9 +403,70 @@ each re-running its agent per baseline file.
   }
        │
        └─ a fixed three-operator plan (scan→sort→limit). No index, no WHERE
-          pushdown. The metadata filter lives one layer up, AFTER this returns:
-          search-knowledge-base-tool.ts:88-90 over-fetches k×4 and filters in
-          memory — a post-scan predicate, not a pushed-down one.
+          pushdown. Every metadata filter lives one layer up, AFTER this returns.
+```
+
+**The over-fetch-then-filter, consumer #1 (the tool)** —
+`packages/retrieval/src/search-knowledge-base-tool.ts:87-90`:
+
+```
+  // Over-fetch when filtering so the post-filter can still return up to topK.
+  const fetchK = filter ? topK * 4 : topK;           ← read 4× WIDER when a
+                                                      │  predicate exists…
+  let hits = await pipeline.query(query, fetchK);     ← …because the scan can't
+  if (filter) hits = hits.filter((hit) =>             │  apply it
+        matchesFilter(hit, filter)).slice(0, topK);   ← filter in app, trim to k
+       │
+       └─ the predicate (matchesFilter) is exact-match over arbitrary meta keys.
+          No filter passed → fetchK == topK (no over-read). Filter passed →
+          4× over-read, post-scan filter. A real planner pushes this into a
+          WHERE; here it runs after the LIMIT-shaped scan returns.
+```
+
+**The over-fetch-then-filter, consumer #2 (memory recall)** —
+`packages/memory/src/conversation-memory.ts:89-105`:
+
+```
+  async recall(query, k = 5) {
+    const [vector] = await embedder.embed([query]);
+    if (!vector) return [];
+    // Over-fetch then filter: a shared store may return documents above memory,
+    // and search itself cannot filter by metadata.
+    const fetchK = Math.max(k * 4, 20);              ← widen window; floor of 20 so
+                                                     │  even small k reads enough
+    const hits = await store.search(vector, fetchK); ← the SAME contract — no
+                                                     │  metadata predicate to pass
+    return hits
+      .filter((h) => h.meta?.kind === kind)          ← the `kind` predicate the
+                                                     │  engine can't see, applied here
+      .slice(0, k)                                   ← trim survivors to k
+      .map((h) => ({ id: h.id, score: h.score, ... }));
+  }
+       │
+       └─ memory rows are written tagged `meta.kind` ('memory' by default,
+          conversation-memory.ts:84). recall keeps only that kind. The store is
+          INJECTED (line 20-26): if memory shares the documents' store, the scan
+          returns documents interleaved with memory rows, and this filter is the
+          only thing separating them. With no `kind` index, a query where many
+          documents outrank the memory rows can push real matches past fetchK and
+          recall under-returns — silently.
+```
+
+**The pushdown that works (buffr, for contrast)** —
+`/Users/rein/Public/buffr/src/pg-vector-store.ts`, `search`:
+
+```
+  select id, content, ..., 1 - (embedding <=> $1::vector) as score
+  from agents.chunks
+  where app_id = $2                       ← ★ predicate PUSHED DOWN into the scan
+  order by embedding <=> $1::vector       ← ranking runs only over matching rows
+  limit $3
+       │
+       └─ proof the pushdown shape works for ONE predicate (app_id). But there is
+          NO `where ... kind = ...` here — so a shared memory+doc store on Postgres
+          would STILL over-fetch on kind today. The indexed metadata filter
+          (where meta->>'kind' = $4 + an index) is the fix/future shape, shipped
+          in neither repo.
 ```
 
 ---
@@ -315,6 +489,19 @@ The relationship *shapes* between artifacts and fixtures (the `fixture.path`
 foreign-key-like reference) are `study-data-modeling`'s concern; this file
 only cares about the execution cost of resolving them.
 
+The over-fetch-then-filter is the same database lesson at a different altitude.
+A real engine with a secondary index on `kind` (or `app_id`, or any predicate
+column) evaluates the filter *during* the scan and never materializes the rows
+that don't match — the predicate is pushed down. The `VectorStore` contract
+exposes no such predicate, so both consumers do the application-side version:
+read a wider window, filter after. It works because the window is generously
+sized (`k*4`, floor 20) relative to a small corpus — the same "correct while N
+is small" bet the whole repo makes. The trigger to need a pushed-down metadata
+filter is a shared collection where one `kind` vastly outnumbers another: enough
+documents to crowd the memory rows out of the `fetchK` window. buffr already
+proves the pushdown shape works (`where app_id = $2`); extending it to `kind`
+is the unshipped fix, not a redesign.
+
 ---
 
 ## Interview defense
@@ -335,6 +522,27 @@ only cares about the execution cost of resolving them.
 **Anchor:** "The N+1 is `runReplay` inside the listing loop —
 `vite.config.ts:1001`."
 
+**Q: "Memory recall has to return only past exchanges, but they share a vector
+store with documents. How does it filter, and what's the failure mode?"**
+
+> The `VectorStore` contract is just `search(vector, k)` — no metadata
+> predicate. So recall can't ask for "top-k where kind='memory'." It over-fetches
+> a wider window (`max(k*4, 20)`), then filters to `meta.kind === 'memory'` in
+> the application and slices to k. The `kind` tag is a logical partition with no
+> index behind it. The failure mode is silent under-return: if enough documents
+> outrank the memory rows for a query, the real matches fall past the fetch
+> window and recall returns fewer than k — no error. buffr proves the fix shape
+> by pushing `where app_id = $2` into the SQL scan, but even buffr has no `kind`
+> predicate, so the indexed metadata filter is the unshipped future.
+
+```
+  recall: top-k WHERE kind='memory'  →  no index on kind  →  over-fetch k×4,
+  filter in app, slice  →  risk: matches pushed past the window → silent under-return
+```
+
+**Anchor:** "No metadata predicate in the contract → over-fetch then filter —
+`conversation-memory.ts:94`; buffr pushes `app_id` down but not `kind`."
+
 ---
 
 ## Validate
@@ -354,9 +562,9 @@ only cares about the execution cost of resolving them.
 
 - `02-records-pages-and-storage-layout.md` — why each row read parses a whole file
 - `03-btree-hash-and-secondary-indexes.md` — why there's no `WHERE` pushdown,
-  and why the cosine scan has no ANN index
-- `09-database-systems-red-flags-audit.md` — the N+1 and the linear-scan vector
-  search ranked as risks
+  why the cosine scan has no ANN index, and the missing `kind` secondary index
+- `09-database-systems-red-flags-audit.md` — the N+1, the linear-scan vector
+  search, and the over-fetch-then-filter under-return ranked as risks
 - `study-system-design` → caching the computed status to kill the N+1
 - `study-ai-engineering` / `study-agent-architecture` → the RAG retrieval that
   this `search` powers

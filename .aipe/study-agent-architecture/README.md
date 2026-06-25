@@ -90,12 +90,21 @@ These are **not yet exercised** and are marked as such throughout:
 - any LLM planner/router choosing *which agent* runs (the query router picks an
   intent string, not an agent)
 - supervisor-worker, parallel fan-out, debate, swarm, graph orchestration
-- long-term / episodic memory across runs (the `rag-query` vector store is a
-  knowledge base, not agent memory — no cross-session persistence yet)
+- any *agent in this repo* that wires the episodic-memory engine — the
+  `@aptkit/memory` package ships `remember`/`recall` + a `search_memory` tool, but
+  no capability in `packages/agents/*` calls it; the chat CLI that does (with a
+  durable `PgVectorStore`) lives in buffr (the `rag-query` vector store is still a
+  read-only knowledge base, not memory)
 - trajectory persistence and a multi-device "body" (deferred to a separate repo)
 - cross-turn caching, fan-out backpressure, per-tool circuit breaking
 
 Newly exercised this session (was previously "not yet"):
+- **episodic-memory ENGINE shipped** — `@aptkit/memory`
+  (`createConversationMemory`: `remember`/`recall` as RAG over past exchanges,
+  built on the same `EmbeddingProvider` + `VectorStore` contracts as retrieval) +
+  a `search_memory` tool (`createMemoryTool`). The "no cross-run memory" claim is
+  now scoped: the engine exists; no agent *in this repo* wires it. See
+  `04-agent-infrastructure/02-agent-memory-tiers.md`.
 - **real vector retrieval** — `rag-query` does embed → ANN → ground → cite over
   `@aptkit/retrieval`; the five analytics agents still use tool-calling, not ANN
 - **tool-call emulation for a weak local model** — Gemma has no native tools; the

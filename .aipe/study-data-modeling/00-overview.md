@@ -8,7 +8,9 @@ That is not a gap to apologize for — it's a deliberate consequence of what Apt
 
 The one exception — and it's a recent and important one — is `@aptkit/retrieval`. That package adds a genuine **store-shaped** model: a vector store that holds a corpus as `(id, vector, meta)` rows, with `upsert`/`search`, deterministic chunk ids, a soft document linkage, and a real write-time `CHECK` (the embedding dimension). It's in-memory (a `Map`), not Postgres, but the *shape* is the pgvector row shape unchanged. That's the first thing in the repo that looks like a database table, and it gets its own file: `06-vector-store-row-model.md`.
 
-So the data model lives in four places, and you should be able to point at each:
+And `@aptkit/memory` extends that store with a *second kind of row* — a remembered conversation turn — living in the **same `VectorStore`** as the document chunks, distinguished only by a `kind` tag in its `meta`. That's a logical partition over one physical collection: the single richest data-modeling case in the repo, and it gets `07-memory-row-model.md`.
+
+So the data model lives in four places (the store layer now holding two row kinds), and you should be able to point at each:
 
 ```
   Where the schema lives — three layers, one question traced through
@@ -30,9 +32,11 @@ So the data model lives in four places, and you should be able to point at each:
   │  enforced by:  hand-written runtime assertions, at read time   │ ← evals
   └──────────────────────────────────────────────────────────────────┘
 
-  ┌─ STORE layer  (packages/retrieval) ─────────────────────────────┐
+  ┌─ STORE layer  (packages/retrieval + packages/memory) ───────────┐
   │  VectorChunk{id,vector,meta} rows in a Map; cosine-ranked search│
-  │  enforced by:  the dimension check, AT WRITE TIME, throws      │ ← retrieval
+  │  TWO row kinds: documents "<docId>#<i>" + memory "memory:<c>:<n>"│
+  │  enforced by:  the dimension check, AT WRITE TIME, throws       │ ← retrieval
+  │  partitioned by: meta.kind (a soft tag, no index) — client filter│ ← memory
   └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -87,6 +91,16 @@ The fourth model is the vector corpus in `packages/retrieval`. This one is diffe
 - **Dimension-as-invariant** — the embedding dimension (768, nomic) is a one-way door, checked at write time with a throw.
 
 This is the closest thing in the repo to a database table, and the shape is deliberately the pgvector row shape so the in-memory store ports to Postgres unchanged. Full walk in `06-vector-store-row-model.md`. (A *persistent* documents/chunks corpus with real FKs lives in a separate repo, buffr — not AptKit. AptKit models only the in-memory shape.)
+
+## The corpus's second tenant — conversation memory
+
+The fifth model isn't a new store, it's a new *kind of row in the fourth one*. `@aptkit/memory` (`packages/memory/src/conversation-memory.ts`) remembers conversation turns as vectors in the **same `VectorStore`** the documents use. A `MemoryTurn { conversationId, question, answer }` becomes a row with id `"memory:<conversationId>:<n>"` and `meta = { kind: 'memory', conversationId, text }`. Three modeling choices distinguish it from the document row:
+
+- **A three-part composite id** — `"memory:<convId>:<n>"` (`conversation-memory.ts:82`), a `kind:scope:counter` namespace, vs the document's two-part `"<docId>#<i>"`. A per-conversation counter `Map` (`:71`) makes turns accumulate instead of clobbering on a shared `memory:<convId>` key.
+- **The `kind` discriminator tag** — `meta.kind = 'memory'` (`:84`) is a *logical partition* over a store with no physical partition. It's how `recall` returns memory rows only even when memory shares the document store — the single-table-inheritance discriminator, applied to a vector collection.
+- **Over-fetch-then-filter recall** — because the `VectorStore` contract has no metadata filter (`contracts.ts:33-37`), `recall` can't ask for "the nearest *memory* rows." It over-fetches `k*4` (min 20) of any kind and filters `meta.kind === 'memory'` client-side (`:94-98`). The over-fetch is a workaround for a missing SQL `WHERE`.
+
+This is the richest data-modeling case in the repo: two logically distinct entities in one physical collection, kept apart by a tag the store can neither index nor filter on. Full walk in `07-memory-row-model.md`. (The durable `PgVectorStore` binding for memory is in buffr; AptKit models the in-memory shape and the partition logic.)
 
 ## How to use this guide
 

@@ -7,8 +7,10 @@
 > chunker, the index/query pipeline (`doc→chunk→embed→upsert`;
 > `query→embed→search→rank`), and a `search_knowledge_base` tool that wraps the
 > query path. The capstone `@aptkit/agent-rag-query` assembles it into a grounded
-> RAG agent (retrieve → ground → cite). So **most files in this section are now a
-> tour of real code, not a foundation taught against a gap.**
+> RAG agent (retrieve → ground → cite). And **`@aptkit/memory` now points that same
+> machine at a second corpus — past conversation exchanges** (RAG over history;
+> `13-conversation-memory.md`). So **most files in this section are now a tour of
+> real code, not a foundation taught against a gap.**
 >
 > What's deliberately *out of scope for aptkit* and lives in the **buffr** repo:
 > the durable `PgVectorStore` / Supabase pgvector persistence and the live
@@ -94,6 +96,11 @@ tool seam — the difference is only what sits behind the tool.
   it (aptkit's *analytics* agents are the "no" case).
 - **[12-graphrag.md](12-graphrag.md)** — retrieval over an entity/relationship
   graph; traverse edges instead of ranking a flat list.
+- **[13-conversation-memory.md](13-conversation-memory.md)** ★ NEW — **RAG over
+  history.** Same embed→store→search machine, but the corpus is past Q/A exchanges.
+  Real: `@aptkit/memory` (`createConversationMemory`) reuses the
+  `EmbeddingProvider`+`VectorStore` contracts; `remember` tags rows `kind:'memory'`,
+  `recall` over-fetches then filters. Shared-vs-dedicated store is the one knob.
 
 ## Reading order
 
@@ -110,10 +117,15 @@ tool seam — the difference is only what sits behind the tool.
                           │
                           ▼
        09 stale embeddings ──► 10 incremental indexing ──► 12 GraphRAG
+                          │
+                          └──────────► 13 conversation-memory  ← RAG over history
 ```
 
 Read **11-rag.md** once the parts make sense — it assembles them. The freshness
 files (09, 10) and GraphRAG (12) are the operational and advanced layers on top.
+**13-conversation-memory.md** is the same pipeline pointed at a second corpus (past
+exchanges instead of documents) — read it after 11 to see how little it took to
+build episodic memory once document RAG existed.
 
 ## What lives elsewhere
 
@@ -130,9 +142,11 @@ files (09, 10) and GraphRAG (12) are the operational and advanced layers on top.
   least-privilege tool policy, the forced-synthesis turn — is taught from the
   agent-orchestration lens in `.aipe/study-agent-architecture/`. This section
   owns the *retrieval mechanics*; that lens owns the *loop*.
-- **Long-term agent memory** — the short-term vs retrieved-memory split is in
+- **Long-term agent memory** — no longer a gap. `@aptkit/memory` ships it, and the
+  *mechanics* (RAG over past exchanges) live in this section at
+  [13-conversation-memory.md](13-conversation-memory.md). The *taxonomy* (short-term
+  `messages` array vs long-term retrieval, and that no aptkit loop auto-calls it yet)
+  lives in
   [../04-agents-and-tool-use/05-agent-memory.md](../04-agents-and-tool-use/05-agent-memory.md).
-  Long-term memory is retrieval; that file and this section are two views of the
-  same gap.
 - **The prompt-context block** the summaries render into:
   [../02-context-and-prompts/](../02-context-and-prompts/).

@@ -338,6 +338,7 @@ Anchor: *"Dimension is the one invariant you can't recover from after the fact, 
 
 ## See also
 
+- `07-memory-row-model.md` — the sibling that shares this exact store: conversation-memory rows (`"memory:<convId>:<n>"`, `meta.kind`) live in the same `VectorStore` as these document chunks, told apart by a `kind` tag. The `text`-into-meta denormalization here is the same move there; read `07` for how two row kinds coexist in one collection.
 - `01-type-as-schema.md` — the type-as-schema pattern; `VectorChunk`/`VectorHit` are the store-shaped members of that family.
 - `02-tagged-union-event-log.md` — the other "self-describing rows on a wire" model; the `capabilityId`-repeated-per-event denormalization is the same shape as `docId`-per-chunk here.
 - `05-structural-diff-integrity.md` — the contrast partner: evals enforce invariants asynchronously when run; the dimension check enforces its one invariant synchronously at write time.

@@ -103,6 +103,36 @@ boundary. The RAG agent (`packages/agents/rag-query/scripts/ask.ts`) depends on
 Ollama being up for *both* embeddings and reasoning — two endpoints on one
 external process. → see `01` (the map now has three boxes), `02`.
 
+### 3b. Memory's durability is an injected choice — and the id counter assumes one process (★ real, new)
+
+`packages/memory/src/conversation-memory.ts` adds episodic memory whose backing
+`VectorStore` is **injected** (`:18-31`, `:60-61`). The same `remember`/`recall`
+logic runs over two very different durability stories:
+
+- An ephemeral `InMemoryVectorStore` (`packages/retrieval/src/in-memory-vector-store.ts:10-12`,
+  a `Map`) — **lost on process exit.** This is what the tests use
+  (`packages/memory/test/conversation-memory.test.ts:27`).
+- A durable `PgVectorStore` that **survives restarts** — but that store lives in
+  the separate `buffr` repo (`/Users/rein/Public/buffr/src/pg-vector-store.ts`),
+  not aptkit. aptkit ships only the `VectorStore` contract
+  (`packages/retrieval/src/contracts.ts:33-37`) and the in-memory adapter.
+
+So the store choice *is* a state-durability axis — the first one in this repo
+where the answer isn't uniformly "lost on exit." But here's the subtle part: the
+memory engine also holds a **per-conversation counter `Map` in process**
+(`conversation-memory.ts:71,78-79`) to mint ids `memory:<convId>:<n>`. That
+counter is **ephemeral state that does not survive a restart** — after a restart
+it resets to 0. With the *ephemeral* store that's harmless (the rows died with
+the counter). With a *durable* store, resuming the **same conversation** after a
+restart would mint `memory:<convId>:0` again, **colliding** with a row already
+persisted under that id — an upsert that silently overwrites the earlier turn.
+**(Inference — not yet exercised in aptkit, which only wires the in-memory store;
+flagged because the durable path in `buffr` is exactly where it would bite.)**
+Memory also inherits the same external Ollama dependency: `remember` and `recall`
+both call `embedder.embed(...)` (`:75,90`), so a down Ollama breaks memory writes
+and reads, not just the chat/RAG path. → see `01` (state ownership), `04`
+(the resume-across-restart consistency risk), `09` (R7).
+
 ### 4. Retry-on-parse is a local resilience pattern distinct from failover (★ real, new)
 
 `packages/providers/gemma/src/gemma-provider.ts:62-89` — Gemma2:9b has no native
@@ -169,10 +199,16 @@ real. Most of the topic surface lands here:
 The single-process design is *why* none of these exist — and that's the right
 call for a library. You don't add Raft to a `.map()`. The trigger column is the
 load-bearing part: it tells you exactly when each concept stops being academic.
-Several of these triggers (a hosted `PgVectorStore`, laptop↔phone memory sync,
-a multi-platform gateway) are already *planned* — but in the separate `buffr`
-repo, explicitly out of aptkit's scope (`docs/personal-agent-packages.md:81-86`).
-When that plane gets built, this table is the checklist of what becomes real.
+Several of these triggers (a durable `PgVectorStore`, laptop↔phone memory sync,
+a multi-platform gateway) are already *built or planned* — but in the separate
+`buffr` repo, explicitly out of aptkit's scope
+(`docs/personal-agent-packages.md:81-86`; the `PgVectorStore` itself lives at
+`/Users/rein/Public/buffr/src/pg-vector-store.ts`). When that plane gets built,
+this table is the checklist of what becomes real. The new `@aptkit/memory`
+package is the first place aptkit ships code that *can* be wired to that durable
+plane — it speaks the `VectorStore` contract and doesn't care which store backs
+it (`packages/memory/src/conversation-memory.ts:18-31`). aptkit itself still only
+wires the ephemeral in-memory store; durability stays a `buffr` concern.
 
 ## The fallacies of distributed computing — which ones bite here
 

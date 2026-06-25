@@ -43,6 +43,10 @@ agent.
   ┌─ Retrieval (packages/retrieval) ★ NEW ◄───────┘──────────────┐
   │  OllamaEmbeddingProvider (nomic, 768) · InMemoryVectorStore  │
   │  (cosine) · pipeline (doc→chunk→embed→upsert; q→search→rank) │
+  │  ┌─ Memory (packages/memory) ★ NEW ─────────────────────────┐│
+  │  │  createConversationMemory: SAME contracts, corpus = past  ││
+  │  │  exchanges (remember/recall) · createMemoryTool           ││
+  │  └───────────────────────────────────────────────────────────┘│
   └────────────────────────────────────────────────────────────────┘
 
   ┌─ Evals (packages/evals) ──── cuts across all layers ──────────┐
@@ -127,12 +131,19 @@ profile injector into the bounded agent loop: retrieve → ground → cite. And
 AptKit now **does** ship a vector RAG pipeline — embeddings, an in-memory vector
 store, chunking, the index/query pipeline, a retrieval tool, and a grounded RAG
 agent — all built from scratch and provider-neutral, all runnable with zero cloud
-(local Gemma + local nomic over Ollama). What it deliberately **does not** ship:
-the durable persistence layer (`PgVectorStore` / Supabase pgvector) and the live
-precision@k-over-a-real-corpus eval run — those live in the **buffr** repo, which
-assembles these packages into a running service. AptKit stays library code: the
-in-memory pipeline + the scorers; buffr is the body. Still genuinely absent here:
-provider-side token streaming, response caching, and any trained ML model (section
-08 is foundations, each with a Project Exercises block). The reader also shipped
-classic cloud RAG separately (AdvntrCue, pgvector + GPT-4) — that's the cloud
-mirror of what's now in-repo as local-first.
+(local Gemma + local nomic over Ollama). It **also** now ships retrieval-based
+**conversation memory** (`@aptkit/memory`): the same embed→store→search machine
+pointed at past exchanges instead of documents — long-term agent memory, which the
+guide previously named as the headline gap. Read
+`03-retrieval-and-rag/13-conversation-memory.md` and
+`04-agents-and-tool-use/05-agent-memory.md`. What aptkit deliberately **does not**
+ship: the durable persistence layer (`PgVectorStore` / Supabase pgvector), the live
+precision@k-over-a-real-corpus eval run, and the runtime that calls memory's
+`remember` on every turn — those live in the **buffr** repo, which assembles these
+packages into a running service. So the memory *engine* is here and unit-tested, but
+no aptkit agent loop calls it on its own yet. AptKit stays library code: the
+in-memory pipeline + the memory engine + the scorers; buffr is the body. Still
+genuinely absent here: provider-side token streaming, response caching, and any
+trained ML model (section 08 is foundations, each with a Project Exercises block).
+The reader also shipped classic cloud RAG separately (AdvntrCue, pgvector + GPT-4) —
+that's the cloud mirror of what's now in-repo as local-first.

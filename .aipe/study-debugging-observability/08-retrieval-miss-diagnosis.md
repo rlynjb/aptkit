@@ -211,6 +211,30 @@ This bug is a textbook **Postel's-law inversion gone wrong, then corrected.** Th
 
 The deeper lesson is about *where signal lives in agent systems.* Traditional code fails loudly — exceptions, stack traces, non-zero exits. Agent systems fail *quietly*: a model passes a slightly-wrong argument and the system produces a plausible empty or wrong answer with no error anywhere. The defense is structural — capture every tool's inputs and outputs as distinct trace events (`01-structured-trace-events.md`) so the silent failures leave evidence even when they leave no error.
 
+#### The same blind spot, now in memory recall (`@aptkit/memory`)
+
+This war story is about `search_knowledge_base`, but the class is wider than one tool — and `@aptkit/memory` (added since this guide was first written) is the second instance. `search_memory` (`packages/memory/src/memory-tool.ts:34-60`) is a vector-search tool just like `search_knowledge_base`: the model calls it through the same registry, so a recall flows through the same loop and emits the **same two trace events** — `tool_call_start.args` (the recall query the model chose) and `tool_call_end.result` (the recalled exchanges). *Inference, not yet observed:* `search_memory` is exported (`packages/core/src/index.ts:8`) and unit-tested through an `InMemoryToolRegistry` (`packages/memory/test/memory-tool.test.ts:28-31`) but **not yet wired into any agent's loop** — so when an agent does register it, the diagnosis path in this file transfers verbatim, because the loop emits `tool_call_start`/`end` for any registered tool by name (`run-agent-loop.ts:147-179`).
+
+And recall has the *exact* silent-empty failure: `recall()` can return `[]` and the agent can't tell "no relevant past exchange exists" from "a miss." Two places produce the empty, both at `conversation-memory.ts:89-106`:
+
+```
+  recall()'s two silent-empty sources — conversation-memory.ts:89-106
+
+  embed(query) ─► no vector? ──► return []          (:91, embedder gave nothing)
+       │
+       ▼ vector
+  store.search(vector, fetchK)  fetchK = max(k*4, 20)   (:94, OVER-FETCH)
+       │ hits (may include documents above memory rows)
+       ▼
+  .filter(h.meta.kind === kind)  ────► [] possible      (:97, KIND-FILTER)
+       │                                    │
+       ▼ .slice(0, k)                       └─ the over-fetch can come back
+  MemoryHit[]  (often shorter than k)          ALL documents, zero memory rows
+                                               → recall returns [] unexpectedly
+```
+
+The load-bearing line is the same shape as `matchesFilter`: a **post-fetch filter that can legitimately reject everything.** Because the VectorStore contract has no metadata filter, `recall` over-fetches `max(k*4, 20)` then keeps only `meta.kind === kind` rows (`:94-97`). On a store that mixes memory with documents, the top `fetchK` results can be *all documents* — the kind-filter then removes everything and recall returns `[]` even though relevant memory rows exist further down the ranking. That is indistinguishable, from the agent's side, from "this user has no memory." The same diagnosis applies: read `tool_call_start.args` (was the recall query reasonable?) and `tool_call_end.result` (`[]`?), then — because the empty is *inside* recall, not the tool wrapper — suspect the kind-filter-after-over-fetch, exactly where `matchesFilter` was the suspect here. The standing fix-shape is identical: a zero-hit recall on a non-empty memory store deserves a proactive `warning`, not just forensic trace evidence (see `audit.md` red-flag 1).
+
 ## Interview defense
 
 **Q: An agent returns "I don't have that information" but the data is clearly in the knowledge base. No errors. How do you debug it?**
@@ -243,5 +267,6 @@ Both contributed, but the fix goes on the tool. You can't stop a weak local mode
 - `01-structured-trace-events.md` — the `tool_call_start`/`tool_call_end` events whose `args` and `result` fields made this diagnosis possible. This war story is the payoff of that primitive.
 - `02-replay-artifact-as-snapshot.md` — had this run been saved as an artifact, the whole trajectory (args included) would be in the JSON; the diagnosis is the same read, offline.
 - `07-reproduction-spike-harness.md` — the spike tests tool *emission*, not retrieval *correctness*; this bug is exactly the class a pre-build spike can't catch and a trace read can.
-- `study-ai-engineering` — the retrieval pipeline, the `search_knowledge_base` tool, hallucinated tool arguments as a failure mode.
+- `@aptkit/memory` (`packages/memory/src/conversation-memory.ts:89-106`) — `search_memory` is the second instance of this exact class: a recall that returns `[]` from the kind-filter-after-over-fetch looks the same as "no memory exists," diagnosed by the same `tool_call_start.args` / `tool_call_end.result` read (see the Elaborate section above). Observable via the existing trace once an agent wires the tool.
+- `study-ai-engineering` — the retrieval pipeline, the `search_knowledge_base` and `search_memory` tools, hallucinated tool arguments as a failure mode.
 - `study-testing` — the regression test as the prevention half of the incident loop.

@@ -53,6 +53,11 @@ Three things cross a trust line and earn the whole audit:
    into a public npm tarball. Anything that leaks into them is published to
    the world — now including the `provider-gemma`, `retrieval`, and
    `agent-rag-query` packages and their fixtures.
+4. **Remembered conversation turns** (NEW, via `@aptkit/memory`) are embedded
+   and stored, then **recalled into a future request**. The model boundary is
+   no longer per-turn: an injected instruction or a typed secret persists and
+   can resurface across sessions. Not yet wired into an aptkit agent; live in
+   buffr's chat session over a durable `PgVectorStore`.
 
 ## Reading order
 
@@ -73,6 +78,11 @@ Three things cross a trust line and earn the whole audit:
    calls parsed from prose over a no-auth, no-TLS local transport. The two new
    seams the cloud providers didn't have, and why removing the key didn't
    remove the trust decision.
+8. `06-conversation-memory-trust-surface.md` — `@aptkit/memory`: remembered
+   turns recalled into future requests. Persistent prompt injection,
+   indefinite raw-Q/A retention, shared-store trust blur, and
+   cross-conversation scoping that the engine leaves to the caller. The
+   highest-leverage new surface this run; live in buffr.
 
 ## Top findings, ranked by real risk for THIS threat model
 
@@ -81,7 +91,17 @@ Three things cross a trust line and earn the whole audit:
    `findSecretLikeString` guard is the only thing standing between a stray
    key and the public registry, and it's a narrow regex. See
    `02-secret-scan-guard.md`.
-2. **Tool-policy is enforced by omission, not by a second gate** — the
+2. **Persistent prompt injection + indefinite retention via conversation
+   memory** (NEW) — `@aptkit/memory` recalls past turns into future requests,
+   so a single-turn injection becomes *persistent* (replayable across
+   sessions), and raw user Q/A is stored verbatim with no TTL, eviction, or
+   secret-scan. The engine filters recalled rows only by `kind`, never by
+   `conversationId`; isolation rests on the store's `app_id` `WHERE` clause
+   with no RLS. Mitigations (output gate, read-only tools) bound *what* a
+   recalled injection can do, not *that* it replays. Live in buffr's shared
+   store, where memory also surfaces through `search_knowledge_base` with no
+   provenance marker. See `06-conversation-memory-trust-surface.md`.
+3. **Tool-policy is enforced by omission, not by a second gate** — the
    registry's `callTool` checks only that a tool is *registered*, not that
    it's in the calling agent's allowlist. The allowlist lives entirely at
    the schema-filtering layer. The Gemma path makes this seam more reachable:
@@ -89,16 +109,16 @@ Three things cross a trust line and earn the whole audit:
    registry's contents stop an off-policy name. See
    `01-tool-policy-enforcement-by-omission.md` and
    `05-local-model-tool-call-trust-boundary.md`.
-3. **Gemma's no-auth local transport + prose-parsed tool calls** — the local
+4. **Gemma's no-auth local transport + prose-parsed tool calls** — the local
    provider POSTs to `http://localhost:11434` with no key and no TLS, and
    reconstructs tool calls by parsing the model's free text. Safe on a single
    laptop; an unauthenticated network service the moment `host` is
    off-loopback. Two trust seams the cloud providers never had. See
    `05-local-model-tool-call-trust-boundary.md`.
-4. **`rubric-improvement` holds the widest grant** — it's the only agent
+5. **`rubric-improvement` holds the widest grant** — it's the only agent
    whose allowlist includes a mutating tool (`save_judgment`). Every other
    agent is read-only. See `audit.md` → LLM/agent security.
-5. **Raw user question into the prompt, no sanitization** — the query and
+6. **Raw user question into the prompt, no sanitization** — the query and
    rag-query agents pass the question straight through as the user turn (and
    rag-query injects `me.md` profile text + retrieved chunks). Prompt-injection
    surface, mitigated by read-only tools, output validation, and the
@@ -114,9 +134,14 @@ Three things cross a trust line and earn the whole audit:
 - **`.aipe/study-prompt-engineering/12-prompt-injection-defense.md`** — the
   injection-defense posture; this guide names it as an input-validation lens
   finding and points at the output gate that backs it.
-- **`.aipe/study-data-modeling/`** — the *shape* of artifacts and fixtures;
-  this guide audits the *secret-scan* that runs over that shape before it's
-  committed or published.
+- **`.aipe/study-data-modeling/`** — the *shape* of artifacts and fixtures,
+  and the `agents.chunks` table that conversation memory shares with documents
+  (the dropped document-FK lets a memory row exist with no document parent);
+  this guide audits the *secret-scan* over that shape and the trust blur of
+  mixing memory into the document store.
+- **`.aipe/study-agent-architecture/`** — conversation memory as an agentic
+  *capability* (retrieval-based recall, the `search_memory` tool); this guide
+  treats the same recall as an untrusted, persistent channel into the prompt.
 - **`.aipe/study-system-design/01-provider-abstraction.md`** — the provider
   boundary as architecture; this guide audits it as the trust line where
   keys leave the machine and untrusted output comes back.

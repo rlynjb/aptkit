@@ -89,6 +89,22 @@ You know that in React you never mutate state two components share without a sin
 
 **`FixtureModelProvider.index` is mutable but single-owner.** Each replay constructs a *new* `FixtureModelProvider` with its own `index` counter that walks the canned responses. Because the provider instance is per-run, the counter is never shared — no two runs increment the same `index`.
 
+**The one piece of process-wide mutable state that now exists — `@aptkit/memory`'s counter `Map` — is safe but *unbounded*.** `createConversationMemory` closes over a `const counters = new Map<string, number>()` (`conversation-memory.ts:71`) that persists *across* `remember` calls so repeated turns in the same conversation get distinct ids (`memory:${conversationId}:${n}`). This is the first real long-lived mutable state in the repo that isn't per-run — it lives for the lifetime of the memory instance, shared by every `remember` that instance serves. Two questions to ask of it, and they split cleanly: *can it race?* No — `const n = counters.get(id) ?? 0; counters.set(id, n + 1)` is a synchronous read-modify-write *before* the `await store.upsert(...)`, so run-to-completion makes it atomic (the increment finishes entirely before any await yields the thread). *Is it bounded?* No — one entry per distinct `conversationId`, never evicted, lost only on restart. It's not a race hazard; it's a slow leak and a durability gap (the ids reset to 0 on restart, so a post-restart `remember` for an old conversation could collide with a pre-restart id). That's a `05`/durability concern, not a synchronization one — flagged here because it's the module-level mutable state `04` previously said didn't exist.
+
+```
+  The counter Map — held across calls, atomic, unbounded
+
+  counters: Map<conversationId, n>   ← closure state, lives with the instance
+       │
+  remember(turn):
+    n = counters.get(id) ?? 0        ┐ synchronous read-modify-write
+    counters.set(id, n + 1)          ┘ → atomic (no await between them)
+    await store.upsert(id:n ...)     ← the yield comes AFTER the increment
+       │
+       └─ safe from races (run-to-completion), but never shrinks:
+          one entry per conversation, forever, until process restart
+```
+
 **The filesystem is the real race surface — and it's last-write-wins.** Two promote operations targeting the same output filename, or a save racing a read, have no lock. The mitigation isn't a mutex; it's *naming*: output paths embed a timestamp and a slug, so two distinct runs rarely collide. `promoteCapabilityReplayArtifact` builds `${slugify(promotedId)}-${formatDateForFilename(...)}.json`, and the Studio save embeds a full ISO timestamp. Collisions require same fixture + same provider + same second.
 
 ```
@@ -191,7 +207,7 @@ The "no locks because single-threaded" property is the flip side of "no parallel
 
 Answer: "No in-memory races — run-to-completion makes sync mutation atomic, and each run owns its own state. But the hazard relocates to the filesystem: two writers to the same path are last-write-wins with no lock. AptKit mitigates by embedding timestamps in filenames rather than locking, which fits the low-contention append pattern." Anchor: `run-agent-loop.ts:94–95`, `vite.config.ts:1356–1360`. The part people forget: single-threaded kills *in-memory* races, not *I/O-boundary* races.
 
-**Q: "Where would a race appear if someone added a feature?"** A module-level mutable cache shared across requests (e.g. memoizing tool results in a top-level `Map`) — mutating it across an `await` reintroduces the read-stale-write race. Currently no such cache exists.
+**Q: "Where would a race appear if someone added a feature?"** A module-level mutable cache shared across requests (e.g. memoizing tool results in a top-level `Map`) — mutating it across an `await` reintroduces the read-stale-write race. The closest thing that now exists is `@aptkit/memory`'s counter `Map` (`conversation-memory.ts:71`), and it's *almost* that pattern — long-lived, shared, mutated — but it stays safe because the read-modify-write happens entirely *before* the `await store.upsert`, never straddling it. Move the `counters.set` to *after* the await and you'd have the classic stale-write race. The real flaw in it isn't a race; it's that it never evicts (unbounded) and resets on restart (durability) — see `05`.
 
 ## Validate
 
@@ -203,5 +219,7 @@ Answer: "No in-memory races — run-to-completion makes sync mutation atomic, an
 ## See also
 
 - `02-processes-threads-and-tasks.md` — the single-thread guarantee that kills in-memory races.
+- `05-memory-stack-heap-gc-and-lifetimes.md` — the memory counter `Map` as an unbounded, restart-ephemeral live set.
 - `06-filesystem-streams-and-resource-lifecycle.md` — the filesystem write paths in depth.
+- `07-backpressure-bounded-work-and-cancellation.md` — `memory.recall`/`remember` taking no signal, the same cancellation gap as the embed path.
 - `.aipe/study-distributed-systems/` *(when generated)* — the fallback chain as partial-failure coordination across providers.

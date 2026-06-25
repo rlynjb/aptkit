@@ -30,9 +30,10 @@ every term here comes from.
 AptKit's whole reason for existing — extract reusable agent parts so they
 ship as one npm bundle without app logic leaking in — *is* an information-
 hiding argument at the package level. The repo is unusually deliberate about
-one interface (`ModelProvider` — and now reuses that exact shape for the
-retrieval contracts) and unusually repetitive about another (the six agent
-classes, newest being `RagQueryAgent`). Both are findings here.
+one interface (`ModelProvider` — and now reuses that exact shape *three* times:
+the retrieval contracts, and conversation memory over those same contracts) and
+unusually repetitive about another (the six agent classes, newest being
+`RagQueryAgent`). Both are findings here.
 
 ---
 
@@ -52,15 +53,24 @@ classes, newest being `RagQueryAgent`). Both are findings here.
   06-retrieval-contracts-as-deep-  ← the deep-module move reused: Embedding +
      seams.md                         VectorStore contracts, the dimension
                                       one-way door, weak-caller defenses, Gemma
+  07-conversation-memory-deep-     ← the same move a THIRD time: ConversationMemory
+     module.md                        over the same contracts, injected store, and
+                                      the over-fetch-then-filter workaround for a
+                                      VectorStore that can't filter by metadata
 ```
 
 **Pass 1** (`audit.md`) is fixed: one section per design lens, same shape every
 repo. **Pass 2** is the discovered patterns — named after design moves AptKit
 actually makes. The file list itself is a finding: a deep module, a decorator
 stack, a rules engine, a template that *should* be an abstraction but isn't,
-a public surface, and (newest) the deep-module move *reused* for retrieval —
-`ModelProvider`'s shape applied to two more swappable seams, plus the one new
-idea retrieval adds: a shared `dimension` fact promoted to a checked invariant.
+a public surface, the deep-module move *reused* for retrieval (`06`), and
+(newest) that move a *third* time for conversation memory (`07`). The trio
+`01`/`06`/`07` is the headline: `ModelProvider`'s narrow-contract-over-large-body
+shape applied to provider, retrieval, and memory — a confirmed house style. `07`
+also adds the one new design finding the memory package brings: an
+over-fetch-then-filter workaround for a `VectorStore` contract that has no
+metadata predicate, *named in a comment* at the line it bites, with an explicit
+trigger to deepen the contract instead (a second consumer needing the filter).
 
 ---
 
@@ -72,9 +82,10 @@ idea retrieval adds: a shared `dimension` fact promoted to a checked invariant.
    is the actionable index; if you read one thing, read that.
 3. **`01`** then **`04`** — the best example (deep module) and the worst
    (agent duplication), back to back. The contrast is the lesson.
-4. **`06`** right after `01` if retrieval is what you're here for — it's the
-   same deep-module move seen a second and third time, which is the cleanest
-   way to confirm you actually internalised `01`.
+4. **`06`** then **`07`** right after `01` if the contracts are what you're here
+   for — they're the same deep-module move seen a second and third time, the
+   cleanest way to confirm you actually internalised `01`. `07` is also where the
+   one genuinely new design finding lives (the over-fetch-then-filter workaround).
 5. **`02`, `03`, `05`** — in any order.
 
 ---

@@ -2,16 +2,16 @@
 
 Pass 1 of the audit-style shape: the seven data-modeling lenses, walked against the real repo. Each lens gets either a concrete finding (with `file:line` grounding) or an honest `not yet exercised`, plus the nearest in-repo analog so the relational concept still has a hook.
 
-**The headline:** AptKit has no SQL/relational database, no ORM, no migration framework, no foreign keys. But `@aptkit/retrieval` now adds a real store-shaped model — a vector corpus of `(id, vector, meta)` rows with a similarity-search query path and a write-time dimension `CHECK`. So the lens picture shifted: the data model, integrity, and (newly) the query-pattern lenses all have a store-shaped finding now, where before they were mostly type/file-shaped. Transactions and relational migrations remain `not yet exercised`, taught as foundations the repo could adopt.
+**The headline:** AptKit has no SQL/relational database, no ORM, no migration framework, no foreign keys. But `@aptkit/retrieval` now adds a real store-shaped model — a vector corpus of `(id, vector, meta)` rows with a similarity-search query path and a write-time dimension `CHECK` — and `@aptkit/memory` puts a *second kind of row* in that same store, partitioned only by a `meta.kind` tag. So the lens picture shifted again: the data model, integrity, normalization, and the query-pattern lenses all have store-shaped findings, and the memory partition is the repo's first genuine "two entities in one collection" problem. Transactions and relational migrations remain `not yet exercised`, taught as foundations the repo could adopt.
 
 Ranked by what actually matters in this repo, worst-or-most-interesting first:
 
-1. **Integrity** — exercised and load-bearing. Two enforcement layers now: evals (async, read-time, the artifact constraints) **and** the retrieval store's dimension check (the repo's *first* synchronous write-time `CHECK`). → `06`.
-2. **The data model / shape** — exercised (type-shaped + file-shaped + now **store-shaped**: the `VectorChunk`/`VectorHit` corpus rows). → `06`.
-3. **Indexing vs query patterns** — *now partly exercised.* The retrieval package has a real query path (embed → cosine-rank → top-k) with a metadata filter, but it's a brute-force O(n) scan with no ANN index. The artifact side is still `not yet exercised`. → `06`.
-4. **Normalization / duplication** — two real duplications: the recommendation-text-in-trace, and `text` copied into chunk `meta` for citations (a deliberate read denormalization). → `06`, `02`.
-5. **Migrations / evolution** — barely exercised (`schemaVersion: 1`, never yet incremented).
-6. **Access patterns / storage choice** — exercised at "flat files" + "in-memory `Map` corpus"; relational-vs-document is still moot. → `06`.
+1. **The data model / shape** — exercised (type-shaped + file-shaped + **store-shaped**, now with TWO row kinds in one store: document chunks `"<docId>#<i>"` and memory turns `"memory:<convId>:<n>"`, told apart by `meta.kind`). The shared-store partition is the richest modeling case in the repo. → `06`, `07`.
+2. **Indexing vs query patterns** — *partly exercised, and the most interesting modeling consequence lives here.* The retrieval package has a real query path (embed → cosine-rank → top-k); memory layers a `kind`-partition filter on top, and because the store has **no metadata index**, recall must over-fetch (`k*4`, min 20) then filter client-side. That over-fetch is a modeling consequence of an unindexed discriminator. Still a brute-force O(n) scan with no ANN index; the artifact side is still `not yet exercised`. → `06`, `07`.
+3. **Integrity** — exercised and load-bearing. Two enforcement layers: evals (async, read-time, the artifact constraints) **and** the retrieval store's dimension check (the repo's *first* synchronous write-time `CHECK`, inherited by memory rows). → `06`.
+4. **Normalization / duplication** — three real duplications: the recommendation-text-in-trace, `text` copied into chunk `meta` for citations, and `text` copied into memory-row `meta` for recall — all deliberate read denormalizations. → `06`, `07`, `02`.
+5. **Access patterns / storage choice** — exercised at "flat files" + "in-memory `Map` corpus"; the corpus now holds two logical entities (documents + memory) in one store, partitioned by a tag. relational-vs-document is still moot. → `06`, `07`.
+6. **Migrations / evolution** — barely exercised (`schemaVersion: 1`, never yet incremented).
 7. **Transactions** — `not yet exercised` (no multi-write atomicity anywhere).
 
 ---
@@ -25,7 +25,8 @@ The load-bearing schemas:
 - **`WorkspaceDescriptor`** — `packages/context/src/workspace-descriptor.ts:18-28`. The domain entity model: one denormalized read-model carrying a project, its `events[]`, `customerProperties[]`, `catalogs[]`, and pre-aggregated `totalCustomers` / `totalEvents`. This is the closest thing to a relational schema in the repo. → full walk in `01-type-as-schema.md`.
 - **`CapabilityEvent`** — `packages/runtime/src/events.ts:1-24`. A six-variant discriminated union; an append-only event-log schema. → `02-tagged-union-event-log.md`.
 - **The replay artifact** — typed as `ReplayArtifact` / `QueryReplayArtifact` / `MonitoringReplayArtifact` / `DiagnosticReplayArtifact` in `apps/studio/src/types.ts:166-265`, persisted to `artifacts/replays/*.json`. The provider wire schema (`ModelRequest`/`ModelResponse`/`ModelMessage`/`ModelContentBlock`) lives in `packages/runtime/src/model-provider.ts:1-58`.
-- **The vector corpus** — `VectorChunk { id, vector, meta }` / `VectorHit { id, score, meta }` in `packages/retrieval/src/contracts.ts:7-19`. The repo's *only* store-shaped model: rows you `upsert` and `search`, not a type that serializes to a file. This is the closest thing to an actual database table in AptKit. → full walk in `06-vector-store-row-model.md`.
+- **The vector corpus** — `VectorChunk { id, vector, meta }` / `VectorHit { id, score, meta }` in `packages/retrieval/src/contracts.ts:7-19`. The repo's store-shaped model: rows you `upsert` and `search`, not a type that serializes to a file. This is the closest thing to an actual database table in AptKit. → full walk in `06-vector-store-row-model.md`.
+- **The memory row** — `MemoryTurn { conversationId, question, answer }` → a `VectorChunk` with id `"memory:<convId>:<n>"` and `meta = { kind:'memory', conversationId, text }` (`packages/memory/src/conversation-memory.ts:4-8, 80-87`); recalled as `MemoryHit { id, score, text, conversationId? }` (`:11-16`). A *second kind of row* in the SAME store as the document chunks, distinguished only by `meta.kind`. This is the repo's first multi-tenant collection — two logical entities, one physical store. → full walk in `07-memory-row-model.md`.
 
 **Red-flag check — "everything in one JSON blob when the data has real structure":** *Not present.* The structure is real and modeled. The descriptor distinguishes events from catalogs from customer properties; the event union distinguishes six event types; the artifact distinguishes per-capability output (`recommendations` vs `anomalies` vs `diagnosis` vs `answer`). Nothing is dumped into an untyped bag.
 
@@ -41,6 +42,8 @@ A second, benign duplication: `capabilityId` repeats on every event in the `trac
 
 A third duplication, in the retrieval corpus: the chunk's source `text` is copied into its `meta` at index time (`pipeline.ts:44`), so the same passage lives both in whatever produced it and in every chunk's metadata bag. This is deliberate — it's what lets the `search_knowledge_base` tool build a citation (`[docId] snippet…`) from a `VectorHit` alone, with no second lookup into a source-document store (there isn't one). Same legitimate-read-optimization shape as the recommendation duplication above. → `06-vector-store-row-model.md`.
 
+A fourth duplication, the memory twin of the third: a remembered turn's formatted `text` is copied into the memory row's `meta` at `remember` time (`conversation-memory.ts:84`), so the exchange text lives both wherever the conversation was logged and in the row's metadata. Same reason — `recall` (and the `search_memory` tool) returns the turn text straight from the hit's `meta`, no second lookup. And one more wrinkle unique to memory: `conversationId` is encoded *twice* per row — once as the middle segment of the id `"memory:<convId>:<n>"` and once as `meta.conversationId` (`:82, 84`). The id-segment is for human readability and collision-safety; the meta field is what survives into a `MemoryHit` (the id isn't parsed back). Both are deliberate, neither is hand-edited. → `07-memory-row-model.md`.
+
 **Red-flag check — "the same fact editable in two places":** *Present but contained.* The recommendation duplication is real; it's mitigated because the structured form is the source the tooling reads and the string form is generated from the same turn, never hand-edited.
 
 → The normalization *principle* (one fact, one home) is information-hiding for data. It's taught in `study-software-design`'s information-hiding concept; this audit applies it, it doesn't re-teach it.
@@ -53,9 +56,11 @@ A third duplication, in the retrieval corpus: the chunk's source `text` is copie
 
 **The retrieval side IS a query path.** `queryKnowledgeBase` (`pipeline.ts:50-59`) runs embed → `store.search` → ranked top-k, and `InMemoryVectorStore.search` (`in-memory-vector-store.ts:25-33`) computes cosine similarity against *every* chunk, sorts descending, and slices `k`. The `search_knowledge_base` tool layers an exact-match metadata filter on top, over-fetching `topK * 4` so the post-filter still returns up to `topK` (`search-knowledge-base-tool.ts:87-90`). So there's a genuine ranked query with a predicate now — but the "index" is a brute-force linear scan, not an ANN structure (no HNSW, no IVF). It's O(n) over the corpus.
 
+**Memory makes the same over-fetch-then-filter a *modeling consequence*, not just a tool detail.** This is the sharpest data-modeling lesson the corpus teaches. Memory rows and document rows share one store with no metadata index (the `VectorStore` contract is `upsert` + `search(vector, k)`, no `where` — `contracts.ts:33-37`). So `recall` *cannot* ask the store for "the nearest *memory* rows." It over-fetches `Math.max(k*4, 20)` rows of *any* kind, then filters `meta.kind === 'memory'` client-side and slices `k` (`conversation-memory.ts:94-98`). The over-fetch headroom is a *guess* — it is not a correctness guarantee. If memory is a heavily-outnumbered minority near the query, even 20 nearest can come back as <`k` after the filter, and recall under-delivers (or returns empty). That's the textbook cost of modeling a partition as an unindexed discriminator tag: the store can't select on it, so every read that needs one kind pays an over-fetch and a client-side scan. The fix when this graduates to `PgVectorStore`: push `WHERE meta->>'kind' = 'memory'` into the SQL and fetch exactly `k` — the over-fetch then vanishes. The over-fetch exists *only* because the in-memory contract has no `WHERE`. → `07`.
+
 **Red-flag check — "frequent query with no supporting index":** *Present, but correctly so for an in-memory toy store.* The vector search has no ANN index — it scans the whole `Map` every query. That's the right call for the from-scratch in-memory adapter (a few thousand chunks max), and the explicit reason `PgVectorStore` is named as a drop-in behind the same contract (`in-memory-vector-store.ts:3-9`). **"N+1":** *Not present.* The closest thing — `evaluateReplayArtifactFiles` reading files in a loop (`replay-runner.ts:81-84`) — is a batch eval over a known small set, not a per-row fan-out on a hot path.
 
-**Buildable target — two of them now.** For artifacts: if volume grows past a few hundred files, move them out of the filesystem into SQLite/Postgres and add an index on `(capabilityId, createdAt)`. For the corpus: when chunk count outgrows a linear scan, swap `InMemoryVectorStore` for a pgvector store with an HNSW/IVF index behind the same `VectorStore` contract — no pipeline change. Both are `study-system-design` storage decisions; the index *shapes* are the data-modeling follow-on. → `06`.
+**Buildable target — three of them now.** For artifacts: if volume grows past a few hundred files, move them out of the filesystem into SQLite/Postgres and add an index on `(capabilityId, createdAt)`. For the corpus: when chunk count outgrows a linear scan, swap `InMemoryVectorStore` for a pgvector store with an HNSW/IVF index behind the same `VectorStore` contract — no pipeline change. For memory's partition: add an index/predicate on `meta.kind` so recall fetches exactly `k` memory rows instead of over-fetching and filtering — in pgvector that's a `WHERE meta->>'kind'='memory'` (optionally a partial index on it). Both are `study-system-design` storage decisions; the index *shapes* are the data-modeling follow-on. → `06`, `07`.
 
 ## Lens 4 — Transactions and integrity
 
@@ -92,6 +97,7 @@ It has never been incremented. There is no migration script, no backfill, no han
 - **Whole-object read** — fixtures and the `WorkspaceDescriptor` are always read entire, parsed, and used whole (`schemaSummary` consumes the full descriptor, `workspace-summary.ts:11-52`). Nothing reads a sub-field in isolation. This is a document-shaped access pattern, and the denormalized `WorkspaceDescriptor` shape matches it exactly.
 - **Append + list** — artifacts are written once, never updated, and listed by filename (`replay-runner.ts:31-44`). Append-only, immutable. This matches the event-log model perfectly.
 - **Upsert + ranked search** — the retrieval corpus is held in an in-memory `Map<id, VectorChunk>` (`in-memory-vector-store.ts:11`) and queried by cosine similarity. Keyed-write + similarity-read. This is a genuinely different access shape from the other two, and the in-memory `Map` is the deliberate "build the whole pipeline with zero cloud" storage choice (`in-memory-vector-store.ts:3-9`), with `PgVectorStore` named as the production drop-in behind the same contract. → `06`.
+- **Upsert + ranked search + partition filter** — memory adds a *fourth* shape on top of the third: the SAME store now holds two logical entities (documents + conversation turns), and the read path must select one. Because the store can't filter, the access shape is "over-fetch a mixed bag, partition client-side by `meta.kind`, slice `k`" (`conversation-memory.ts:94-98`). The module supports two storage choices with zero code change (`conversation-memory.ts:20-26`): memory *shares* the document store (the tag does the partitioning) or gets a *dedicated* store (the tag is a no-op, the filter always passes). Shared = one piece of infra, but over-fetch can under-deliver in a large corpus; dedicated = isolation + an explicit `search_memory` tool, no over-fetch risk. The "which store?" call is `study-system-design`; the `kind`-as-partition *shape* is data modeling. → `07`.
 
 The storage *choices* (flat JSON files for artifacts/fixtures; an in-memory `Map` for the corpus) are the right ones for a library + preview tool: zero infra, git-diffable fixtures, inspectable artifacts, and a corpus you can index and query in a unit test with no Ollama and no Postgres. The shapes (denormalized documents, append-only log, keyed vector rows) match their access patterns. There's no relational schema fighting a document access pattern, because there's no relational schema at all.
 
@@ -109,22 +115,32 @@ The consolidated checklist, marked against AptKit:
   no discernible model (one untyped blob)            CLEAR — types + corpus rows
   same fact editable in two places                   CONTAINED — recommendation
                                                        text dup'd in trace; chunk
-                                                       text dup'd into meta — both
-                                                       deliberate read opts
+                                                       text dup'd into meta; memory
+                                                       text + convId dup'd into row
+                                                       — all deliberate read opts
   frequent query with no supporting index            PRESENT-BY-DESIGN — vector
                                                        search is O(n) brute force,
-                                                       no ANN index (in-memory toy)
+                                                       no ANN index; memory recall
+                                                       over-fetches k×4 then filters
+                                                       on an UNINDEXED kind tag
   N+1 query pattern in app code                       N/A — batch reads only
   multi-write op with no transaction                  N/A — no multi-writes exist
   invariant enforced only in hopeful app code         MOSTLY — evals is async,
                                                        read-time; ONE exception:
                                                        retrieval dimension CHECK
-                                                       is synchronous write-time
+                                                       is synchronous write-time.
+                                                       memory id-uniqueness rests on
+                                                       an UNENFORCED convId-unique
+                                                       assumption
   destructive migration with no rollback              N/A — none has run; but the
                                                        read check is hard-fail on
                                                        schemaVersion !== 1
   relational schema vs document access mismatch       CLEAR — doc/KV storage,
                                                        matching access, consistent
+  two entities in one collection, no real partition   PRESENT-BY-DESIGN — memory +
+                                                       documents share one store,
+                                                       split only by meta.kind (a
+                                                       tag, not an index) — `07`
 ```
 
 The finding to internalize: **AptKit's data integrity used to be only as good as the last time you ran the evals — and that's still true for everything except the corpus.** A database enforces constraints on every write, synchronously, no opt-out. AptKit enforces *artifact* constraints in `packages/evals`, asynchronously, only when invoked. The one place it now matches a database is `@aptkit/retrieval`'s dimension check: synchronous, write-time, no opt-out. So the honest one-liner is sharper than before — "one synchronous constraint, the rest run when you remember to," which is exactly the right tradeoff for a library whose persisted data is test fixtures and an in-memory corpus, not customer records.
@@ -142,7 +158,10 @@ For quick reference, the relational concepts AptKit does **not** exercise, each 
 | Ranked query / search | **exercised (no ANN index)** | `queryKnowledgeBase` → O(n) cosine scan + metadata filter (`pipeline.ts`, `search-knowledge-base-tool.ts`) |
 | Indexes / query plans | not exercised | brute-force `Map` scan; `readdir` + filename `.sort()` (`replay-runner.ts:43`) |
 | Foreign keys | **soft-exercised (no enforcement)** | `meta.docId` linkage on chunks (`pipeline.ts:44`); repeated `capabilityId` per event |
-| Composite primary key | **exercised** | deterministic chunk id `"<docId>#<index>"` (`pipeline.ts:44`) |
+| Composite primary key | **exercised** | deterministic chunk id `"<docId>#<index>"` (`pipeline.ts:44`); memory id `"memory:<convId>:<n>"` (`conversation-memory.ts:82`) |
+| Discriminator / partition key | **soft-exercised (tag, no index)** | `meta.kind` splits memory from document rows in one store (`conversation-memory.ts:84, 97`) — single-table inheritance, filtered client-side |
+| Server-side `WHERE` filter | not exercised | over-fetch `k*4` then client-side `meta.kind` filter (`conversation-memory.ts:94-98`) — stand-in for SQL `WHERE` |
+| Sequence / unique-id generator | not exercised | in-process counter `Map` per conversation (`conversation-memory.ts:71`); convId-uniqueness is *assumed*, not enforced (`:69-70`) |
 | Transactions / atomicity | not exercised | single-file writes (atomic by construction) |
 | Migrations / backfills | not exercised | `schemaVersion: 1` (reserved, never incremented) |
 | `NOT NULL` / `CHECK` constraints | **enforced — read-time evals + one write-time** | `assertRequiredPaths` + per-field checks (`assertions.ts`); dimension `CHECK` (`in-memory-vector-store.ts:36-42`) |

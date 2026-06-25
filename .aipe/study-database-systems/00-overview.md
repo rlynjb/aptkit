@@ -10,12 +10,21 @@ cosine-similarity *search* over an in-memory array. That third one is the
 closest thing in the repo to a real database query engine: it has a contract
 (`VectorStore`: upsert/search-by-vector), it ranks records by similarity, and
 it does a linear scan that stands in for an index. What it does *not* have is
-durability (a `Map` that dies with the process), transactions, or an ANN index
-— which is exactly the database-systems lesson. The real Postgres/pgvector/HNSW
+durability (a `Map` that dies with the process), transactions, an ANN index, or
+a metadata index — which is exactly the database-systems lesson. That engine now
+has **two consumers**: the RAG document pipeline and, newly, `@aptkit/memory`
+(`packages/memory/src/conversation-memory.ts`), an episodic memory that stores
+exchanges in the same `VectorStore` and recalls them by similarity. Because the
+contract has no metadata predicate, memory recall *over-fetches then filters by
+`kind`* — the canonical "no secondary index → over-read then filter in the
+application" pattern (detail in `04`). The real Postgres/pgvector/HNSW
 implementation of the same `VectorStore` contract lives in a **separate repo
 (buffr)**, not aptkit; aptkit ships only the in-memory store + the contract.
-This file is the map: where each store lives, what each does (and doesn't)
-guarantee, and the triggers that force the real engine in.
+buffr does push one predicate (`where app_id = $2`) into the scan — proof the
+pushdown shape works — but no `kind` predicate, so even there a shared
+memory+doc store would over-fetch today. This file is the map: where each store
+lives, what each does (and doesn't) guarantee, and the triggers that force the
+real engine in.
 
 ## The one diagram to hold
 
@@ -194,6 +203,11 @@ a concept, then marked absent with its trigger:
   hash / secondary indexes      analog: filename    need lookup by capabilityId
                                 sort + Map<id>       without scanning every file
                                 point lookup
+  metadata-filter pushdown      ANALOG: over-fetch   shared memory+doc collection
+                                then filter `kind`   where one kind crowds the
+                                in app (NO index on   other → push `where kind`
+                                kind; buffr pushes    into the scan + index it
+                                app_id, not kind)     (shipped in NEITHER repo)
   vector / ANN index            ANALOG: linear scan  corpus outgrows a few hundred
                                 (InMemoryVectorStore  chunks → swap in HNSW/pgvector
                                 cosine, NO ANN)       (buffr's PgVectorStore)
@@ -227,6 +241,20 @@ Two genuinely-present database mechanisms worth flagging:
    file in a directory and *re-run the full replay for each one* — one directory
    scan plus one expensive operation per row. Covered in
    `04-query-planning-and-execution.md`.
+
+3. **Over-fetch-then-filter (no index on the filter column).** The same
+   `VectorStore` engine now has a *second* consumer: `@aptkit/memory`
+   (`packages/memory/src/conversation-memory.ts`). Its `recall` must return only
+   memory rows (`meta.kind === 'memory'`), but the contract
+   (`packages/retrieval/src/contracts.ts:33-37`) has no metadata predicate, so it
+   over-fetches a wider window (`fetchK = max(k*4, 20)`) and filters client-side
+   (`conversation-memory.ts:94-98`). Classic "no secondary index → over-read then
+   filter in the application." The `search_knowledge_base` tool does the same when
+   a `filter` is passed (`search-knowledge-base-tool.ts:87-90`). buffr's
+   `PgVectorStore` proves the pushed-down version works for *one* predicate
+   (`where app_id = $2`) but has no `kind` predicate — so the indexed metadata
+   filter is the unshipped fix, in neither repo. Covered in `04` (execution path)
+   and `03` (the missing `kind` secondary index).
 
 ## Where to go next
 

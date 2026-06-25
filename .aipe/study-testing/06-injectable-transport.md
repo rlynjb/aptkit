@@ -286,11 +286,18 @@ seam drops to the wire.
 
 The same idea reappears across the repo at different depths: the agent loop
 injects the provider (`01-replay-as-test.md`); the structured-generation helper
-injects the provider; these new providers inject the transport. Each is "swap the
-collaborator at a constructor boundary, default it to the real thing." Name it
-once, recognise it everywhere. Next read: `01-replay-as-test.md` for the coarse
-seam this one sits beneath, and `study-software-design`'s dependency-injection
-treatment for why the default-to-real constructor is a deep-module property.
+injects the provider; these new providers inject the transport; and
+`@aptkit/memory` injects the *vector store* — `createConversationMemory({ embedder,
+store })` takes the store as a constructor option (`conversation-memory.ts:60`), so
+the remember→recall logic is tested against an `InMemoryVectorStore` + a fake
+embedder and swaps to a `PgVectorStore` in production with zero code change
+(`conversation-memory.test.ts:27`). That's the same seam at the *storage* boundary
+instead of the *wire* boundary — different collaborator, identical move. Each is
+"swap the collaborator at a constructor boundary, default it to the real thing."
+Name it once, recognise it everywhere. Next read: `01-replay-as-test.md` for the
+coarse seam this one sits beneath, and `study-software-design`'s dependency-
+injection treatment for why the default-to-real constructor is a deep-module
+property.
 
 ## Interview defense
 

@@ -64,7 +64,8 @@ so and names the trigger.
   01-distributed-system-map ───► nodes, the one boundary, failure domains
   02-partial-failure-...   ────► timeouts, retries, backoff, classification ★ real
   03-idempotency-...       ────► duplicate work, delivery semantics       ★ partial
-  04-consistency-...       ────► staleness, read-your-writes              ~ weak analog
+  04-consistency-...       ────► staleness, read-your-writes + memory's      ~ weak analog
+                                  durable-store id-collision seam (new)
   05-replication-...       ────► replicas, shards, quorums                not yet exercised
   06-queues-streams-...    ────► ordering, backpressure, poison messages  not yet exercised
   07-clocks-coordination-..────► time, leases, leadership, split-brain    not yet exercised
@@ -101,6 +102,8 @@ cross-links rather than re-teaching.
   agent loop as in-process execution control. This guide treats bounded turns
   as an idempotency/recovery analog; runtime-systems owns the execution model.
 - **`study-ai-engineering` / `study-agent-architecture`** — the RAG retrieval
-  pipeline and Gemma's tool-call emulation themselves. This guide only cares
-  that the embed/chat calls to Ollama can fail and how the repo copes (failover,
-  retry-on-parse); those guides own how RAG and tool-calling actually work.
+  pipeline, Gemma's tool-call emulation, and `@aptkit/memory`'s episodic
+  recall themselves. This guide only cares that memory's `embed` calls share the
+  Ollama failure domain, that its store choice is a state-durability axis, and
+  that its in-process id counter assumes a single process (`04`/`09` R7); those
+  guides own how RAG, tool-calling, and memory retrieval actually work.

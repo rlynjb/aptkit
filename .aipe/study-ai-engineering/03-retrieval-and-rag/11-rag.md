@@ -331,9 +331,10 @@ a prose corpus instead of structured analytics endpoints.
 Adjacent: the augment block is prompt engineering
 ([../02-context-and-prompts/](../02-context-and-prompts/)); grounding's failure
 mode (confidently wrong on bad retrieval) is an eval concern
-([../05-evals-and-observability/](../05-evals-and-observability/)); long-term
-agent memory is RAG over the agent's own past
-([../04-agents-and-tool-use/05-agent-memory.md](../04-agents-and-tool-use/05-agent-memory.md)).
+([../05-evals-and-observability/](../05-evals-and-observability/)); and the same
+pipeline pointed at the agent's *own past* is conversation memory
+([13-conversation-memory.md](13-conversation-memory.md)) — RAG over history, shipped
+as `@aptkit/memory`.
 
 ## Project exercises
 
@@ -436,6 +437,7 @@ vectors; queryable facts get a tool."
 - [06-hybrid-retrieval-rrf.md](06-hybrid-retrieval-rrf.md) — better retrieval ordering
 - [07-reranking.md](07-reranking.md) — the precision pass before augment
 - [../05-evals-and-observability/05-precision-at-k.md](../05-evals-and-observability/05-precision-at-k.md) — how to measure the agent's retrieval quality
-- [../04-agents-and-tool-use/05-agent-memory.md](../04-agents-and-tool-use/05-agent-memory.md) — long-term memory is RAG over the agent's past
+- [13-conversation-memory.md](13-conversation-memory.md) — the same pipeline over past exchanges (`@aptkit/memory`)
+- [../04-agents-and-tool-use/05-agent-memory.md](../04-agents-and-tool-use/05-agent-memory.md) — the short-term vs long-term taxonomy
 - `.aipe/study-agent-architecture/` — the orchestration/loop internals the rag-query agent runs on
 - the **buffr** repo — durable persistence (`PgVectorStore`/Supabase) and the live precision@k-over-real-corpus eval run (out of aptkit scope)

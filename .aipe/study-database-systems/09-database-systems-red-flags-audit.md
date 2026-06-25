@@ -22,8 +22,9 @@ one access pattern changes. Each names the trigger.
   │  #1 filename-sort index   #2 read-time constraints         │
   │  #3 N+1 in listing        #4 no-fsync durability           │
   └───────────────────────────┬───────────────────────────────┘
-  ┌─ Capability layer (@aptkit/retrieval) ────────────────────┐
+  ┌─ Capability layer (@aptkit/retrieval + @aptkit/memory) ───┐
   │  #4b vector store: no durability · linear scan · no txn    │
+  │  #4c memory recall: over-fetch + filter `kind` (no index)  │
   └───────────────────────────┬───────────────────────────────┘
   ┌─ Storage layer ───────────▼───────────────────────────────┐
   │  #5 full-scan reads   #6 no backup beyond git              │
@@ -162,6 +163,45 @@ query path). **Boundary note:** that durable engine, its transactions, and its
 HNSW index live in buffr, *not* aptkit — aptkit ships only the in-memory store
 and the contract.
 
+### #4c — Memory recall over-fetches then filters by `kind` — silent under-return on a shared collection
+
+**Consequence: LOW today / MEDIUM on a shared, skewed store (silent wrong
+results).** The `VectorStore` contract (`packages/retrieval/src/contracts.ts:33-37`)
+has no metadata predicate — `search(vector, k)` only. `@aptkit/memory`'s
+`recall` (`packages/memory/src/conversation-memory.ts:89-105`) needs the top-k
+of *only* memory rows (`meta.kind === 'memory'`), but memory may share a
+collection with documents (the store is injected — `conversation-memory.ts:20-26`).
+With no `kind` index, recall over-fetches a wider window
+(`fetchK = Math.max(k * 4, 20)`, `line 94`), then filters and slices in the
+application (`lines 96-98`). The failure mode is **silent under-return**: if a
+query surfaces enough documents to outrank the memory rows, the real memory
+matches fall past the fetch window and recall returns fewer than `k` — no error,
+no log. The same shape exists in the `search_knowledge_base` tool when a `filter`
+is passed (`search-knowledge-base-tool.ts:87-90`), but that filter is optional;
+memory's is structural — it runs on every recall.
+
+```
+  evidence chain — predicate the engine can't see → over-read then filter
+  contracts.ts:33-37            search(vector, k)        → no metadata predicate
+  conversation-memory.ts:94     fetchK = max(k*4, 20)    → over-fetch the window
+  conversation-memory.ts:96-98  filter kind==='memory'   → predicate in the app
+        │
+        └─ matches outranked by docs past fetchK are never fetched → recall
+           returns < k, silently. `kind` is a partition with no index behind it.
+```
+
+**Trigger / fix:** a shared memory+document collection where documents vastly
+outnumber memory rows (or a query that strongly favors documents). Fix options,
+in order: (a) give memory a *dedicated* store so no filter is needed (the
+contract already supports it — `conversation-memory.ts:20-26`); (b) widen
+`fetchK` further, trading read cost for recall; (c) the real fix — an indexed,
+pushed-down metadata predicate. buffr proves the pushdown shape works for one
+column (`where app_id = $2`, `/Users/rein/Public/buffr/src/pg-vector-store.ts`)
+but has **no `kind` predicate either**, so even on Postgres a shared store
+over-fetches on `kind` today. The indexed metadata filter is shipped in neither
+repo. Detail: `04` (the over-fetch-then-filter execution path) and `03` (the
+missing `kind` secondary index).
+
 ### #5 — Every read is a full directory scan with no projection
 
 **Consequence: LOW today / MEDIUM at scale.** There's no index for any
@@ -233,11 +273,14 @@ items above, each one trigger away from mattering.
         │ #4 no-fsync write → corruption window  vite.config.ts:377 │
         │ #4b vector store: no durability + linear scan + no txn    │
         │     in-memory-vector-store.ts:11,25,18 (durable: buffr)   │
+        │ #4c recall over-fetch+filter `kind` → silent under-return │
+        │     conversation-memory.ts:94-98 · contracts.ts:33 (no    │
+        │     metadata predicate; buffr pushes app_id, not kind)    │
   LOW   ├──────────────────────────────────────────────────────────┤
         │ #5 full-scan reads   replay-runner.ts:81 · vite.config:949│
         │ #6 git-only manual backup                                 │
         └──────────────────────────────────────────────────────────┘
-  all seven are LATENT: harmless now, sharp when their trigger fires.
+  all eight are LATENT: harmless now, sharp when their trigger fires.
 ```
 
 ---
@@ -286,8 +329,8 @@ The four lines that, between them, carry every risk above:
 
 ## Validate
 
-1. **Reconstruct:** List the six risks in consequence order and the one
-   `file:line` that anchors each.
+1. **Reconstruct:** List the eight risks (including #4b and #4c) in consequence
+   order and the one `file:line` that anchors each.
 2. **Explain:** Why do risks #1 and #2 rank above #3 and #4? (Silent vs visible
    failure.)
 3. **Apply:** A teammate switches artifact filenames to UUIDs and adds 5,000
@@ -304,7 +347,7 @@ The four lines that, between them, carry every risk above:
 - `00-overview.md` — the same findings in map form
 - `03-btree-hash-and-secondary-indexes.md` — risk #1, #5 in depth
 - `05-transactions-isolation-and-anomalies.md` — risk #2 in depth
-- `04-query-planning-and-execution.md` — risk #3 in depth
+- `04-query-planning-and-execution.md` — risk #3 and #4c (over-fetch-then-filter) in depth
 - `07-wal-durability-and-recovery.md` — risk #4, #6 in depth
 - `study-system-design` → the storage-choice and caching decisions that fix #3/#5
 - `study-data-modeling` → the schema and `schemaVersion` behind #2

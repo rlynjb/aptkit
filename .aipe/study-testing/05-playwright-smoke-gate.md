@@ -154,7 +154,10 @@ the wiring's broken, this goes red before a user sees a blank screen.
    heading fails the smoke before anyone opens the browser.
 2. Verify the Vite replay middleware still wires the UI to the agent fixture replay
    end to end (the seam unit tests skip).
-3. Prove every capability card is reachable and renders its panels.
+3. Prove every capability card is reachable and renders its panels — every card the
+   spec *lists*. The `pages` array enumerates six cards (`studio-smoke.spec.ts:3`);
+   it does NOT include the new `RagQueryWorkspace`, so that card is reachable in the
+   app but unverified by the smoke (gap, below).
 
 **Code side by side — the increment + render assertion**
 (`tests/studio/studio-smoke.spec.ts`):
@@ -215,6 +218,17 @@ that timeout. It hasn't been a problem, but if it ever flakes, the fix is to
 pre-build the Studio app in CI before the smoke step and/or raise the timeout
 (`audit.md` lens 4). And the bigger gap: this smoke runs only locally — no CI
 workflow invokes `npm run smoke:studio` (`audit.md` lens 7).
+
+The coverage gap to close next: Studio gained a `RagQueryWorkspace` card backed by
+`runRagQueryFixtureReplay` (`apps/studio/src/agent-runners.ts:167`) — a *real*
+retrieval pipeline running deterministically in the browser (fake embedder +
+`InMemoryVectorStore` + a recorded Gemma response through the loop), wired into the
+gallery via `main.tsx`. The smoke does not touch it: there's no `pages` entry for
+it and no `rag`/`RAG`/`memory` reference anywhere in the spec. So the one card that
+exercises a full retrieval+agent path in-browser is the one card with no E2E proof
+it opens, runs, and renders its answer panel. The fix mirrors the Query test
+exactly — add a `pages` entry plus one run-counter case — and it's cheap because the
+runner is already deterministic. Until then: **not yet exercised.**
 
 Where it connects: it drives the exact same `runFixtureReplay` + `FixtureModelProvider`
 as `01-replay-as-test.md`, just through the browser and Vite middleware instead of

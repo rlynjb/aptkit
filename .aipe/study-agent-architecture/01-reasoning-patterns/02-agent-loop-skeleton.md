@@ -63,8 +63,11 @@ collected. There is no persistence layer. This is exactly `useState` inside a
 component: the state lives while the component is mounted and vanishes on
 unmount. `messages` is the agent's `useState`, and the function call is the
 mount/unmount boundary. That single fact ("no memory survives the return") is
-why AptKit has no episodic memory and why the latent pipeline passes data by
-*return value*, not by shared store — see
+why the six agents here are stateless and why the latent pipeline passes data by
+*return value*, not by shared store. (The repo now ships an episodic-memory
+*engine* — `@aptkit/memory`, `remember`/`recall` — but no agent in this loop
+calls it; that's a deliberate engine-vs-wired-loop split covered in
+`../04-agent-infrastructure/02-agent-memory-tiers.md`.) See
 `../03-multi-agent-orchestration/03-sequential-pipeline.md`.
 
 ## How it works

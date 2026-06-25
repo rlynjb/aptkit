@@ -40,7 +40,7 @@ reach, or tamper with?
   └───────────────────────────────────────────────────────────────────┘
 ```
 
-## The two assets
+## The three assets
 
 - **API keys** (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, plus their `_MODEL`
   names) — live only in `.env`, gitignored. Compromise = someone runs up your
@@ -52,8 +52,15 @@ reach, or tamper with?
   git and **inlined into the published npm bundle** via `bundledDependencies`.
   Compromise = a stray secret or sensitive workspace datum ships to the
   public registry.
+- **Conversation memory** (NEW) — `@aptkit/memory` stores raw past
+  question/answer pairs as durable vector rows
+  (`packages/memory/src/conversation-memory.ts`); live in buffr's Postgres
+  (`agents.chunks`). Compromise = a typed secret/PII is durably retained, **or**
+  a past turn's injected instruction is recalled into a later session.
+  This asset both holds sensitive data *and* is itself an untrusted recall
+  channel back into the prompt (see control 6 below).
 
-## The five controls (the Pass-2 pattern files)
+## The six controls (the Pass-2 pattern files)
 
 | Control | Guards | Where |
 | --- | --- | --- |
@@ -62,6 +69,14 @@ reach, or tamper with?
 | Server-side key boundary | key confidentiality + path traversal | `03-server-side-key-boundary.md` |
 | Validated output gate | untrusted model output | `04-validated-model-output-gate.md` |
 | Local-model tool-call boundary | model-driven dispatch over a no-auth local transport | `05-local-model-tool-call-trust-boundary.md` |
+| Conversation-memory trust surface | persistent injection, retention/PII, shared-store mixing, cross-conversation scoping | `06-conversation-memory-trust-surface.md` |
+
+The sixth row is the exception that proves the framing: it is the one pattern
+file that documents a surface the engine **opens** rather than a control it
+*enforces* — the only filter `@aptkit/memory` applies is `kind` (memory vs
+document), and every other trust decision (scoping, retention, provenance) is
+left to the caller. It earns a file because it is a recurring, deliberate
+recall mechanism, not a one-off gap.
 
 ## What's deliberately out of scope
 
