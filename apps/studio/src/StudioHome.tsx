@@ -107,8 +107,8 @@ export function StudioHome({ onOpen }: { onOpen: (view: StudioView, anchor?: str
         </p>
       </section>
 
-      <section className="homeSection" aria-label="Available capabilities">
-        <div className="sectionLabel">capabilities</div>
+      <section className="homeSection" aria-label="Agents">
+        <div className="sectionLabel">agents</div>
         <div className="capabilityGrid">
           <CapabilityCard
             icon={<CircleDollarSign size={18} />}
@@ -165,8 +165,13 @@ export function StudioHome({ onOpen }: { onOpen: (view: StudioView, anchor?: str
         </div>
       </section>
 
-      <section className="homeSection" aria-label="Other packages in the toolkit">
-        <div className="sectionLabel">also in the toolkit</div>
+      <section className="homeSection" aria-label="Building blocks">
+        <div className="sectionLabel">building blocks</div>
+        <p className="sectionLead">
+          The primitives every agent is composed from — the runtime loop, model providers, retrieval,
+          memory, tools, and evals that make up the agent architecture in aptkit. Agents are just
+          these blocks wired together; each one opens its section in the API Reference.
+        </p>
         <div className="packageGrid">
           {TOOLKIT_PACKAGES.map((pkg) => (
             <button

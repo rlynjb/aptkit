@@ -488,6 +488,7 @@ h1 {
 }
 
 .homeIntro {
+  margin-top: 32px;
   margin-bottom: 56px;
 }
 
@@ -511,6 +512,15 @@ h1 {
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.06em;
+}
+
+/* Optional description under a section label (pulled up tight beneath it). */
+.sectionLead {
+  margin: -16px 0 22px;
+  max-width: 64ch;
+  color: #8f8f8f;
+  font-size: 13px;
+  line-height: 1.55;
 }
 
 .capabilityGrid {
