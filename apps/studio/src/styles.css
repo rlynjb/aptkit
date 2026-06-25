@@ -60,10 +60,9 @@ button {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  padding: 6px 12px;
-  border-radius: 999px;
-  border: 1px solid #363636;
-  background: #121212;
+  padding: 4px 2px;
+  border: 0;
+  background: none;
   color: #c3c3c3;
   font-size: 13px;
   font-weight: 700;
@@ -73,7 +72,7 @@ button {
 }
 
 .topbarLink:hover {
-  background: #232323;
+  color: #ef4444;
 }
 
 /* Documentation pages (DocPage.tsx) */
@@ -482,8 +481,8 @@ h1 {
 
 .capabilityGrid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 12px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
 }
 
 .packageList {
@@ -516,15 +515,15 @@ h1 {
   padding: 0;
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 10px;
+  gap: 18px;
 }
 
 .packageList li button {
   display: grid;
-  gap: 4px;
+  gap: 6px;
   width: 100%;
   text-align: left;
-  padding: 6px 0;
+  padding: 8px 0;
   border: 0;
   background: none;
   cursor: pointer;
@@ -566,12 +565,12 @@ h1 {
 
 .capabilityCard {
   display: grid;
-  gap: 10px;
+  gap: 12px;
   align-content: start;
-  padding: 12px;
+  padding: 14px;
   border: 1px solid #313131;
   border-radius: 8px;
-  background: #121212;
+  background: none;
   cursor: pointer;
 }
 
