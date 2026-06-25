@@ -32,13 +32,22 @@ export function DocPage({
   markdown,
   sourceHref,
   onHome,
+  anchor,
 }: {
   title: string;
   markdown: string;
   sourceHref: string;
   onHome: () => void;
+  anchor?: string;
 }) {
   const toc = React.useMemo(() => buildToc(markdown), [markdown]);
+
+  // When opened with a target section (e.g. from the Studio home package list),
+  // scroll to that heading once the markdown has rendered.
+  React.useEffect(() => {
+    if (!anchor) return;
+    document.getElementById(anchor)?.scrollIntoView({ block: 'start' });
+  }, [anchor]);
 
   return (
     <main className="shell">

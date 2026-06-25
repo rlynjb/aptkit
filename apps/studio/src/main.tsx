@@ -6,7 +6,6 @@ import { DiagnosticWorkspace } from './DiagnosticWorkspace';
 import { QueryWorkspace } from './QueryWorkspace';
 import { RubricImprovementWorkspace } from './RubricImprovementWorkspace';
 import { RagQueryWorkspace } from './RagQueryWorkspace';
-import { CapabilitiesWorkspace } from './CapabilitiesWorkspace';
 import { StudioHome } from './StudioHome';
 import { DocPage } from './DocPage';
 import type { StudioView } from './types';
@@ -18,6 +17,14 @@ const REPO_DOCS = 'https://github.com/rlynjb/aptkit/blob/main/docs';
 
 function App() {
   const [view, setView] = React.useState<StudioView>('home');
+  const [docAnchor, setDocAnchor] = React.useState<string>();
+
+  // Navigate, optionally carrying a doc section to scroll to (used by the
+  // home package list to deep-link into the API Reference).
+  const openView = (next: StudioView, anchor?: string) => {
+    setDocAnchor(anchor);
+    setView(next);
+  };
 
   if (view === 'recommendation') {
     return <RecommendationWorkspace onHome={() => setView('home')} />;
@@ -43,10 +50,6 @@ function App() {
     return <RagQueryWorkspace onHome={() => setView('home')} />;
   }
 
-  if (view === 'capabilities') {
-    return <CapabilitiesWorkspace onHome={() => setView('home')} />;
-  }
-
   if (view === 'api-docs') {
     return (
       <DocPage
@@ -54,6 +57,7 @@ function App() {
         markdown={coreApiMarkdown}
         sourceHref={`${REPO_DOCS}/core-api.md`}
         onHome={() => setView('home')}
+        anchor={docAnchor}
       />
     );
   }
@@ -69,7 +73,7 @@ function App() {
     );
   }
 
-  return <StudioHome onOpen={setView} />;
+  return <StudioHome onOpen={openView} />;
 }
 
 const rootHost = window as Window & { __aptkitStudioRoot?: ReturnType<typeof createRoot> };

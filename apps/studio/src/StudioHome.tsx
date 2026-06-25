@@ -1,11 +1,62 @@
 import React from 'react';
-import { Activity, BookOpen, BookText, Boxes, CircleDollarSign, Database, Github, MessageSquareText, Package, Play, Scale, SearchCheck } from 'lucide-react';
+import { Activity, BookOpen, BookText, Boxes, ChevronRight, CircleDollarSign, Database, Github, MessageSquareText, Package, Play, Scale, SearchCheck } from 'lucide-react';
+import GithubSlugger from 'github-slugger';
 import { ECOMMERCE_ANOMALY_CATEGORIES, coverageReport, schemaCapabilities } from '@aptkit/agent-anomaly-monitoring';
 import { diagnosticFixtures, fixtures, monitoringFixtures, queryFixtures, rubricImprovementFixtures } from './fixtures';
 import { ragQueryFixtures } from './rag-query-fixtures';
 import type { StudioView } from './types';
 
-export function StudioHome({ onOpen }: { onOpen: (view: StudioView) => void }) {
+/** Slug a heading the same way rehype-slug does in DocPage, so deep-links land on the right section. */
+const apiAnchor = (heading: string) => new GithubSlugger().slug(heading);
+
+/**
+ * The non-agent packages aptkit ships. These aren't runnable workspaces — each
+ * deep-links into its section of the in-Studio API Reference.
+ */
+const TOOLKIT_PACKAGES: { name: string; summary: string; heading: string }[] = [
+  {
+    name: '@aptkit/runtime',
+    summary: 'Bounded agent loop, the ModelProvider contract, structured generation, and the CapabilityEvent trace.',
+    heading: '4. Runtime',
+  },
+  {
+    name: '@aptkit/providers',
+    summary: 'Local Gemma over Ollama, a context-window guard, cloud adapters, and a fallback chain — all behind one contract.',
+    heading: '5. Providers',
+  },
+  {
+    name: '@aptkit/retrieval',
+    summary: 'From-scratch RAG: embed → cosine search → rank, behind swappable EmbeddingProvider / VectorStore contracts.',
+    heading: '6. Retrieval (RAG)',
+  },
+  {
+    name: '@aptkit/memory',
+    summary: 'Episodic conversation memory that reuses the retrieval contracts to remember and recall past turns.',
+    heading: 'Conversation memory — `packages/memory/src/conversation-memory.ts`',
+  },
+  {
+    name: '@aptkit/tools',
+    summary: 'A tool registry plus least-privilege policies that gate which tools an agent may call.',
+    heading: '7. Tools & policy',
+  },
+  {
+    name: '@aptkit/prompts + @aptkit/context',
+    summary: 'Versioned prompt packages and workspace / profile context injection.',
+    heading: '8. Prompts & context',
+  },
+  {
+    name: '@aptkit/evals',
+    summary: 'precision@k / recall@k retrieval scoring, an LLM rubric judge, structural diff, and detection scoring.',
+    heading: '9. Evals',
+  },
+  {
+    name: '@aptkit/workflows',
+    summary: 'Compose multi-step content workflows on top of the runtime.',
+    heading: 'Appendix: Workflows',
+  },
+];
+
+export function StudioHome({ onOpen }: { onOpen: (view: StudioView, anchor?: string) => void }) {
   const monitoringCoverage = coverageReport(
     ECOMMERCE_ANOMALY_CATEGORIES,
     schemaCapabilities(monitoringFixtures[0].workspace),
@@ -123,18 +174,34 @@ export function StudioHome({ onOpen }: { onOpen: (view: StudioView) => void }) {
           ]}
           onOpen={() => onOpen('rag-query')}
         />
-        <CapabilityCard
-          icon={<Boxes size={20} />}
-          title="Runtime & Eval Utilities"
-          status="Preview ready"
-          summary="Exercise structured generation, rubric judging, content workflows, provider fallback, and local context guards."
-          details={[
-            '4 utility previews',
-            'Fixture providers',
-            'Trace and retry review',
-          ]}
-          onOpen={() => onOpen('capabilities')}
-        />
+      </section>
+
+      <section className="packageList" aria-label="Other packages in the toolkit">
+        <div className="packageListHeader">
+          <div className="capabilityIcon">
+            <Boxes size={18} />
+          </div>
+          <div>
+            <h2>Also in the toolkit</h2>
+            <p>
+              The non-agent packages behind the capabilities above. These aren't runnable here —
+              each opens its section of the API Reference.
+            </p>
+          </div>
+        </div>
+        <ul>
+          {TOOLKIT_PACKAGES.map((pkg) => (
+            <li key={pkg.name}>
+              <button type="button" onClick={() => onOpen('api-docs', apiAnchor(pkg.heading))}>
+                <span className="packageName">
+                  <code>{pkg.name}</code>
+                  <ChevronRight size={14} aria-hidden="true" />
+                </span>
+                <span className="packageSummary">{pkg.summary}</span>
+              </button>
+            </li>
+          ))}
+        </ul>
       </section>
     </main>
   );

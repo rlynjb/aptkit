@@ -148,7 +148,6 @@ export type StudioView =
   | 'query'
   | 'rubric-improvement'
   | 'rag-query'
-  | 'capabilities'
   | 'api-docs'
   | 'user-guide';
 

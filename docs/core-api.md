@@ -432,6 +432,27 @@ const CHUNK_OVERLAP = 64;
 function chunkText(text: string, size?: number, overlap?: number): string[];   // defaults to the constants
 ```
 
+### Conversation memory — `packages/memory/src/conversation-memory.ts`
+
+Episodic conversation memory built on the *same* `EmbeddingProvider` + `VectorStore` contracts as retrieval — remember a turn, recall earlier ones by similarity. It is the clearest proof the retrieval contracts generalize: a second, unrelated feature rides them with no new seams. No agent in the bundle wires it yet — buffr's chat runtime is the first consumer.
+
+```ts
+type MemoryTurn = { conversationId: string; question: string; answer: string };
+type MemoryHit  = { id: string; score: number; text: string; conversationId?: string };
+
+function createConversationMemory(opts: {
+  embedder: EmbeddingProvider;
+  store: VectorStore;
+  format?: (turn: MemoryTurn) => string;   // what gets embedded; defaults to a "Q… / A…" join
+  kind?: string;                            // metadata tag, default 'conversation'
+}): {
+  remember(turn: MemoryTurn): Promise<void>;                 // embed + upsert as memory:<conversationId>:<n>
+  recall(query: string, k?: number): Promise<MemoryHit[]>;   // embed query, search, filter by kind, top-k
+};
+```
+
+`recall` over-fetches (`max(k * 4, 20)`) and then filters to its `kind`, because `VectorStore.search` has no metadata predicate. `createMemoryTool(memory)` wraps `recall` as a `search_memory` tool for the agent loop, mirroring `search_knowledge_base`.
+
 ---
 
 ## 7. Tools & policy
