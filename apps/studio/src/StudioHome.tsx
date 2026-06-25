@@ -99,7 +99,6 @@ export function StudioHome({ onOpen }: { onOpen: (view: StudioView, anchor?: str
       </header>
 
       <section className="homeIntro">
-        <h1 className="introTitle">aptkit</h1>
         <p>
           A provider-neutral toolkit for building local-first LLM agents — a bounded agent loop,
           swappable model providers, and a from-scratch RAG pipeline, all behind small contracts.
