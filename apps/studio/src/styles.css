@@ -479,65 +479,144 @@ h1 {
   margin-bottom: 16px;
 }
 
+.brandTitle {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 600;
+  line-height: 1;
+  color: #a78bfa;
+}
+
 .homeIntro {
-  margin-bottom: 22px;
+  margin-bottom: 56px;
+}
+
+.introTitle {
+  margin: 0 0 6px;
+  font-size: 24px;
+  font-weight: 500;
+  line-height: 1.2;
+  color: #a78bfa;
 }
 
 .homeIntro p {
   margin: 0;
-  max-width: 70ch;
-  color: #b0b0b0;
-  font-size: 14px;
+  color: #d4d4d4;
+  font-size: 15px;
   line-height: 1.6;
 }
 
-.homeIntro strong {
-  color: #ededed;
-  font-weight: 700;
+.homeSection {
+  margin-bottom: 56px;
+}
+
+.sectionLabel {
+  margin-bottom: 24px;
+  padding-top: 8px;
+  border-top: 1px solid #262626;
+  color: #737373;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
 }
 
 .capabilityGrid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 18px;
+  gap: 10px;
 }
 
-.packageList {
-  margin-top: 28px;
-}
-
-.packageListHeader {
+.capabilityCard {
   display: flex;
-  align-items: flex-start;
-  gap: 12px;
-  margin-bottom: 14px;
+  flex-direction: column;
+  gap: 8px;
+  padding: 16px;
+  border: 1px solid #262626;
+  border-radius: 12px;
+  background: none;
+  cursor: pointer;
 }
 
-.packageListHeader h2 {
+.capabilityCard:hover {
+  border-color: #404040;
+}
+
+.capabilityCard:focus-visible {
+  outline: 3px solid #ef4444;
+  outline-offset: 2px;
+}
+
+.capabilityCardHeader {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.capabilityIcon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 34px;
+  height: 34px;
+  border-radius: 6px;
+  background: #1a1a1a;
+  color: #c3c3c3;
+}
+
+.capabilityTitleBlock {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.capabilityCard h2 {
   margin: 0;
-  font-size: 18px;
   color: #a78bfa;
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.25;
+  letter-spacing: 0;
 }
 
-.packageListHeader p {
-  margin: 4px 0 0;
-  font-size: 13px;
-  color: #979797;
-  max-width: 70ch;
+.capabilityStatus {
+  font-size: 11px;
+  color: #737373;
 }
 
-.packageList ul {
-  list-style: none;
+.capabilityCard p {
   margin: 0;
-  padding: 0;
+  color: #d4d4d4;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.capabilityStats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 2px;
+}
+
+.capabilityStats span {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  padding: 2px 6px;
+  border-radius: 6px;
+  background: #171717;
+  color: #a3a3a3;
+}
+
+.packageGrid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 18px;
+  gap: 10px;
 }
 
-.packageList li button {
+.packageItem {
   display: grid;
-  gap: 6px;
+  gap: 4px;
   width: 100%;
   text-align: left;
   padding: 8px 0;
@@ -547,11 +626,11 @@ h1 {
   font: inherit;
 }
 
-.packageList li button:hover .packageName code {
+.packageItem:hover .packageName code {
   color: #ef4444;
 }
 
-.packageList li button:focus-visible {
+.packageItem:focus-visible {
   outline: 3px solid #ef4444;
   outline-offset: 2px;
 }
@@ -564,6 +643,7 @@ h1 {
 }
 
 .packageName code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 13px;
   font-weight: 600;
   color: #d1d1d1;
@@ -575,92 +655,9 @@ h1 {
 }
 
 .packageSummary {
-  font-size: 13px;
-  color: #979797;
-  line-height: 1.45;
-}
-
-.capabilityCard {
-  display: grid;
-  gap: 12px;
-  align-content: start;
-  padding: 14px;
-  border: 1px solid #313131;
-  border-radius: 8px;
-  background: none;
-  cursor: pointer;
-}
-
-.capabilityCard:focus-visible {
-  outline: 3px solid #ef4444;
-  outline-offset: 2px;
-}
-
-.capabilityCard:hover {
-  border-color: #484848;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.45);
-}
-
-.capabilityCardHeader {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.capabilityIcon {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 32px;
-  height: 32px;
-  border: 1px solid #2d2d2d;
-  border-radius: 7px;
-  background: #1a1a1a;
-  color: #c3c3c3;
-}
-
-.capabilityCardHeader span {
-  display: inline-flex;
-  align-items: center;
-  min-height: 20px;
-  padding: 0 7px;
-  border-radius: 999px;
-  background: #232323;
-  color: #c3c3c3;
-  font-size: 10.5px;
-  font-weight: 800;
-  text-transform: uppercase;
-}
-
-.capabilityCard h2 {
-  margin: 0;
-  color: #a78bfa;
-  font-size: 15px;
-  line-height: 1.2;
-  letter-spacing: 0;
-}
-
-.capabilityCard p {
-  margin: 0;
-  color: #bbbbbb;
   font-size: 12.5px;
+  color: #8f8f8f;
   line-height: 1.45;
-}
-
-.capabilityStats {
-  display: grid;
-  gap: 6px;
-}
-
-.capabilityStats strong {
-  padding: 5px 8px;
-  border: 1px solid #2a2a2a;
-  border-radius: 6px;
-  background: #161616;
-  color: #bbbbbb;
-  font-size: 11px;
-  font-weight: 750;
 }
 
 .capabilityWorkspace {
@@ -2200,7 +2197,7 @@ h1 {
   .layout,
   .capabilityWorkspace,
   .capabilityGrid,
-  .packageList ul,
+  .packageGrid,
   .anomalyMeta,
   .scoreGrid {
     grid-template-columns: 1fr;

@@ -1,5 +1,5 @@
 import React from 'react';
-import { Activity, BookOpen, BookText, Boxes, ChevronRight, CircleDollarSign, Database, Github, MessageSquareText, Package, Play, Scale, SearchCheck } from 'lucide-react';
+import { Activity, BookOpen, BookText, ChevronRight, CircleDollarSign, Database, Github, MessageSquareText, Package, Scale, SearchCheck } from 'lucide-react';
 import GithubSlugger from 'github-slugger';
 import { ECOMMERCE_ANOMALY_CATEGORIES, coverageReport, schemaCapabilities } from '@aptkit/agent-anomaly-monitoring';
 import { diagnosticFixtures, fixtures, monitoringFixtures, queryFixtures, rubricImprovementFixtures } from './fixtures';
@@ -67,17 +67,15 @@ export function StudioHome({ onOpen }: { onOpen: (view: StudioView, anchor?: str
   return (
     <main className="shell shellNarrow">
       <header className="topbar">
-        <div>
-          <p className="eyebrow">AptKit Studio</p>
-        </div>
-        <div className="topbarLinks">
+        <p className="brandTitle">AptKit Studio</p>
+        <nav className="topbarLinks">
           <button type="button" className="topbarLink" onClick={() => onOpen('api-docs')}>
-            <BookOpen size={15} />
-            <span>API Reference</span>
+            <BookOpen size={14} />
+            <span>api reference</span>
           </button>
           <button type="button" className="topbarLink" onClick={() => onOpen('user-guide')}>
-            <BookText size={15} />
-            <span>User Guide</span>
+            <BookText size={14} />
+            <span>user guide</span>
           </button>
           <a
             className="topbarLink"
@@ -85,7 +83,7 @@ export function StudioHome({ onOpen }: { onOpen: (view: StudioView, anchor?: str
             target="_blank"
             rel="noopener noreferrer"
           >
-            <Package size={15} />
+            <Package size={14} />
             <span>npm</span>
           </a>
           <a
@@ -94,122 +92,98 @@ export function StudioHome({ onOpen }: { onOpen: (view: StudioView, anchor?: str
             target="_blank"
             rel="noopener noreferrer"
           >
-            <Github size={15} />
-            <span>GitHub</span>
+            <Github size={14} />
+            <span>github</span>
           </a>
-        </div>
+        </nav>
       </header>
 
       <section className="homeIntro">
+        <h1 className="introTitle">aptkit</h1>
         <p>
-          <strong>AptKit</strong> is a provider-neutral toolkit for building local-first LLM agents —
-          a bounded agent loop, swappable model providers, and a from-scratch RAG pipeline, all behind
-          small contracts. Studio replays each capability from recorded fixtures so you can read,
-          evaluate, and compare the output in the browser.
+          A provider-neutral toolkit for building local-first LLM agents — a bounded agent loop,
+          swappable model providers, and a from-scratch RAG pipeline, all behind small contracts.
+          Studio replays each capability from recorded fixtures so you can read, evaluate, and
+          compare the output in the browser.
         </p>
       </section>
 
-      <section className="capabilityGrid" aria-label="Available capabilities">
-        <CapabilityCard
-          icon={<CircleDollarSign size={20} />}
-          title="Recommendation Agent"
-          status="Ready"
-          summary="Replay ecommerce recommendations, compare fixture vs OpenAI, save artifacts, and promote fixtures."
-          details={[
-            `${fixtures.length} fixtures`,
-            'Fixture/OpenAI comparison',
-            'Replay promotion workflow',
-          ]}
-          onOpen={() => onOpen('recommendation')}
-        />
-        <CapabilityCard
-          icon={<Activity size={20} />}
-          title="Anomaly Monitoring Agent"
-          status="Fixture ready"
-          summary="Scan ecommerce workspace data for seeded anomaly categories with trace and coverage review."
-          details={[
-            `${monitoringFixtures.length} fixture`,
-            `${fullCoverage} full / ${limitedCoverage} limited categories`,
-            'Deterministic monitoring replay',
-          ]}
-          onOpen={() => onOpen('monitoring')}
-        />
-        <CapabilityCard
-          icon={<SearchCheck size={20} />}
-          title="Diagnostic Investigation Agent"
-          status="Fixture ready"
-          summary="Investigate a known anomaly, test hypotheses, and return evidence-backed diagnosis output."
-          details={[
-            `${diagnosticFixtures.length} fixture`,
-            'Hypothesis/evidence output',
-            'Deterministic diagnostic replay',
-          ]}
-          onOpen={() => onOpen('diagnostic')}
-        />
-        <CapabilityCard
-          icon={<MessageSquareText size={20} />}
-          title="Query Agent"
-          status="Fixture ready"
-          summary="Ask a free-form workspace question and get a grounded prose answer from allowed tools."
-          details={[
-            `${queryFixtures.length} fixture`,
-            'Natural-language answer',
-            'Fixture/OpenAI replay',
-          ]}
-          onOpen={() => onOpen('query')}
-        />
-        <CapabilityCard
-          icon={<Scale size={20} />}
-          title="Rubric Improvement Agent"
-          status="Fixture ready"
-          summary="Score a subject against a rubric, use recent judgment history, and generate one focused next action."
-          details={[
-            `${rubricImprovementFixtures.length} fixture`,
-            'Rubric scoring output',
-            'Agentic improvement loop',
-          ]}
-          onOpen={() => onOpen('rubric-improvement')}
-        />
-        <CapabilityCard
-          icon={<Database size={20} />}
-          title="RAG Query Agent"
-          status="Fixture ready"
-          summary="Retrieve from an in-memory knowledge base and answer grounded, cited questions, scored with precision@k / recall@k."
-          details={[
-            `${ragQueryFixtures.length} fixtures`,
-            'Embed → cosine search → cite',
-            'Deterministic in-browser RAG',
-          ]}
-          onOpen={() => onOpen('rag-query')}
-        />
+      <section className="homeSection" aria-label="Available capabilities">
+        <div className="sectionLabel">capabilities</div>
+        <div className="capabilityGrid">
+          <CapabilityCard
+            icon={<CircleDollarSign size={18} />}
+            title="Recommendation Agent"
+            status="recommendation"
+            summary="Replay ecommerce recommendations, compare fixture vs OpenAI, save artifacts, and promote fixtures."
+            details={[`${fixtures.length} fixtures`, 'fixture/openai compare', 'replay promotion']}
+            onOpen={() => onOpen('recommendation')}
+          />
+          <CapabilityCard
+            icon={<Activity size={18} />}
+            title="Anomaly Monitoring Agent"
+            status="monitoring"
+            summary="Scan ecommerce workspace data for seeded anomaly categories with trace and coverage review."
+            details={[
+              `${monitoringFixtures.length} fixture`,
+              `${fullCoverage} full / ${limitedCoverage} limited`,
+              'deterministic replay',
+            ]}
+            onOpen={() => onOpen('monitoring')}
+          />
+          <CapabilityCard
+            icon={<SearchCheck size={18} />}
+            title="Diagnostic Investigation Agent"
+            status="diagnostic"
+            summary="Investigate a known anomaly, test hypotheses, and return evidence-backed diagnosis output."
+            details={[`${diagnosticFixtures.length} fixture`, 'hypothesis/evidence', 'deterministic replay']}
+            onOpen={() => onOpen('diagnostic')}
+          />
+          <CapabilityCard
+            icon={<MessageSquareText size={18} />}
+            title="Query Agent"
+            status="query"
+            summary="Ask a free-form workspace question and get a grounded prose answer from allowed tools."
+            details={[`${queryFixtures.length} fixture`, 'natural-language answer', 'fixture/openai replay']}
+            onOpen={() => onOpen('query')}
+          />
+          <CapabilityCard
+            icon={<Scale size={18} />}
+            title="Rubric Improvement Agent"
+            status="rubric"
+            summary="Score a subject against a rubric, use recent judgment history, and generate one focused next action."
+            details={[`${rubricImprovementFixtures.length} fixture`, 'rubric scoring', 'agentic loop']}
+            onOpen={() => onOpen('rubric-improvement')}
+          />
+          <CapabilityCard
+            icon={<Database size={18} />}
+            title="RAG Query Agent"
+            status="rag query"
+            summary="Retrieve from an in-memory knowledge base and answer grounded, cited questions, scored with precision@k / recall@k."
+            details={[`${ragQueryFixtures.length} fixtures`, 'embed → search → cite', 'in-browser rag']}
+            onOpen={() => onOpen('rag-query')}
+          />
+        </div>
       </section>
 
-      <section className="packageList" aria-label="Other packages in the toolkit">
-        <div className="packageListHeader">
-          <div className="capabilityIcon">
-            <Boxes size={18} />
-          </div>
-          <div>
-            <h2>Also in the toolkit</h2>
-            <p>
-              The non-agent packages behind the capabilities above. These aren't runnable here —
-              each opens its section of the API Reference.
-            </p>
-          </div>
-        </div>
-        <ul>
+      <section className="homeSection" aria-label="Other packages in the toolkit">
+        <div className="sectionLabel">also in the toolkit</div>
+        <div className="packageGrid">
           {TOOLKIT_PACKAGES.map((pkg) => (
-            <li key={pkg.name}>
-              <button type="button" onClick={() => onOpen('api-docs', apiAnchor(pkg.heading))}>
-                <span className="packageName">
-                  <code>{pkg.name}</code>
-                  <ChevronRight size={14} aria-hidden="true" />
-                </span>
-                <span className="packageSummary">{pkg.summary}</span>
-              </button>
-            </li>
+            <button
+              key={pkg.name}
+              type="button"
+              className="packageItem"
+              onClick={() => onOpen('api-docs', apiAnchor(pkg.heading))}
+            >
+              <span className="packageName">
+                <code>{pkg.name}</code>
+                <ChevronRight size={13} aria-hidden="true" />
+              </span>
+              <span className="packageSummary">{pkg.summary}</span>
+            </button>
           ))}
-        </ul>
+        </div>
       </section>
     </main>
   );
@@ -247,18 +221,16 @@ export function CapabilityCard({
     >
       <div className="capabilityCardHeader">
         <div className="capabilityIcon">{icon}</div>
-        <span>{status}</span>
+        <div className="capabilityTitleBlock">
+          <h2>{title}</h2>
+          <span className="capabilityStatus">{status}</span>
+        </div>
       </div>
-      <h2>{title}</h2>
       <p>{summary}</p>
       <div className="capabilityStats">
         {details.map((detail) => (
-          <strong key={detail}>{detail}</strong>
+          <span key={detail}>{detail}</span>
         ))}
-      </div>
-      <div className="primaryAction capabilityCardAction" aria-hidden="true">
-        <Play size={15} />
-        <span>Open</span>
       </div>
     </article>
   );
