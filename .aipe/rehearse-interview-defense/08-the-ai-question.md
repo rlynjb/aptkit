@@ -19,7 +19,7 @@ The whole chapter lives in one picture: every decision in this codebase falls in
   │   local-first Gemma, cloud (Anthropic/OpenAI) fallback ready  │
   │   aptkit-library / buffr-deployment repo split               │
   │   eval-driven iteration (precision@k / recall@k gates)        │
-  │   publishing the bundle to npm (@rlynjb/aptkit-core@0.4.0)    │
+  │   publishing the bundle to npm (@rlynjb/aptkit-core@0.4.1)    │
   │   ── defend by: naming the goal and the alternative rejected  │
   └───────────────────────────────────────────────────────────────┘
                               │
@@ -124,7 +124,7 @@ That last line is the one to memorize. It does two things at once: it's honest a
 
 This is where you bring out the three-mode split. Don't recite it as a framework — walk it with real decisions. Your voice:
 
-"I'll split it three ways. First, the deliberate calls — those were mine, the AI just executed them. The big one is that the RAG pipeline is built from *contracts*, not a framework. `EmbeddingProvider` and `VectorStore` are vendor-neutral interfaces in `packages/retrieval/src/contracts.ts`; the pipeline logic never names nomic or pgvector. That's why buffr can drop in a `PgVectorStore` against the exact same contract. I also decided the repo split — aptkit is the deployment-agnostic library, buffr is the Supabase-backed body that consumes `@rlynjb/aptkit-core` from npm. And I decided to gate retrieval changes on `precision@k` and `recall@k` scorers in `packages/evals`, and to publish the bundle to npm at `@rlynjb/aptkit-core@0.4.0`. Those are goals — the AI doesn't pick your goals.
+"I'll split it three ways. First, the deliberate calls — those were mine, the AI just executed them. The big one is that the RAG pipeline is built from *contracts*, not a framework. `EmbeddingProvider` and `VectorStore` are vendor-neutral interfaces in `packages/retrieval/src/contracts.ts`; the pipeline logic never names nomic or pgvector. That's why buffr can drop in a `PgVectorStore` against the exact same contract. I also decided the repo split — aptkit is the deployment-agnostic library, buffr is the Supabase-backed body that consumes `@rlynjb/aptkit-core` from npm. And I decided to gate retrieval changes on `precision@k` and `recall@k` scorers in `packages/evals`, and to publish the bundle to npm at `@rlynjb/aptkit-core@0.4.1`. Those are goals — the AI doesn't pick your goals.
 
 Second, the evaluated-and-accepted calls. Claude proposed the contract *shapes* and I judged them against one question: can a swap happen without rewriting the pipeline? It proposed the `minTopK` floor and the hallucinated-filter tolerance — I accepted both after I understood the failure they prevented. And dropping the chunks→documents foreign key was a proposal I accepted once I saw it would otherwise break drop-in parity.
 
@@ -338,7 +338,7 @@ If you were doing this again, the thing to change is the *verification gap that 
 **Core claim:** The 2026 baseline assumes you used AI heavily. The differentiator is judgment and verification — owning which decisions were yours, which you evaluated and accepted, which you defaulted to, and proving you can catch the tool when it's wrong.
 
 **The three modes (memorize this split):**
-- **Deliberate (your call):** provider-neutral RAG from contracts, local-first Gemma with cloud fallback, the aptkit/buffr repo split, eval gates (`precision@k`/`recall@k`), publishing `@rlynjb/aptkit-core@0.4.0` to npm.
+- **Deliberate (your call):** provider-neutral RAG from contracts, local-first Gemma with cloud fallback, the aptkit/buffr repo split, eval gates (`precision@k`/`recall@k`), publishing `@rlynjb/aptkit-core@0.4.1` to npm.
 - **Evaluated & accepted (AI proposed, you judged):** the `VectorStore`/`EmbeddingProvider` contract shapes, the `minTopK` floor, the hallucinated-filter tolerance, the FK removal.
 - **Defaulted-to (own it honestly):** some `package.json` conventions, some `packages/*` layout. "I didn't deeply evaluate that; here's how I'd check it."
 
@@ -362,3 +362,6 @@ If you were doing this again, the thing to change is the *verification gap that 
 ```
 
 **What you'd change:** Add a shared `VectorStore` contract-conformance test suite that every implementation (in-memory and `PgVectorStore`) must pass, so a parity-breaking change like the FK fails in CI instead of in a live run. Keep the fixtures; add the conformance layer underneath.
+
+---
+Updated: 2026-06-24 — Published version `0.4.0 → 0.4.1` in the three-mode diagram and summary (0.4.1 is now the published bundle).

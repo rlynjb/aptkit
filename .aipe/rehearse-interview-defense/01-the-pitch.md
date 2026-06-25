@@ -14,8 +14,8 @@ Here is aptkit at a glance — the shape you're compressing into three sentences
   aptkit AT A GLANCE — what you're pitching
 
   ┌─ PUBLISHED SURFACE ─────────────────────────────────────────┐
-  │  @rlynjb/aptkit-core @ 0.4.0 on npm                          │
-  │  one tarball, 15 internal @aptkit/* packages bundled         │
+  │  @rlynjb/aptkit-core @ 0.4.1 on npm                          │
+  │  one tarball, 16 internal @aptkit/* packages bundled         │
   └───────────────────────────┬─────────────────────────────────┘
                               │ re-exports
   ┌─ AGENT LAYER ─────────────▼─────────────────────────────────┐
@@ -61,7 +61,7 @@ That's it. It names what (a toolkit for agents), the differentiator (no lock-in,
 
 Now you add the hard part and the proof, still without a whiteboard.
 
-> ▸ "It's published on npm as @rlynjb/aptkit-core — fifteen internal
+> ▸ "It's published on npm as @rlynjb/aptkit-core — sixteen internal
 >   packages bundled into one. The core idea is that everything routes
 >   through a single ModelProvider.complete() contract, so providers
 >   are swappable adapters. To prove the abstraction holds, I built a
@@ -91,7 +91,7 @@ This is the real one. It has a shape: **problem → architecture → the hard pa
 
 **Beat 4 — the proof (≈20s).**
 
-> It's not a demo that only runs on my machine. It's published — `@rlynjb/aptkit-core@0.4.0` on npm, fifteen packages in one bundled tarball. And there's a companion repo, buffr, that consumes it from npm and supplies a `PgVectorStore` implementing my `VectorStore` contract against Supabase/pgvector. I ran it live: index a folder of notes, ask a grounded and cited question, run the eval — precision@1 and recall@3 both came back 1.0 — and the trajectory persisted to Postgres. That's the whole loop, end to end, against a real database.
+> It's not a demo that only runs on my machine. It's published — `@rlynjb/aptkit-core@0.4.1` on npm, sixteen packages in one bundled tarball. And there's a companion repo, buffr, that consumes it from npm and supplies a `PgVectorStore` implementing my `VectorStore` contract against Supabase/pgvector. I ran it live: index a folder of notes, ask a grounded and cited question, run the eval — precision@1 and recall@3 both came back 1.0 — and the trajectory persisted to Postgres. That's the whole loop, end to end, against a real database.
 
 Land the arc at the end if they give you room:
 
@@ -128,7 +128,7 @@ Here's the contrast that does the teaching:
 │ WEAK ANSWER                  │ STRONG ANSWER                │
 ├──────────────────────────────┼──────────────────────────────┤
 │ "So it's a TypeScript        │ "aptkit extracts the reusable│
-│ monorepo with fifteen        │ parts of an LLM agent into a │
+│ monorepo with sixteen        │ parts of an LLM agent into a │
 │ packages — there's a runtime,│ toolkit with no vendor       │
 │ tools, context, retrieval,   │ lock-in. The whole thing     │
 │ prompts, evals, workflows,   │ turns on one contract —      │
@@ -253,7 +253,7 @@ If you were pitching this project a second time, the thing to reconsider is **wh
 
 **The three lengths:**
 - **10s** — "A published TypeScript toolkit for LLM agents with no vendor lock-in: every agent talks to one provider contract, so I swap Claude for local Gemma without touching the agent."
-- **30s** — Add: published as `@rlynjb/aptkit-core` (15 packages bundled), built a from-scratch RAG stack on a *local* Gemma model with *emulated* tool-calling, and a second repo (buffr) that swaps in pgvector. Runs live.
+- **30s** — Add: published as `@rlynjb/aptkit-core` (16 packages bundled), built a from-scratch RAG stack on a *local* Gemma model with *emulated* tool-calling, and a second repo (buffr) that swaps in pgvector. Runs live.
 - **90s** — problem (reusable agents, no lock-in) → architecture (everything behind `ModelProvider.complete()`, `packages/runtime/src/model-provider.ts`) → hard part (from-scratch RAG + emulated tool-calling for a weak local model, `packages/providers/gemma/src/gemma-provider.ts`, measured with precision@k in `packages/evals/src/precision-at-k.ts`) → proof (npm + buffr's `PgVectorStore`, live eval p@1 = r@3 = 1.0).
 
 **Questions covered:**
@@ -267,3 +267,6 @@ If you were pitching this project a second time, the thing to reconsider is **wh
 - "This is my second RAG system. The first taught me RAG works; this one taught me how to make it portable and measured."
 
 **What you'd change:** Move the "second RAG system" line from the closer to the opener when the interviewer asks about your AI background first — pitch the arc, not just the project.
+
+---
+Updated: 2026-06-24 — Published version `0.4.0 → 0.4.1` and bundle count `15 → 16` (added `@aptkit/memory`) across the at-a-glance diagram and all three pitch lengths.

@@ -284,6 +284,9 @@ Interviewers don't let you finish the clean walk. They jab mid-sentence. Here ar
 **"Where does state live? Is the loop stateful?"**
 > "The loop in aptkit is stateless — it builds a `messages` array per run and the trace is held in memory, then handed to Studio. There's no session store in the library. State lives one layer out: in buffr the same trace flows into `SupabaseTraceSink`, which persists every turn to `agents.messages`. So the library stays a pure function of its inputs; the deployment decides durability."
 
+**"Is retrieval the only thing those two contracts power? What's `@aptkit/memory`?"**
+> "No — and that's the proof the abstraction earned its keep. `@aptkit/memory` is episodic conversation memory, and it rides the *exact same* `EmbeddingProvider` and `VectorStore` contracts as retrieval — `createConversationMemory` embeds each turn, upserts it, and recalls by similarity, reusing both seams for a completely different feature. When one abstraction powers both search and memory, 'pattern over vendor' stops being a slogan and becomes a fact. The honest caveat I'd volunteer: no aptkit agent wires memory into its loop yet — the bundle ships it as an engine and buffr's chat runtime is the only consumer so far. So I'd frame it as 'the retrieval contracts generalized,' not as something `rag-query` uses today."
+
 ```
         ▸ When they interrupt, answer in one sentence and put
           your finger back on the diagram. The interruption is a
@@ -394,3 +397,6 @@ If you were drawing this architecture fresh today, the one thing you'd reconside
 ```
 
 **What you'd change:** Make the trace a first-class streaming `CapabilityTraceSink` contract from day one — the model seam and storage seam landed early, the observability seam hardened second.
+
+---
+Updated: 2026-06-24 — Added the `@aptkit/memory` interrupt (episodic memory reusing the same `EmbeddingProvider`/`VectorStore` contracts; honest that no aptkit agent wires it yet).

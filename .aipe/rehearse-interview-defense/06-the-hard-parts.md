@@ -207,7 +207,7 @@ The strong answer, in your voice:
 
 > "The part I'm proudest of is that I built RAG with *emulated* tool-calling for Gemma — a local model with no native tool-calling at all — from my own contracts, not a framework, and it dropped into the existing agent loop with zero new control flow. Gemma can't take a `tools` array, so the provider renders the tool schemas into the system prompt, demands a single JSON object back, and parse-retries with a corrective nudge if Gemma fumbles the JSON. From the loop's point of view it's just a `ModelProvider` that returns a `tool_use` block — identical to how the Anthropic adapter looks. So the RAG agent in `packages/agents/rag-query` is the sixth instance of the same capability shape as the other five agents: a provider, a tool policy, a loop config, a validator. The same `runAgentLoop` with the same `maxTurns`, `maxToolCalls`, and `synthesisInstruction` options the other agents already used. I didn't add a branch. That's the evidence the abstraction was right — I bolted on a genuinely new capability and the control flow never noticed. Then I published it as `@rlynjb/aptkit-core` on npm so the companion runtime, buffr, consumes it cleanly off the registry."
 
-Grounded: the Gemma provider's `buildSystemText` renders tools into the system text and the `RETRY_NUDGE` / `maxToolCallAttempts` path handles parse-retry (`packages/providers/gemma/src/gemma-provider.ts`). The RAG agent calls `runAgentLoop` with `maxTurns: 6, maxToolCalls: 4, synthesisInstruction` — all pre-existing options in `packages/runtime/src/run-agent-loop.ts` (lines 45–46, 89–90). Published bundle is `@rlynjb/aptkit-core@0.4.0` on npm (repo dev at `0.4.1`).
+Grounded: the Gemma provider's `buildSystemText` renders tools into the system text and the `RETRY_NUDGE` / `maxToolCallAttempts` path handles parse-retry (`packages/providers/gemma/src/gemma-provider.ts`). The RAG agent calls `runAgentLoop` with `maxTurns: 6, maxToolCalls: 4, synthesisInstruction` — all pre-existing options in `packages/runtime/src/run-agent-loop.ts` (lines 45–46, 89–90). Published bundle is `@rlynjb/aptkit-core@0.4.1` on npm.
 
 ```
 ┃ "Zero new control flow" is the proudest line.
@@ -462,3 +462,6 @@ In this chapter's territory — the hard parts — the thing I'd change is the o
 **The recovery line to memorize:** "I haven't done X end to end, so I won't pretend to walk you through it. What I *have* built is [the real thing], and here's how I reason about the gate." Honest limit beats faked confidence every time — same knowledge gap, opposite outcome in the room.
 
 **What you'd change:** Add a tool-boundary assertion that flags a silent empty result loudly, so the system surfaces the blind spot instead of waiting for me to find it three layers down in the trace.
+
+---
+Updated: 2026-06-24 — Published version reconciled to `@rlynjb/aptkit-core@0.4.1` (0.4.1 is now the published bundle, no longer dev-only).

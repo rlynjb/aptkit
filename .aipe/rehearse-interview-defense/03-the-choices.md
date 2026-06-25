@@ -43,7 +43,7 @@ Here is the decision tree of every load-bearing choice in aptkit, with the optio
   ┌─ PUBLISHING ──────────────────▼────────────────────────────────┐
   │  N separately-published packages   ·   git dependencies         │
   │  ★ ONE bundle: @rlynjb/aptkit-core (bundledDependencies) ★     │
-  │     15 internal packages → one standalone tarball, one version  │
+  │     16 internal packages → one standalone tarball, one version  │
   └───────────────────────────────┬────────────────────────────────┘
                                   │ what proves it works?
   ┌─ TESTING ─────────────────────▼────────────────────────────────┐
@@ -170,6 +170,8 @@ This is the choice where your background does the heaviest lifting. You've shipp
 > I built the RAG pipeline from two contracts instead of pulling in LangChain. The whole pipeline depends on `EmbeddingProvider` and `VectorStore` — both defined in `packages/retrieval/src/contracts.ts` — and the pipeline logic never names a vendor. That's deliberate. I'd already shipped cloud RAG in a previous project, AdvntrCue, on GPT-4 and pgvector. The pattern I learned there is that vector stores rotate — Pinecone, pgvector, Weaviate, Qdrant — but the *shape* never changes: embed, approximate-nearest-neighbor search, retrieve. So this time I built that invariant as a contract I own. The cost is real: it's more code than `import` from a framework. What it buys me is clean testability — I can drop in an `InMemoryVectorStore` and test the whole pipeline with no Postgres — and no framework lock-in. When the framework breaks on a version bump or hides the chunking logic I need to tune, that's not my problem, because there's no framework.
 
 The "pattern over vendor" line is yours — it's in `me.md` as an explicit value — and it lands hard here because the code *is* the value made literal. Read the header comment in `contracts.ts`: *"the pipeline logic never names a vendor (nomic / OpenAI / pgvector / in-memory are incidental)."* That's not a coincidence you can defend; that's a principle you wrote into the file.
+
+And here's the proof that turns the value into a fact, because it's the move that wins this one: those same two contracts now have a *second* consumer that has nothing to do with search. `@aptkit/memory` — episodic conversation memory in `packages/memory/src/conversation-memory.ts` — reuses `EmbeddingProvider` and `VectorStore` to remember and recall past turns. When one abstraction powers both retrieval *and* memory, "pattern over vendor" stops being a slogan and becomes demonstrated. Be honest if pushed: no aptkit agent wires memory into its loop yet — buffr's chat runtime is the only consumer — so it proves the contract *generalizes*, not that `rag-query` uses it today.
 
 ```
 ┌─────────────────────────────┬─────────────────────────────┐
@@ -414,7 +416,7 @@ This is your `me.md` system-design story made literal — the "library/deploymen
 ```
 ┌─────────────────────────────────────────────────────┐
 │ THEY ASK                                            │
-│   "You have 15 internal packages. Why publish them   │
+│   "You have 16 internal packages. Why publish them   │
 │    as one bundle instead of separately, or just      │
 │    using git dependencies?"                         │
 │                                                     │
@@ -429,7 +431,7 @@ This is your `me.md` system-design story made literal — the "library/deploymen
 
 This is a packaging question, which sounds boring, but it's actually a question about whether you think past your own machine. The strong answer is about the *consumer*.
 
-> I publish exactly one package, `@rlynjb/aptkit-core`, and it bundles all 15 internal `@aptkit/*` packages via `bundledDependencies` into one standalone tarball. The monorepo root is `private: true` on purpose — it never gets published. The reason is the consumer's experience. buffr depends on `@rlynjb/aptkit-core` and imports everything from it — one install, one version number. The alternative, publishing 15 packages separately, means 15 version numbers a consumer has to keep in lockstep, and a mismatch between, say, the runtime and the retrieval package becomes the consumer's debugging problem. Git dependencies would mean the consumer clones submodules and builds my internal workspace graph themselves — they'd inherit my whole build chain. The bundle collapses all of that: a clean clone gets one tarball with all the `dist/` inlined, and one semver to track. The cost I pay is on the publishing side — `scripts/pack-core-standalone.mjs` has to pack every workspace, and every bundled package needs an explicit `files` allowlist or `npm pack` excludes its gitignored `dist/`. I moved the complexity to the producer so the consumer never sees it.
+> I publish exactly one package, `@rlynjb/aptkit-core`, and it bundles all 16 internal `@aptkit/*` packages via `bundledDependencies` into one standalone tarball. The monorepo root is `private: true` on purpose — it never gets published. The reason is the consumer's experience. buffr depends on `@rlynjb/aptkit-core` and imports everything from it — one install, one version number. The alternative, publishing 16 packages separately, means 16 version numbers a consumer has to keep in lockstep, and a mismatch between, say, the runtime and the retrieval package becomes the consumer's debugging problem. Git dependencies would mean the consumer clones submodules and builds my internal workspace graph themselves — they'd inherit my whole build chain. The bundle collapses all of that: a clean clone gets one tarball with all the `dist/` inlined, and one semver to track. The cost I pay is on the publishing side — `scripts/pack-core-standalone.mjs` has to pack every workspace, and every bundled package needs an explicit `files` allowlist or `npm pack` excludes its gitignored `dist/`. I moved the complexity to the producer so the consumer never sees it.
 
 The detail that proves you actually shipped this — and didn't just describe it from a tutorial — is the gotcha. The `.gitignore` ignores `dist/`, `npm pack` honors `.gitignore`, so without `"files": ["dist/src"]` in each package, the tarball ships with no JavaScript and consumers get `has no exported member` errors. That bit you when `provider-gemma` and `provider-local` were first bundled, and it's documented in `RELEASE.md`. Naming a real scar like that is worth more than any amount of clean theory.
 
@@ -440,14 +442,14 @@ The detail that proves you actually shipped this — and didn't just describe it
 ```
 
 ```
-  "Why one bundle and not 15 packages?"
+  "Why one bundle and not 16 packages?"
         │
         ▼
   You give the consumer-experience + one-version answer.
         │
         ├─► IF THEY ASK "what's the downside of bundling?"
         │     Consumers can't pull just one package — they
-        │     take all 15 or none. For a cohesive core
+        │     take all 16 or none. For a cohesive core
         │     that's fine; if someone wanted only the
         │     retrieval contracts, they over-install.
         │
@@ -514,7 +516,7 @@ If I were starting aptkit today, I'd reconsider one thing in this chapter: I'd d
 | RAG | Contracts (`EmbeddingProvider` + `VectorStore`) over LangChain | More code I own — buys in-memory tests + no lock-in |
 | Provider seam | `ModelProvider.complete()` over the vendor SDK | One abstraction — buys swap + fixture + fallback at once |
 | Deployment split | `InMemoryVectorStore` in aptkit, `PgVectorStore` in buffr | In-memory isn't durable — by design; durability is a deployment concern |
-| Publishing | One bundle `@rlynjb/aptkit-core` (15 pkgs) over N packages | Producer-side pack complexity (`files` allowlist gotcha) — buys one-version clean-clone install |
+| Publishing | One bundle `@rlynjb/aptkit-core` (16 pkgs) over N packages | Producer-side pack complexity (`files` allowlist gotcha) — buys one-version clean-clone install |
 | Testing | `node:test` + injectable transports over jest/vitest | None worth defending — the runner is incidental; the seam is the provider contract again |
 
 **Pull quotes to carry in:**
@@ -534,3 +536,6 @@ If I were starting aptkit today, I'd reconsider one thing in this chapter: I'd d
 **What you'd change:** Push metadata filtering into the `VectorStore` contract so pgvector can filter in SQL instead of the tool over-fetching and post-filtering in memory.
 
 **The one thing to remember:** Lead every choice with *why*, then volunteer the *cost* before they ask. A defaulted choice you can't explain reads junior; a paid cost you can name reads senior — even when the choice is unusual. Especially when it's unusual.
+
+---
+Updated: 2026-06-24 — Bundle count 15 → 16 (`@rlynjb/aptkit-core@0.4.1`, added `@aptkit/memory`); added the second-consumer proof to Choice 2 (memory reuses the retrieval contracts), with the honest caveat that no aptkit agent wires it yet.

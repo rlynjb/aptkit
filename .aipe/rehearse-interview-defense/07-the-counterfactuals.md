@@ -372,7 +372,7 @@ The last reconsiderable decision is a packaging one. It's lower-stakes than the 
 ```
 ┌─────────────────────────────────────────────────────┐
 │ THEY ASK                                            │
-│   "You bundle 15 internal packages into one          │
+│   "You bundle 16 internal packages into one          │
 │    @rlynjb/aptkit-core. Why not publish them          │
 │    separately? Separate packages give finer-grained  │
 │    versioning — consumers take only what they need." │
@@ -387,7 +387,7 @@ The last reconsiderable decision is a packaging one. It's lower-stakes than the 
 
 The counter is legitimate: separate packages give finer-grained versioning and consumption. A consumer who only needs retrieval could install just `@aptkit/retrieval` and bump it independently of the agents. Monorepo-of-published-packages is a real, common shape.
 
-The defense is consumption simplicity for the actual scale: a single bundle is simpler to consume for a solo project. One `npm install @rlynjb/aptkit-core`, one version number, one clean clone — no juggling fifteen package versions that have to stay mutually compatible. The mechanism is `bundledDependencies` in `packages/core/package.json` (lines 48–64): it inlines all fifteen internal `@aptkit/*` packages into one standalone tarball, so the consumer never sees the internal package graph at all. And the contract surface is still clean inside the bundle — buffr imports `VectorStore`, `GemmaModelProvider`, `OllamaEmbeddingProvider` straight from `@rlynjb/aptkit-core` (see `buffr/src/pg-vector-store.ts` line 2 and `buffr/src/cli/ask-cmd.ts`). One install gives buffr everything; the bundling didn't cost the consumer anything.
+The defense is consumption simplicity for the actual scale: a single bundle is simpler to consume for a solo project. One `npm install @rlynjb/aptkit-core`, one version number, one clean clone — no juggling sixteen package versions that have to stay mutually compatible. The mechanism is `bundledDependencies` in `packages/core/package.json`: it inlines all sixteen internal `@aptkit/*` packages into one standalone tarball, so the consumer never sees the internal package graph at all. And the contract surface is still clean inside the bundle — buffr imports `VectorStore`, `GemmaModelProvider`, `OllamaEmbeddingProvider` straight from `@rlynjb/aptkit-core` (see `buffr/src/pg-vector-store.ts` line 2 and `buffr/src/cli/ask-cmd.ts`). One install gives buffr everything; the bundling didn't cost the consumer anything.
 
 When you'd flip it: multiple independent consumers needing different versions of different parts. The moment there are several teams each pulling a *subset* and each wanting to bump retrieval without bumping agents, the single-version bundle becomes the bottleneck and you split into separately-versioned packages. For a solo project with one real consumer (buffr), that day hasn't come, and pre-splitting would be versioning overhead with no payoff.
 
@@ -404,7 +404,7 @@ When you'd flip it: multiple independent consumers needing different versions of
 │                         │ clean clone. bundled-    │
 │                         │ Dependencies in core's   │
 │                         │ package.json inlines all │
-│                         │ 15 internal packages, so │
+│                         │ 16 internal packages, so │
 │                         │ buffr does one npm       │
 │                         │ install and imports the  │
 │                         │ contracts straight from  │
@@ -435,7 +435,7 @@ When you'd flip it: multiple independent consumers needing different versions of
         │
         ├─► IF THEY ASK "how does the bundling actually work"
         │     bundledDependencies in core/package.json inlines
-        │     all 15 @aptkit/* packages into one tarball via
+        │     all 16 @aptkit/* packages into one tarball via
         │     scripts/pack-core-standalone.mjs. The consumer
         │     never sees the internal graph.
         │
@@ -467,7 +467,7 @@ If you were starting aptkit today, the one decision you'd seriously revisit is t
 - **(a) Local Gemma vs frontier model** — *Counter:* a frontier model has native tool-calling and wouldn't need the emulation, the `minTopK` floor, or the hallucinated-filter guard; faster and more reliable. *Defense:* local-first was the explicit goal (cost/privacy/learning); the emulation is contained behind the `ModelProvider` contract, so the swap is one line at `ask.ts:52`. *Flip when:* reliability/latency matters more than local-first.
 - **(b) RAG from scratch vs LangChain/LlamaIndex** — *Counter:* a framework is faster to a demo and handles edge cases you hand-rolled. *Defense:* contracts (`contracts.ts`) gave zero-infra testability and "pattern over vendor"; this is a learning project where the substrate is the point, after already shipping framework RAG in AdvntrCue. *Flip when:* a production team on a deadline.
 - **(c) In-memory store first vs pgvector day one** — *Counter:* pgvector from the start skips the migration. *Defense:* in-memory proved the whole pipeline at zero infra; the `VectorStore` contract made `PgVectorStore` (buffr) a verified drop-in. This was deliberate sequencing, not debt — don't apologize. *Flip when:* essentially never for the build order.
-- **(d) One bundled core vs separate packages** — *Counter:* separate packages give finer versioning. *Defense:* one bundle is simpler to consume for a solo project — `bundledDependencies` inlines all 15 packages; buffr does one install. *Flip when:* multiple consumers need different versions of different parts.
+- **(d) One bundled core vs separate packages** — *Counter:* separate packages give finer versioning. *Defense:* one bundle is simpler to consume for a solo project — `bundledDependencies` inlines all 16 packages; buffr does one install. *Flip when:* multiple consumers need different versions of different parts.
 
 **Pull quotes:**
 
@@ -484,3 +484,6 @@ If you were starting aptkit today, the one decision you'd seriously revisit is t
 ```
 
 **What you'd change:** Only the model choice, and only because it's the decision most sensitive to a change in goal — keep local Gemma if the job is learning the substrate, start frontier if the job is reliable answers. Every reconsiderable decision in aptkit is contained behind a contract or a config value, so flipping any of them is localized, not a rewrite.
+
+---
+Updated: 2026-06-24 — Bundle count 15 → 16 (`@rlynjb/aptkit-core@0.4.1`, added `@aptkit/memory`). The four-decision matrix is unchanged; only the packaging counts were reconciled.

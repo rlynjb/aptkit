@@ -10,7 +10,7 @@ One diagram to anchor the whole book — when they say "walk me through it," thi
 
 ```
   aptkit — a provider-neutral toolkit for building LLM agents
-  published as @rlynjb/aptkit-core@0.4.0 (npm) · 15 packages in one bundle
+  published as @rlynjb/aptkit-core@0.4.1 (npm) · 16 packages in one bundle
 
   ┌─ Studio (apps/studio) ── React/Vite preview + NDJSON replay UI ──────────┐
   └──────────────────────────────────┬───────────────────────────────────────┘
@@ -41,6 +41,8 @@ One diagram to anchor the whole book — when they say "walk me through it," thi
 ```
 
 The two load-bearing ideas in that picture: **one `ModelProvider.complete()` contract** (swap any model, inject fixtures, chain fallbacks without touching an agent) and **the same contract shape reused for retrieval** (`VectorStore` — in-memory in aptkit, pgvector in buffr, one-line swap). If you can defend those two seams, you can defend the system.
+
+Two things grew in since this diagram first settled, and both reinforce the same two seams rather than adding new ones. First, `@aptkit/memory` — episodic conversation memory — now rides the *exact same* `EmbeddingProvider` + `VectorStore` contracts as retrieval, which is the clearest proof the abstraction paid off (the honest caveat: no aptkit agent wires it into its loop yet — buffr's chat runtime is the only consumer). Second, Studio grew off-shell pages beyond trace replay: an in-browser `rag-query` demo that runs the whole retrieval path deterministically and scores it live (precision@1 / recall@k), plus rendered doc pages (api-docs, user-guide). Neither changes the spine — they're more consumers of the contracts you already defend.
 
 ## The eight chapters
 
@@ -80,3 +82,6 @@ Be ready for it: **the internals of an ANN vector index (HNSW — how the naviga
 ## Where this connects
 
 This book is the **wide opener** — the whole-project defense. The **deep dives** live in the concept-level "Interview defense" blocks inside `.aipe/study-system-design/` (the architectural seams) and `.aipe/study-ai-engineering/` (RAG, embeddings, agentic retrieval, evals). When a chapter here points at a seam and says "the deep walk is in the study guide," that's where it goes. Read this book to defend the project; read those to defend the concepts underneath it.
+
+---
+Updated: 2026-06-24 — Bundle is now 16 packages at `@rlynjb/aptkit-core@0.4.1` (added `@aptkit/memory`); noted memory reusing the retrieval contracts and Studio's new off-shell pages (rag-query demo + doc pages).
