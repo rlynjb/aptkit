@@ -48,11 +48,18 @@ button {
 }
 
 .topbar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  margin-bottom: 18px;
+  /* Bleed out to the shell's edges so the black bar is flush, then pad the
+     content back so brand/nav line up with the page content below. */
+  margin: -24px -24px 18px;
+  padding: 14px 24px;
+  background: #000000;
 }
 
 .topbarLinks {

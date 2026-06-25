@@ -61,10 +61,9 @@ export function DocPage({
         <div className="docTitleRow">
           <button type="button" className="topbarLink" onClick={onHome}>
             <ArrowLeft size={15} />
-            <span>Studio</span>
+            <span>AptKit Studio</span>
           </button>
           <div>
-            <p className="eyebrow">AptKit Studio</p>
             <h1>{title}</h1>
           </div>
         </div>
