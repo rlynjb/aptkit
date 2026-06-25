@@ -100,6 +100,15 @@ export function StudioHome({ onOpen }: { onOpen: (view: StudioView, anchor?: str
         </div>
       </header>
 
+      <section className="homeIntro">
+        <p>
+          <strong>AptKit</strong> is a provider-neutral toolkit for building local-first LLM agents —
+          a bounded agent loop, swappable model providers, and a from-scratch RAG pipeline, all behind
+          small contracts. Studio replays each capability from recorded fixtures so you can read,
+          evaluate, and compare the output in the browser.
+        </p>
+      </section>
+
       <section className="capabilityGrid" aria-label="Available capabilities">
         <CapabilityCard
           icon={<CircleDollarSign size={20} />}

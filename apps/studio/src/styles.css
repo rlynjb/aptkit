@@ -479,6 +479,23 @@ h1 {
   margin-bottom: 16px;
 }
 
+.homeIntro {
+  margin-bottom: 22px;
+}
+
+.homeIntro p {
+  margin: 0;
+  max-width: 70ch;
+  color: #b0b0b0;
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+.homeIntro strong {
+  color: #ededed;
+  font-weight: 700;
+}
+
 .capabilityGrid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
