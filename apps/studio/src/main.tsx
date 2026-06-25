@@ -15,39 +15,75 @@ import './styles.css';
 
 const REPO_DOCS = 'https://github.com/rlynjb/aptkit/blob/main/docs';
 
-function App() {
-  const [view, setView] = React.useState<StudioView>('home');
-  const [docAnchor, setDocAnchor] = React.useState<string>();
+// Hash routing: every view has a URL (#api-docs, #user-guide, #rag-query, …) so
+// pages are linkable, bookmarkable, and survive a refresh. Hash-based because the
+// GitHub Pages deploy is static (no SPA/404 fallback) and served under /aptkit/.
+// Doc sections live after a slash (#api-docs/conversation-memory) so the existing
+// slug anchors keep working without colliding with the route.
+const VIEW_TOKENS: StudioView[] = [
+  'recommendation',
+  'monitoring',
+  'diagnostic',
+  'query',
+  'rubric-improvement',
+  'rag-query',
+  'api-docs',
+  'user-guide',
+];
 
-  // Navigate, optionally carrying a doc section to scroll to (used by the
-  // home package list to deep-link into the API Reference).
-  const openView = (next: StudioView, anchor?: string) => {
-    setDocAnchor(anchor);
-    setView(next);
+function parseHash(): { view: StudioView; anchor?: string } {
+  const raw = window.location.hash.replace(/^#\/?/, '');
+  if (!raw) return { view: 'home' };
+  const slash = raw.indexOf('/');
+  const token = slash === -1 ? raw : raw.slice(0, slash);
+  const anchor = slash === -1 ? undefined : raw.slice(slash + 1) || undefined;
+  const view = (VIEW_TOKENS as string[]).includes(token) ? (token as StudioView) : 'home';
+  return { view, anchor: view === 'home' ? undefined : anchor };
+}
+
+function App() {
+  const [route, setRoute] = React.useState(parseHash);
+
+  React.useEffect(() => {
+    const onHashChange = () => setRoute(parseHash());
+    window.addEventListener('hashchange', onHashChange);
+    return () => window.removeEventListener('hashchange', onHashChange);
+  }, []);
+
+  const navigate = (next: StudioView, anchor?: string) => {
+    const hash = next === 'home' ? '' : anchor ? `${next}/${anchor}` : next;
+    if (window.location.hash.replace(/^#\/?/, '') === hash) {
+      setRoute(parseHash()); // already on this hash; sync state without a hashchange
+      return;
+    }
+    window.location.hash = hash; // fires hashchange -> setRoute
   };
 
+  const { view, anchor } = route;
+  const home = () => navigate('home');
+
   if (view === 'recommendation') {
-    return <RecommendationWorkspace onHome={() => setView('home')} />;
+    return <RecommendationWorkspace onHome={home} />;
   }
 
   if (view === 'monitoring') {
-    return <MonitoringWorkspace onHome={() => setView('home')} />;
+    return <MonitoringWorkspace onHome={home} />;
   }
 
   if (view === 'diagnostic') {
-    return <DiagnosticWorkspace onHome={() => setView('home')} />;
+    return <DiagnosticWorkspace onHome={home} />;
   }
 
   if (view === 'query') {
-    return <QueryWorkspace onHome={() => setView('home')} />;
+    return <QueryWorkspace onHome={home} />;
   }
 
   if (view === 'rubric-improvement') {
-    return <RubricImprovementWorkspace onHome={() => setView('home')} />;
+    return <RubricImprovementWorkspace onHome={home} />;
   }
 
   if (view === 'rag-query') {
-    return <RagQueryWorkspace onHome={() => setView('home')} />;
+    return <RagQueryWorkspace onHome={home} />;
   }
 
   if (view === 'api-docs') {
@@ -56,8 +92,9 @@ function App() {
         title="API Reference"
         markdown={coreApiMarkdown}
         sourceHref={`${REPO_DOCS}/core-api.md`}
-        onHome={() => setView('home')}
-        anchor={docAnchor}
+        onHome={home}
+        routeToken="api-docs"
+        anchor={anchor}
       />
     );
   }
@@ -68,12 +105,14 @@ function App() {
         title="Studio Guide — Reading & Evaluating Output"
         markdown={userGuideMarkdown}
         sourceHref={`${REPO_DOCS}/studio-guide.md`}
-        onHome={() => setView('home')}
+        onHome={home}
+        routeToken="user-guide"
+        anchor={anchor}
       />
     );
   }
 
-  return <StudioHome onOpen={openView} />;
+  return <StudioHome onOpen={navigate} />;
 }
 
 const rootHost = window as Window & { __aptkitStudioRoot?: ReturnType<typeof createRoot> };

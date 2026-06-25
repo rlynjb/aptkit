@@ -32,21 +32,27 @@ export function DocPage({
   markdown,
   sourceHref,
   onHome,
+  routeToken,
   anchor,
 }: {
   title: string;
   markdown: string;
   sourceHref: string;
   onHome: () => void;
+  /** This page's route segment (e.g. 'api-docs'), used to build section hash links. */
+  routeToken: string;
   anchor?: string;
 }) {
   const toc = React.useMemo(() => buildToc(markdown), [markdown]);
 
-  // When opened with a target section (e.g. from the Studio home package list),
-  // scroll to that heading once the markdown has rendered.
+  // When a target section is in the route (e.g. #api-docs/conversation-memory),
+  // scroll to that heading after the markdown has rendered and laid out.
   React.useEffect(() => {
     if (!anchor) return;
-    document.getElementById(anchor)?.scrollIntoView({ block: 'start' });
+    const id = window.requestAnimationFrame(() => {
+      document.getElementById(anchor)?.scrollIntoView({ block: 'start' });
+    });
+    return () => window.cancelAnimationFrame(id);
   }, [anchor]);
 
   return (
@@ -77,7 +83,7 @@ export function DocPage({
             <ul>
               {toc.map((entry) => (
                 <li key={entry.slug}>
-                  <a className={`docTocLink h${entry.depth}`} href={`#${entry.slug}`}>
+                  <a className={`docTocLink h${entry.depth}`} href={`#${routeToken}/${entry.slug}`}>
                     {entry.text}
                   </a>
                 </li>
