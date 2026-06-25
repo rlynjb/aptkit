@@ -40,6 +40,13 @@ button {
   margin: 0 auto;
 }
 
+/* Doc pages: constrain the whole page (header + content) to the content
+   column width so the header lines up with the doc text instead of the window. */
+.shellDoc {
+  max-width: 1120px;
+  margin: 0 auto;
+}
+
 .topbar {
   display: flex;
   align-items: center;
@@ -517,7 +524,6 @@ h1 {
 /* Optional description under a section label (pulled up tight beneath it). */
 .sectionLead {
   margin: -16px 0 22px;
-  max-width: 64ch;
   color: #8f8f8f;
   font-size: 13px;
   line-height: 1.55;

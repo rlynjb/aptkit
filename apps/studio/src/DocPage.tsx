@@ -56,7 +56,7 @@ export function DocPage({
   }, [anchor]);
 
   return (
-    <main className="shell">
+    <main className="shell shellDoc">
       <header className="topbar">
         <div className="docTitleRow">
           <button type="button" className="topbarLink" onClick={onHome}>
