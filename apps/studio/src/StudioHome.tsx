@@ -69,7 +69,6 @@ export function StudioHome({ onOpen }: { onOpen: (view: StudioView, anchor?: str
       <header className="topbar">
         <div>
           <p className="eyebrow">AptKit Studio</p>
-          <h1>Capability Gallery</h1>
         </div>
         <div className="topbarLinks">
           <button type="button" className="topbarLink" onClick={() => onOpen('api-docs')}>

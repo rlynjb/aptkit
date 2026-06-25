@@ -151,6 +151,7 @@ button {
 .docPage h4 {
   line-height: 1.25;
   margin: 1.6em 0 0.6em;
+  color: #a78bfa;
 }
 
 .docPage h1 { font-size: 1.7rem; }
@@ -422,7 +423,7 @@ button {
 
 .eyebrow {
   margin: 0 0 4px;
-  color: #8f8f8f;
+  color: #a78bfa;
   font-size: 12px;
   font-weight: 700;
   text-transform: uppercase;
@@ -433,6 +434,7 @@ h1 {
   font-size: 30px;
   line-height: 1.1;
   letter-spacing: 0;
+  color: #a78bfa;
 }
 
 .answerText {
@@ -491,7 +493,7 @@ h1 {
 .packageListHeader h2 {
   margin: 0;
   font-size: 18px;
-  color: #cecece;
+  color: #a78bfa;
 }
 
 .packageListHeader p {
@@ -512,20 +514,18 @@ h1 {
 
 .packageList li button {
   display: grid;
-  gap: 6px;
+  gap: 4px;
   width: 100%;
   text-align: left;
-  padding: 14px 16px;
-  border: 1px solid #313131;
-  border-radius: 8px;
-  background: #121212;
+  padding: 6px 0;
+  border: 0;
+  background: none;
   cursor: pointer;
   font: inherit;
 }
 
-.packageList li button:hover {
-  border-color: #484848;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.45);
+.packageList li button:hover .packageName code {
+  color: #ef4444;
 }
 
 .packageList li button:focus-visible {
@@ -543,11 +543,7 @@ h1 {
 .packageName code {
   font-size: 13px;
   font-weight: 600;
-  color: #bdbdbd;
-  background: #1a1a1a;
-  border: 1px solid #2d2d2d;
-  border-radius: 5px;
-  padding: 2px 7px;
+  color: #d1d1d1;
 }
 
 .packageName svg {
@@ -617,7 +613,7 @@ h1 {
 
 .capabilityCard h2 {
   margin: 0;
-  color: #d1d1d1;
+  color: #a78bfa;
   font-size: 22px;
   line-height: 1.2;
   letter-spacing: 0;
