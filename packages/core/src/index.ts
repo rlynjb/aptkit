@@ -5,6 +5,7 @@ export * from '@aptkit/prompts';
 export * from '@aptkit/evals';
 export * from '@aptkit/workflows';
 export * from '@aptkit/retrieval';
+export * from '@aptkit/memory';
 export * from '@aptkit/provider-gemma';
 export * from '@aptkit/provider-local';
 export * from '@aptkit/agent-recommendation';

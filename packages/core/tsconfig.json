@@ -15,6 +15,7 @@
     { "path": "../agents/rubric-improvement" },
     { "path": "../context" },
     { "path": "../evals" },
+    { "path": "../memory" },
     { "path": "../prompts" },
     { "path": "../providers/gemma" },
     { "path": "../providers/local" },
