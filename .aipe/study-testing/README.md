@@ -1,93 +1,84 @@
-# Study — Testing & Correctness · AptKit
+# Study — Testing & Correctness (aptkit)
 
-The question this guide answers: **how do you know the code works — and will keep
-working after the next change — when the most interesting part of the system is a
-non-deterministic LLM?**
+How do you *know* this code works — and will keep working after the next
+change? A good suite tells you what a change broke before your users do. A
+suite that doesn't is decoration. This guide audits aptkit's tests against
+that bar.
 
-That last clause is the whole story for AptKit. Most of the repo is ordinary
-deterministic TypeScript (a tool registry, a prompt renderer, a usage ledger) and
-gets ordinary unit tests. But the agents call a model, and a model is not
-deterministic — you cannot assert `equals` on its output. AptKit's answer is to
-build a **deterministic harness around the non-deterministic core**: record the
-model's responses once, replay them forever, and assert on the replay. That seam
-is what makes this repo worth a testing study.
+The headline: aptkit's tests are unusually good for a one-person repo. Zero
+test dependencies (`node --test`, the built-in runner), TDD throughout, and a
+**single load-bearing design move** that makes everything testable — every
+expensive seam (the model, the embedder, the vector store, the transport) is
+an *injected contract*, so a fake slots in where production wires a real one.
+The same `ModelProvider` boundary that buys provider-swap and fallback is what
+lets a recorded Gemma reply replace a live `:11434` call in a unit test.
 
-The recent RAG / personal-agent packages (a Gemma provider, a retrieval stack, a
-profile injector, a precision@k metric, a `rag-query` agent, and `@aptkit/memory`)
-push this further with a **second, finer isolation seam**: inject the HTTP transport
-*inside* a provider — or the vector store *inside* the engine — so the real decode /
-recall logic runs against recorded bytes and an in-memory store, with no live Ollama.
-That's `06-injectable-transport.md` — the new pattern, sitting one layer below the
-replay seam. `@aptkit/memory` is the latest instance: its store is injected, so the
-remember→recall round-trip, the kind-filter on a shared store, the dimension guard,
-and the `search_memory` tool are all tested with `InMemoryVectorStore` + a fake
-embedder (`packages/memory/test/`, 5 cases). (The vector store's pg integration
-tests, DATABASE_URL-gated, live in a separate repo, buffr, and are out of scope
-here.)
-
-## The seam that organizes everything
+## The seam that organizes this whole guide: determinism
 
 ```
-  Two kinds of correctness check — know which half you're in
+  The fault line — which half is a finding here vs in study-ai-engineering
 
-  ┌─ DETERMINISTIC (this guide) ─────────────────────────────┐
-  │  given a known input, assert a known output.             │
-  │  node --test, equals, deepEqual, fixture replay.         │
-  │  "did this break?" → red/green, no judgment call.        │
-  └──────────────────────────────────────────────────────────┘
-                            │  meets at the agent boundary
-                            ▼
-  ┌─ PROBABILISTIC (study-ai-engineering) ───────────────────┐
-  │  given a live model output, is it good enough / did it   │
-  │  regress? rubric LLM-as-judge, detection scoring.        │
-  │  "is this good?" → a score, a verdict, not a hard equal. │
-  └──────────────────────────────────────────────────────────┘
+  ┌─ TESTING (here) ─────────────────────────────┐
+  │  assertion = "equals the expected value"      │
+  │  given known input → assert known output      │
+  │  unit · integration · contract · regression   │
+  └───────────────────────────────────────────────┘
+                      │  they MEET when you test an AI feature:
+                      │  a deterministic harness wrapping a
+                      ▼  probabilistic core
+  ┌─ EVALUATION (study-ai-engineering) ──────────┐
+  │  assertion = "good enough / didn't regress"   │
+  │  non-deterministic model output, scored        │
+  │  precision@k · LLM-as-judge · rubric scoring   │
+  └───────────────────────────────────────────────┘
 ```
 
-AptKit straddles the line on purpose. The structural-diff assertions, the fixture
-replay, the Playwright smoke — all deterministic, all here. The rubric judge that
-scores prose quality with another model call — that's probabilistic evaluation,
-and the deep teaching of *why you'd score instead of assert* lives in
-`study-ai-engineering`. This guide covers it only as a tested seam: the judge's
-prompt assembly and output validation are deterministic and ARE tested here.
+aptkit is interesting precisely because it sits on this fault line. The
+`scorePrecisionAtK` / `RubricJudge` machinery is an *evaluation* tool — but
+its own tests (`packages/evals/test/*`) are pure *testing*: known ranking,
+known relevant set, precision computed by hand, `assert.equal(score, 2/3)`.
+The eval logic is deterministic and unit-tested here; the model output it
+scores is probabilistic and belongs to study-ai-engineering. Every finding
+below states which half it's on.
+
+## What's in this folder
+
+- `audit.md` — Pass 1. The 7-lens audit. Walks coverage, levels, design
+  pressure, determinism, error paths, AI-feature testing, and a red-flag
+  capstone. Start here for the verdict.
+- `01-injectable-transport-seam.md` — the kernel pattern. Every provider takes
+  its I/O as a constructor arg (`chat`, `embed`, an array of providers), so
+  tests feed recorded bytes with no network. This is why the suite has zero
+  network dependencies.
+- `02-fixture-replay-golden-master.md` — `FixtureModelProvider` replays
+  recorded `ModelResponse[]` deterministically; promoted fixtures are
+  timestamped correctness baselines. Regression-tests agent trajectories
+  across model/prompt changes.
+- `03-regression-test-from-a-real-bug.md` — the `{textContains}` hallucinated
+  filter bug → a test asserting a hallucinated filter key returns non-empty.
+  A real bug pinned by a named test.
+- `04-deterministic-eval-scorers.md` — the testing half of the eval seam:
+  precision@k, detection-scorer, structural-diff scored against hand-computed
+  expected values. Where testing meets evaluation.
+- `05-db-integration-serialized.md` — buffr's `PgVectorStore` tests run against
+  real Postgres with `--test-concurrency=1` and a `skip` guard when
+  `DATABASE_URL` is unset. The one true integration layer in the system.
 
 ## Reading order
 
-1. **`audit.md`** — the 7-lens audit. Start here. It's the risk map: what's tested,
-   what isn't, where the gaps are, marked honestly. Every other file is a deep-dive
-   on something the audit flags.
-2. **`01-replay-as-test.md`** — the load-bearing pattern. `FixtureModelProvider`
-   replays recorded `ModelResponse[]` so an agent test never calls a live model.
-   Read this before anything else in Pass 2.
-3. **`02-structural-shape-assertions.md`** — how you assert on LLM JSON without
-   pinning exact strings: required-path + rule-based structural diff.
-4. **`03-promote-to-fixture-baseline.md`** — the golden-master lifecycle: a live run
-   becomes a saved artifact, gets eval'd, then gets promoted into a frozen
-   regression baseline.
-5. **`04-detection-scoring.md`** — matched/missed/unexpected scoring for the
-   anomaly detector, the half-step from assertion toward evaluation.
-6. **`05-playwright-smoke-gate.md`** — the one E2E test: does the Studio UI still
-   wire up and run fixtures end to end?
-7. **`06-injectable-transport.md`** — the newest pattern, from the RAG / Gemma
-   packages: a *finer* isolation seam below the provider. Inject the HTTP transport
-   so the real provider decode (Gemma's tool-call emulation, the embedder) runs
-   against recorded bytes with no live Ollama. Read after `01` — it's the seam that
-   sits one layer beneath it.
+1. `audit.md` — the map and the verdict.
+2. `01` and `02` — the two patterns that make everything else testable.
+3. `03`, `04`, `05` — the specific techniques worth naming.
 
-## Cross-links to other study guides
+## Cross-links to other guides
 
-- **`study-ai-engineering`** — the probabilistic half: rubric judge as eval, the
-  eval-set discipline, regression-by-score. This guide tests the harness; that one
-  evaluates the model.
-- **`study-data-modeling`** — replay artifacts and fixtures are this repo's data
-  model, and here they double as test data. The artifact schema (`schemaVersion`,
-  `trace`, `eval`, `modelTurns`) is the contract both guides lean on.
-- **`study-system-design`** — the `ModelProvider` seam. The reason testing is
-  cheap here is the same reason the architecture is clean: everything depends on
-  `ModelProvider.complete()`, so the test swaps a fixture provider for a live one
-  at exactly that seam.
-- **`study-debugging-observability`** — `CapabilityEvent` traces are evidence. The
-  same NDJSON trace that debugs a run is asserted on in tests (`events.map(e => e.type)`).
-- **`study-software-design`** — "hard to test" as a design smell. AptKit's agents
-  are easy to test *because* the provider is injected; that's a deep-module win
-  covered there, referenced not re-audited here.
+- **study-ai-engineering** — the *evaluation* half. The rubric-judge as
+  LLM-as-judge, the eval-set design, precision@k as a retrieval metric (not
+  as a unit-test assertion). This guide tests the scorers; that guide uses
+  them to grade models.
+- **study-software-design** — "hard to test" is a design smell there, not
+  re-audited here. aptkit's testability is downstream of its deep-module /
+  injected-contract design; lens 3 below cross-links rather than duplicates.
+- **study-debugging-observability** — the `CapabilityEvent` trace that tests
+  assert on (`events.map(e => e.type)`) is the same trace that powers Studio
+  replay and NDJSON observability. Tests and observability share one stream.

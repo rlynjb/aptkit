@@ -1,305 +1,181 @@
-# 07 — Timeouts, retries, pooling, and backpressure
+# Timeouts, Retries, Pooling, and Backpressure
 
-**Industry name(s):** failure handling / cancellation / failover / connection pooling. **Type:** Industry standard (the patterns); Project-specific (the fallback chain).
+**Industry name:** resilience patterns / deadline propagation / connection pooling / flow control · *Industry standard*
 
-## Zoom out — where this concept lives
+## Zoom out, then zoom in
 
-This file covers what happens when the network doesn't cooperate — slow, failing, or overloaded. The repo's own answer lives at the application layer (the fallback chain) and in cancellation (`AbortSignal`); the transport-layer answers (pooling, SDK retries) are delegated.
+This is the file about what keeps a network call from hanging, retrying forever, or drowning a downstream. It's also the file with the sharpest honest gap in the repo.
 
 ```
-  Zoom out — failure handling, split across layers
+  Zoom out — where resilience controls live (and don't)
 
-  ┌─ UI (browser) ────────────────────────────────────────────┐
-  │  AbortSignal can cancel a run → stops the stream decode     │
+  ┌─ Service layer ────────────────────────────────────────────┐
+  │  agent loop: maxTurns bound (caps total work)              │
+  │  FallbackModelProvider: retries across PROVIDERS, not hops │
   └───────────────────────────┬────────────────────────────────┘
-                              │  signal threads down
-  ┌─ Service (Node) ──────────▼────────────────────────────────┐
-  │  ★ FallbackModelProvider: app-level failover (built) ★      │
-  │  AbortSignal → SDK call cancellation                        │
+                              │
+  ┌─ Provider layer ─────────▼─────────────────────────────────┐
+  │  Gemma fetch: AbortSignal pass-through ✓ ... but NO timeout │ ← ★ the gap ★
+  │  Ollama embed fetch: same — NO timeout                     │
   └───────────────────────────┬────────────────────────────────┘
-                              │  delegated: timeouts, retries, pooling
-  ┌─ Provider (SDK) ──────────▼────────────────────────────────┐
-  │  SDK owns: socket pool, per-request timeout, 5xx retries    │
-  └──────────────────────────────────────────────────────────────┘
+                              │
+  ┌─ Storage layer (buffr) ──▼─────────────────────────────────┐
+  │  pg.Pool: bounded connections = the system's only real     │
+  │    backpressure (connect() queues when all are busy)        │
+  └────────────────────────────────────────────────────────────┘
 ```
 
-## Zoom in — narrow to the concept
+**Zoom in.** Verdict first: **the repo has cancellation but no deadline, retries across providers but not across network attempts, and backpressure only in buffr's pool.** The Ollama `fetch` honors a caller's `AbortSignal` but sets no timeout of its own — so a wedged daemon hangs until something else aborts it. The pattern to learn: **resilience is four separate knobs — timeout, retry, pool, backpressure — and a system can have some and not others; naming which is which is the skill.**
 
-Verdict first: AptKit's failure story is mostly **failover, not retry** — *with one new exception*. When a cloud provider call throws, the `FallbackModelProvider` moves to the next provider in the chain — it does not back off and retry the *same* provider, and it does not distinguish a 429 rate-limit from a 500 from a timeout. There's no jitter, no backoff curve, no circuit breaker. The exception, new this session: `GemmaModelProvider` *does* run a real repo-owned retry loop — but it retries for a *parsing* failure, not a *network* failure. If Gemma returns a malformed tool-call JSON, the provider re-asks (up to `maxToolCallAttempts`, default 2) with a corrective nudge appended (`gemma-provider.ts:62-89`). That's the repo's first hand-written retry loop, and it's worth seeing precisely because it is *not* a network retry — a 500 from Ollama still throws on the first try and bubbles straight up. Cancellation stays clean and first-class: one `AbortSignal` cancels the cloud SDK call, the Gemma `fetch`, and the downstream stream decode. Timeouts: the cloud SDK sets one; the Ollama `fetch` sets *none*. This file is honest about what's built, what's delegated, and what's genuinely missing.
+## Structure pass
 
-## The structure pass
+**Layers:** caller (sets deadlines, ideally) → transport (`fetch` / `pg.Pool`) → downstream.
 
-**Layers.** Cancellation layer (`AbortSignal`, repo-owned, threads everywhere). Failover layer (`FallbackModelProvider`, repo-owned, app-level). Transport-resilience layer (timeouts, retries, pooling — SDK-owned).
-
-**Axis — failure (where does it originate, propagate, get contained?).**
+**Axis — "what stops this from waiting forever or overloading the next layer?"** Trace each knob:
 
 ```
-  One axis (failure containment) down the stack
+  Axis — what bounds the work — knob by knob
 
-  ┌─ fallback chain ──┐  → CONTAINS: catches throw, tries next provider
-  ┌─ provider.complete┐  → PROPAGATES: SDK throws on timeout/5xx/network
-  ┌─ SDK transport ───┐  → ORIGINATES + partially absorbs (its own retries)
-
-  failure is born in the SDK, may be absorbed by SDK retries, propagates as a
-  throw, and is finally contained by the fallback chain switching providers
+  knob          where it lives                       present?
+  ────────────────────────────────────────────────────────────────
+  cancellation  request.signal → fetch signal        YES (pass-through)
+  timeout       (would be AbortSignal.timeout)        NO  ← the gap
+  retry (net)   none at the HTTP layer                NO
+  retry (logic) tool-call parse-retry in Gemma        YES (app-level)
+  fallback      FallbackModelProvider across providers YES (different mechanism)
+  pool          buffr pg.Pool                          YES (buffr only)
+  backpressure  pg.Pool connection cap (queues)        YES (buffr only)
+  iteration cap agent loop maxTurns                    YES (bounds the loop)
 ```
 
-The containment answer flips at the fallback boundary: below it, failure propagates as exceptions; at it, failure is swallowed and converted into "try the next provider." That seam is the repo's entire network-failure strategy.
-
-**Seams.** The load-bearing seam is the `try/catch` in `FallbackModelProvider.complete()` (`fallback-provider.ts:54-85`): it's where a thrown network error becomes a failover decision. The second seam is `signal?.throwIfAborted()` (`run-agent-loop.ts:99`, `fallback-provider.ts:52`): the point where a user cancel short-circuits everything, and crucially where the chain *refuses* to treat an abort as a fallback-worthy error.
+**Seam:** the seam is `request.signal` — the boundary where a caller's intent to cancel crosses into the transport. It's wired (the signal is forwarded), but nothing upstream ever attaches a *deadline* to that signal, so the wire is there with no current to run through it.
 
 ## How it works
 
-### Move 1 — the mental model
+#### Move 1 — the mental model
 
-You know how a `try/catch` around a `fetch` lets you fall back to a cached value when the network dies? The fallback chain is that, looped over a list of providers: try provider 1, catch, try provider 2, catch, … give up. And cancellation is the `AbortController` you already pass to `fetch` — same `signal`, threaded through one extra layer (the `ModelRequest`) into the SDK.
-
-```
-  The failover-loop shape
-
-  for each provider in [primary, ...fallbacks]:
-      check abort                       ← bail immediately if cancelled
-      try:    return provider.complete()  ← success → done
-      catch:  if abort → rethrow (not a fallback)
-              record attempt
-              continue to next provider
-  all failed → throw ProviderFallbackError(attempts)
-```
-
-### Move 2 — the load-bearing skeleton
-
-**The kernel:** `ordered provider list` + `try each in turn` + `abort-aware short-circuit` + `record-and-continue on failure` + `give-up error carrying all attempts`.
-
-**Part 1 — the ordered list (failover order).** Providers are tried in array order: `[primary, ...fallbacks]`. **What breaks without it:** no list, no failover — a single provider failure is fatal. The order encodes preference (try the configured primary first).
-
-**Part 2 — try-each-in-turn (the loop).** A `for` loop calls `provider.complete(request)`; the first success returns immediately. **What breaks without it:** you'd only ever try one provider.
-
-**Part 3 — the abort short-circuit (don't fail over a cancel).** Before each attempt, `request.signal?.throwIfAborted()`. Inside the catch, `if (isAbortError(error) || request.signal?.aborted) throw error` — an abort is rethrown, *not* recorded as a failed attempt. **What breaks without it:** a user cancel would be mistaken for a provider failure, and the chain would pointlessly hammer every remaining provider with a request the user already abandoned. This is the part that's easy to forget — and getting it wrong wastes money and time on cancelled work.
+Think of a `fetch` with a loading spinner that never stops. The request went out, the server is stuck, and your UI waits forever because nothing told `fetch` "give up after N seconds." That's a missing timeout. The four resilience knobs answer four different "what if" questions:
 
 ```
-  Abort short-circuit — a cancel is NOT a fallback trigger
+  The pattern — four independent knobs
 
-  user aborts → signal.aborted = true
-       │
-  loop: throwIfAborted() → throws immediately, no more providers tried
-  catch: isAbortError? → rethrow, do NOT push to attempts[]
-       │
-       └─ without this, cancel → "provider failed" → try next → waste
+  timeout   ──► "what if it never answers?"     bound the WAIT
+  retry     ──► "what if it fails transiently?" try AGAIN (with backoff)
+  pool      ──► "what if I call it constantly?" REUSE connections
+  backpressure ► "what if I call faster than    SLOW the caller down
+                  it can serve?"
 ```
 
-**Part 4 — record-and-continue (failover proper).** On a non-abort error, push `{providerId, model, error}` to `attempts[]`, emit a `warning` trace event, and continue to the next provider. **What breaks without it:** you'd lose the diagnostic trail of *why* each provider failed.
+The part people conflate: **a retry without a timeout is useless** — if the first attempt hangs forever, you never reach the retry. And **fallback (try a different provider) is not retry (try the same call again)**. The repo has fallback and app-level parse-retry but no network timeout, which is precisely the dangerous combination.
 
-**Part 5 — the give-up error (`ProviderFallbackError`).** If every provider fails, throw `ProviderFallbackError(attempts)` — one error carrying every attempt's failure message. **What breaks without it:** the caller would only see the last provider's error, not the full picture of "openai: quota; anthropic: timeout."
+#### Move 2 — walking the knobs in this repo
 
-```
-  Give-up — one error carries the whole failure history
+**Cancellation is wired; the deadline is missing.** The Gemma transport forwards `request.signal` into `fetch` (`packages/providers/gemma/src/gemma-provider.ts:203-209`):
 
-  ProviderFallbackError:
-    "all model providers failed: openai: rate_limit; anthropic: 500"
-       │
-       └─ the .attempts array is the post-mortem: every provider, every reason
-```
-
-### Move 2.5 — what's delegated and what's missing (honest)
-
-The kernel above is the *whole* repo-owned failure strategy. Everything else is delegated or absent.
-
-```
-  Comparison — built vs delegated vs missing
-
-  BUILT (repo):     failover across providers, abort short-circuit,
-                    attempt recording, give-up error,
-                    Gemma's PARSE-retry loop (malformed JSON → re-ask)
-  DELEGATED (SDK):  per-request timeout, retry on 5xx/network,
-                    connection pool / keep-alive  ── cloud providers only
-  MISSING:          backoff + jitter on the SAME provider,
-                    429-specific handling (Retry-After),
-                    circuit breaker (cooldown after repeated failures),
-                    ANY timeout on the local Ollama fetch (B3),
-                    network-level retry for Gemma (it only retries PARSING)
+```ts
+return async ({ signal, ...payload }) => {
+  const res = await fetch(`${base}/api/chat`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(payload),
+    ...(signal ? { signal } : {}),   // ✓ if a caller aborts, fetch aborts
+  });                                 // ✗ but nothing sets a timeout-based signal
+  // ...
+};
 ```
 
-**Gemma's retry loop is a parse-retry, not a network-retry — know the difference.** This is the repo's only hand-written retry, and it's easy to mistake for resilience it doesn't provide. The loop in `gemma-provider.ts:62-89` runs up to `maxToolCallAttempts` times; on each pass it sends the chat request, and if the model's reply *looks like a botched tool call* (`looksLikeToolAttempt` — a `{` in the text, `gemma-provider.ts:185`), it appends a corrective nudge and asks again. What it retries is the model getting the *JSON shape* wrong. What it does **not** retry is the HTTP call failing: a non-2xx from Ollama throws inside the transport (`gemma-provider.ts:210`) and propagates out of the loop on the first attempt — there's no catch, no backoff, no second network try.
+And `complete()` checks the signal between attempts (`gemma-provider.ts:52,63`: `request.signal?.throwIfAborted()`). So cancellation *works* — if a caller passes an `AbortSignal` that fires, the call unwinds cleanly. The gap: **no code in the repo constructs an `AbortSignal.timeout(ms)` and passes it in.** A wedged Ollama (model loading, GPU stuck, daemon hung) leaves the `fetch` pending with no deadline. The embedding transport has the identical shape and identical gap (`packages/retrieval/src/ollama-embedding-provider.ts:62-68`).
 
 ```
-  Gemma's loop — retries the MODEL's output, not the WIRE
+  Layers-and-hops — the missing deadline
 
-  for attempt in 0..maxToolCallAttempts:
-      check abort
-      resp = await chat(messages)        ← network error here → THROWS, loop ends
-      if wantsTool:
-          call = parseToolCall(resp)
-          if call: return tool_use        ← good JSON → done
-          if looksLikeToolAttempt(resp):  ← bad JSON → nudge + retry
-              continue
-      break                               ← plain prose is a real answer
-  return text(resp)
-       │
-       └─ the retry covers a malformed tool call, NOT a failed HTTP request.
-          A 500 from Ollama is a first-try throw, same as a cloud SDK exhausting
-          its own retries — except Ollama has NO retries underneath to exhaust.
+  ┌─ caller (agent loop) ──────┐   no AbortSignal.timeout attached
+  │  model.complete(request)   │ ─────────────────────────────────┐
+  └────────────────────────────┘                                   │
+                              request.signal (maybe present,        │
+                              but never a timeout)                  ▼
+  ┌─ transport ────────────────────────────────────────────────────┐
+  │  fetch(..., { signal })  ── hangs indefinitely if Ollama wedged │
+  └──────────────────────────┬──────────────────────────────────────┘
+                  hop C: HTTP │ ... no response ...
+                             ▼
+                      ┌─ Ollama (stuck) ─┐
+                      │ never replies     │
+                      └───────────────────┘
 ```
 
-**The local fetch has no timeout — a wedged Ollama hangs on the signal, or forever.** Neither `gemma-provider.ts:202-215` nor `ollama-embedding-provider.ts:60-74` passes a timeout to `fetch`. If the Ollama daemon accepts the connection but never responds (model loading, OOM, stuck), the `await fetch(...)` blocks indefinitely. The only escape is the `AbortSignal`: Gemma threads `request.signal` into the transport (`gemma-provider.ts:73`) and the embedder threads `options.signal` (`ollama-embedding-provider.ts:55`), so a caller-driven cancel *can* unwedge it. But if no signal is passed — which is the case for a bare `embedder.embed(texts)` call with no options — the request can hang with nothing to cancel it. Unlike the cloud SDK, there's no built-in default timeout underneath to backstop this.
+**The fix is one line and it's not in the repo.** A `signal: AbortSignal.timeout(30_000)` (or merging a timeout with the caller's signal) in `defaultHttpTransport` would bound the wait. That's the move — named here, not present in the code.
 
-**Timeouts and same-provider retries are the SDK's.** The repo sets no timeout and no retry count on the provider call. Both SDKs have built-in defaults (a request timeout, automatic retries on transient 5xx/network errors with their own backoff). So a *transient blip* is absorbed by the SDK before the fallback chain ever sees it; the fallback chain only engages when the SDK has *exhausted its own retries* and thrown.
+**Retry exists, but at the application layer, not the network layer.** Gemma's `complete()` retries the *model call* when the response isn't a valid tool call, appending a corrective nudge (`gemma-provider.ts:57-89`):
 
+```ts
+const maxAttempts = wantsTool ? this.maxToolCallAttempts : 1;  // default 2
+for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+  const messages = attempt === 0 ? baseMessages : [...baseMessages, { role: 'user', content: RETRY_NUDGE }];
+  lastResponse = await this.chat({ ... });        // each attempt is a fresh HTTP call
+  const call = parseToolCall(raw);
+  if (call) return ...;                            // good tool call → done
+  if (looksLikeToolAttempt(raw)) continue;         // botched JSON → retry with nudge
+  break;
+}
 ```
-  Two-level failure handling — SDK retries first, THEN failover
 
-  provider.complete()
-       │  SDK: retry transient errors (own backoff) ── absorbs blips
-       ▼  still failing → throw
-  fallback chain: catch → next provider ── absorbs provider-level outages
-```
+This is a *semantic* retry (the model produced bad JSON), not a *transport* retry (the network failed). There's no backoff, no jitter — and critically, since each attempt is a `fetch` with no timeout, a hang on attempt 1 means the retry never runs.
 
-**The notable gap: failover treats every error the same.** A 429 (rate-limited, *retry me later*) gets the identical treatment as a 500 (server error, *try elsewhere*): switch providers. For a 429, the textbook move is back off and retry the *same* provider after `Retry-After` — switching providers might just hit the same rate-limit policy on the other one. AptKit doesn't do this. **Why it's still the right call here:** with a two-provider chain and no sustained traffic, switching to the other provider *is* a reasonable response to a 429 (the other provider has independent quota), and adding per-status-code logic would be complexity the use case doesn't need. The honest cost: at higher volume, you'd want 429-aware backoff so you don't exhaust both providers' quotas in lockstep. **The seam to add it** already exists — the optional `shouldFallback(error, provider)` predicate (`fallback-provider.ts:13,73`) lets a caller decide per-error whether to fall over; a 429-aware policy would live there.
+**Fallback is a different resilience mechanism.** `FallbackModelProvider` (used by Studio's live modes, `apps/studio/vite.config.ts:820-829`) tries the primary provider, and on failure moves to the next provider in the chain, emitting trace events. That's resilience against *a whole provider being down*, not against *one network attempt hanging*. It composes over the missing timeout, not in place of it — see `study-distributed-systems` for the fallback chain as a partial-failure pattern.
 
-**Backpressure: bounded by `maxTurns`, not by the network.** There's no flow-control on the stream — the server writes records as fast as the agent loop emits them. What prevents runaway is the agent loop's hard turn budget (`maxTurns`, e.g. 6), which caps how many provider round-trips (and thus how many events) a run can produce. So backpressure is a *work* bound, not a *transport* bound. For a single-user dev tool with a low turn cap, the network never becomes the bottleneck.
+**The agent loop's `maxTurns` bounds total work.** Each agent runs `runAgentLoop` with a turn cap (recommendation agent: `maxTurns 6`). This bounds how many model round-trips a single capability makes — a different axis of "don't run forever" that caps the *count* of network calls, not the *duration* of any one.
 
-### Move 3 — the principle
+**Pooling and backpressure live only in buffr.** `pg.Pool` (`buffr/src/db.ts:4`) reuses connections (see `03`) and, crucially, provides the system's *only* real backpressure: when every pooled connection is checked out, `pool.connect()` (used by `PgVectorStore.upsert`, `buffr/src/pg-vector-store.ts`) *queues* rather than opening unbounded sockets. That queue is flow control — it slows the caller when Postgres is saturated. aptkit's own HTTP path has no equivalent: nothing limits concurrent in-flight Ollama calls, so a burst of agent turns could fan out unbounded requests at the daemon. `not yet exercised` as a real risk because the agents run sequentially, but the mechanism isn't there.
 
-The principle: *failure handling lives at two layers, and you should know which layer owns which failure*. Transient network blips are the SDK's problem (it retries the same endpoint with backoff); provider-level outages are the application's problem (the fallback chain switches endpoints). Conflating them — putting app-level retries on top of SDK retries — multiplies wait times and costs. AptKit gets the split right by *not* adding a retry layer; its one gap (429-specific handling) is a known, gated extension point, not an oversight.
+**Request collapsing / dedup / circuit breakers:** `not yet exercised`. No identical-in-flight-request coalescing, no circuit breaker that trips after N failures, no rate limiter. None are needed for sequential local agents, but all would matter under concurrency.
+
+#### Move 3 — the principle
+
+The principle: **timeout, retry, pool, and backpressure are four independent knobs, and the dangerous failure is having retry/fallback without a timeout — because a hang on the first attempt starves everything downstream of it.** aptkit has cancellation wired (the signal flows) but no deadline set, fallback across providers but no transport retry, and backpressure only where `pg.Pool` happens to provide it. The single highest-leverage fix is a timeout on the Ollama `fetch`; everything else is appropriately scoped to a sequential local toolkit.
 
 ## Primary diagram
 
-The full failure-and-cancellation picture across layers.
-
 ```
-  AptKit failure handling — full picture
+  Resilience recap — what's wired, what's missing
 
-  ┌─ UI / agent loop ──────────────────────────────────────────┐
-  │  AbortSignal ── signal.throwIfAborted() before each step    │
-  └───────────────────────────┬────────────────────────────────┘
-                              │ signal threads into request
-  ┌─ FallbackModelProvider ───▼────────────────────────────────┐
-  │  for provider in [primary, ...fallbacks]:                   │
-  │     throwIfAborted()  ── cancel = rethrow, NOT failover     │
-  │     try complete() → success → return                       │
-  │     catch → record attempt, warning event, next provider    │
-  │  all fail → throw ProviderFallbackError(attempts)           │
-  └───────────────────────────┬────────────────────────────────┘
-                              │ provider.complete(request, {signal})
-  ┌─ SDK (delegated) ─────────▼────────────────────────────────┐
-  │  per-request timeout · retry 5xx/network (own backoff)      │
-  │  connection pool / keep-alive                               │
-  │  abort: signal cancels the in-flight HTTPS request          │
-  └──────────────────────────────────────────────────────────────┘
-```
-
-## Implementation in codebase
-
-**Use cases.** The fallback chain wraps the primary provider on every non-fixture Studio run (`vite.config.ts:819-828`, `providerWithConfiguredFallback`) — e.g. OpenAI primary with Anthropic fallback. Cancellation is reachable wherever an `AbortSignal` is threaded (the agent loop, structured generation, the stream decoder).
-
-**The failover loop with the abort short-circuit.** `packages/providers/fallback/src/fallback-provider.ts:47-89`:
-
-```
-  fallback-provider.ts  (complete, lines 47–89)
-
-  for (let index = 0; index < this.providers.length; index += 1) {
-    const provider = this.providers[index];
-    request.signal?.throwIfAborted();               ← cancel bails BEFORE trying
-    try {
-      const response = await provider.complete(request);
-      this.lastSelectedProvider = { providerId: provider.id, ... };
-      return { ...response, model: response.model ?? provider.defaultModel };
-    } catch (error) {
-      if (isAbortError(error) || request.signal?.aborted) throw error;  ← cancel ≠ failover
-      attempts.push({ providerId: provider.id, model: provider.defaultModel,
-                      error: ... });                ← record WHY it failed
-      if (!this.shouldFallback(error, provider)) throw error;  ← per-error opt-out seam
-      if (index < this.providers.length - 1) {
-        this.trace?.emit({ type: 'warning', ... });  ← observable failover
-      }
-    }
-  }
-  throw new ProviderFallbackError(attempts);         ← give-up, carries all attempts
+  CALLER         caller could attach AbortSignal.timeout ... but doesn't
        │
-       └─ no backoff, no jitter, no per-status logic: any non-abort error → next
-          provider. The shouldFallback predicate is where 429-aware logic WOULD go
-```
-
-**The give-up error packs every attempt.** `packages/providers/fallback/src/fallback-provider.ts:16-24`:
-
-```
-  fallback-provider.ts  (ProviderFallbackError, lines 16–24)
-
-  super(`all model providers failed: ${attempts.map(a =>
-        `${a.providerId}: ${a.error}`).join('; ')}`);
-  this.attempts = attempts;                          ← full post-mortem on the error
-```
-
-**Cancellation threads through the agent loop into the SDK.** `packages/runtime/src/run-agent-loop.ts:99-109` calls `signal?.throwIfAborted()` then passes `signal` into `model.complete({..., signal})`; the provider forwards it to the SDK (`openai-provider.ts:47`, `anthropic-provider.ts:38`) as the SDK's request-options `signal`. One `AbortController` cancels the whole chain down to the in-flight HTTPS request.
-
-**The same signal cancels the stream decode.** `packages/runtime/src/ndjson-stream.ts:112,123` — `options.signal?.throwIfAborted()` between chunks and between records. So cancelling a run stops both the upstream provider call and the downstream decode.
-
-**No SDK timeout/retry/pool config — delegated.** The SDK clients (`openai-provider.ts:30`, `anthropic-provider.ts:25`) take `apiKey` only. No `timeout`, no `maxRetries`, no `httpAgent`. The SDK defaults apply: `not yet exercised` at the repo level.
-
-**Gemma's parse-retry loop — the repo's one hand-written retry.** `packages/providers/gemma/src/gemma-provider.ts:62-89`:
-
-```
-  gemma-provider.ts  (complete, lines 62–89)
-
-  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-    request.signal?.throwIfAborted();             ← cancel bails before each try
-    const messages = attempt === 0
-      ? baseMessages
-      : [...baseMessages, { role: 'user', content: RETRY_NUDGE }]; ← corrective nudge on retry
-    lastResponse = await this.chat({ ... });       ← network error here THROWS, no catch
-    raw = lastResponse.message?.content ?? '';
-    if (wantsTool) {
-      const call = parseToolCall(raw);
-      if (call) return this.toResponse([tool_use], lastResponse);  ← good JSON → done
-      if (looksLikeToolAttempt(raw)) continue;     ← bad JSON → retry
-    }
-    break;
-  }
+       ▼
+  TRANSPORT  fetch(signal) ── cancellation ✓ ── timeout ✗ ──► hang risk
+       │     Gemma parse-retry ✓ (app-level, no backoff/jitter)
+       │     transport-level network retry ✗
        │
-       └─ maxAttempts = maxToolCallAttempts only when tools are requested, else 1.
-          The retry is for MALFORMED OUTPUT, not a failed request — a thrown
-          fetch ends the loop immediately
+  PROVIDER   FallbackModelProvider ── try next provider on failure ✓
+       │     (resilience vs provider-down, not vs hang)
+       │
+  LOOP       runAgentLoop maxTurns ── bounds CALL COUNT ✓
+       │
+  STORAGE    buffr pg.Pool ── reuse ✓ ── connect() queues = backpressure ✓
+            (the only flow control in the system)
 ```
-
-**The local transports set no timeout.** `gemma-provider.ts:202-215` and `ollama-embedding-provider.ts:60-74` call `fetch` with `method`/`headers`/`body`/`signal` only — no `timeout`, no `dispatcher`. A hung daemon blocks on the `await` until the `AbortSignal` fires; with no signal, indefinitely. `not yet exercised` and a real gap (see `08` R7).
 
 ## Elaborate
 
-The two-level failure split (SDK retries transient blips, app fails over on outages) is the correct mental model for any "thin server in front of an external API" — and it's exactly the shape your AdvntrCue and dryrun work hint at: dryrun runs on-device Gemini Nano with an *API fallback*, which is the same "primary fails → switch source" move AptKit's chain makes, just across a device/cloud boundary instead of two clouds. The lesson that transfers: failover (switch source) and retry (try the same source again) are different tools for different failures, and stacking them naively multiplies latency. AptKit's deliberate *absence* of an app-level retry layer is the disciplined choice — it lets the SDK own retries and keeps the app layer focused on the one thing it's positioned to do (pick a different provider). The single gap worth flagging in a review is the 429 case; the `shouldFallback` hook is the designed place to close it, so it's a one-function extension, not a redesign.
+These patterns come from production RPC stacks (gRPC deadlines, Finagle's circuit breakers, every database client's pool) where the lesson was learned the hard way: an unbounded wait is how one slow dependency takes down a whole service. The repo is small enough that the missing timeout hasn't bitten — local Ollama on a dev laptop rarely wedges — but the *mechanism* is the same one that causes cascading outages at scale. The `AbortSignal` plumbing is already in place, which means the fix is genuinely one line; the absence is an omission, not an architectural problem. See `study-performance-engineering` for why the missing timeout is also a tail-latency issue, and `study-distributed-systems` for the fallback chain under partial failure.
 
 ## Interview defense
 
-**Q: Retry or failover? What happens when a provider 429s?**
+**Q: "What happens if your model server hangs?"**
+Answer with the honest verdict and the fix: "Right now it hangs — the `fetch` to Ollama forwards a caller's `AbortSignal` so cancellation works, but nothing sets a timeout, so a wedged daemon leaves the call pending indefinitely. The one-line fix is an `AbortSignal.timeout` in the transport. I have fallback across providers and an app-level retry for malformed tool calls, but neither helps if attempt one never returns — which is exactly why the missing timeout is the most consequential gap." That answer shows you can tell the four knobs apart and rank them.
 
 ```
-  any non-abort error → next provider. No backoff. No 429-special-casing.
+  sketch: retry without timeout = useless
+
+  attempt 1 ──► HANG (no deadline) ──► retry never reached ✗
+  attempt 1 ──► TIMEOUT after Ns ───► retry runs ✓
+                     ▲ the missing knob
 ```
 
-Failover, not retry — at the app layer. The `FallbackModelProvider` catches any non-abort error and moves to the next provider; it does *not* back off and retry the same one, and it treats a 429 identically to a 500 (`fallback-provider.ts:64-85`). The SDK absorbs transient blips with its own retries first; the chain only engages after the SDK gives up. **Anchor:** failover switches endpoints; the SDK owns same-endpoint retries.
-
-**Q: Is that 429 behavior correct?**
-
-For two providers with independent quota and no sustained traffic, yes — the other provider has separate rate limits, so switching is a reasonable 429 response, and per-status logic would be unneeded complexity. At higher volume you'd add 429-aware backoff via the existing `shouldFallback(error, provider)` hook (`fallback-provider.ts:13`). **Anchor:** the extension seam already exists; it's a one-predicate change.
-
-**Q: How does cancellation work end to end?**
-
-```
-  one AbortSignal → throwIfAborted in loop + decoder → cancels SDK request too
-```
-
-One `AbortSignal` threads from the agent loop (`run-agent-loop.ts:99`) through `ModelRequest.signal` into the SDK call (`openai-provider.ts:47`) *and* into the stream decoder (`ndjson-stream.ts:112`). The fallback chain rethrows an abort instead of failing over (`fallback-provider.ts:65`), so a cancel doesn't pointlessly hammer the remaining providers. **Anchor:** one signal, both directions, and the chain refuses to fail over on a cancel.
-
-## Validate
-
-1. **Reconstruct:** Write the five kernel parts of the fallback loop and what breaks without each.
-2. **Explain:** Why does the chain rethrow an abort instead of recording it as a failed attempt? (A cancel isn't a provider failure; failing over would waste calls on abandoned work — `fallback-provider.ts:65`.)
-3. **Apply:** Both providers fail. What does the caller receive and what's in it? (`ProviderFallbackError` with `.attempts` listing every provider + reason — `fallback-provider.ts:88`.)
-4. **Defend:** Where would you add 429-aware backoff and why there? (The `shouldFallback` predicate — `fallback-provider.ts:13,73` — it's the designed per-error decision point.)
+Anchor: *a retry without a timeout never fires — bound the wait first.*
 
 ## See also
 
-- `06-websockets-sse-streaming-and-realtime.md` — the no-resume limit (cancel/drop = no recovery)
-- `03-tcp-udp-connections-and-sockets.md` — the SDK pool (and conn-3 undici pool) this delegates to
-- `04-tls-and-trust-establishment.md` — boundary 3's keyless/plaintext posture the retry runs over
-- `08-networking-red-flags-audit.md` — the 429 gap and the no-timeout-on-Ollama gap ranked among the risks
-- study-distributed-systems — failover as partial-failure handling across external systems
-- study-runtime-systems — `AbortSignal` plumbing and cooperative cancellation
+- `08-networking-red-flags-audit.md` — the missing timeout ranked as the #1 risk
+- `03-tcp-udp-connections-and-sockets.md` — the pg.Pool that provides the only backpressure
+- `study-distributed-systems` (neighbor guide) — the fallback chain as partial-failure coordination

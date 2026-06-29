@@ -1,198 +1,128 @@
-# 04 — TLS and trust establishment
+# TLS and Trust Establishment
 
-**Industry name(s):** TLS / encryption in transit / certificate trust. **Type:** Industry standard.
+**Industry name:** TLS / transport encryption / certificate trust · *Industry standard*
 
-## Zoom out — where this concept lives
+## Zoom out, then zoom in
 
-TLS sits between the TCP socket (file `03`) and HTTP (file `05`) — it's the encryption wrapper around the byte pipe. Here's which of AptKit's connections is wrapped and which is bare.
+Above the TCP connection sits the question "is this byte stream encrypted, and do I trust the other end?" Here's where that question gets answered in this system — and where it's deliberately skipped.
 
 ```
-  Zoom out — TLS on one connection, plaintext on two
+  Zoom out — where encryption lives (and doesn't)
 
-  ┌─ UI (browser) ────────────────────────────────────────────┐
-  │  fetch('/api/...')  ── plaintext HTTP (localhost dev)      │
+  ┌─ aptkit code ──────────────────────────────────────────────┐
+  │  fetch('http://localhost:11434/api/chat')                  │
+  │    ★ http:// — NO TLS ★  (loopback, plaintext)             │
   └───────────────────────────┬────────────────────────────────┘
-                              │  ★ CONN 1: NO TLS — same-machine dev loop ★
-  ┌─ Service (Node/Vite) ─────▼────────────────────────────────┐
-  │  SDK ── HTTPS to cloud provider                            │
-  │  fetch ── plaintext HTTP to local Ollama                   │
-  └────────────┬────────────────────────────┬──────────────────┘
-               │ ★ CONN 2: TLS ★            │ ★ CONN 3: NO TLS ★
-               │ SDK + Node trust store      │ plaintext, no auth
-  ┌─ Cloud ────▼─────────────┐  ┌─ Local Ollama ──▼────────────┐
-  │ api.* (presents a cert)  │  │ localhost:11434 (no cert)    │
-  └──────────────────────────┘  └──────────────────────────────┘
+                              │
+  ┌─ dependency boundary ────▼─────────────────────────────────┐
+  │  Anthropic/OpenAI SDK → https:// → TLS handshake (SDK owns) │
+  │  buffr pg.Pool → TLS to Supabase (driver/PaaS owns)         │
+  └────────────────────────────────────────────────────────────┘
 ```
 
-## Zoom in — narrow to the concept
+**Zoom in.** TLS does two jobs: it encrypts the byte stream so no one in the middle can read it, and it proves the server is who it claims via a certificate signed by a trusted authority. In aptkit's own code, neither job is needed — the only socket goes to loopback, where there's no "middle" to defend against. So TLS in this system is entirely a dependency concern. The pattern to learn: **TLS is a cost you pay to defend a hop against an untrusted network, and a loopback hop has no untrusted network to defend.**
 
-TLS answers two questions at once: *is the channel encrypted?* and *am I really talking to who I think I am?* In AptKit only connection 2 (Node↔cloud provider) runs TLS, and the repo configures none of it — the SDK negotiates the handshake and Node's default CA trust store validates the provider's certificate. Connection 1 (browser↔Node) and connection 3 (Node↔local Ollama) are both plaintext HTTP because both are same-machine where there's nothing to encrypt against. So "trust establishment" here is three short stories: one delegated TLS (conn 2), and two deliberately-absent (conn 1, conn 3) — and conn 3 is the interesting new one, because it carries *no auth at all* across a process boundary.
+## Structure pass
 
-## The structure pass
+**Layers:** TCP (the raw connection) → TLS (encryption + identity, optional) → HTTP (the application). TLS is the middle layer that aptkit's code skips and its dependencies add.
 
-**Layers.** Connection 1 (plaintext, same process tree). Connection 2 (TLS layer present, owned by SDK + Node). Connection 3 (plaintext, cross-process to the Ollama daemon).
-
-**Axis — trust (am I sure of the peer's identity, and is the channel private?).**
+**Axis — trust: "could someone read or tamper with these bytes in flight?"** Trace it:
 
 ```
-  One axis (trust) across the three connections
+  Axis — in-flight trust — across the encryption surfaces
 
-  connection 1 (browser↔Node):
-    identity: implicit (same machine)   channel: plaintext
-    → trust comes from "it's localhost", not from crypto
-
-  connection 2 (Node↔cloud):
-    identity: provider cert vs CA store  channel: encrypted
-    → trust comes from the TLS handshake the SDK runs
-
-  connection 3 (Node↔local Ollama):
-    identity: NONE (any local caller)    channel: plaintext
-    → trust comes from "the port is only reachable on this box"
+  hop                       scheme   TLS?   why
+  ──────────────────────────────────────────────────────────────────
+  Gemma → Ollama            http://  NO     loopback: no network to sniff
+  embed → Ollama            http://  NO     same
+  Anthropic/OpenAI SDK      https:// YES    public internet (SDK enforces)
+  buffr pg.Pool → Supabase  (pg)     YES*   public internet (PaaS expects TLS)
 ```
 
-The trust mechanism flips across all three: conn 1 and conn 3 trust by *locality* (same box), conn 2 trusts by *cryptography* (a certificate chain to a root CA). Conn 3 is the sharpest case — it sends a model request with *no bearer key* and reads a response with *no cert check*, accepting both because Ollama binds to `localhost` and anything that reached the port is already on the trusted machine. The *reason* each is acceptable is the lesson; conn 2 is the only one where "acceptable" rests on math instead of geography.
+\* `not yet verified in buffr's code` — the pool is built from `connectionString` alone (`buffr/src/db.ts:4-6`) with no explicit `ssl` option; Supabase's URL typically carries the TLS expectation, but the repo doesn't set it.
 
-**Seams.** Connection 2's seam is the TLS handshake inside the SDK — the point where the provider's certificate is validated against Node's trust store. The repo could intercept it (custom CA, cert pinning, `rejectUnauthorized`) only by injecting a configured HTTP agent into the SDK client, which it never does. Connection 1 has no TLS seam at all. Connection 3's seam is the injectable transport (`GemmaChatTransport`, `gemma-provider.ts:19`; `EmbedTransport`, `ollama-embedding-provider.ts:18`) — that's where a future deployment *could* swap the plaintext `fetch` for an HTTPS+keyed one if Ollama ever moved off-host, without touching the provider's logic.
+**Seam:** the scheme flip from `http://` to `https://` is the seam. It's the exact line where "trusted local channel" becomes "must encrypt and authenticate." aptkit's code lives entirely on the `http://` side.
 
 ## How it works
 
-### Move 1 — the mental model
+#### Move 1 — the mental model
 
-You know how your browser shows a padlock and you trust the site because its certificate chains up to a root CA your OS already trusts? Connection 2 is exactly that, run by Node instead of a browser. The SDK opens the socket, the provider presents a cert, Node checks it against the same kind of trust store your OS ships, and only then does any HTTP flow. The pattern: *encrypt the pipe, then prove the peer's identity with a certificate chain, before sending the secret (your API key)*.
-
-```
-  The TLS handshake shape (connection 2)
-
-  client (SDK)                          provider
-     │  1. ClientHello (TLS versions) ──►│
-     │◄─ 2. ServerHello + certificate ───│
-     │  3. validate cert vs CA store     │   ← Node's default trust store
-     │  4. key exchange ────────────────►│
-     │◄═════ encrypted channel ═════════►│
-     │  5. NOW send HTTPS request         │   ← API key rides inside the
-     │     (Authorization: Bearer …)      │     encrypted channel
-```
-
-### Move 2 — walking trust on each connection
-
-**Connection 2: the SDK negotiates, Node validates.** When `client.chat.completions.create` opens its socket, the SDK initiates a TLS handshake. The provider sends its certificate. Node's TLS stack checks the cert chains to a trusted root CA (the default bundle Node ships) and that the hostname matches. If validation fails, the handshake aborts and `complete()` throws — which the fallback chain treats like any other failure. The repo writes none of this; it only set `apiKey`, which becomes the `Authorization` header *inside* the now-encrypted channel.
+You've seen the padlock in the browser. That padlock is TLS: before any HTTP data flows, the client and server do a handshake where the server presents a certificate (a public key signed by a CA the client trusts), they agree on a shared secret, and from then on the stream is encrypted. The kernel is *identity + encryption negotiated up front*.
 
 ```
-  Connection 2 trust — delegated handshake, then the key flows
+  The pattern — TLS handshake on top of TCP
 
-  ┌─ Service (Node) ─┐  TLS handshake (SDK)   ┌─ Provider ─┐
-  │ SDK opens socket │ ═══════════════════════►│ cert       │
-  │ Node validates   │ ◄══════════════════════ │            │
-  │ cert vs CA store │                          │            │
-  │ key in encrypted │ ═══ Bearer apiKey ══════►│            │
-  └──────────────────┘   (only after handshake) └────────────┘
+  client                                  server
+    │ ── (TCP handshake first) ──────────►  │
+    │ ── ClientHello (ciphers) ──────────►  │
+    │ ◄── ServerHello + CERTIFICATE ──────  │   server proves identity
+    │ ── verify cert against trusted CAs ─  │   (client checks the signature)
+    │ ── key exchange ───────────────────►  │
+    │ ◄══ encrypted application data ═════► │   everything after = ciphertext
 ```
 
-**Connection 1: no TLS, and that's correct in dev.** The browser fetches `http://localhost:4187/...` (plaintext). There's no certificate, no handshake, no encryption. Why is that fine? Because both endpoints are the same machine — the bytes never leave the host, so there's no network to eavesdrop on. The boundary condition: this is *only* acceptable in dev. A deployed Studio would need HTTPS on connection 1 (TLS termination at a proxy or the server), which is `not yet exercised` because Studio is a dev tool.
+The part people forget: TLS adds *round trips on top of the TCP handshake* (one extra RTT for TLS 1.3, two for 1.2) before your first byte of HTTP. On loopback that cost is pointless — there's no attacker between two processes on the same machine — so skipping it is the right call, not a shortcut.
+
+#### Move 2 — walking the trust boundaries in this repo
+
+**The Ollama hop is plaintext on purpose.** The transport builds a `http://localhost:11434` URL (`packages/providers/gemma/src/gemma-provider.ts:48`, `packages/retrieval/src/ollama-embedding-provider.ts:47`). The `http` scheme means `fetch` opens a raw TCP connection with no TLS handshake. There's no certificate to verify, no cipher to negotiate, no key to manage. This is correct: the traffic never leaves the machine, so encrypting it defends against nothing.
 
 ```
-  Connection 1 trust — locality, not crypto
+  Layers-and-hops — the plaintext loopback hop
 
-  ┌─ browser ─┐   plaintext HTTP    ┌─ Node ────┐
-  │ localhost │ ───────────────────►│ localhost │
-  └───────────┘   (same machine)    └───────────┘
-        trust = "the bytes never leave this box"
-        NOT a deployable posture — dev only
+  ┌─ aptkit transport ──────────┐  hop C: plaintext HTTP   ┌─ Ollama ──────┐
+  │  fetch('http://localhost..')│ ───────────────────────► │ :11434        │
+  └──────────────────────────────┘  no TLS, no cert check   └───────────────┘
+        no attacker possible between two processes on 127.0.0.1
 ```
 
-**Connection 3: no TLS, no key, cross-process — and correct *only* on localhost.** When `GemmaModelProvider.complete` calls its default transport, it `fetch`es `http://localhost:11434/api/chat` with a `content-type: application/json` header and *nothing else* — no `Authorization`, no cert validation, no handshake (`gemma-provider.ts:204-209`). The Ollama daemon answers any caller that opened its port. Why is that acceptable? Because Ollama binds to loopback, so "reached the port" already means "runs on this machine." The boundary condition — and it's a real one — is that this is correct *only* while Ollama stays local. The day someone points `host` at a remote inference box (`http://gpu-box.internal:11434`), this connection sends model prompts unauthenticated over plaintext across a real network, which is a credential-and-data exposure. The fix isn't a code change to the provider — it's swapping the injectable transport for an HTTPS+keyed one. That's why the transport is injectable in the first place.
+**Cloud TLS is real but invisible to aptkit.** `new Anthropic({ apiKey })` and `new OpenAI({ apiKey })` (`packages/providers/anthropic/src/...:25`, `packages/providers/openai/src/openai-provider.ts:30`) talk `https://` to their APIs. The full handshake — certificate verification against the system trust store, cipher negotiation, key exchange — happens inside the SDK. aptkit never writes a line of TLS code; it just hands over an API key (the *application*-layer credential, carried inside the already-encrypted channel). The key in `.env` is the secret; TLS is what keeps it from being readable on the wire — and that's the SDK's job.
 
-```
-  Connection 3 trust — locality, cross-process, no auth
+**buffr's database TLS is unset in code.** `createPool(databaseUrl)` passes only `{ connectionString }` to `pg.Pool` (`buffr/src/db.ts:4-6`) with no `ssl: ...` option. Whether the connection is encrypted depends on the `DATABASE_URL` (e.g. an `sslmode=require` query param) and Supabase's server policy. The code itself is silent on TLS — that's a real observation, not a recommendation: the repo delegates the decision to the connection string and the PaaS.
 
-  ┌─ Node (provider) ─┐  plaintext HTTP   ┌─ Ollama daemon ─┐
-  │ fetch /api/chat   │ ─────────────────►│ localhost:11434  │
-  │ no Authorization  │  (same machine)   │ trusts any local │
-  │ no cert check     │ ◄─────────────────│ caller           │
-  └───────────────────┘                   └──────────────────┘
-        trust = "the port is only reachable on this box"
-        SAFE on localhost · UNSAFE the moment host points off-box
-```
+**TLS termination, mTLS, cert pinning, custom CAs:** `not yet exercised`. The repo terminates no TLS itself (it runs no public server — Studio in prod is static files behind GitHub's CDN, which terminates TLS for you). There's no mutual TLS, no certificate pinning, no custom trust store anywhere in aptkit's code.
 
-**What the repo never does — and when it would.** On conn 2: no cert pinning, no custom CA, no mTLS, no `rejectUnauthorized: false` — each would require injecting an HTTP agent into the SDK client via `options.client`. On conn 3: no key, no TLS — each would require swapping the injectable transport. Conn 2's extras become relevant behind a corporate TLS-inspecting proxy or a self-hosted gateway; conn 3's become *mandatory* the moment Ollama moves off-host. AptKit has neither requirement today, so both are `not yet exercised`.
+#### Move 3 — the principle
 
-### Move 3 — the principle
-
-Trust establishment is the sharpest "different boundary, different rules" lesson in the guide. The *same repo* talks plaintext on two connections and full TLS on the third, and all three are correct — because the trust comes from a different source on each. Locality justifies connections 1 and 3; cryptography justifies connection 2. The principle: match the trust mechanism to the threat model of the specific hop, not to a blanket "always encrypt" rule. (And know exactly when locality stops being enough — the moment the bytes leave the machine. Conn 3 is the one to watch: its safety is a deployment assumption — `localhost` — not a property of the code, so a single config change can invalidate it silently.)
+The principle: **encrypt the hops that cross an untrusted network; don't pay TLS where there's no network to defend.** aptkit gets this exactly right by accident of design — its only socket is loopback, so plaintext is correct, and every encrypted hop is owned by a dependency that does TLS properly. The danger is the same one timeouts have: the moment the Ollama `host` points at a remote box, that `http://` becomes a plaintext credential leak across the internet, and the scheme would have to flip to `https://` with a real certificate.
 
 ## Primary diagram
 
-Both connections, the trust source for each, the API key's path.
-
 ```
-  AptKit trust — one TLS hop, one plaintext hop
+  TLS recap — the http:// → https:// seam
 
-  ┌─ UI (browser) ─────────────────────────────────────────────┐
-  │  fetch http://localhost:4187  ── PLAINTEXT                  │
-  │     trust source: same machine (dev only)                  │
-  └───────────────────────────┬────────────────────────────────┘
-                              │ connection 1: NO TLS
-  ┌─ Service (Node) ──────────▼────────────────────────────────┐
-  │  SDK TLS handshake → validate cert vs Node CA store        │
-  │  API key sent as Bearer INSIDE the encrypted channel       │
-  └───────────────────────────┬────────────────────────────────┘
-                              │ connection 2: TLS 1.2/1.3 (SDK-owned)
-  ┌─ Provider ────────────────▼────────────────────────────────┐
-  │  presents certificate; operates the endpoint               │
-  └──────────────────────────────────────────────────────────────┘
+  aptkit owns          │  http:// (plaintext, loopback)
+  ─────────────────────┼─────────────────────────────────────
+  Gemma / embed ───────┼──► localhost:11434   NO TLS  ✓ correct
+                       │
+  dependencies own     │  https:// (encrypted, internet)
+  ─────────────────────┼─────────────────────────────────────
+  Anthropic/OpenAI SDK ┼──► api.*.com         TLS, cert-verified
+  buffr pg.Pool ───────┼──► Supabase          TLS expected (not set in code)
+  Studio Pages (prod) ─┼──► github.io         TLS terminated by GitHub CDN
 ```
-
-## Implementation in codebase
-
-**Use cases.** TLS is established on every non-fixture provider call. The only repo input to it is the API key (which TLS protects, not configures).
-
-**The API key is the repo's entire TLS-adjacent input.** `packages/providers/anthropic/src/anthropic-provider.ts:25`:
-
-```
-  anthropic-provider.ts  (constructor, line 25)
-
-  this.client = options.client
-    ?? new Anthropic({ apiKey: options.apiKey ?? process.env.ANTHROPIC_API_KEY });
-       │
-       └─ apiKey is the ONLY security input the repo provides; the SDK turns it
-          into an Authorization header sent INSIDE the TLS channel it negotiates.
-          No agent, no CA, no cert config → Node's default trust store validates
-          the provider cert
-```
-
-The key comes from `process.env`, populated from a gitignored `.env` (per project context). It never appears in repo source — which matters precisely because TLS is what keeps it private on the wire. (Whether the key is *handled* safely is a study-security question; this file only notes that TLS is what protects it in transit.)
-
-**Connection 1 is plaintext by virtue of the dev server.** `apps/studio/src/api.ts:126` fetches a relative `/api/...` URL against an `http://localhost:4187` origin (`playwright.studio.config.ts:10`). No `https://` anywhere in the client. The Vite dev server serves plain HTTP.
 
 ## Elaborate
 
-The "API key inside the TLS channel" detail is worth internalizing: the key is a bearer credential, so anyone who can read it gets full account access. The *only* thing keeping it private on connection 2 is the TLS encryption the SDK negotiated — if that channel were plaintext (or if cert validation were disabled with `rejectUnauthorized: false`), the key would be sniffable. This is why the absent custom-TLS config is actually a *good* default: the repo can't accidentally weaken cert validation because it never touches it. Where your AdvntrCue experience maps in: that app's GPT-4 calls run the identical delegated-TLS pattern from a serverless function — same SDK, same trust store, same "key inside the channel". The pattern transfers wholesale; only the runtime (serverless vs dev server) differs.
+TLS exists because the internet is a shared medium — any router on the path can read plaintext. Loopback isn't shared, which is why local-daemon protocols (Ollama, Postgres-on-localhost, Redis) routinely run unencrypted. The hard parts of TLS — certificate chain validation, revocation, cipher downgrade attacks — all live in the libraries here, which is the right place for them; reimplementing TLS is how you get CVEs. When aptkit goes remote, the upgrade isn't subtle: flip the scheme, get a cert, and the handshake-cost from `03` doubles the round trips before first byte. See `study-security` for the trust-boundary view of the same hops (this file owns *the encryption mechanism*; security owns *whether each boundary is safe*).
 
 ## Interview defense
 
-**Q: Where does TLS happen and who configures it?**
+**Q: "Is your traffic encrypted? Walk me through the TLS story."**
+Lead with the verdict: "My own code opens one socket — plaintext HTTP to a local Ollama daemon — and that's correct, because it's loopback, so there's no network to encrypt against. Every hop that crosses the internet is encrypted by a dependency: the Anthropic and OpenAI SDKs do `https://` with full cert verification, and the database connection's TLS is governed by the connection string and Supabase." Then name the trap: "If I pointed Ollama at a remote host, that `http://` would leak across the wire and I'd have to switch to TLS."
 
 ```
-  connection 2 only: SDK negotiates, Node CA store validates, repo sets apiKey
+  sketch: the scheme seam
+
+  http://  loopback   → no TLS (correct, no network)
+     │ flip when remote
+  https:// internet   → TLS, verify cert, +1 RTT
 ```
 
-Only on connection 2 (Node↔provider). The SDK negotiates the handshake; Node's default CA trust store validates the provider's certificate; the repo configures none of it beyond supplying the API key, which rides inside the encrypted channel as a bearer header. Connection 1 is plaintext localhost — fine in dev, not deployable. **Anchor:** the API key's privacy depends entirely on the SDK's TLS, which the repo can't accidentally weaken because it never configures it.
-
-**Q: When would you need to touch TLS config?**
-
-Behind a TLS-inspecting corporate proxy (inject a custom CA via an HTTP agent into the SDK client) or for mTLS to a self-hosted gateway. Both go through the `options.client` injection seam. **Anchor:** `not yet exercised` — no such requirement exists.
-
-## Validate
-
-1. **Reconstruct:** Draw the connection-2 handshake; mark where the API key first flows.
-2. **Explain:** Why is plaintext acceptable on connections 1 and 3 but not 2? (Locality vs cross-network — same machine has no eavesdrop surface; conn 2 crosses the open internet.)
-3. **Apply:** A security review asks "can the API key be sniffed?" What's the answer and what protects it? (No, on connection 2 — TLS the SDK negotiates; the repo never disables cert validation.)
-4. **Defend:** Connection 3 sends prompts with no key over plaintext — defend it, then name the one change that breaks the defense. (Defensible only while Ollama is `localhost` — bytes never leave the box; pointing `host` off-machine — `gemma-provider.ts:48` — sends unauthenticated prompts over a real network. Fix via the injectable transport, not the provider.)
+Anchor: *don't encrypt a channel that has no eavesdropper — loopback has none.*
 
 ## See also
 
-- `03-tcp-udp-connections-and-sockets.md` — the socket TLS wraps (and conn 3's bare socket)
-- `05-http-semantics-caching-and-cors.md` — what flows inside the encrypted channel
-- `02-dns-routing-and-addressing.md` — the `options.client` seam for custom TLS; conn 3's `host` option
-- `08-networking-red-flags-audit.md` — conn 3's off-host exposure ranked among the risks
-- study-security — whether the API-key trust boundary (and conn 3's keyless one) is actually safe
+- `03-tcp-udp-connections-and-sockets.md` — TLS rides on top of the TCP handshake
+- `02-dns-routing-and-addressing.md` — resolution happens before TLS can start
+- `study-security` (neighbor guide) — whether each trust boundary is *safe*, not just *encrypted*

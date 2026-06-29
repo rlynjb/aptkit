@@ -1,511 +1,285 @@
-# LLM-as-judge bias — and the rubric contract that defends against it
+# LLM-as-judge bias
 
-**Industry names:** LLM-as-judge, model-graded eval, position/verbosity/self-preference bias · *Industry standard*
+**Subtitle:** Rubric judging and the three judge biases · Claude-judges-Gemma anti-circular design · *Industry standard (self-preference mitigated structurally; position/verbosity `not yet exercised`)*
 
 ## Zoom out, then zoom in
 
-When you cross the model-in-the-loop seam from `02`, you hand grading to an LLM —
-and you inherit a grader that is *itself* a biased language model. AptKit's
-answer is `RubricJudge`: not "trust the model," but "constrain the model with a
-contract." Here's where it sits.
+When the output is free-form, you reach the top rung of the eval ladder: a model
+judges another model. It's powerful and it's dangerous, because a judge is a model
+and models are biased. aptkit's judge lives in `rubric-judge.ts`, and its single
+most important design decision isn't in the code at all — it's *which model* you
+point it at.
 
 ```
-  Zoom out — where the judge (and its contract) live
+  Zoom out — where the judge sits, and the biases around it
 
-  ┌─ Eval method ladder (@aptkit/evals) ────────────────────────────┐
-  │  structural-diff · detection-scorer   (deterministic, see 02)    │
-  ╞══════════════ model-in-the-loop seam ═══════════════════════════╡
-  │  ★ RubricJudge.judge() ★   ←── THIS CONCEPT                      │ ← we are here
-  │     system prompt (rubric) + validator (the CONTRACT)            │
-  └───────────────────────────────┬──────────────────────────────────┘
-                                   │  generateStructured() round-trip
-  ┌─ Runtime / provider ───────────▼────────────────────────────────┐
-  │  model.complete() → JSON judgment, re-validated against rubric   │
-  └──────────────────────────────────────────────────────────────────┘
-
-  used inside an agent loop by:
-  packages/agents/rubric-improvement/src/rubric-improvement-agent.ts
+  ┌─ RubricJudge.judge (rubric-judge.ts) ─────────────────────┐
+  │  generateStructured → { dimensions, verdict, fix }        │
+  │  validated against the rubric's own score ranges          │
+  └───────────────────────────┬───────────────────────────────┘
+                              │ subject to score
+        ┌─────────────────────┼─────────────────────┐
+        ▼                     ▼                     ▼
+   POSITION bias         VERBOSITY bias        SELF-PREFERENCE bias
+   prefers first-shown   prefers longer        prefers own family
+   (not yet exercised)   (not yet exercised)   ★ MITIGATED: Claude judges Gemma ★
 ```
 
-Zoom in: you already distrust a flaky reviewer who rubber-stamps long PRs,
-prefers their own style, and is swayed by whichever option you list first. An LLM
-judge has *exactly* those failure modes, with names: **verbosity bias** (rewards
-length), **self-preference bias** (rewards outputs that sound like its own), and
-**position bias** (favors the first/last option in a comparison). You don't fix a
-biased reviewer by asking nicely — you give them a rubric, force them to justify
-each score against declared criteria, and clamp what scores they're allowed to
-give. That structure *is* `RubricJudge`. This file is about how the contract
-neutralizes each bias, and where it still doesn't.
+Now zoom in. Two of these three biases aptkit doesn't address yet — and it says
+so. But the third, self-preference, it kills *structurally*: the intended setup is
+**Claude (the anthropic provider) judging Gemma's outputs.** A judge from a
+different model family can't prefer its own outputs, because none of the outputs
+are its own. That's the move worth understanding — bias mitigation by
+architecture, not by prompt.
 
 ## Structure pass
 
-**Layers.** Two, and the split is the whole lesson. The *content* layer (the
-system prompt built from the rubric — dimensions, scales, calibration examples,
-the "score meaning not style" instruction) *steers* the model. The *contract*
-layer (the validator — `createRubricJudgmentValidator`) *enforces* on the way
-back out. Steering is best-effort; enforcement is structural. A judge with only
-steering is a suggestion; the validator is what makes the rubric binding.
+**Layers.** A capability produces a subject → `RubricJudge` builds a system prompt
+from a `RubricDefinition` → the *judge model* scores it → a validator rejects
+anything outside the rubric's own rules.
 
-**Axis — trust: how much do you trust the judge's raw output, and where do you
-clamp it?** Trace it across the two layers:
+**Axis — trust.** Trace how far you trust the judge's output. You don't trust the
+raw verdict at all — `createRubricJudgmentValidator` (`rubric-judge.ts:170`)
+rejects scores outside each dimension's `[min,max]` and verdicts the rubric never
+declared. And you don't trust the judge to be its own family: the trust boundary
+is drawn at *model family*, with a different family on each side
+(Claude judging, Gemma judged). Trust is granted only after the structural
+boundary and the validator both pass.
 
-```
-  One axis — "how much do we trust the judge's word?"
-
-  system prompt (steering)  →  trust it to TRY: "score meaning, not style;
-                               return per-dimension {score, reason}; one fix"
-  validator (enforcement)   →  trust NOTHING: score out of the rubric's
-                               declared range? REJECT. verdict not in the
-                               allowed set? REJECT. missing a reason? REJECT.
-
-  trust drops to zero at the validator — that's the point
-```
-
-**Seams.** The load-bearing seam is the **validator boundary** between the
-model's raw JSON and the typed `RubricJudgment` the caller receives. Trust flips
-hard across it: on the model side the output is an unverified claim; on the
-caller side every score is provably within its rubric scale and every verdict is
-provably in the allowed set, or the parse failed. Each bias is defeated (or not)
-at this seam. Study it before the prompt details.
+**Seam.** The `model: ModelProvider` field on `RubricJudgeOptions`
+(`rubric-judge.ts:60`). The judge takes a provider as a *parameter*. That seam is
+the whole anti-circular design: because the judge model is injected, you point it
+at a different family than the one under test, and self-preference has nothing to
+grab.
 
 ## How it works
 
-You know how you'd structure a code review to make it fair: a checklist (not "is
-this good?"), a required comment per checklist item (no silent thumbs-up), and a
-fixed verdict vocabulary (approve / request-changes, not freeform). The rubric
-judge is that, made machine-enforceable. Walk the contract one defense at a time.
-
 ### Move 1 — the mental model
 
-The judge is a model call wrapped in a contract that constrains both what it's
-asked and what it's allowed to return.
+A judge model is a **code reviewer who's biased in three predictable ways.**
+Picture a reviewer who (1) rubber-stamps the first PR they see and nitpicks the
+rest (position), (2) approves the longer diff because it "looks more thorough"
+(verbosity), and (3) approves code written in their own style and dings everyone
+else's (self-preference). You wouldn't ban the reviewer — you'd *design around*
+the biases: shuffle review order, judge by correctness not line count, and get a
+reviewer from a different team for the call that matters.
 
 ```
-  RubricJudge — steer in, enforce out
+  Biased reviewer  ─analogy─►  biased judge model
 
-  rubric ──► buildRubricJudgeSystemPrompt ──┐
-             (dimensions+scales,             │  steering layer
-              calibration anchors,           │
-              "score meaning not style")     ▼
-                                    model.complete() ──► raw JSON
-                                                            │
-  rubric ──► createRubricJudgmentValidator ──────────────► │  contract layer
-             clamp score to scale range                     ▼
-             verdict ∈ allowed set                  validate → REJECT or
-             per-dimension {score, reason} required          typed RubricJudgment
+  rubber-stamps first PR     ─►   position bias  → randomize order
+  approves the longer diff   ─►   verbosity bias → cap/score length
+  approves own coding style  ─►   self-preference → different reviewer/family
 ```
 
-The model is free to *propose* a judgment; the rubric decides what's *admissible*.
-That two-sided design — steer the proposal, enforce the admissibility — is what
-turns "an LLM's opinion" into "a score on a defined scale you can put in a
-report."
+aptkit hires the reviewer from a different team for the third one — that's the
+Claude-judges-Gemma design. The first two it hasn't fixed yet.
 
-### Move 2 — the step-by-step walkthrough
+### Move 2 — the judge, the validator, and the three biases
 
-#### Defense 1 — verbosity bias, beaten by per-dimension {score, reason}
+**The rubric and the anti-rewrite instruction.** The judge scores a subject
+against a `RubricDefinition` — dimensions with score scales, allowed verdicts,
+optional boolean checks, and calibration examples (`rubric-judge.ts:31`). The
+system prompt is explicit about scoring *meaning*, not style, and never editing the
+subject (`rubric-judge.ts:147`):
 
-A naive judge asked "rate this 1-5" rewards length: more words *look* like more
-substance. The rubric contract refuses a bare number. Every dimension must come
-back as `{score, reason}`, and the score must sit on a *declared scale* whose
-levels describe *what the score means* — not how long the answer is.
-
-```
-  Verbosity defense — force justification against a meaning-scale
-
-  naive:    judge → "4/5"          ← length sneaks in as quality
-  rubric:   judge → { grounding: { score: 4, reason: "cites the
-                       checkout-funnel metric and the W10 baseline" } }
-                          │
-                          └─ score MUST map to a scale LEVEL whose
-                             description is about EVIDENCE, and the
-                             reason must point at that evidence
+```ts
+'Score the subject against the rubric. Score meaning and evidence, not style preferences unless the rubric asks for style.',
+'Never rewrite the subject. Return one highest-leverage fix, not a list.',
 ```
 
-Because each dimension's scale levels are spelled out in the system prompt
-(`score = description`), and the model must write a `reason` that the validator
-requires to be a non-empty string, a verbose-but-empty answer has nowhere to
-hide: there's no evidence to cite, so the reason is hollow and the dimension that
-measures grounding scores low. The boundary condition: the *quality* of bias
-defense here depends on the rubric author writing dimensions about substance.
-The contract enforces "you must justify per dimension"; it can't enforce "your
-dimensions measure the right things." Garbage rubric, garbage judge.
-
-#### Defense 2 — self-preference + style bias, beaten by the prompt instruction
-
-LLM judges prefer outputs that sound like their own generation — and prefer
-polished prose over plain correctness. The system prompt attacks this head-on
-with two explicit instructions: score *meaning and evidence, not style* (unless
-the rubric asks for style), and *never rewrite the subject — return one
-highest-leverage fix*.
+"Score meaning and evidence, not style" is a direct shot at verbosity/style bias —
+a prompt-level nudge. "Never rewrite the subject" keeps the judge a judge, not a
+co-author. One fix, not a list, keeps the output actionable.
 
 ```
-  Self-preference / style defense — explicit prompt clamps
+  Rubric judge — meaning over style
 
-  "Score meaning and evidence, not style preferences
-   unless the rubric asks for style."   ← detaches score from polish
-  "Never rewrite the subject. Return one
-   highest-leverage fix, not a list."   ← stops the judge re-authoring
-                                           the answer into its own voice
+  subject + RubricDefinition ─► system prompt:
+     "score meaning, not style" + "never rewrite" + "one fix"
+                              │ generateStructured
+                              ▼
+     { dimensions:{id:{score,reason}}, verdict, fix, reasoning? }
 ```
 
-The "never rewrite" instruction is subtle and load-bearing: a judge that rewrites
-the subject implicitly scores against *its own rewrite* (peak self-preference). By
-forbidding the rewrite and demanding a single fix, the contract keeps the judge in
-the grader's chair instead of the author's. The boundary condition: this is the
-*steering* layer — it's an instruction, not an enforcement. A model can ignore it.
-That's why it's paired with the structural defenses below; instruction alone isn't
-trustworthy.
+**The validator — distrust the judge's own output.** A judge can return an
+out-of-range score or invent a verdict. `createRubricJudgmentValidator` computes
+each dimension's allowed range from the rubric's own scale and rejects anything
+outside it (`rubric-judge.ts:195`):
 
-#### Defense 3 — scale drift, beaten by the validator clamp
-
-Even told the scale is 1-5, a model will return 7, or 0.5, or "high". The
-validator computes the min and max of each dimension's declared scale and
-*rejects* any score outside that range. The judgment doesn't get clamped to the
-nearest valid value — it fails validation, which (through `generateStructured`)
-triggers a re-ask. An out-of-range score is treated as a malformed response, not
-a creative one.
-
-```
-  Scale-clamp defense — reject, don't coerce
-
-  rubric dimension "grounding" scale = [1,2,3,4,5]
-        │ validator precomputes  min=1, max=5
-        ▼
-  model returns grounding.score = 7
-        │
-        ▼  7 < 1 || 7 > 5  →  { ok:false,
-                                error:"dimensions.grounding.score must be
-                                       between 1 and 5" }
-        │
-        └─ parse FAILS → re-ask. The judge cannot invent a scale.
+```ts
+const range = scoreRanges.get(id);
+if (range && (score.score < range.min || score.score > range.max)) {
+  return { ok: false, error: `dimensions.${id}.score must be between ${range.min} and ${range.max}` };
+}
+// ...and an unknown verdict is rejected outright:
+if (typeof value.verdict !== 'string' || !verdicts.has(value.verdict)) {
+  return { ok: false, error: 'judgment.verdict is not allowed by the rubric' };
+}
 ```
 
-This is the single most important structural defense: it makes the *scale* a
-hard constraint rather than a polite request. Without it, "score 1-5" is a
-suggestion and your aggregate scores are meaningless. The boundary condition: the
-clamp only works because the scale is *declared in the rubric* — the validator
-derives the range from `dimension.scale`, so a rubric with a sloppy scale gets a
-sloppy clamp.
-
-#### Defense 4 — verdict drift, beaten by the allowlist
-
-The same logic for the categorical verdict: the model must return one of the
-rubric's declared verdict strings. "mostly pass", "B+", "looks good" — all
-rejected. The verdict is constrained to a closed set, so downstream code can
-switch on it safely.
+The rubric defines the legal score space; the validator enforces it. A judge that
+scores 7 on a 1–5 dimension fails validation rather than corrupting the eval.
 
 ```
-  Verdict-allowlist defense
+  Validator — the rubric polices its own judge
 
-  rubric verdicts = { "pass", "revise", "fail" }
-        │ validator builds a Set
-        ▼
-  model returns verdict = "mostly pass"
-        │
-        ▼  !verdicts.has("mostly pass")  → REJECT
-        │
-        └─ the verdict vocabulary is closed; no freeform grades leak through
+  judge output ─► score in [min,max]?  ─no─► reject
+                  verdict in allowed?   ─no─► reject
+                  checks all boolean?   ─no─► reject
+                       │ yes
+                       ▼
+                  trusted RubricJudgment
 ```
 
-#### Defense 5 — scale anchoring, via calibration examples
-
-The remaining problem: even a 1-5 scale means different things to different
-graders (one judge's 3 is another's 5). The rubric carries optional
-`calibrationExamples` — input/expected pairs the prompt injects to *anchor* the
-scale, with the explicit instruction "use these only to anchor the scoring scale;
-do not repeat them." This is how you reduce variance between runs: pin the scale
-to concrete reference points.
-
-```
-  Calibration-anchor defense — pin the scale to references
-
-  rubric.calibrationExamples = [{ input: "<weak answer>",
-                                  expected: "<scores ~2, here's why>" }, …]
-        │ injected into the system prompt
-        ▼
-  judge now scores RELATIVE to anchors, not its private notion of "3"
-        │
-        └─ instruction: "anchor only; do not repeat" — anchors calibrate,
-           they don't become output the judge parrots
-```
-
-#### The bias AptKit does NOT defend against — position bias
-
-Honest gap. **Position bias** — favoring whichever option appears first/last — is
-defeated by *randomizing or swapping order* across runs (the swap-and-agree trick
-from `02`'s pairwise exercise). `RubricJudge` scores a *single* subject, so there's
-no A/B order to randomize *within* the judge. But the moment you use it
-comparatively — judge A, judge B, compare scores — order effects re-enter and
-AptKit does nothing about them: no randomized presentation, no swap-and-agree.
-Don't claim position-bias robustness you don't have. Case A builds the defense.
+**Bias 1 — self-preference (MITIGATED, structurally).** A judge prefers outputs
+from its own model family. aptkit's mitigation isn't a prompt — it's the
+architecture: Claude judges Gemma. Because the judge model is an injected
+`ModelProvider` (`rubric-judge.ts:60`), you point it at the anthropic provider
+while the subject came from Gemma. The judge *cannot* prefer its own outputs
+because none of the outputs are its own. Different family on each side, by
+construction.
 
 ```
-  Position bias — present but UNGUARDED
+  Self-preference — killed by family separation
 
-  single-subject judge:  no A/B order exists → bias N/A
-  comparative use:       judge(A) vs judge(B) → order effects re-enter
-                         AptKit: no swap, no randomization → UNDEFENDED
+  Gemma (subject) ─────────►  RubricJudge(model = Claude)  ─────► verdict
+       │ different families on each side                       │
+       └── judge has no "own output" to favor ────────────────┘
+                       structural mitigation, not a prompt
 ```
 
-### Move 2.5 — the judge inside an agent loop
+**Bias 2 — position bias (`not yet exercised`).** A judge shown two options
+prefers whichever came first. The fix is to randomize order (and ideally judge
+both orderings and average). `rubric-judge.ts` scores *one* subject at a time
+against a rubric — there's no pairwise A/B path and no order randomization. If you
+extend it to compare two subjects, you'd have to add the shuffle. Today: not
+addressed.
 
-`RubricJudge` is a primitive; the **rubric-improvement agent** wires it into a
-bounded agent loop (the same `runAgentLoop` from
-[../04-agents-and-tool-use/03-react-pattern.md](../04-agents-and-tool-use/03-react-pattern.md)).
-The agent can call tools to fetch recent judgments and pattern history, then
-produces a structured improvement (judgment + weakest dimension + one next
-action) validated by the *same rubric contract*.
+**Bias 3 — verbosity bias (`not yet exercised`).** A judge rates a longer answer
+higher even when it's padded. The mitigations are to cap subject length or make
+length an explicit scored dimension. The "score meaning, not style" instruction
+points the right direction, but there's no length cap and no length dimension in
+the rubric machinery — so a verbose subject can still win on impression. Today:
+nudged in the prompt, not enforced.
 
 ```
-  Judge as a primitive vs judge inside an agent loop
+  The two unmitigated biases
 
-  primitive:  RubricJudge.judge(subject) ──► one judgment
-  agent:      runAgentLoop( tools: get_recent_judgments, …,
-                            maxTurns: 6, maxToolCalls: 3,
-                            parseResult: validateRubricImprovementResult )
-                 │  the loop gathers evidence, then emits a judgment
-                 └─ validated by the SAME rubric contract → bias defenses
-                    apply inside the loop too
+  POSITION:  first-shown wins      → fix = randomize order   (not yet exercised)
+  VERBOSITY: longer wins           → fix = cap/score length  (not yet exercised)
+             ("score meaning" prompt nudges, but nothing enforces it)
 ```
-
-The takeaway: the contract isn't bolted to one call site. Whether the judge runs
-standalone or as the brain of an agent loop, the *same* validator clamps the
-scores. The defense travels with the rubric, not the caller.
 
 ### Move 3 — the principle
 
-An LLM judge's reliability comes from the *constraints you put around it*, not
-from the model's good intentions. Steering (the prompt) is best-effort and a
-model can ignore it; enforcement (the validator) is structural and a model
-cannot. Every bias you actually beat is beaten by a constraint that *rejects* a
-biased output, not one that *asks* for an unbiased one. If you can't point at the
-line of code that rejects the bias, you haven't defended against it — you've
-hoped.
+An LLM judge is a measuring instrument with known, predictable bias — so you
+mitigate the bias *structurally* where you can and at least *name* it where you
+can't. aptkit's strongest move is using a different model family as the judge,
+which removes self-preference by construction rather than hoping a prompt fixes
+it. Pair that with a validator that enforces the rubric's own score space, and the
+judge can't drift out of bounds. The honest part is admitting position and
+verbosity aren't handled — a judge you over-trust is worse than no judge, because
+it launders a biased opinion as a score.
 
 ## Primary diagram
 
-The full judge with every bias and its defense marked at the layer it lives in.
-
 ```
-  RubricJudge — biases and where each is defended
+  LLM-as-judge in aptkit — the three biases and their status
 
-  ┌─ STEERING (system prompt, best-effort) ─────────────────────────┐
-  │  dimensions + meaning-scales   → verbosity: must justify         │
-  │  "score meaning, not style"    → self-preference / style         │
-  │  "never rewrite; one fix"      → self-preference (no re-author)  │
-  │  calibrationExamples           → scale anchoring (variance)      │
-  └───────────────────────────────┬──────────────────────────────────┘
-                                   │  model.complete() → raw JSON
-  ┌─ ENFORCEMENT (validator, structural) ──▼────────────────────────┐
-  │  score ∈ [scale.min, scale.max]  → scale drift: REJECT          │
-  │  verdict ∈ allowed set           → verdict drift: REJECT        │
-  │  per-dimension {score, reason}   → verbosity: REJECT if missing │
-  └───────────────────────────────┬──────────────────────────────────┘
-                                   │  pass → typed RubricJudgment
-  ┌─ UNDEFENDED ──────────────────▼────────────────────────────────┐
-  │  position bias — no order randomization (single subject; and    │
-  │  comparative use is unguarded). Honest gap → Case A.            │
-  └──────────────────────────────────────────────────────────────────┘
+  ┌─ RubricJudge (rubric-judge.ts) ───────────────────────────────────────┐
+  │  system prompt: "score meaning, not style" · "never rewrite" · one fix │
+  │  model: ModelProvider  ◄── injected → point at a DIFFERENT family      │
+  └───────────────┬──────────────────────────────────────▲────────────────┘
+                  │ generateStructured                    │ validated
+                  ▼                                        │
+  Gemma subject ──► Claude judge ──► { dimensions, verdict, fix } ──► validator
+                                                                    (score in range?
+                                                                     verdict allowed?)
+  ───────────────────────────────────────────────────────────────────────────
+  SELF-PREFERENCE  ✓ mitigated structurally (Claude judges Gemma)
+  POSITION         ✗ not yet exercised (no order randomization)
+  VERBOSITY        ✗ not yet exercised (prompt nudge only, no length cap/dimension)
 ```
-
-## Implementation in codebase
-
-**Use cases.** `RubricJudge` scores any text subject against a declared rubric —
-e.g. judging the quality of a generated answer or a coaching response. It is the
-grading primitive behind the rubric-improvement agent
-(`packages/agents/rubric-improvement/src/rubric-improvement-agent.ts`), which uses
-the same validator (`validateRubricImprovementResult`) so a judgment produced
-inside the agent loop is held to the identical contract.
-
-**The scale-clamp + verdict-allowlist enforcement**,
-`packages/evals/src/rubric-judge.ts:175-203`:
-
-```
-  packages/evals/src/rubric-judge.ts  (lines 175-203)
-
-  const scoreRanges = new Map(rubric.dimensions.map(d => [d.id, {
-    min: Math.min(...d.scale.map(l => l.score)),    ← derive range from
-    max: Math.max(...d.scale.map(l => l.score)),       the DECLARED scale
-  }]));
-  …
-  for (const id of dimensionIds) {
-    const score = value.dimensions[id];
-    if (typeof score.score !== 'number')             ← verbosity defense:
-      return { ok:false, error:`dimensions.${id}.score must be a number` };
-    if (typeof score.reason !== 'string')            ← must JUSTIFY
-      return { ok:false, error:`dimensions.${id}.reason must be a string` };
-    const range = scoreRanges.get(id);
-    if (range && (score.score < range.min || score.score > range.max))
-      return { ok:false,                             ← scale-clamp defense:
-        error:`dimensions.${id}.score must be between ${range.min} and ${range.max}` };
-  }
-  if (typeof value.verdict !== 'string' || !verdicts.has(value.verdict))
-    return { ok:false, error:'judgment.verdict is not allowed by the rubric' };
-       │                                             ← verdict-allowlist defense
-       └─ every defense here REJECTS, never coerces. A rejected judgment
-          fails validation → generateStructured re-asks. Bias = malformed.
-```
-
-**The steering instructions + calibration anchor**,
-`packages/evals/src/rubric-judge.ts:125-148`:
-
-```
-  packages/evals/src/rubric-judge.ts  (lines 125-148)
-
-  const examples = rubric.calibrationExamples?.length
-    ? `\nCalibration examples. Use these only to anchor the scoring scale;
-       do not repeat them.\n…`                       ← scale-anchoring defense
-    : '';
-  …
-  'Score the subject against the rubric. Score meaning and evidence,
-   not style preferences unless the rubric asks for style.',   ← style defense
-  'Never rewrite the subject. Return one highest-leverage fix, not a list.',
-       │                                             ← self-preference defense
-       └─ these are STEERING — they shape the proposal but can't enforce it.
-          They're paired with the validator above, which can.
-```
-
-**The judge inside the agent loop**,
-`packages/agents/rubric-improvement/src/rubric-improvement-agent.ts:66-90`: the
-agent runs `runAgentLoop` with `maxTurns: 6, maxToolCalls: 3` and
-`parseResult: (text) => parseImprovementResult(text, validate)`, where `validate`
-is `validateRubricImprovementResult(this.rubric)` — the same rubric contract,
-enforced on the loop's final answer.
 
 ## Elaborate
 
-LLM-as-judge entered practice with MT-Bench and the Chatbot Arena work (Zheng et
-al., 2023), which also catalogued the bias trio: position, verbosity, and
-self-preference. The field's standard mitigations are: a *rubric* (score against
-criteria, not vibes), *reference-guided* grading (anchor with examples —
-AptKit's `calibrationExamples`), *forced rationale* (justify each score — AptKit's
-required `reason`), and *order swapping* for pairwise (the one AptKit lacks).
-AptKit's distinctive move is making the rubric a *validated contract* rather than
-prose guidance: the scale and verdict aren't suggestions in the prompt, they're
-ranges and sets the validator enforces. That's the difference between "we asked
-the model to use a 1-5 scale" and "a score outside 1-5 is structurally a parse
-failure."
-
-The deeper point connects to `02`'s seam: the moment you grade with a model, your
-grader is fallible in the same ways the thing it grades is. The defense is to
-shrink the surface where the model's judgment is *trusted* — clamp the range,
-close the verdict set, force a reason — so the only thing left to trust is the
-relative ordering within a tightly constrained space.
-
-Adjacent: the seam this lives above ([02-eval-methods.md](02-eval-methods.md)); the
-agent loop it runs inside
-([../04-agents-and-tool-use/03-react-pattern.md](../04-agents-and-tool-use/03-react-pattern.md));
-the observability that traces a judge call
-([04-llm-observability.md](04-llm-observability.md)); eval-driven prompt iteration
-that uses judge scores as the signal
-([../../study-prompt-engineering/05-eval-driven-iteration.md](../../study-prompt-engineering/05-eval-driven-iteration.md)).
+The "LLM-as-judge" literature warns about position, verbosity, and self-preference
+(self-enhancement) bias; aptkit addresses exactly one and is candid about the
+other two. The design choice that reads as senior is making the judge model an
+injected dependency rather than hardcoding it — that one seam is what turns
+"different family as judge" from a slogan into something you can actually
+configure. The validator is the other quietly good move: a judge that returns a
+score outside the rubric's scale, or a verdict the rubric never defined, fails
+loudly instead of silently poisoning the eval. The `rubric-improvement` agent
+wraps this judge (`packages/agents/rubric-improvement`). Read `02-eval-methods.md`
+for why the judge is the *last* rung you reach for, and `01-llm-foundations/
+08-provider-abstraction.md` for the seam that makes family-swapping possible.
 
 ## Project exercises
 
-*Provenance: Phase 5 — Evals and observability (C5.x). No `aieng-curriculum.md`
-present; IDs are by-phase convention. Case A — the contract exists; position-bias
-defense does not.*
+### Add order randomization for pairwise judging
+- **Exercise ID:** —  (no curriculum file in repo)
+- **What to build:** extend `RubricJudge` (or a wrapper) to judge two subjects A/B,
+  randomize which is shown first, judge both orderings, and average — neutralizing
+  position bias.
+- **Why it earns its place:** position bias is one of the two named biases aptkit
+  doesn't handle; implementing the standard counter-the-shuffle mitigation shows
+  you can move a bias from "named" to "mitigated."
+- **Files to touch:** `packages/evals/src/rubric-judge.ts`,
+  `packages/evals/test/`.
+- **Done when:** a test with two near-identical subjects shows the verdict is
+  stable regardless of input order.
+- **Estimated effort:** `1–4hr`
 
-### Exercise — position-bias defense via swap-and-agree
-
-- **Exercise ID:** `[C5.5]` Phase 5, llm-as-judge-bias concept, Case A (extend)
-- **What to build:** A comparative wrapper around `RubricJudge` that, given two
-  subjects, judges them in *both* orders (A-then-B and B-then-A) and only declares
-  a winner if the higher-scoring subject is the same in both orderings; otherwise
-  returns `tie` with a `positionSensitive: true` flag. This is the order-swap
-  mitigation AptKit lacks.
-- **Why it earns its place:** Position bias is the one bias in the standard trio
-  AptKit does not defend against. Building swap-and-agree shows you know the bias
-  exists, know the canonical fix, and can detect when a judge's preference is an
-  artifact of ordering rather than quality.
-- **Files to touch:** `packages/evals/src/rubric-judge.ts` (add
-  `compareWithRubric`), `packages/evals/src/index.ts`,
-  `packages/evals/test/rubric-judge.test.ts` (fixture provider returning
-  order-dependent scores to prove the `tie` path).
-- **Done when:** A test where the fixture judge prefers whichever subject is
-  listed first yields `tie` / `positionSensitive: true`, and an order-stable
-  fixture yields a stable winner.
-- **Estimated effort:** `1-4hr`
-
-### Exercise — calibration-drift detection
-
-- **Exercise ID:** `[C5.6]` Phase 5, llm-as-judge-bias concept
-- **What to build:** A test harness that runs the judge over its own
-  `calibrationExamples` and asserts the returned score lands within tolerance of
-  each example's `expected` score — a self-check that the judge is actually
-  calibrated to its anchors.
-- **Why it earns its place:** Calibration examples are injected but never
-  verified to *work*. Closing that loop turns the anchors from a hope into a
-  checked invariant and surfaces a miscalibrated rubric before it scores real
-  outputs.
-- **Files to touch:** `packages/evals/src/rubric-judge.ts` (a
-  `assertCalibrated(rubric, model)` helper), `packages/evals/test/rubric-judge.test.ts`.
-- **Done when:** A rubric whose fixture judge scores its anchors correctly passes;
-  one whose judge scores an anchor outside tolerance fails with the offending
-  dimension named.
-- **Estimated effort:** `1-4hr`
+### Make length an explicit scored dimension
+- **Exercise ID:** —  (no curriculum file in repo)
+- **What to build:** add a rubric dimension (or a pre-check) that scores
+  conciseness / penalizes padding, and/or cap subject length before judging, so a
+  verbose answer can't win on impression alone.
+- **Why it earns its place:** verbosity bias is the second unmitigated bias;
+  turning "score meaning, not style" from a prompt nudge into an enforced
+  dimension closes the gap the prompt only gestures at.
+- **Files to touch:** `packages/evals/src/rubric-judge.ts`, a `RubricDefinition`
+  fixture, `packages/evals/test/`.
+- **Done when:** a padded subject scores lower than a concise one carrying the
+  same meaning.
+- **Estimated effort:** `1–4hr`
 
 ## Interview defense
 
-**Q: Your LLM judge gives higher scores to longer answers. How do you stop that?**
+**Q: "Your eval uses a model to judge another model. How do you trust the judge?"**
+I distrust it deliberately, in two ways. Structurally: the judge model is an
+injected dependency, and I point it at a *different model family* than the one
+under test — Claude judging Gemma — which removes self-preference bias by
+construction, because none of the outputs are the judge's own. And mechanically: a
+validator enforces the rubric's own score ranges and allowed verdicts, so a judge
+that scores out of range or invents a verdict fails validation instead of
+corrupting the eval.
 
 ```
-  naive: "rate 1-5"  → length leaks in as quality
-  rubric: per dimension → { score, reason }   ← must justify
-          score ∈ declared meaning-scale       ← validator clamps
-          "score meaning, not style"           ← prompt detaches polish
+  Gemma subject → Claude judge (different family → no self-preference)
+  → validator (score in [min,max]? verdict allowed?) → trusted
 ```
+Anchor: *mitigate self-preference structurally — different family as judge, not a prompt.*
 
-"Verbosity bias. I beat it structurally, not by asking. The rubric forces a
-`{score, reason}` per dimension and the validator rejects a missing reason
-(`rubric-judge.ts:193`), so a long-but-empty answer has no evidence to cite and
-the grounding dimension scores low. The score must land on a *meaning-scale* the
-validator clamps to (`:196`), and the prompt says score evidence not style
-(`:147`). Length has nowhere to turn into points."
-*Anchor: every bias defense is a rejection in the validator, not a polite request.*
-
-**Q: Does your judge have position bias?**
+**Q: "Which judge biases are you NOT handling?"**
+Position and verbosity. Self-preference I kill structurally. Position bias — a
+judge favoring the first-shown option — I don't address because the judge scores
+one subject at a time with no order randomization; if I added pairwise comparison
+I'd have to shuffle and average. Verbosity bias — favoring the longer answer — I
+only nudge with a "score meaning, not style" instruction; there's no length cap or
+length dimension enforcing it. I'd rather name both than pretend a prompt fixed
+them.
 
 ```
-  single subject  → no A/B order → bias N/A
-  comparative use → judge(A) vs judge(B) → order re-enters → UNGUARDED
-  fix not present: swap-and-agree / order randomization
+  self-preference ✓ structural   position ✗ (no shuffle)   verbosity ✗ (prompt nudge only)
 ```
-
-"`RubricJudge` scores one subject, so there's no order to bias *within* a call.
-But the moment you use it comparatively — score A, score B, compare — position
-effects re-enter, and AptKit does nothing about them: no swap, no randomization.
-The standard fix is swap-and-agree — judge both orders and only trust a verdict
-that survives the swap. That's an honest gap I'd close before relying on
-comparative scores."
-*Anchor: name the gap precisely — single-subject is safe, comparative isn't.*
-
-## Validate
-
-- **Reconstruct:** From memory, list the four *structural* defenses the validator
-  enforces (number score, required reason, scale clamp, verdict allowlist) and the
-  two *steering* defenses in the prompt (score-meaning-not-style, never-rewrite).
-  Check against `packages/evals/src/rubric-judge.ts:185-203` and `:147-148`.
-- **Explain:** Why does the validator *reject* an out-of-range score
-  (`rubric-judge.ts:196`) instead of clamping it to the nearest valid value?
-  (Clamping would silently fabricate a score the model didn't mean; rejection
-  treats it as a malformed response and re-asks, keeping the score honest.)
-- **Apply:** A rubric author writes a `grounding` dimension whose scale levels all
-  say "well-written." The judge now rewards polish. Did the contract fail?
-  (No — the contract enforces "justify per dimension on the declared scale"; it
-  cannot enforce that the *dimension measures the right thing*. Garbage rubric,
-  garbage judge. The defense is upstream, in rubric authoring.) See the scale
-  construction at `rubric-judge.ts:108-115`.
-- **Defend:** Why is the steering layer ("score meaning, not style") not enough on
-  its own? (It's a prompt instruction a model can ignore; only the validator
-  *structurally* prevents an inadmissible score. Steering shapes the proposal,
-  enforcement guarantees the result — you need both, and only enforcement is
-  trustworthy.) Contrast `rubric-judge.ts:147` (steering) with `:196` (enforcement).
+Anchor: *an over-trusted judge is worse than none — name the biases you haven't fixed.*
 
 ## See also
 
-- [02-eval-methods.md](02-eval-methods.md) — the seam this judge sits above
-- [01-eval-set-types.md](01-eval-set-types.md) — the sets a judge scores
-- [04-llm-observability.md](04-llm-observability.md) — tracing a judge call
-- [../04-agents-and-tool-use/03-react-pattern.md](../04-agents-and-tool-use/03-react-pattern.md) — the loop the rubric-improvement agent runs the judge inside
-- [../../study-prompt-engineering/05-eval-driven-iteration.md](../../study-prompt-engineering/05-eval-driven-iteration.md) — using judge scores to iterate prompts
+- `02-eval-methods.md` — why the judge is the last rung on the ladder
+- `01-llm-foundations/04-structured-outputs.md` — `generateStructured`, the validated output the judge rides on
+- `01-llm-foundations/08-provider-abstraction.md` — the seam that lets you swap the judge's model family
+- `04-llm-observability.md` — the trace the judge call emits

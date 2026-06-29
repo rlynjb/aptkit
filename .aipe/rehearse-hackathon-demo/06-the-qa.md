@@ -1,223 +1,244 @@
-# Chapter 6 — The Q&A   (prep only — runs after the buzzer)
+# Chapter 06 — The Q&A   (prep only — runs after the clock)
 
 ## Opening hook
 
-This chapter never counts against your ten minutes. It runs after the buzzer, in the open conversation, and it's where a good demo either holds or unravels. Judges ask the same handful of questions at every hackathon — "is this actually working?", "what was the hard part?", "what's the stack?", "did you build this in the window?", "is the local model good enough?", "what's next?" — and the presenters who lose are the ones who get defensive or vague. You're not getting defensive. Every one of these has a crisp, honest, speakable answer grounded in code you can open, and most of them you've already half-answered on stage. This chapter is just making sure none of them catch you cold.
+This chapter never eats your ten minutes. It runs after the buzzer, one-on-one
+with whichever judge walked over. The slot is for landing impact; the Q&A is
+for holding ground. Different mode entirely — here, depth wins, and the worst
+move is bluffing. A judge who builds AI will catch a hand-wave instantly. The
+goal for each answer: crisp, honest, one level deeper than the demo went, and
+anchored to a file you can name.
 
-One rule runs through all of it: **answer in one or two sentences, then stop and let them follow up.** A Q&A answer that turns into a second talk is how you lose the room you just won. Crisp, true, done.
+Six probes come up at almost every hackathon. Below is the answer for each, the
+follow-up tree, and the one rule that governs all of them: when AI assistance
+shaped the build, own it flat. Judges in 2026 assume heavy AI use; defensiveness
+reads worse than candor.
 
-## The map of likely questions
-
-Here's the decision space. The six standard probes, plus where each one can fork.
-
-```
-  Q&A — the six probes and their follow-ups
-
-  "Is it actually working?" ──────► show the trace; it's a real
-        │                            loop, not a hardcoded result
-        └─► "so the demo's faked?" ─► own the stub embedder + the
-                                       recorded responses, explain WHY
-
-  "What was the hard part?" ──────► the silent-zero retrieval bug,
-        │                            read the trace backward
-        └─► "how did you debug it?" ► the persisted trajectory IS
-                                       the debugger
-
-  "What's the stack?" ────────────► TS monorepo, local Gemma via
-        │                            Ollama, in-memory store + evals
-        └─► "where's the database?" ► buffr: same agents on Supabase
-                                       pgvector, one-line swap
-
-  "Did you build this in the      ─► yes, on the real parts; honest
-   window?"                          about what AI did vs what I did
-
-  "Local model — good enough?" ───► good enough WITH the guardrails;
-                                     honest about where it isn't
-
-  "What's next / a business?" ────► framed as future, not faked;
-                                     it's a portfolio + learning build
-```
-
-Everything below walks those branches. Read it once; you won't need notes for it.
-
-## The answers
-
-### Q1 — "Is this actually working, or is it a mockup?"
-
-You already answered this in the demo with the trace, so lean on that.
+## The time-budget bar
 
 ```
-  ┃ "It's working — that's why I showed the trace. The model
-  ┃  chose to call search, the search ran, and the answer
-  ┃  grounded on what came back. It's a real agent loop, not a
-  ┃  scripted result. The same agent runs against a live local
-  ┃  Gemma through the command line, too."
-```
-
-**Follow-up — "but the demo page is in the browser. Isn't that faked?"** This is the sharp version, and you own it head-on:
-
-```
-  ┃ "Good catch — and I'll be exact. The in-browser demo swaps
-  ┃  two things for determinism: a keyword-hash embedder instead
-  ┃  of the real nomic embedder, and recorded Gemma responses
-  ┃  instead of a live call. Everything else is the real code —
-  ┃  the same RagQueryAgent, the real in-memory vector store,
-  ┃  the real eval scorers. I made it deterministic so it can't
-  ┃  flake on stage, not to fake the result. The live version
-  ┃  runs against real Gemma and real embeddings on the CLI."
-```
-
-That's the strongest possible version of this answer: you named exactly what's stubbed (`makeFixtureEmbedder`, the recorded `modelResponses`) and exactly what's real (`RagQueryAgent`, `InMemoryVectorStore`, `scorePrecisionAtK`/`scoreRecallAtK`), and you gave the reason. Precision plus a reason reads as someone who knows their own system; vagueness reads as someone hiding it.
-
-### Q2 — "What was the hard part?"
-
-You seeded this in the build story; here's the full version.
-
-```
-  ┃ "Two things. First, teaching a model with no tool-calling to
-  ┃  call tools — Gemma, locally. Second, the bug that came out
-  ┃  of that: retrieval started silently returning nothing
-  ┃  because Gemma hallucinated a filter the store couldn't
-  ┃  satisfy. No error, just empty. I found it reading the saved
-  ┃  trace backward until the made-up filter appeared, then
-  ┃  fixed the matcher to ignore keys a chunk doesn't have and
-  ┃  added a regression test."
-```
-
-**Follow-up — "how did you actually debug a silent failure?"**
-
-```
-  ┃ "The trace. Every turn the agent takes gets recorded — the
-  ┃  tool calls, the arguments, the results. So when retrieval
-  ┃  came back empty with no error, I read the trajectory
-  ┃  backward until I saw the argument that didn't belong: a
-  ┃  textContains filter the model invented. The trace is the
-  ┃  observability surface — it's the same thing Studio replays."
-```
-
-### Q3 — "What's the stack?"
-
-Crisp inventory, no rambling.
-
-```
-  ┃ "TypeScript monorepo, published as one npm package with
-  ┃  sixteen internal packages bundled inside it. The model is
-  ┃  Gemma running locally through Ollama; embeddings are
-  ┃  nomic-embed-text, also local. The vector store is in-memory
-  ┃  with cosine ranking. Evals are precision and recall at k,
-  ┃  plus a rubric judge where Claude grades Gemma's output so
-  ┃  the model isn't grading itself. Studio is React and Vite."
-```
-
-**Follow-up — "there's no real database. How does this run in production?"** This is your strongest seam; answer it with the one-line swap.
-
-```
-  ┃ "aptkit is the library — in-memory on purpose, zero infra.
-  ┃  The production version lives in a second repo, buffr, which
-  ┃  runs the exact same agents against Supabase Postgres with
-  ┃  pgvector. The store implements the same VectorStore
-  ┃  contract, so the swap is genuinely one line — new
-  ┃  PgVectorStore instead of new InMemoryVectorStore — and the
-  ┃  agent is imported unchanged from the published package. I've
-  ┃  run it live end to end."
-```
-
-If they push into ANN index internals — HNSW graph construction, recall-vs-latency tuning — that's past your hands-on depth, and the honest boundary is stronger than a fake. The interview-defense book's chapter 02 has the full recovery; the short version on stage:
-
-```
-╔══════════════════════════════════════════════════════════════╗
-║ WHEN YOU DON'T KNOW — vector index internals                 ║
-║                                                              ║
-║  They ask: "How does your vector search scale? HNSW? How do  ║
-║  you tune recall against latency?"                           ║
-║                                                              ║
-║  Say: "My in-memory store is an exact linear cosine scan —    ║
-║  correct, not fast, deliberate for a zero-infra library. The  ║
-║  durable store is pgvector, which I'd index with HNSW for     ║
-║  scale. I've used HNSW on defaults, not tuned the recall/      ║
-║  latency tradeoff myself — if you want to walk through what    ║
-║  you'd have me reason about, I'll think it through with you." ║
-║                                                              ║
-║  This reads as senior: precise on what you built, honest on   ║
-║  where your depth ends. Do NOT say "cosine is optimized and   ║
-║  pgvector scales automatically" — that's the tell of someone  ║
-║  who never looked under the hood.                             ║
-╚══════════════════════════════════════════════════════════════╝
-```
-
-### Q4 — "Did you build this during the hackathon? How much was AI?"
-
-The 2026 baseline assumes you used AI heavily. Defensiveness reads worse than candor. Own it matter-of-factly — the differentiator is judgment, not typing.
-
-```
-  ┃ "Yes, and I used AI heavily — most people did. What I want
-  ┃  to be clear about is which parts were judgment. The two
-  ┃  contracts, making retrieval a tool the model calls instead
-  ┃  of a prompt-splice, bounding the loop — those were my
-  ┃  design calls, and I can defend why each one. The AI wrote a
-  ┃  lot of the implementation, and I evaluated and corrected it
-  ┃  — the hallucinated-filter bug is exactly the kind of thing
-  ┃  you only catch by actually reading the trace, not by
-  ┃  accepting the diff. The tools sped up the typing; the
-  ┃  architecture and the debugging were mine."
-```
-
-The move: separate the decisions you made deliberately (the contracts, retrieval-as-tool, the loop budgets) from the code the AI generated that you judged and corrected (caught by reading traces). That's the line judges are actually probing for — can you tell which is which.
-
-### Q5 — "A local 9B model — is it actually good enough?"
-
-Honest answer: good enough *with the guardrails*, and you name where it isn't.
-
-```
-  ┃ "For grounded retrieval-QA with the guardrails around it,
-  ┃  yes. On its own Gemma will hallucinate a filter or pass a
-  ┃  bad top_k — I saw both. So the tool clamps top_k up to a
-  ┃  minimum floor, bad tool-call JSON gets one retry then falls
-  ┃  back to text, and the eval scores every retrieval so a bad
-  ┃  one is visible instead of silent. Where it's weaker is
-  ┃  long-horizon reasoning — for that the same contract lets me
-  ┃  swap in Claude or GPT without touching the agent. That's
-  ┃  the whole point of the model seam."
-```
-
-Notice you turned the weakness into the architecture pitch: the local model has limits, *and the contract is exactly what lets you route around them.*
-
-### Q6 — "Is there a business here? What's next?"
-
-Don't oversell. It's a portfolio and learning build; say so, and frame next steps as future.
-
-```
-  ┃ "I'll be straight — this is a portfolio and learning build,
-  ┃  not a startup. It's my second RAG system, and the point was
-  ┃  to build the substrate myself instead of wiring a framework
-  ┃  to a cloud API like I did the first time. Where it goes next
-  ┃  is technical, not commercial: persistent memory across more
-  ┃  agents, a live provider-fallback chain in the production
-  ┃  repo, and a hosted deploy. If there's a product in it, it's
-  ┃  the 'see whether your agent's answer was actually grounded'
-  ┃  piece — but I'm not claiming that today."
-```
-
-Honesty here is a strength. A judge trusts "this is a learning build and here's what I learned" far more than a forced business case that collapses on the second question.
-
-## The closing posture
-
-Three things to carry into every Q&A answer, no matter which question comes:
-
-```
-  ┌─ ANSWER SHORT ──────────────────────────────────────────┐
-  │  one or two sentences, then stop. Let them follow up.    │
-  │  A second talk loses the room you just won.              │
-  └──────────────────────────────────────────────────────────┘
-  ┌─ OWN THE EDGES ─────────────────────────────────────────┐
-  │  stub embedder, hallucinating model, no real DB in the   │
-  │  library, AI-assisted build — name them before they're    │
-  │  pulled out of you. Candor reads as confidence.           │
-  └──────────────────────────────────────────────────────────┘
-  ┌─ POINT AT CODE ─────────────────────────────────────────┐
-  │  every claim maps to a file you can open. "I can show     │
-  │  you" beats "trust me" every time.                        │
+  ┌──────────────────────────────────────────────────────────┐
+  │ ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓ │
+  │   PREP ONLY — runs AFTER 10:00, does not count against slot │
   └──────────────────────────────────────────────────────────┘
 ```
 
-When a question goes deeper than this chapter — the emulated-tool-calling parse internals, the pgvector index internals, the eval design — that's the interview-defense book's territory. Its chapter 02 (the architecture and the one-line swap), chapter 05 (the failure story), and chapter 08 (the AI-honesty answer) are the deep versions of Q1, Q2, and Q4 here. Keep them within reach; this chapter gets you through the room, that book gets you through the follow-up conversation.
+No clock pressure here — but keep each answer tight. A judge asks because they
+want a signal, not a lecture.
+
+## The chapter-opening diagram — the six probes and where they go
+
+This is the map of what's coming and how deep each one is allowed to go before
+you stop and let them ask the follow-up.
+
+```
+  THE SIX PROBES — depth allowed before you stop
+
+  "is it real?" ───────────► npm + the live trace + the regression test
+  "what was the hard part?" ► tool-emulation + the hallucinated-filter bug
+  "what's the stack?" ──────► TS monorepo, 16 pkgs, Ollama/Gemma, Studio
+  "built in the window?" ───► honest: the agents + Studio + RAG capstone
+  "is the local model       ► honest: good enough HERE; cloud providers
+   good enough?" ──────────►   are drop-ins behind the same contract
+  "what's next / business?" ► memory wired in + buffr as the runtime
+
+  rule for all six: answer one level deeper than the demo, name a file,
+  then STOP and let them drive the follow-up
+```
+
+The discipline the diagram encodes: each answer goes exactly one level past
+what the room saw, names a concrete anchor, and stops. You're inviting the
+follow-up, not preempting it.
+
+## The body — the six probes
+
+### Probe 1 — "Is this actually working, or is it a mockup?"
+
+```
+  ┃ "It's working. The score you saw is computed live by the eval
+  ┃  package against the chunks the agent actually retrieved — not
+  ┃  a hardcoded label. The browser version replays recorded model
+  ┃  responses so it's deterministic, but the retrieval pipeline,
+  ┃  the agent loop, and the eval are all real and running in the
+  ┃  page. And the same agent runs live against local Gemma — I can
+  ┃  show you in the terminal."
+```
+
+Anchor: `scorePrecisionAtK` / `scoreRecallAtK` in `@aptkit/evals`, called from
+`runRagQueryFixtureReplay` in `apps/studio/src/agent-runners.ts`.
+
+```
+  Follow-up tree:
+  ├─ "so the answer is recorded?" → "the model's text is recorded, yes —
+  │    that's what makes it deterministic. The retrieval and the scoring
+  │    run fresh every click. Live Gemma in the CLI isn't recorded."
+  └─ "prove the score isn't hardcoded" → change the fixture's relevant set
+       or question in rag-query-fixtures.ts; the precision number moves.
+```
+
+### Probe 2 — "What was the hard part?"
+
+```
+  ┃ "Teaching a model that can't call tools to drive a tool-using
+  ┃  agent loop. Gemma has no native tool API, so the provider
+  ┃  renders the tool schemas into the prompt and parses a JSON
+  ┃  tool call back out, with a retry when it botches the JSON. And
+  ┃  that surfaced a real bug — a weak model would hallucinate a
+  ┃  metadata filter key that doesn't exist, which silently wiped
+  ┃  every retrieval result. The fix makes absent filter keys a
+  ┃  no-op, and there's a regression test that locks it."
+```
+
+Anchors: `packages/providers/gemma/src/gemma-provider.ts` (the emulation +
+parse-retry), `matchesFilter` in
+`packages/retrieval/src/search-knowledge-base-tool.ts` (the fix), and the test
+*"ignores filter keys absent from chunk metadata (a hallucinated filter does
+not wipe results)"* in
+`packages/retrieval/test/search-knowledge-base-tool.test.ts`.
+
+```
+  Follow-up tree:
+  ├─ "why not just use a model with native tools?" → "I wanted it to run
+  │    fully local and free — no cloud, no key. The contract means I can
+  │    still drop in Anthropic or OpenAI when I want native tools."
+  └─ "how did you catch the bug?" → "the eval flagged retrieval returning
+       nothing on a question I knew had a relevant doc; the trace showed
+       the filter wiping the hits."
+```
+
+### Probe 3 — "What's the stack?"
+
+```
+  ┃ "TypeScript monorepo, ESM, Node's built-in test runner — no
+  ┃  jest. 16 internal packages bundled into one npm release.
+  ┃  Models go through a provider contract: Anthropic, OpenAI, and
+  ┃  local Gemma over Ollama, with a fallback chain and a context-
+  ┃  window guard. Retrieval is a from-scratch pipeline — embedder
+  ┃  plus vector store behind swappable contracts, in-memory and
+  ┃  Ollama nomic today, pgvector in the companion repo. Studio is
+  ┃  React plus Vite."
+```
+
+Anchor: the project context — `@rlynjb/aptkit-core`, 16 bundled packages,
+`@aptkit/provider-gemma` on Ollama `:11434`.
+
+```
+  Follow-up tree:
+  ├─ "why Node's test runner over vitest?" → "fewer dependencies; the
+  │    eval harness is the real test layer — replay artifact → eval →
+  │    promote to fixture → deterministic replay."
+  └─ "why a monorepo?" → "to isolate reusable agent parts from app
+       product logic — that separation is the whole reason it exists."
+```
+
+### Probe 4 — "Did you build this in the hackathon window?"
+
+Own the AI assistance flat — this is where candor wins.
+
+```
+  ┃ "The RAG capstone agent, the Studio page that scores it, and
+  ┃  the in-browser deterministic demo are the hackathon build, on
+  ┃  top of an agent loop and provider layer I'd already extracted
+  ┃  from a prior app. I used AI heavily — pair-programming the
+  ┃  TypeScript, drafting tests. What I did was the design: the two
+  ┃  contracts as the boundary, the tool-emulation approach, and
+  ┃  debugging the retrieval-miss when the eval caught it. The
+  ┃  architecture decisions are mine; the typing went faster with
+  ┃  AI."
+```
+
+```
+  Follow-up tree:
+  ├─ "so AI wrote it?" → "AI wrote a lot of the code; I made the calls
+  │    on the boundaries and debugged what the tools got wrong — like
+  │    the hallucinated-filter bug, which took understanding the
+  │    retrieval path, not just generating code."
+  └─ "what's reused vs new?" → "reused: the agent loop, providers,
+       extracted from earlier work. New this window: the RAG agent,
+       the scored Studio page, the deterministic in-browser demo."
+```
+
+### Probe 5 — "Is a local model actually good enough for this?"
+
+```
+  ┃ "For this — grounded Q&A over a small personal corpus — Gemma
+  ┃  on Ollama is good enough, and the eval is how I know: it
+  ┃  scores whether retrieval actually grounded the answer. Where
+  ┃  it struggles is tool-calling reliability, which is exactly why
+  ┃  the provider has the parse-retry. If I needed stronger
+  ┃  reasoning I'd swap in Anthropic or OpenAI — same contract, no
+  ┃  agent changes. The point isn't 'local is best,' it's 'the
+  ┃  choice is a one-line swap.'"
+```
+
+```
+  Follow-up tree:
+  ├─ "what about bigger corpora?" → "in-memory cosine scan is fine for
+  │    a demo corpus; that's what buffr's pgvector is for at scale —
+  │    same VectorStore contract."
+  └─ "how do you measure 'good enough'?" → "precision@k and recall@k
+       on the retrieval, plus the structural and rubric evals on the
+       agent output. It's measured, not vibes."
+```
+
+### Probe 6 — "Is there a business here / what's next?"
+
+```
+  ┃ "Next is wiring the episodic memory engine — it already exists
+  ┃  on the same contracts, remember and recall, zero new infra —
+  ┃  into an agent that remembers past conversations, and running
+  ┃  the whole thing as a persistent local agent through buffr on
+  ┃  Supabase. The toolkit itself is open and on npm. Whether
+  ┃  there's a business, honestly, I don't know yet — right now
+  ┃  it's the substrate I build my own agents on, and I'd rather
+  ┃  prove it's useful than pitch a market I can't back up."
+```
+
+That last sentence is a strength, not a weakness. Naming the edge of what you
+can defend reads as someone who ships, not someone who pitches.
+
+```
+  Follow-up tree:
+  ├─ "who's the user?" → "developers building agents who don't want to
+  │    rebuild the loop, the providers, and the eval harness each time."
+  └─ "why open source it?" → "the reusable parts shouldn't be locked in
+       an app; that's the whole reason I pulled them out into a package."
+```
+
+## The "I don't know" recovery
+
+When a probe goes past what you can defend, say so and convert it into a real
+answer — never bluff.
+
+```
+  ┃ "I haven't measured that — here's how I'd find out: [the
+  ┃  concrete next step]. What I can tell you is [the adjacent thing
+  ┃  you do know]."
+```
+
+A judge trusts "I don't know, here's how I'd check" far more than a confident
+wrong answer. The demo already earned the credibility; don't spend it bluffing.
+
+## The one-page run sheet
+
+```
+  ┌─ THE Q&A — prep only, after the clock ───────────────────────────┐
+  │ 1 IS IT REAL? score is computed live (scorePrecisionAtK), not     │
+  │   hardcoded; retrieval + loop + eval run in-browser; live Gemma   │
+  │   in CLI. Anchor: agent-runners.ts.                               │
+  │ 2 HARD PART? tool-emulation for tool-less Gemma + hallucinated-   │
+  │   filter bug → fix → named regression test.                       │
+  │ 3 STACK? TS monorepo, 16 pkgs on npm, provider contract           │
+  │   (Anthropic/OpenAI/Gemma), from-scratch RAG, React+Vite Studio.  │
+  │ 4 IN THE WINDOW? RAG agent + scored page + in-browser demo are    │
+  │   new; loop/providers reused. AI wrote code; design + debug mine. │
+  │ 5 LOCAL GOOD ENOUGH? yes here, measured by eval; cloud is a       │
+  │   one-line swap behind the contract.                              │
+  │ 6 WHAT'S NEXT? memory wired in + buffr on Supabase. Business:     │
+  │   "don't know yet" — own it.                                      │
+  │                                                                   │
+  │ AI USE: own it flat — code assisted, boundaries + debugging mine. │
+  │ "I DON'T KNOW": "haven't measured — here's how I'd check; what I  │
+  │   can tell you is [adjacent known thing]." Never bluff.           │
+  └───────────────────────────────────────────────────────────────────┘
+```

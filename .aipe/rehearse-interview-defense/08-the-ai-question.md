@@ -1,367 +1,311 @@
-# Chapter 8 — The AI question
+# Chapter 8 — The AI Question
 
-## Opening hook
+"Did you use AI to build this?" In 2026 this is table stakes, and every
+interviewer asking it already knows the answer is yes — for you and for every
+other candidate in the loop. The question isn't really about whether you used
+AI. It's whether you understand what you shipped well enough to *own* it. The
+worst possible answer is defensive or evasive. The best is grounded:
+matter-of-fact about the AI's role, matter-of-fact about your role, ending in
+a real reflection on what the tools taught you.
 
-Here's the question that ends a lot of interviews badly: "Did you use AI to build this?" The candidates who fail it do one of two things. They get defensive — "well, I wrote most of it myself" — and the interviewer's antenna goes up, because now you sound like you're hiding something. Or they over-credit the tool — "yeah, Claude basically built it" — and the interviewer hears: *this person can't own their own work*. Both answers lose. And they lose for the same reason: they treat AI use as something to apologize for instead of something to account for.
+This chapter is the one place where the honesty posture that ran quietly
+through every other chapter becomes the explicit topic. You built aptkit with
+heavy AI assistance — Claude wrote a lot of this code. Saying that plainly,
+and then demonstrating that you can explain any line of it, is a far stronger
+position than pretending you typed every character. Let's make you fluent in
+owning it.
 
-In 2026 the interviewer already assumes you used AI. They use it too. The question isn't "did you cheat." The question is "do you understand what you shipped well enough to own it." This chapter teaches you the calibrated-honest answer for aptkit and buffr: yes, you built this collaboratively with an AI coding agent, test-driven the whole way — and the engineering was in the *judgment* and the *verification*, not in the typing. You're going to learn to name three modes of decision-making, defend each one differently, and tell two war stories where you caught the AI being wrong. By the end you'll be able to say, plainly, "I used AI agents to build an AI-agent toolkit. The work was the contracts, the evals, and catching the mistakes." That answer wins.
+## The chapter-opening diagram — what AI did, what you did
 
-## The chapter-opening diagram
-
-The whole chapter lives in one picture: every decision in this codebase falls into one of three modes, and you defend each mode differently. Here's the split.
+The split that matters isn't "AI code vs my code" line by line — it's the
+*decisions*. Here's the honest division by decision-mode, the three modes
+from the overview made concrete for this codebase.
 
 ```
-  WHO DECIDED WHAT — the three decision modes in aptkit/buffr
+WHAT AI DID / WHAT I DID — split by decision, not by line
 
-  ┌───────────────────────────────────────────────────────────────┐
-  │ MODE 1 — DELIBERATE          (your call, AI executed)         │
-  │   provider-neutral RAG built from contracts, not a framework  │
-  │   local-first Gemma, cloud (Anthropic/OpenAI) fallback ready  │
-  │   aptkit-library / buffr-deployment repo split               │
-  │   eval-driven iteration (precision@k / recall@k gates)        │
-  │   publishing the bundle to npm (@rlynjb/aptkit-core@0.4.1)    │
-  │   ── defend by: naming the goal and the alternative rejected  │
-  └───────────────────────────────────────────────────────────────┘
-                              │
-  ┌───────────────────────────────────────────────────────────────┐
-  │ MODE 2 — EVALUATED & ACCEPTED (AI proposed, you judged)       │
-  │   the VectorStore / EmbeddingProvider contract shapes        │
-  │   the minTopK floor (stop a weak model starving retrieval)   │
-  │   the hallucinated-filter tolerance fix                      │
-  │   dropping the chunks→documents FK to keep drop-in parity    │
-  │   ── defend by: naming the criterion you judged it against   │
-  └───────────────────────────────────────────────────────────────┘
-                              │
-  ┌───────────────────────────────────────────────────────────────┐
-  │ MODE 3 — DEFAULTED-TO        (AI's default, not deeply judged)│
-  │   some package.json conventions / "files" field per package  │
-  │   some file layout under packages/*                          │
-  │   ── defend by: OWNING it — "I didn't deeply evaluate that;  │
-  │      here's how I'd check it." Riskiest. Most senior when     │
-  │      owned honestly.                                          │
-  └───────────────────────────────────────────────────────────────┘
+  ┌─ DELIBERATE (my decision, AI executed) ─────────────────┐
+  │  • the library/deployment split (aptkit ↔ buffr)        │
+  │  • RAG from scratch, not a framework                    │
+  │  • local Gemma as the forcing-function default          │
+  │  • retrieval as TWO contracts, not one class            │
+  │  ► I decided the shape. AI wrote a lot of the code.      │
+  └──────────────────────────────────────────────────────────┘
+  ┌─ EVALUATED-AND-ACCEPTED (AI suggested, I weighed it) ───┐
+  │  • forced-synthesis turn pattern in the agent loop      │
+  │  • bundledDependencies packaging approach               │
+  │  • minTopK floor on search_knowledge_base               │
+  │  ► AI proposed; I understood the tradeoff and kept it.   │
+  └──────────────────────────────────────────────────────────┘
+  ┌─ DEFAULTED-TO (AI's default, I didn't deeply evaluate) ─┐
+  │  • HNSW index params in buffr (took pgvector defaults)  │
+  │  • the specific chunking strategy / chunk size          │
+  │  • some eval scorer details                             │
+  │  ► I own these as defaults I'd revisit, not as my work.  │
+  └──────────────────────────────────────────────────────────┘
 
-         the differentiator isn't "did you use AI"
-         it's "can you place every decision in the right box"
+  the move: own all three modes openly. the third is the riskiest
+  and the strongest senior signal when owned WELL.
 ```
 
-The interviewer is trying to find out which box your decisions actually live in — and whether you'll be honest when one of them is Mode 3.
-
-## The body — questions and defenses
+That three-way split is the whole chapter. The trick is that the *defaulted-to*
+box — the riskiest to admit — is the one that earns the most credibility when
+you name it without flinching. Let's build the answers.
 
 ### Question 1 — "Did you use AI to build this?"
 
 ```
 ┌─────────────────────────────────────────────────────┐
 │ THEY ASK                                            │
-│   "Did you use AI to build this?"                   │
+│   "Did you use AI to build this project?"           │
 │                                                     │
 │ WHAT THEY'RE TESTING                                │
-│   Not whether you used it — they assume you did.    │
-│   They want to see your *posture*. Defensive means  │
-│   you're hiding the seams. Over-crediting means     │
-│   you can't own your work. Matter-of-fact, with a   │
-│   clear account of who decided what, is the only    │
-│   answer that reads as senior.                      │
+│   Not whether you used AI — they assume you did.    │
+│   Whether you're DEFENSIVE about it, and whether    │
+│   you can distinguish what you decided from what    │
+│   the tool generated. Composure is the probe.       │
 └─────────────────────────────────────────────────────┘
 ```
 
-Lead with yes, then immediately reframe the work. Here's the answer in your voice:
+> "Yes, heavily — Claude wrote a lot of this code. I'm matter-of-fact about
+> that because the interesting part isn't who typed the characters, it's who
+> made the decisions. The architecture decisions were mine: the library-
+> versus-deployment split, building RAG from scratch instead of a framework,
+> defaulting to a local Gemma as a forcing function, making retrieval two
+> contracts. I decided the shape; the AI executed a lot of it.
+>
+> There's a middle band where the AI suggested something and I evaluated it —
+> the forced-synthesis turn in the agent loop is a good example. And there's
+> an honest third band: things I took as the tool's default and didn't deeply
+> evaluate, like the HNSW index parameters and the exact chunking strategy. I
+> can tell you which decisions fall in which bucket, and I think that map is
+> more useful than pretending I hand-wrote everything."
 
-"Yes — I built aptkit and its companion runtime buffr collaboratively with Claude Code, test-driven throughout. I'll be precise about what that means, because it's the interesting part. The AI did a lot of the typing. I did the contracts, the evals, and the verification. The whole repo is a provider-neutral agent toolkit — a bounded agent loop, swappable model providers, a from-scratch RAG pipeline behind `EmbeddingProvider` and `VectorStore` contracts — and I drove every one of those shapes. I used AI agents to build an AI-agent toolkit. The engineering was in the judgment, not the keystrokes."
-
-That last line is the one to memorize. It does two things at once: it's honest about heavy AI use, and it relocates the engineering to exactly where a senior would expect it — design and verification.
-
-```
-┌─────────────────────────┬─────────────────────────┐
-│ WEAK ANSWER             │ STRONG ANSWER           │
-├─────────────────────────┼─────────────────────────┤
-│ "I used it a bit for    │ "Yes — built it with    │
-│ boilerplate, but I      │ Claude Code, test-      │
-│ wrote the important     │ driven. The AI did the  │
-│ parts myself."          │ typing; I did the       │
-│                         │ contracts, the evals,   │
-│                         │ and the verification.   │
-│                         │ I drove the design and  │
-│                         │ caught the AI's         │
-│                         │ mistakes."              │
-├─────────────────────────┼─────────────────────────┤
-│ Why it's weak:          │ Why it works:           │
-│ It's defensive and      │ Matter-of-fact, no      │
-│ vague. "A bit" and      │ flinch. Relocates the   │
-│ "the important parts"   │ engineering to design   │
-│ are dodges. The         │ and verification — the  │
-│ interviewer now wants   │ part a tool can't do     │
-│ to test whether you     │ for you — and invites    │
-│ understand the parts    │ the drill instead of    │
-│ you claim you wrote.    │ deflecting it.          │
-└─────────────────────────┴─────────────────────────┘
-```
+That answer is calm, specific, and structured around the three modes. It
+preempts the follow-up ("which parts did you actually decide?") by answering
+it inside the first answer. No defensiveness, no overclaiming.
 
 ```
-┃ "I used AI agents to build an AI-agent toolkit.
-┃  The work was the contracts, the evals, and the
-┃  verification."
+┃ The interesting part isn't who typed the characters.
+┃ It's who made the decisions — and I can map every one.
 ```
 
-### Question 2 — "So did the AI write all of it? What did YOU actually do?"
+### Question 2 — "Can you explain this section line by line?"
 
 ```
 ┌─────────────────────────────────────────────────────┐
 │ THEY ASK                                            │
-│   "Did the AI write all of it? What did you         │
-│    actually do?"                                    │
+│   "Pick a file. Can you walk me through this code    │
+│    line by line and tell me why it's there?"        │
 │                                                     │
 │ WHAT THEY'RE TESTING                                │
-│   Can you separate the parts you DROVE from the     │
-│   parts you accepted? A candidate who claims they   │
-│   drove everything is lying; a candidate who        │
-│   claims they drove nothing is useless. The senior  │
-│   answer names the three modes and puts real        │
-│   decisions in each.                                │
+│   The real test behind the AI question: do you      │
+│   understand the code AI wrote, or did you ship it  │
+│   unread? This is where evasive candidates collapse.│
 └─────────────────────────────────────────────────────┘
 ```
 
-This is where you bring out the three-mode split. Don't recite it as a framework — walk it with real decisions. Your voice:
+The defense here isn't a speech — it's *being able to do it*. Pick the file
+you understand cold and offer it. The `matchesFilter` function is perfect:
+it's six lines, it's the heart of your war story, and you fixed it yourself.
 
-"I'll split it three ways. First, the deliberate calls — those were mine, the AI just executed them. The big one is that the RAG pipeline is built from *contracts*, not a framework. `EmbeddingProvider` and `VectorStore` are vendor-neutral interfaces in `packages/retrieval/src/contracts.ts`; the pipeline logic never names nomic or pgvector. That's why buffr can drop in a `PgVectorStore` against the exact same contract. I also decided the repo split — aptkit is the deployment-agnostic library, buffr is the Supabase-backed body that consumes `@rlynjb/aptkit-core` from npm. And I decided to gate retrieval changes on `precision@k` and `recall@k` scorers in `packages/evals`, and to publish the bundle to npm at `@rlynjb/aptkit-core@0.4.1`. Those are goals — the AI doesn't pick your goals.
+> "Sure — let me pick `matchesFilter` in the search tool, because I actually
+> debugged that one. It takes a hit and a filter object and returns whether
+> the hit passes. The body is one line: for every key-value pair in the
+> filter, the hit passes if *either* the chunk's metadata doesn't have that
+> key at all, *or* it has it with a matching value. The `!(key in hit.meta)`
+> is the load-bearing part — that's the clause I added. Before my fix it was a
+> strict exact-match, so a hallucinated filter key like `textContains` that no
+> chunk has would fail every hit and zero the results. The comment right above
+> it says exactly that: a weak model's hallucinated filter can't silently wipe
+> every result. I can keep going through the over-fetch logic if you want — it
+> fetches 4x when filtering so the post-filter still returns a full top-k."
 
-Second, the evaluated-and-accepted calls. Claude proposed the contract *shapes* and I judged them against one question: can a swap happen without rewriting the pipeline? It proposed the `minTopK` floor and the hallucinated-filter tolerance — I accepted both after I understood the failure they prevented. And dropping the chunks→documents foreign key was a proposal I accepted once I saw it would otherwise break drop-in parity.
-
-Third — and I want to be straight about this — there's a tier I *defaulted to*. Some of the per-package `package.json` conventions and some of the file layout under `packages/*` I took as the AI's defaults without deeply evaluating them. I can tell you which ones and how I'd check them if it mattered."
-
-That third paragraph is the one that wins the room. We'll come back to it.
+That's the demonstration. You didn't *say* "I understand the AI's code" — you
+*proved* it on a file you can defend to the character. Always pick the file
+you debugged, never a file you only read.
 
 ```
-┃ "The AI doesn't pick your goals. Provider-neutral,
-┃  contracts-not-a-framework, the repo split, eval
-┃  gates — those were mine."
+┌──────────────────────────────┬──────────────────────────────┐
+│ WEAK ANSWER                  │ STRONG ANSWER                │
+├──────────────────────────────┼──────────────────────────────┤
+│ "Uh, this part... I think    │ "Let me pick matchesFilter — │
+│  this handles the filtering, │  I debugged that one. It      │
+│  it loops through and checks │  passes a hit if every filter │
+│  the metadata... I'd have to  │  key is either absent from    │
+│  read it more carefully to    │  the chunk's meta OR matches. │
+│  tell you exactly why each    │  The absent-key clause is the │
+│  line is there."             │  line I added to fix the      │
+│                              │  hallucinated-filter bug."    │
+├──────────────────────────────┼──────────────────────────────┤
+│ Why it's weak:               │ Why it works:                │
+│ "I'd have to read it more     │ Picks a file they OWN, walks  │
+│ carefully" on your own code   │ the load-bearing line, ties   │
+│ confirms the interviewer's    │ it to a real bug they fixed.  │
+│ worst fear: you shipped AI    │ Proves understanding instead  │
+│ code unread. Game over on     │ of asserting it. The AI       │
+│ that file.                   │ question is now answered.     │
+└──────────────────────────────┴──────────────────────────────┘
 ```
 
-### Question 3 — "How do I know YOU understand it, and not just the AI?"
+### Question 3 — "What did AI get wrong?"
 
 ```
 ┌─────────────────────────────────────────────────────┐
 │ THEY ASK                                            │
-│   "How do I know you actually understand this       │
-│    code, instead of just accepting what the AI      │
-│    produced?"                                        │
+│   "Where did the AI steer you wrong, or where did   │
+│    you have to override it?"                        │
 │                                                     │
 │ WHAT THEY'RE TESTING                                │
-│   The real probe. Comprehension under pressure.     │
-│   They want evidence you can REASON about the code,  │
-│   not recite it. The proof is: design decisions you  │
-│   can justify, bugs you diagnosed that the AI        │
-│   caused, and the ability to defend any choice when  │
-│   pushed. Memorized lines collapse on the second     │
-│   follow-up; understanding doesn't.                  │
+│   Do you treat AI output critically, or accept it    │
+│   wholesale? Naming where you OVERRODE the tool is   │
+│   the strongest possible proof you're driving.       │
 └─────────────────────────────────────────────────────┘
 ```
 
-Don't answer this with a claim ("I understand it, I promise"). Answer it with evidence — point at the design decisions, then tell a war story where you caught the AI being wrong. The catch is the proof, because you can only catch a mistake in code you actually understand.
+> "The clearest place is the `matchesFilter` bug itself — in a sense the AI-
+> generated exact-match filter logic *was* the wrong call for a system using a
+> weak local model that hallucinates arguments. The original logic was
+> technically reasonable; it just didn't account for a model inventing filter
+> keys. I had to understand the failure from the trace and override it with
+> the absent-key-tolerant version. That's the pattern with AI code generally:
+> it writes locally-correct code that doesn't account for the *specific*
+> failure modes of *my* system. The judgment call — 'a weak model will
+> hallucinate filters, so this needs to be tolerant' — is the part I bring.
+>
+> Honestly, the broader thing AI gets wrong is it'll happily generate the
+> defaulted-to decisions and present them with the same confidence as the
+> deliberate ones. The HNSW defaults, the chunk size — it'll pick something
+> reasonable and move on. Part of my job is knowing which of its confident
+> choices I actually evaluated and which I just accepted."
 
-Your voice:
-
-"Three pieces of evidence. First, the design — I can defend every load-bearing choice in this repo and tell you the alternative I rejected. Ask me about the provider neutrality, the repo split, the eval gates, any of it. Second, I caught the AI's mistakes — and you can only catch a bug in code you understand. Let me give you the clearest one.
-
-The `VectorStore` contract is a drop-in seam: buffr's `PgVectorStore` has to satisfy the same interface as the `InMemoryVectorStore`, so a host app can swap storage without touching pipeline code. When the AI generated buffr's SQL schema, it added a foreign key from `agents.chunks.document_id` to `agents.documents.id` — which is the *correct* instinct for a normalized schema. But the `VectorStore.upsert` contract takes chunks that carry no notion of a documents row. So the FK meant: try to upsert a chunk live, and Postgres rejects it because the parent document doesn't exist. That broke drop-in parity. And here's the part that matters — it didn't surface in fixtures, because fixtures don't hit a real database. I only caught it by running buffr live against actual Postgres. The fix is in `buffr/sql/001_agents_schema.sql`: the `document_id` column is a soft link with no FK, with an explicit comment saying why, plus an idempotent `drop constraint if exists` for already-migrated databases.
-
-Third — and this is the deepest one — I diagnosed a *retrieval* miss. A weak local model would call `search_knowledge_base` with a hallucinated filter key, like `{textContains: "moon"}`, that no chunk's metadata actually carries. A naive exact-match filter would then exclude *every* result and the model would answer from nothing. The fix in `packages/retrieval/src/search-knowledge-base-tool.ts` is that a filter key only excludes a hit that *has* that key with a different value — absent keys are ignored. There's a test for it that asserts a hallucinated filter key doesn't zero out retrieval. Same file has the `minTopK` floor: a weak model that asks for `top_k: 1` starves its own multi-part answer, so the floor lifts it back up.
-
-If you want to test my understanding directly — open any file and I'll walk it. The catches are the proof I'm not reciting."
-
-```
-┃ "You can only catch a bug in code you understand.
-┃  The FK that broke drop-in parity is my proof I
-┃  understood the contract."
-```
-
-Notice the structure of that FK story — it's a complete diagnosis, not a vague "I fixed some bugs." It names the contract that broke, *why* the AI's instinct was reasonable, why fixtures hid it, how live running surfaced it, and where the fix lives. That's what comprehension sounds like under pressure.
-
-Here's the side-by-side for the war story, because the failure mode here is subtle:
-
-```
-┌─────────────────────────┬─────────────────────────┐
-│ WEAK ANSWER             │ STRONG ANSWER           │
-├─────────────────────────┼─────────────────────────┤
-│ "The AI made some       │ "It added a chunks→     │
-│ mistakes and I fixed    │ documents FK — a sane   │
-│ them. Like there was a  │ normalization instinct  │
-│ database bug and a      │ — but it broke the      │
-│ retrieval bug."         │ VectorStore drop-in     │
-│                         │ contract: upsert takes  │
-│                         │ chunks with no parent   │
-│                         │ row. Fixtures hid it;    │
-│                         │ running buffr live      │
-│                         │ against Postgres        │
-│                         │ surfaced it. Fix is the │
-│                         │ soft link in            │
-│                         │ 001_agents_schema.sql."  │
-├─────────────────────────┼─────────────────────────┤
-│ Why it's weak:          │ Why it works:           │
-│ No specifics. "Some     │ Names the contract,     │
-│ mistakes" could be      │ why the AI's call was   │
-│ anything. The           │ reasonable, why tests   │
-│ interviewer can't tell  │ missed it, how it was    │
-│ if you diagnosed it or  │ found, where the fix     │
-│ the AI fixed its own    │ lives. This is a        │
-│ bug. No proof of        │ diagnosis only the      │
-│ understanding.          │ author could give.      │
-└─────────────────────────┴─────────────────────────┘
-```
-
-### The follow-up decision tree
-
-Once you've given the three-mode answer, the interviewer will push on one branch. Here's where it goes and what to say.
+That answer is gold because it ties "what AI got wrong" directly to your war
+story (the filter) and to your honest decision-map (defaulted-to choices). It
+shows you treat AI as a strong but fallible collaborator, and that the
+*judgment* — not the typing — is your contribution.
 
 ```
-"How do I know you understand it?"
+"Did you use AI?" → "yes, heavily"
       │
-      ▼
-You point at design + the war-story catches.
+      ├─► IF THEY ASK "so what's actually YOUR work?"
+      │     The decisions and the judgment. The architecture
+      │     was mine; I can map every choice to deliberate /
+      │     evaluated / defaulted. → the three-mode split.
       │
-      ├─► IF THEY OPEN A FILE AND SAY "WALK ME THROUGH THIS"
-      │     Do it live. Lead with the contract or the
-      │     shape, then the mechanism. You can defend
-      │     every choice in this book — that's the whole
-      │     point of having written it.
+      ├─► IF THEY ASK "explain a file line by line"
+      │     Pick matchesFilter or runAgentLoop — files I
+      │     debugged. Walk the load-bearing line. PROVE it.
       │
-      ├─► IF THEY ASK "WHAT ELSE DID THE AI GET WRONG?"
-      │     Have the second war story ready: the
-      │     hallucinated-filter retrieval miss in
-      │     search-knowledge-base-tool.ts, and the
-      │     minTopK floor. Two catches beat one.
+      ├─► IF THEY ASK "what did AI get wrong?"
+      │     The exact-match filter for a hallucinating model;
+      │     and it presents defaulted choices as confidently
+      │     as deliberate ones. I bring the judgment.
       │
-      ├─► IF THEY PUSH ON A MODE-3 DEFAULT
-      │     ("did you evaluate this package.json setup?")
-      │     OWN IT. "No — I took the AI's default there.
-      │     Here's how I'd check it." Do not fake having
-      │     evaluated it. The honest answer is the
-      │     senior signal. (See the recovery box.)
-      │
-      └─► IF THEY ASK "WOULD YOU TRUST THIS IN PRODUCTION?"
-            Point at the testing backbone: node:test
-            across 28 test files, eval gates on
-            retrieval (precision@k), live-run
-            verification that caught the FK. The
-            verification IS the trust story.
+      └─► IF THEY ASK "did you fine-tune anything?"
+            No — deliberately. Fine-tuning is eval-gated and I
+            didn't have the eval bar to justify it. → recovery box.
 ```
 
-### Question 4 — "Isn't using AI for all this just... cheating?"
-
 ```
-┌─────────────────────────────────────────────────────┐
-│ THEY ASK                                            │
-│   "If the AI wrote most of the code, what's the     │
-│    actual skill here?"                              │
-│                                                     │
-│ WHAT THEY'RE TESTING                                │
-│   Whether you can articulate the 2026 differentiator │
-│   without sounding defensive about it. The baseline  │
-│   assumes heavy AI use. The skill is judgment and    │
-│   verification — and they want to hear you say that  │
-│   like it's obvious, because to a senior, it is.     │
-└─────────────────────────────────────────────────────┘
-```
-
-Your voice, calm and matter-of-fact:
-
-"The skill is the same skill it's always been, just with the typing compressed. The AI will happily generate a normalized schema with a foreign key that breaks my drop-in contract, or a retrieval filter that wipes results when a weak model hallucinates a key. It generates plausible code fast. What it doesn't do is decide that the `VectorStore` contract is the thing that must not break, run the system live against real Postgres to find where the plausible code fails, or build precision@k gates so a retrieval regression can't merge silently. That's the work. I came into this already understanding RAG — I shipped a pgvector-backed RAG app, AdvntrCue, before this — so I was driving the retrieval design from experience, not discovering it from the AI's output. The AI accelerated the build. It didn't supply the judgment."
-
-```
-        ▸ The 2026 baseline assumes heavy AI use.
-          The differentiator is judgment and
-          verification — owning which decisions
-          were yours and proving you can catch
-          the tool when it's wrong.
-```
-
-## When you don't know
-
-The riskiest question in this chapter isn't a hard technical one — it's the interviewer pushing on a Mode-3 default and watching whether you'll fake it. This is the box to internalize.
-
-```
-╔═══════════════════════════════════════════════════════╗
-║ WHEN YOU DON'T KNOW                                   ║
-║                                                       ║
-║   They push on a defaulted-to decision — something    ║
-║   the AI set up that you didn't deeply evaluate.      ║
-║   For aptkit, that's some of the per-package          ║
-║   package.json conventions (the `"files": ["dist/    ║
-║   src"]` field every bundled package needs, the       ║
-║   bundledDependencies setup) and some file layout     ║
-║   under packages/*.                                   ║
-║                                                       ║
-║   Say:                                                ║
-║   "Honestly — I didn't deeply evaluate the per-       ║
-║    package package.json conventions. The AI set       ║
-║    those up and I confirmed the bundle published      ║
-║    and resolved, but I took the layout as its         ║
-║    default. If I needed to defend it, I'd check       ║
-║    that every bundled package has its `files` field   ║
-║    set so npm pack doesn't drop a gitignored dist,    ║
-║    and I'd diff the published tarball contents        ║
-║    against what core re-exports. I know how I'd       ║
-║    verify it; I just haven't had to."                 ║
-║                                                       ║
-║   What this signals: you can DISTINGUISH the          ║
-║   decisions you drove from the ones you accepted on   ║
-║   default, AND you have a concrete verification       ║
-║   path for the ones you didn't. That's the most       ║
-║   senior thing you can do in this chapter. It's the   ║
-║   opposite of fragile.                                ║
-║                                                       ║
-║   Do NOT say:                                         ║
-║   "Yeah I set all that up deliberately, the package   ║
-║    structure is designed for..."                      ║
-║   The moment you over-claim a Mode-3 default, the     ║
-║   interviewer asks one more question and watches you  ║
-║   improvise. Faking ownership of a default is how a   ║
-║   strong interview turns into a failed one.           ║
-╚═══════════════════════════════════════════════════════╝
+╔════════════════════════════════════════════════════════╗
+║ WHEN YOU DON'T KNOW                                     ║
+║                                                         ║
+║   They push into ML depth you deliberately don't have:  ║
+║   "Why didn't you fine-tune Gemma for tool-calling      ║
+║   instead of emulating it? Walk me through how you'd    ║
+║   set up the fine-tuning run."                          ║
+║                                                         ║
+║   You have NOT done fine-tuning — it's a deliberate gap, ║
+║   not an accidental one. You chose emulation over fine-  ║
+║   tuning on purpose. Own the choice AND the gap.         ║
+║                                                         ║
+║   Say:                                                  ║
+║   "I didn't fine-tune, and that was deliberate. Fine-   ║
+║    tuning is something I'd want to gate behind a real    ║
+║    eval bar — I'd need to prove emulated tool-calling    ║
+║    was the actual bottleneck before spending the data    ║
+║    and compute to fine-tune, and my evals weren't at     ║
+║    that bar. Emulation got me working tool-calls on a    ║
+║    model that has none, which was enough for what I was  ║
+║    building. As for setting up the run itself — the      ║
+║    data prep, the training loop — I haven't done a fine- ║
+║    tuning run, so I'd be learning that, not telling you  ║
+║    from experience. The DECISION not to fine-tune I can  ║
+║    defend; the mechanics I'd be picking up."            ║
+║                                                         ║
+║   What this signals: you made fine-tuning a deliberate,  ║
+║   eval-gated NON-decision (senior — you don't fine-tune  ║
+║   on vibes), and you cleanly separate "I can defend the  ║
+║   decision" from "I haven't done the mechanics."         ║
+║                                                         ║
+║   Do NOT say:                                            ║
+║   "Fine-tuning would've been better but I didn't have    ║
+║    time" — that frames a deliberate, defensible choice   ║
+║   as a corner you cut, and invites a dig into mechanics   ║
+║   you haven't practiced.                                ║
+╚════════════════════════════════════════════════════════╝
 ```
 
-The grounding here is real: `RELEASE.md` documents that each new bundled package needs `"files": ["dist/src"]` or `npm pack` excludes its gitignored `dist`. That's exactly the kind of convention that's easy to default to and easy to verify *later* — which is precisely why it's the safe, honest Mode-3 example to name.
+### The closing reflection — what the tools taught you
+
+End the AI question on a real reflection. Not a platitude — a specific thing
+the build taught you about working with these tools. Here's yours:
+
+> "What building aptkit with heavy AI assistance actually taught me is that
+> the bottleneck moved. The typing isn't the work anymore — the AI does that
+> fast. The work is judgment: knowing which of the tool's confident choices to
+> evaluate and which to accept, knowing that locally-correct code can be
+> globally wrong for *my* system's failure modes, and being able to debug the
+> thing the AI built when it breaks in a way the AI didn't anticipate. The
+> `matchesFilter` bug is the whole lesson in one function — the AI wrote
+> reasonable code, my system had a failure mode the code didn't expect, and
+> closing that gap required understanding the system end to end. That's the
+> skill that didn't get automated away. If anything it got more valuable."
+
+That reflection is the strongest possible close to the AI question. It's
+specific (the filter bug), it's honest (AI did the typing), and it names the
+durable skill (judgment + debugging) without sounding defensive or
+self-congratulatory.
 
 ```
-┃ "I didn't deeply evaluate that — but here's how
-┃  I'd check it." Owning a default is more senior
-┃  than faking a deliberate choice.
+        ▸ The typing got automated. The judgment didn't. Owning
+          what you shipped means owning the decisions, not the
+          keystrokes.
 ```
 
 ## What you'd change
 
-If you were doing this again, the thing to change is the *verification gap that the FK bug exposed*. The foreign key broke drop-in parity and fixtures didn't catch it — only running buffr live did. The honest reflection: I leaned on fixtures for fast deterministic replay, which is the right backbone, but I had no contract-conformance test that ran a real adapter against the real `VectorStore` interface. If I started over, I'd add a shared contract test suite that every `VectorStore` implementation — in-memory and `PgVectorStore` — has to pass, so a parity-breaking change like that FK fails in CI instead of in a live run. The fixtures stay; I'd add the conformance layer underneath them. That's the senior move: I don't regret the fixtures, I name the specific gap the bug revealed and the test that would have closed it.
+If I were doing the AI-assisted build over, I'd keep a running decision log
+that tags each significant choice as deliberate, evaluated, or defaulted-to *as
+I make it* — because reconstructing that map after the fact is harder than it
+should be, and the map is exactly what makes the AI question easy to answer.
+The honest meta-point: the thing I'd improve isn't the code AI wrote, it's my
+own record of which decisions I actually owned versus accepted. That record is
+the difference between sounding like you built the system and sounding like
+you supervised it.
 
-## One-page summary
+## One-page summary — Chapter 8
 
-**Core claim:** The 2026 baseline assumes you used AI heavily. The differentiator is judgment and verification — owning which decisions were yours, which you evaluated and accepted, which you defaulted to, and proving you can catch the tool when it's wrong.
-
-**The three modes (memorize this split):**
-- **Deliberate (your call):** provider-neutral RAG from contracts, local-first Gemma with cloud fallback, the aptkit/buffr repo split, eval gates (`precision@k`/`recall@k`), publishing `@rlynjb/aptkit-core@0.4.1` to npm.
-- **Evaluated & accepted (AI proposed, you judged):** the `VectorStore`/`EmbeddingProvider` contract shapes, the `minTopK` floor, the hallucinated-filter tolerance, the FK removal.
-- **Defaulted-to (own it honestly):** some `package.json` conventions, some `packages/*` layout. "I didn't deeply evaluate that; here's how I'd check it."
-
-**Questions covered:**
-- *Did you use AI to build this?* → "Yes, with Claude Code, test-driven. The AI did the typing; I did the contracts, the evals, and the verification."
-- *Did the AI write all of it / what did YOU do?* → Walk the three modes with real decisions in each.
-- *How do I know YOU understand it?* → Point at design decisions + the war-story catches. The FK that broke drop-in parity (`buffr/sql/001_agents_schema.sql`) and the hallucinated-filter miss (`packages/retrieval/src/search-knowledge-base-tool.ts`) are proof, because you can only catch a bug in code you understand.
-- *Isn't this cheating?* → The AI generates plausible code fast; it doesn't supply judgment or verification. I came in already understanding RAG (shipped AdvntrCue before this).
-- *Pushing on a Mode-3 default?* → Own it. Name how you'd verify it. Never fake deliberate ownership of a default.
-
-**Pull quotes:**
 ```
-┃ "I used AI agents to build an AI-agent toolkit.
-┃  The work was the contracts, the evals, and the
-┃  verification."
+CORE CLAIM
+  Own AI assistance plainly. The probe is composure + whether you
+  can map decisions to deliberate / evaluated / defaulted-to.
 
-┃ "You can only catch a bug in code you understand."
+QUESTIONS COVERED
+  Q: Did you use AI? A: Yes, heavily — Claude wrote a lot. The work
+     was the DECISIONS; I can map each to one of three modes.
+  Q: Explain a file line by line? A: PROVE it — pick matchesFilter
+     (debugged it). Walk the absent-key clause I added. Don't assert.
+  Q: What did AI get wrong? A: exact-match filter for a hallucinating
+     model; it presents defaulted choices as confidently as deliberate.
+  Q: Why not fine-tune? A: deliberate, eval-gated non-decision.
+     Defend the decision; honest the mechanics are unpracticed. (box)
 
-┃ "I didn't deeply evaluate that — but here's how
-┃  I'd check it."
+PULL QUOTES
+  ▸ The interesting part isn't who typed the characters.
+  ▸ The typing got automated; the judgment didn't.
+
+WHAT YOU'D CHANGE
+  Keep a live decision log tagging each choice deliberate/evaluated/
+  defaulted-to as I make it — the map is what makes this question easy.
 ```
-
-**What you'd change:** Add a shared `VectorStore` contract-conformance test suite that every implementation (in-memory and `PgVectorStore`) must pass, so a parity-breaking change like the FK fails in CI instead of in a live run. Keep the fixtures; add the conformance layer underneath.
-
----
-Updated: 2026-06-24 — Published version `0.4.0 → 0.4.1` in the three-mode diagram and summary (0.4.1 is now the published bundle).

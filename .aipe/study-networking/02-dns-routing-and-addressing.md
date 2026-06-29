@@ -1,191 +1,139 @@
-# 02 — DNS, routing, and addressing
+# DNS, Routing, and Addressing
 
-**Industry name(s):** name resolution / address resolution / origin routing. **Type:** Industry standard.
+**Industry name:** name resolution / addressing / origin routing · *Industry standard*
 
-## Zoom out — where this concept lives
+## Zoom out, then zoom in
 
-Names and addresses are the very first thing that happens on any network hop, below everything else in this guide. Here's where resolution sits relative to AptKit's two boundaries.
+Before a byte can travel, the code has to answer "to which address?" Here's where that question gets asked in this system — and the surprise is how often the answer is "no lookup needed."
 
 ```
-  Zoom out — resolution sits below both boundaries
+  Zoom out — where addressing happens
 
-  ┌─ UI (browser) ────────────────────────────────────────────┐
-  │  fetch('/api/stream/replay')  ← relative URL, no hostname  │
+  ┌─ Service layer ────────────────────────────────────────────┐
+  │  GemmaModelProvider                                        │
+  │    host = 'http://localhost:11434'   ← ★ literal address ★ │
+  │  OllamaEmbeddingProvider                                   │
+  │    host = 'http://localhost:11434'   ← ★ literal address ★ │
   └───────────────────────────┬────────────────────────────────┘
-                              │  resolves to: same origin (localhost:4187)
-  ┌─ Service (Node/Vite) ─────▼────────────────────────────────┐
-  │  ★ DNS happens here, inside the SDK ★                       │
-  │  client.chat.completions.create → resolves api.openai.com  │
-  └───────────────────────────┬────────────────────────────────┘
-                              │  hostname → IP (OS resolver + SDK)
-  ┌─ Provider (external) ─────▼────────────────────────────────┐
-  │  api.anthropic.com / api.openai.com                        │
-  └──────────────────────────────────────────────────────────────┘
+                              │ resolves to 127.0.0.1 — loopback,
+                              │ no DNS query leaves the machine
+  ┌─ Provider layer ─────────▼─────────────────────────────────┐
+  │  Anthropic/OpenAI SDK  →  api.anthropic.com / api.openai.com│
+  │    DNS happens HERE, inside the SDK (not aptkit's code)     │
+  └────────────────────────────────────────────────────────────┘
 ```
 
-## Zoom in — narrow to the concept
+**Zoom in.** DNS is the phonebook step: turn a human name (`api.openai.com`) into an IP the OS can route to. Routing and proxies decide the path those packets take. In aptkit, the foreground answer is `localhost` — a name the OS resolves to `127.0.0.1` without any network query — so the interesting DNS lives entirely inside dependencies. The pattern to learn: **the address is configuration, and where the address is a literal loopback, the whole resolution+routing+proxy stack collapses to nothing.**
 
-DNS answers "what IP do I open a socket to?" In AptKit there are now three addresses, and the repo writes a real hostname for exactly one of them. The browser uses a relative URL (no hostname — it inherits the page's origin). The cloud provider hostname is resolved inside the SDK by Node's default resolver. The *new* one: the repo's own Gemma/Ollama transports name `http://localhost:11434` explicitly (`gemma-provider.ts:48`, `ollama-embedding-provider.ts:47`) — but `localhost` resolves to the loopback `127.0.0.1` with no real DNS query, so even this hand-written hostname touches no resolver. So this concept stays almost entirely `not yet exercised` at the resolver level — but the repo now *does* write an addressable host string, which is the change worth noting.
+## Structure pass
 
-## The structure pass
+**Layers:** the address is decided in the Service layer (the provider constructors), used at the wire in the transport, and — for cloud — re-decided inside the Provider SDK.
 
-**Layers.** Browser address resolution (relative URL), Node-side address resolution (SDK + OS resolver), provider address (a public DNS name someone else operates).
-
-**Axis — control (who decides the address?).**
+**Axis — "who resolves the name, and does a query leave the box?"** Trace it:
 
 ```
-  One axis (control of addressing) down the stack
+  Axis — name resolution — across the addressing surfaces
 
-  ┌─ browser ──────┐   → the PAGE decides (relative URL = same origin)
-  ┌─ Node/SDK ─────┐   → the SDK decides (default base URL constant)
-  ┌─ provider ─────┐   → the PROVIDER decides (they run the DNS record)
+  surface                     name              who resolves       query leaves box?
+  ─────────────────────────────────────────────────────────────────────────────────
+  Gemma / Ollama embed        localhost:11434   OS, instantly      NO (loopback)
+  Anthropic SDK               api.anthropic.com SDK → OS → resolver YES (DNS over UDP/53)
+  OpenAI SDK                  api.openai.com    SDK → OS → resolver YES
+  buffr → Supabase            host in DATABASE_URL  pg → OS         YES
+  Studio (Pages, prod)        <user>.github.io  browser → OS       YES (user side)
 ```
 
-Control of the address flips at every layer, and crucially *no layer is the repo's own code making a routing decision*. The browser inherits the origin from the dev server it was served by; the SDK hardcodes its base URL (`api.openai.com`); the provider operates the DNS zone. The repo never writes a hostname.
-
-**Seams.** The load-bearing seam is the SDK boundary: it's where a logical name (`api.openai.com`) becomes a concrete socket address, and it's entirely behind the SDK. If you ever needed to point the SDK at a proxy or a self-hosted gateway, *this* is the seam you'd intercept — by passing `baseURL` to the client constructor, which the repo currently does not.
+**Seam:** the boundary between "loopback literal" and "real hostname" is where DNS becomes real. aptkit's own code sits entirely on the loopback side; cross into a dependency and a resolver gets involved.
 
 ## How it works
 
-### Move 1 — the mental model
+#### Move 1 — the mental model
 
-You know how a relative `fetch('/api/foo')` in a React app "just works" without you typing the domain? The browser fills in the origin of whatever page it's running on. Provider DNS is the same idea one layer down: the SDK fills in `api.openai.com` and Node's resolver turns it into an IP. The pattern is *somebody else supplies the address; you supply only the path or the intent*.
-
-```
-  The resolution shape — name to address, owned by a layer below you
-
-   logical name              resolver               socket address
-  "api.openai.com"  ──────►  OS / SDK   ──────►  104.x.x.x:443
-   (SDK constant)            (cached)            (TLS connects here)
-
-   "/api/stream/replay" ──► browser origin ──► 127.0.0.1:4187
-   (relative URL)           (the served page)
-```
-
-### Move 2 — walking each resolution
-
-**The browser's address: a relative URL inherits the origin.** Every Studio `fetch` call uses a leading-slash path — `'/api/stream/replay'`, `'/api/model-status'`. There's no `http://` and no hostname. The browser resolves this against the origin of the page, which Vite served from the dev server. The boundary condition: this is *why* there's no CORS — same origin means the browser never does a cross-origin preflight (file `05`).
+You've typed `localhost:3000` into a browser a thousand times and never thought about DNS — because there isn't any. `localhost` is a name the OS maps to `127.0.0.1` from a local file (`/etc/hosts`), instantly, with no packet sent. aptkit's two real sockets both target exactly that.
 
 ```
-  Browser resolution — relative path → page origin
+  The pattern — resolution as a fork
 
-  page served from http://localhost:4187
-       │
-  fetch('/api/stream/replay')
-       │  browser prepends the page origin
-       ▼
-  http://localhost:4187/api/stream/replay   ← same origin, no DNS lookup of
-                                               a remote host needed
+  name string
+      │
+      ├─ is it loopback/literal? ──► OS-local map ──► 127.0.0.1  (no query)
+      │
+      └─ is it a real hostname? ──► resolver ──► A/AAAA record ──► routable IP
+                                    (UDP :53, cached, can fail/be slow)
 ```
 
-**The provider's address: the SDK owns it, the OS resolves it.** When `client.chat.completions.create` runs, the SDK already knows its base URL is `api.openai.com` (a default baked into the OpenAI client; same for Anthropic's `api.anthropic.com`). It hands that hostname to Node's networking stack, which calls the OS resolver (`getaddrinfo`), which returns an IP, possibly from a cache. None of this surfaces in repo code.
+The kernel of DNS: a name goes to a resolver, which returns an IP (an A record for IPv4, AAAA for IPv6), usually cached with a TTL. Strip the resolver and a real hostname can't be reached at all. Strip it for `localhost` and nothing changes — because that branch never runs.
 
-```
-  Provider resolution — entirely below the repo
+#### Move 2 — walking the addressing in this repo
 
-  repo code: client.chat.completions.create(...)
-       │
-       ▼  (inside SDK)
-  base URL = "api.openai.com"
-       │
-       ▼  (inside Node)
-  OS resolver: api.openai.com → 104.x.x.x   ← cached per OS/TTL
-       │
-       ▼
-  TLS socket opens to that IP:443
+**Both Ollama clients hardcode the loopback host as a default.** The address is a constructor default you can override, but in practice it's `localhost:11434` (`packages/providers/gemma/src/gemma-provider.ts:48`, `packages/retrieval/src/ollama-embedding-provider.ts:47`):
+
+```ts
+// gemma-provider.ts:48
+this.chat = options.chat ?? defaultHttpTransport(options.host ?? 'http://localhost:11434');
+//                                                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+// ollama-embedding-provider.ts:47
+options.embed ?? defaultHttpTransport(options.host ?? 'http://localhost:11434');
 ```
 
-**What the repo would have to do to participate.** If it ever needed to route through a proxy or self-hosted gateway, it'd pass `baseURL` into the SDK constructor — `new OpenAI({ apiKey, baseURL })`. The constructor in `openai-provider.ts:30` passes only `apiKey`. That single absent argument is the entire reason addressing is delegated.
+The `host` is a string, parsed by `fetch`'s URL handling. Because it's loopback, the OS short-circuits resolution — no DNS query, no resolver dependency, no routing across a network. That's why these calls have no DNS-failure mode: the only way `localhost` fails to resolve is a broken `/etc/hosts`.
 
-### Move 3 — the principle
+**Cloud addressing is the SDK's secret.** `AnthropicModelProvider` and `OpenAIModelProvider` never name a host — they construct the vendor client and let it own the base URL, DNS, and routing (`packages/providers/anthropic/src/...:25`, `packages/providers/openai/src/openai-provider.ts:30`). So aptkit's code has *no* line where `api.anthropic.com` appears; the resolution is real but invisible to this repo.
 
-Addressing is the cleanest example in this whole guide of *delegation as a design choice*. The repo wrote no hostname because the SDK is a better place to own it — base URLs change, regional endpoints get added, the SDK ships those updates. The principle: own the *intent* (which provider, what request), delegate the *address*. You only pull addressing back in-house when you have a routing requirement the SDK can't express, and AptKit doesn't.
+```
+  Layers-and-hops — addressing crosses into the SDK
+
+  ┌─ aptkit ──────────────────┐  hop: complete()  ┌─ vendor SDK ───────────┐
+  │  new Anthropic({ apiKey })│ ─────────────────►│ baseURL → DNS → TLS →  │
+  │  (no host named)          │                   │ api.anthropic.com      │
+  └───────────────────────────┘                   └────────────────────────┘
+        addressing decided here is NONE; it's all on the SDK side
+```
+
+**buffr's address is a connection string.** `createPool(databaseUrl)` (`buffr/src/db.ts:4`) takes a full `DATABASE_URL` — host, port, db, credentials packed into one URI. The `pg` driver parses it and resolves the host. aptkit never sees this; it's buffr's boundary.
+
+**Studio in production routes through GitHub Pages.** The deploy workflow (`.github/workflows/deploy-studio-pages.yml`) builds with `base: '/aptkit/'` (`apps/studio/vite.config.ts:196`) and ships the static bundle via `actions/deploy-pages@v4`. The origin routing — GitHub's CDN, the `<user>.github.io/aptkit/` path — is GitHub infrastructure configured by the workflow, not code aptkit executes. There's no reverse proxy, no load balancer, no edge logic the repo owns.
+
+#### Move 3 — the principle
+
+The principle: **the address is just configuration, and loopback is the address that needs no resolution.** A system that talks only to `localhost` has no DNS-failure surface, no split-horizon DNS to misconfigure, no resolver timeout to tune. The cost is that you've pushed every real-hostname concern (DNS caching, failover, geo-routing) into dependencies — which is fine until one of them resolves slowly and your missing timeout (file `07`) turns that into a hang.
 
 ## Primary diagram
 
-Both resolutions in one frame, neither owned by repo code.
-
 ```
-  AptKit addressing — two names, zero repo-owned hostnames
+  Addressing recap — loopback vs real-hostname fork
 
-  ┌─ UI ──────────────────────────────────────────────────────┐
-  │  fetch('/api/...')  ──► browser prepends page origin       │
-  │                          → localhost:4187 (same origin)    │
-  └────────────────────────────────────────────────────────────┘
-  ┌─ Service / SDK ───────────────────────────────────────────┐
-  │  client constructed with apiKey only (no baseURL)          │
-  │     │  SDK supplies "api.openai.com" / "api.anthropic.com" │
-  │     ▼  Node OS resolver: name → IP (cached, TTL)           │
-  └────────────────────────────────────────────────────────────┘
-  ┌─ Provider ────────────────────────────────────────────────┐
-  │  provider operates the DNS zone + the endpoint             │
-  └────────────────────────────────────────────────────────────┘
+  aptkit code          │  loopback side (no DNS)
+  ─────────────────────┼──────────────────────────────────────────
+  Gemma/embed host ────┼──► localhost:11434 → 127.0.0.1  (OS map)
+                       │
+  dependency side      │  real-hostname side (DNS over :53)
+  ─────────────────────┼──────────────────────────────────────────
+  Anthropic/OpenAI SDK ┼──► api.*.com        (SDK resolves)
+  buffr pg.Pool ───────┼──► DATABASE_URL host (pg resolves)
+  Studio Pages (prod) ─┼──► <user>.github.io  (browser resolves)
 ```
-
-## Implementation in codebase
-
-**Use cases.** Addressing is reached for implicitly on every provider call and every Studio fetch. The only place the repo could insert itself — the client constructor — deliberately doesn't.
-
-**The provider client constructors take no `baseURL`.** `packages/providers/openai/src/openai-provider.ts:28-31` and `packages/providers/anthropic/src/anthropic-provider.ts:23-26`:
-
-```
-  openai-provider.ts  (constructor, lines 28–31)
-
-  this.client = options.client                 ← caller can inject a client…
-    ?? new OpenAI({ apiKey: options.apiKey      ← …otherwise: apiKey only
-        ?? process.env.OPENAI_API_KEY });       ← NO baseURL → SDK default host
-       │
-       └─ the absent baseURL is the whole addressing story: the SDK's default
-          (api.openai.com) wins, resolved by the OS; the repo never names a host
-```
-
-Note the `options.client` escape hatch — a caller *could* inject a pre-configured client with a custom `baseURL`, which is the seam for routing through a proxy. The repo never uses it, but it's there.
-
-**The local provider names its host explicitly — and exposes it as a `host` option.** Unlike the cloud providers, the Gemma/Ollama transports write the address themselves. `packages/providers/gemma/src/gemma-provider.ts:48`:
-
-```
-  gemma-provider.ts  (constructor, line 48)
-
-  this.chat = options.chat
-    ?? defaultHttpTransport(options.host ?? 'http://localhost:11434');
-       │
-       └─ the repo writes a real host string here (the only one in the codebase),
-          but `localhost` → 127.0.0.1 loopback, so no resolver runs. `host` is the
-          addressing seam: pass a different value and you re-point boundary 3 —
-          which is also where the off-host TLS/auth risk enters (see 04/08 R8)
-```
-
-The embedder mirrors this (`ollama-embedding-provider.ts:47`). So addressing is *authored* on boundary 3 but still doesn't exercise DNS — loopback is resolver-free.
-
-**The browser uses relative URLs.** `apps/studio/src/api.ts:11` (`fetch('/api/model-status')`), `:126` (`fetch(endpoint, ...)` where `endpoint` is `/api/stream/replay`). Leading slash = same-origin, no remote hostname.
 
 ## Elaborate
 
-DNS is where a lot of production incidents actually originate — a stale cache, a slow resolver, a TTL that's too long after a provider fails over. AptKit is insulated from all of it precisely *because* it delegates: the SDK and OS handle resolution and caching, and a single-user dev tool never generates the resolver pressure that exposes those bugs. The flip side — and this is the honest cost — is that if a provider's DNS misbehaves, the repo has no hook to observe or override it; the failure surfaces only as a thrown error inside `complete()`, which the fallback chain then treats like any other failure (file `07`). For the scale AptKit operates at, that's the correct trade.
+DNS is the oldest distributed database on the internet, and its failure modes (stale cache, slow resolver, split horizon) cause outages out of all proportion to how little code touches it. aptkit dodges all of that for its own sockets by using loopback. When this repo grows a remote inference endpoint — swapping the Ollama `host` for a real hostname — DNS resolution, its caching, and its failure modes all become live, and the missing timeout in `07` becomes a much sharper problem because a slow resolver now sits in front of every call. See `study-distributed-systems` for how name-resolution failure propagates through the fallback chain.
 
 ## Interview defense
 
-**Q: How does AptKit resolve the model API hostname?**
+**Q: "How does your system handle DNS resolution and failover?"**
+Be honest and precise: "My own code talks only to `localhost`, so there's no DNS in aptkit's sockets — loopback resolves from the OS map with no query. DNS for the cloud providers is owned by their SDKs; the database host resolution is owned by the `pg` driver in the companion repo. I haven't had to tune resolver timeouts because I never resolve a real hostname myself." Then name the upgrade: "The moment I point the Ollama `host` at a remote box, DNS becomes real and I'd want a connect timeout in front of it."
 
 ```
-  client (no baseURL) ─► SDK default "api.openai.com" ─► OS resolver ─► IP
+  sketch: the fork — most of my arrows go left (loopback)
+
+  name ──► [loopback?] ──yes──► 127.0.0.1   (where I live)
+                    └───no────► resolver     (where deps live)
 ```
 
-It doesn't — the SDK does. The client is constructed with `apiKey` only (`openai-provider.ts:30`), so the SDK's default base URL wins and Node's OS resolver turns it into an IP, cached by TTL. **Anchor:** the absent `baseURL` argument is the entire addressing decision.
-
-**Q: How would you point it at a proxy or self-hosted gateway?**
-
-Pass `baseURL` into the client constructor, or inject a pre-built client via the `options.client` escape hatch (`openai-provider.ts:28`). That's the seam where addressing would come back in-house. **Anchor:** the injection point already exists; the repo just doesn't use it.
-
-## Validate
-
-1. **Reconstruct:** Name the two addresses in the system and who resolves each.
-2. **Explain:** Why is there no CORS in Studio? (Relative URLs → same origin → no cross-origin request — `api.ts:11,126`.)
-3. **Apply:** You need all provider traffic to go through `https://gateway.internal`. What's the one-line change and where? (`baseURL` in the `new OpenAI({...})` call — `openai-provider.ts:30`.)
-4. **Defend:** Why is delegating DNS the right call here? (No routing requirement; the SDK owns endpoint updates; a dev tool never hits resolver-pressure bugs.)
+Anchor: *loopback is the address that needs no phonebook.*
 
 ## See also
 
-- `04-tls-and-trust-establishment.md` — what happens to the resolved address (TLS connect)
-- `05-http-semantics-caching-and-cors.md` — why same-origin means no CORS
-- `07-timeouts-retries-pooling-and-backpressure.md` — what happens when resolution/connection fails
+- `01-network-map.md` — the five hops these addresses sit on
+- `03-tcp-udp-connections-and-sockets.md` — what happens after the address resolves
+- `04-tls-and-trust-establishment.md` — why the loopback hop skips TLS too

@@ -1,211 +1,192 @@
-# 01 — Runtime Map
+# Runtime Map — the process, task, and resource map as-built
 
-**Industry name:** runtime topology / process-and-task map · *Language-agnostic*
+**Industry name(s):** runtime model / execution model · **Type:** Project-specific (grounded in a standard Node + browser model)
 
 ## Zoom out, then zoom in
 
-Before any single mechanism, here's the whole territory: which runtimes exist, what process each piece runs in, and where work actually executes.
+Before any single mechanism, here's the whole machine. aptkit runs in exactly two kinds of process, and they never share memory — they talk over HTTP.
 
 ```
-  Zoom out — the runtimes AptKit runs in
+  Zoom out — every place aptkit code executes
 
-  ┌─ Browser runtime ───────────────────────────────────────────┐
-  │  ★ Studio React UI ★   (1 event loop, 1 thread)              │
-  │     state, render, fetch, stream-decode                      │
-  └───────────────────────────────┬──────────────────────────────┘
-                                   │  HTTP (NDJSON response stream)
-  ┌─ Node runtime ─────────────────▼──────────────────────────────┐
-  │  ★ Vite dev server ★   (1 event loop, 1 thread)               │
-  │     middleware → agents → runAgentLoop → providers            │
-  │                                                               │
-  │  ★ scripts/*.mjs ★     (1 event loop, 1 short-lived process)  │
-  │     eval / promote / replay → exit code                       │
-  │                                                               │
-  │  ★ node --test ★       (1 event loop per package test run)    │
-  └───────────────────────────────┬──────────────────────────────┘
-                                   │  HTTPS (SDK calls)
-  ┌─ Provider boundary ────────────▼──────────────────────────────┐
-  │  Anthropic / OpenAI model API   (someone else's machine)      │
-  └───────────────────────────────────────────────────────────────┘
+  ┌─ Node process ─────────────────────────────────────────────────────────┐
+  │  one of: `node --test` · a script in scripts/*.mjs · the Vite dev server │
+  │                                                                          │
+  │  ┌─ Runtime layer (packages/runtime) ────────────────────────────────┐  │
+  │  │   ★ runAgentLoop ★   generateStructured   ndjson-stream  events    │  │ ← we are here
+  │  └───────────────────────────────┬────────────────────────────────────┘  │
+  │  ┌─ Provider layer (packages/providers/*) ──▼─────────────────────────┐  │
+  │  │   gemma  anthropic  openai  fallback  local-context-guard          │  │
+  │  └───────────────────────────────┬────────────────────────────────────┘  │
+  │  ┌─ Retrieval/memory layer ──────▼───────────────────────────────────┐  │
+  │  │   InMemoryVectorStore  OllamaEmbeddingProvider  conversation-memory │  │
+  │  └────────────────────────────────────────────────────────────────────┘  │
+  └────────────────────────────────────┬───────────────────────────────────────┘
+                                        │ fetch() → HTTP (localhost:11434 Ollama,
+                                        │ or api.anthropic.com / api.openai.com)
+                                        ▼
+  ┌─ External processes (not aptkit code) ──────────────────────────────────┐
+  │   Ollama daemon (Gemma + nomic-embed)   ·   cloud LLM APIs               │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  ┌─ Browser process (apps/studio) — entirely separate, own event loop ─────┐
+  │   React 18 render loop · fetch + ReadableStream reader for NDJSON traces │
+  └──────────────────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: a *runtime map* answers one question — "if I drop a breakpoint anywhere in this repo, which process is it in, which thread, and what's the loop doing while it waits?" For AptKit the answer is short because the topology is small: a handful of single-threaded event loops, each owning its own work, connected only by HTTP/NDJSON and by the filesystem. There is no shared process memory between them, no thread pool inside them.
+**Zoom in.** A "runtime map" is just the answer to: when this code runs, what process owns it, what thread executes it, and what resources (sockets, file handles, memory) does it hold? For aptkit the answer is unusually simple, and the simplicity is the lesson — one process, one thread, work driven by `await` on I/O. Everything downstream in this guide is a detail on this picture.
 
 ## Structure pass
 
-**Layers.** Three nested altitudes, outer to inner:
-- **Process** — a running `node` (dev server, script, test) or the browser tab.
-- **Event loop** — the one scheduler inside each process that pulls ready tasks.
-- **Task** — a single awaited Promise continuation (a model call resolving, a tool result, a stream chunk).
-
-**Axis — "where does control live at this altitude?"** Hold that one question constant as you descend:
+Pick one axis and trace it across the layers: **control — who decides what runs next?**
 
 ```
-  One question down the layers: "who decides what runs next?"
+  Axis: "who drives execution?" — traced top to bottom
 
-  ┌─ Process ───────────────────────────┐   the OS scheduler decides
-  │  node / browser tab                 │   (preemptive, across processes)
-  └──────────────────┬───────────────────┘
-      ┌──────────────▼────────────────────┐  the event loop decides
-      │  one loop, cooperative scheduling  │  (run-to-completion per task)
-      └──────────────┬────────────────────┘
-          ┌──────────▼──────────────────────┐ YOUR code decides
-          │  await points in runAgentLoop    │ (control yields only at await)
-          └──────────────────────────────────┘
+  ┌─────────────────────────────────────────────┐
+  │ Runtime layer: runAgentLoop                  │  → CODE decides (fixed for-loop, hard bounds)
+  └───────────────────┬───────────────────────────┘
+      ┌───────────────▼─────────────────────────┐
+      │ inside a turn: model.complete()          │  → the LLM decides (tool call vs final text)
+      └───────────────┬─────────────────────────┘
+          ┌───────────▼─────────────────────────┐
+          │ a tool call: tools.callTool()        │  → the TOOL runs (deterministic code)
+          └───────────────────────────────────────┘
 ```
 
-The control answer flips at each altitude: the OS preempts processes whenever it likes; the event loop never preempts a task mid-run (run-to-completion); and *your* code chooses where to yield by where it writes `await`. That last flip is the whole game in single-threaded JS — between two `await`s, nothing else runs, so you never have a data race, but a synchronous loop with no `await` freezes everything.
+The seams — boundaries where the control answer flips:
 
-**Seams.** The load-bearing boundaries — the ones where the control answer changes:
-- **Browser ⇄ Node** — HTTP. Control and memory are fully separate; the only thing crossing is bytes (NDJSON). A bug on one side can't corrupt the other's state.
-- **Node ⇄ Provider API** — HTTPS via SDK. This is where the loop *yields* the longest (a model call is hundreds of ms to seconds of awaited I/O). The `AbortSignal` is the one control signal that crosses this seam.
-- **`runAgentLoop` ⇄ `ToolExecutor`** — an in-process `await` seam. Same thread, same loop, but the loop yields here too.
+- **`runAgentLoop` → `model.complete()`** (`run-agent-loop.ts:103`). Control flips from your code to the model: your loop decides *whether* there's another turn, the model decides *what's in it*. This is the load-bearing seam in the whole repo.
+- **`model.complete()` → the transport** (`gemma-provider.ts:69`, `fallback-provider.ts:55`). Control flips from in-process logic to a network call — an `await` that yields the event-loop thread.
+- **Node process → external daemon** (the `fetch` at `gemma-provider.ts:204`). Control flips from aptkit to Ollama/cloud, across a process boundary, over HTTP. This is the only place real parallelism happens — but it's the *server's* threads, not yours.
+
+State ownership and failure trace the same boundaries: in-process state lives in the loop's local variables (`messages`, `toolCalls`); failure originates in the transport (`fetch` throws) and propagates back up the `await` chain as a rejected Promise.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You already know this shape from any frontend you've shipped: a single-threaded UI thread that stays responsive by *awaiting* `fetch()` instead of blocking on it. AptKit's Node side is the same primitive, one level out — one loop, work expressed as awaited Promises, control yielded only at `await`.
+You already know the shape from any frontend app: a single-threaded JS runtime where `fetch()` doesn't block — it registers a callback and the event loop moves on. aptkit is exactly that, server-side. There is one execution thread; the only thing that ever "pauses" your code is an `await` on an I/O Promise.
 
 ```
-  The map kernel — one loop, three task sources, no second thread
+  The model: one thread, work gated by I/O awaits
 
-         ┌──────────────── one event loop ────────────────┐
-         │                                                 │
-   timers ──►│   microtask queue (Promise .then / await)   │──► your code
-   I/O    ──►│   macrotask queue (timers, I/O callbacks)   │     runs to
-   network──►│                                             │     completion
-         │   pulls next ready task, runs it to the end,    │     then yields
-         │   then pulls the next                           │
-         └─────────────────────────────────────────────────┘
+  time ──────────────────────────────────────────────────────►
+
+  [agent loop turn 1] ──await fetch──┐
+                                     ╎ (thread free — but nothing else queued)
+                       ┌─────────────┘
+  [parse response]──[cosine scan: CPU, BLOCKS]──[agent loop turn 2]──await...
+
+  the only "parallelism" is the OS/Ollama doing the HTTP work
+  while this thread waits at the await
 ```
 
-The kernel: **one loop + one ready-task queue + run-to-completion**. Strip any part and it stops being this model — two loops would need synchronization (the thing JS avoids); a preemptive scheduler would reintroduce races.
+The strategy: **structure all latency as awaited I/O so one thread stays responsive, and keep CPU work small enough that running it inline never matters.** That second clause is a bet — `03` and `05` examine where the bet holds and where it's thin.
 
-### Move 2 — walking the map
+### Move 2 — the resource inventory
 
-**The process is the outermost container.** Each `node scripts/eval-replay-artifacts.mjs` is its own OS process with its own V8 heap, its own event loop, its own exit code. Scripts are short-lived: spin up, do sequential work, set `process.exitCode`, drain, exit. The dev server is long-lived: one process serving many requests on the same loop. Nothing is shared between two script invocations except files on disk.
+**The process.** aptkit ships no long-running server of its own. The three ways its code runs are all short-lived single processes:
 
 ```
-  Process boundary — separate heaps, shared only by disk
+  How aptkit code actually gets a process
 
-  ┌─ node (script A) ─┐      ┌─ node (script B) ─┐
-  │  V8 heap A        │      │  V8 heap B        │
-  │  event loop A     │      │  event loop B     │
-  └─────────┬─────────┘      └─────────┬─────────┘
-            │ writes JSON              │ reads JSON
-            ▼                          ▼
-        ┌────────────────────────────────────┐
-        │  artifacts/replays/*.json (disk)    │ ← the only shared state
-        └────────────────────────────────────┘
+  ┌─ `node --test dist/test/*.test.js` ─┐   per-package test runner
+  │   package.json scripts, every pkg    │   (no jest/vitest)
+  └──────────────────────────────────────┘
+  ┌─ `node scripts/*.mjs` ───────────────┐   eval-replay, promote-fixture,
+  │   one-shot CLI scripts                │   pack-core-standalone
+  └──────────────────────────────────────┘
+  ┌─ Vite dev server (apps/studio) ──────┐   the only persistent process;
+  │   serves the React app + replay API  │   port 4187 in the Playwright config
+  └──────────────────────────────────────┘
 ```
 
-**The event loop is the single scheduler inside a process.** It does not run two of your tasks at once. It runs one to completion, then the next. A model call resolving and a stream chunk arriving are two separate tasks that interleave *between* awaits, never *during* a synchronous run of your code.
+Confirmed in the root `package.json` (`"type": "module"`, workspaces over `packages/*`, `packages/agents/*`, `packages/providers/*`, `apps/*`) and `tsconfig.base.json` (`target: ES2022`, `module`/`moduleResolution: NodeNext`). ESM, NodeNext — modern Node, no transpile-to-CommonJS step at runtime.
 
-**A task is one awaited continuation.** `await model.complete()` parks the current function, lets the loop run other ready work, and resumes when the Promise settles. In AptKit the tasks are: a model API call resolving, a tool handler returning, a stream chunk decoding, a file read finishing. That's the whole vocabulary.
+**The thread.** One. There is no `worker_threads`, no `cluster`, no `new Worker` anywhere in `packages/`, `apps/`, or `scripts/`. The single use of `child_process` is `spawnSync` in `scripts/pack-core-standalone.mjs:68`, shelling out to `npm pack` during the publish flow — blocking, sequential, off the hot path. So every line of aptkit's actual logic runs on one event-loop thread.
+
+**The sockets.** Outbound HTTP only, via `fetch`. Gemma's transport opens a connection to Ollama at `gemma-provider.ts:204`; cloud providers use their vendor SDKs. No inbound server sockets in the library; the Vite dev server owns the only listening socket, and that's dev tooling.
+
+**The file handles.** All buffered `fs.promises` calls (`readFile`/`writeFile`/`readdir`) in `scripts/*.mjs`, `apps/studio/vite.config.ts`, and `packages/evals/src/replay-runner.ts`. No streaming file descriptors held open — read whole, close, done. (`06` walks this.)
+
+**The memory.** Heap-resident JS objects: the `messages` array growing per turn in `runAgentLoop`, the `Map<string, VectorChunk>` backing `InMemoryVectorStore` (`in-memory-vector-store.ts:12`), the NDJSON buffer in `decodeNdjsonStream`. All garbage-collected; nothing pinned, nothing off-heap. (`05` walks this.)
+
+Here's the wiring that proves the layering — a real agent composing the layers above:
+
+```
+  packages/agents/rag-query — the layers, instantiated
+
+  pipeline = createRetrievalPipeline({ embedder, store })   // retrieval layer
+       │
+  tool   = search_knowledge_base over pipeline               // tools layer
+       │
+  result = runAgentLoop({ model: gemmaProvider, tools, ... }) // runtime + provider
+```
+
+The agent never touches a process, thread, or socket directly — it composes contracts (`ModelProvider`, `VectorStore`, `ToolExecutor`), and the runtime resolves them to actual I/O. That indirection is *why* the runtime map stays this simple: the execution model is concentrated in `runAgentLoop` and the providers, and everything else is pure-ish logic hanging off it.
 
 ### Move 3 — the principle
 
-A runtime map is the first thing to draw for any system, because every later question (races, memory, cancellation) is answered relative to *which loop owns this work*. For AptKit the map is small and clean: a few single-threaded loops, isolated by process/HTTP boundaries, connected by streams and files. The cleanliness is the point — it's why files 04 (races) and 05 (memory) are short.
+A runtime map is the first thing to draw for any system, because it tells you where your real costs and risks can possibly live. For aptkit the map says: you cannot have a data race between threads (there's one thread), you cannot be killed mid-write by a missing signal handler doing harm (nothing long-running holds critical state), and your only true concurrency is the I/O the OS does while you `await`. That narrows the entire rest of this guide — most "runtime systems" failure modes are structurally impossible here, and the few that remain (event-loop blocking, unbounded growth, ungraceful cancellation) are exactly the ones the later files target.
 
 ## Primary diagram
 
-The full topology, every layer and hop labelled.
+The full map, one frame — process boundaries, the single thread, the I/O seams.
 
 ```
-  AptKit runtime topology
+  aptkit runtime map — complete
 
-  ┌─ Browser (1 loop) ──────────────────────────────────────────┐
-  │  Studio UI  ──fetch POST──►                                  │
-  │  ◄──for await decodeNdjsonStream── (NDJSON, one event/line)  │
-  └───────────────────────────────┬──────────────────────────────┘
-                          HTTP     │  Network boundary
-  ┌─ Node: Vite dev server (1 loop, long-lived) ──▼──────────────┐
-  │  middleware ─► runReplay ─► Agent ─► runAgentLoop            │
-  │                                  │  await model + await tools│
-  │                                  ▼                           │
-  │              traceSink.emit ─► res.write(ndjson)             │
-  └───────────────────────────────┬──────────────────────────────┘
-                          HTTPS    │  Provider boundary (SDK + signal)
-  ┌─ Anthropic / OpenAI API (remote) ──────────────▼─────────────┐
-  │  model inference                                             │
-  └───────────────────────────────────────────────────────────────┘
-
-  ┌─ Node: scripts/*.mjs (1 loop, short-lived) ──────────────────┐
-  │  read fixtures ─► sequential for-await replay ─► exitCode    │
-  └───────────────────────────────────────────────────────────────┘
-```
-
-## Implementation in codebase
-
-**Use cases.** You reach for the runtime map whenever you ask "where is this running?" — debugging a hung Studio replay (is it the browser loop or the Node loop?), reasoning about whether two script runs can corrupt each other (they can't, except via disk), or deciding whether a slow tool blocks anything else (it doesn't block other requests, because each request's loop yields at `await`).
-
-**Code side by side.**
-
-The Node server loop — one handler, awaited work, live writes:
-
-```
-  apps/studio/vite.config.ts (lines 887–918)  — streamReplayResponse
-
-  res.setHeader('content-type', 'application/x-ndjson; charset=utf-8'); ← stream, not buffered
-  const body = await readJsonBody(req);          ← yields the loop while reading the request
-  const result = await run(body, (event) => {    ← yields again during the whole agent run
-    res.write(encodeNdjsonRecord({ type: 'event', event })); ← each emit → one line, written now
-  });
-  res.write(encodeNdjsonRecord({ type: 'result', result }));
-       │
-       └─ between these awaits the SAME loop serves other requests;
-          nothing here spawns a thread — it's one loop interleaving tasks
-```
-
-The short-lived script process — sequential, then an exit code:
-
-```
-  scripts/replay-promoted-fixtures.mjs (lines 28–47)
-
-  for (const fixturePath of fixturePaths) {        ← strictly sequential
-    const result = await runFixtureReplay(fixturePath); ← one at a time, awaited
-    results.push({ ... });
-  }
-  if (failed.length > 0) process.exitCode = 1;     ← the process's only output channel
-       │
-       └─ no Promise.all, no worker pool: this is one loop draining a list in order
+  ┌─ NODE PROCESS (single thread, libuv event loop) ────────────────────────┐
+  │                                                                          │
+  │   runAgentLoop ─turn loop─► model.complete() ─► transport ─┐            │
+  │        ▲  bounds: maxTurns, maxToolCalls, signal            │ fetch     │
+  │        │                                                    │ (await)   │
+  │   tools.callTool() ◄── tool_use ──┘                         │           │
+  │        │                                                    │           │
+  │   InMemoryVectorStore.search()  ← CPU, inline, blocks ──────┘           │
+  │   heap: messages[], chunks Map, ndjson buffer                           │
+  │   files: fs.promises (buffered, no streams)                             │
+  └───────────────────────────────────┬──────────────────────────────────────┘
+                                       │ HTTP (NDJSON for traces)
+       ┌───────────────────────────────┼────────────────────────────┐
+       ▼                               ▼                            ▼
+  ┌─ Ollama daemon ─┐        ┌─ cloud LLM APIs ─┐        ┌─ Browser: apps/studio ─┐
+  │ Gemma + nomic   │        │ Anthropic/OpenAI │        │ React loop + stream    │
+  └─────────────────┘        └──────────────────┘        │ reader (own process)   │
+                                                          └─────────────────────────┘
 ```
 
 ## Elaborate
 
-The single-loop model is Node's defining design choice, inherited from the browser. It trades the throughput of true parallelism for the *absence* of an entire class of bugs (data races, deadlocks, torn reads) and the simplicity of never needing a lock. For I/O-bound work — which an LLM agent overwhelmingly is — this is the right trade: the CPU sits idle during network round-trips anyway, so a thread would mostly wait. The map you've just drawn is the substrate every other file in this guide annotates: `03` zooms into the loop's queues, `02` confirms there's no second thread, `06` follows the stream across the browser⇄Node seam.
+This map is the deliberate consequence of aptkit's reason to exist: it's a *library* of provider-neutral capabilities, not a deployed service. The "body" that turns these capabilities into a long-running runtime — process supervision, the durable Postgres/pgvector store, the `agents` schema — lives in the companion **buffr** repo. So aptkit's runtime map is intentionally thin: it owns the execution *logic* (the loop, the providers, the scan) and leaves process lifecycle, persistence, and scale to whoever embeds it. When you read "single process, no shutdown handler" in `07`, that's not an oversight — it's the seam where aptkit ends and the host runtime begins.
 
 ## Interview defense
 
-**Q: "Walk me through what runs where when a Studio replay streams."**
+**Q: Walk me through aptkit's runtime model in one breath.**
 
 ```
-  Browser loop          Node loop                 Provider
-  ───────────           ─────────                 ────────
-  fetch POST ──────────► handler awaits run
-                         runAgentLoop awaits ─────► model.complete
-                         (loop free for others)
-                         ◄──────────────────────── response
-                         emit → res.write ──┐
-  decodeNdjsonStream ◄───────────────────────┘ (one line)
-  onEvent → setState
-  (repeat per event)
+  one Node process · one thread · libuv event loop
+  work = sequential awaits on HTTP I/O (LLM + embeddings)
+  CPU work (cosine, parse, sort) runs inline on the same thread
+  no workers, no cluster, no signal handlers — it's a library, not a service
+  Studio is a separate browser process reached over NDJSON/HTTP
 ```
 
-Answer: "Two single-threaded event loops connected by an NDJSON HTTP stream. The browser loop fetches and decodes; the Node loop runs the agent and writes one line per trace event. While the Node loop awaits the provider, it's free to serve other requests — that's the cooperative scheduling, not parallelism." Anchor: `vite.config.ts:887–918`.
+Anchor: "It's a single-threaded async-I/O runtime — every cost is either an awaited network call or a small inline CPU loop, and the agent loop is the one place control flow lives."
 
-**Q: "Can two replays corrupt each other's state?"** No — each request's run owns its own `messages`/`toolCalls` on its own async call tree; the only shared state is `artifacts/replays/*.json` on disk. Anchor: `run-agent-loop.ts:94–95`.
+**Q: Where could real parallelism happen?**
 
-## Validate
+```
+  in-process:  nowhere — one thread, no Promise.all fan-out anywhere
+  cross-process: the Ollama/cloud server runs your request on ITS threads
+                 while your event loop waits at the await
+```
 
-1. **Reconstruct:** Draw the AptKit topology from memory — name the loops, the seams, and the one shared resource (disk). Check against the Primary diagram.
-2. **Explain:** Why can the Node loop serve another request *during* a model call? (It yields at `await model.complete()` — `run-agent-loop.ts:103`.)
-3. **Apply:** A script `scripts/eval-replay-artifacts.mjs` is slow. Does it slow the dev server? (No — separate process, separate loop. `eval-replay-artifacts.mjs:25`.)
-4. **Defend:** Argue why one loop is the right choice for this workload, and name the one case where it isn't (CPU-bound work, e.g. the on-device ML in `contrl` — different repo, needs Worklets/threads).
+Anchor: "The only concurrency aptkit gets is free I/O concurrency from the OS and the model server — it never schedules parallel CPU work itself."
 
 ## See also
 
-- `02-processes-threads-and-tasks.md` — the "no second thread" claim, in depth.
-- `03-event-loop-and-async-io.md` — inside the loop: microtasks and awaited I/O.
-- `.aipe/study-system-design/` — the same topology as an architecture (boundaries, request flow).
+- `02-processes-threads-and-tasks.md` — why one process/one thread, and the task model on top of it
+- `03-event-loop-and-async-io.md` — the await points and the one blocking CPU loop
+- `study-system-design` — WHERE these components live and how requests cross the buffr/aptkit boundary

@@ -1,87 +1,163 @@
 # Interview Defense — aptkit
 
-This is your book. Not a study guide you read once — a thing you read front-to-back the week before, skim the morning of, and pull one chapter from the night before they ask. It defends **aptkit** (the published provider-neutral agent toolkit) and its companion runtime **buffr**, in your voice, from your real code. Every claim in here is grounded in a file you can open — because the fastest way to lose a room is to claim something you can't walk.
+You built aptkit. Now you have to defend it in a room, out loud, while
+someone who has read a lot of bad architecture diagrams pokes at the seams.
+This book is the rehearsal. Not the comprehension guide — you already
+understand the code. This is the performance: turning what you know into
+speech that holds up under follow-ups.
 
-You've shipped RAG before (AdvntrCue: Next.js + pgvector + GPT-4). This is your *second* RAG system, and the growth is the whole story: last time you wired a framework to a cloud model; this time you built the substrate from contracts and ran a local model you had to teach to call tools. That arc is what these eight chapters arm you to defend.
-
-## The system at a glance
-
-One diagram to anchor the whole book — when they say "walk me through it," this is what you draw.
+I'm going to be direct with you the whole way through, because that's what
+gets you hired. I've sat on enough hiring committees to know the difference
+between a candidate who *built* a thing and one who *watched a thing get
+built*. The difference is almost never knowledge. It's composure under the
+second follow-up. This book is about earning that composure by walking every
+branch before you're in the room.
 
 ```
-  aptkit — a provider-neutral toolkit for building LLM agents
-  published as @rlynjb/aptkit-core@0.4.1 (npm) · 16 packages in one bundle
+THE BOOK AT A GLANCE — what each chapter buys you
 
-  ┌─ Studio (apps/studio) ── React/Vite preview + NDJSON replay UI ──────────┐
-  └──────────────────────────────────┬───────────────────────────────────────┘
-  ┌─ Agents (packages/agents/*) ──────▼───────────────────────────────────────┐
-  │   query · recommendation · anomaly · diagnostic · rubric · ★ rag-query     │
-  │   each = prompt + tool policy + bounded loop + validator                   │
-  └──────────────────────────────────┬───────────────────────────────────────┘
-  ┌─ Runtime (packages/runtime) ──────▼───────────────────────────────────────┐
-  │   runAgentLoop (bounded) · structured-generation · CapabilityEvent trace   │
-  │   ┌───────────────────────────────────────────────────────────────────┐   │
-  │   │  THE CONTRACT:  ModelProvider.complete(request) → response         │   │
-  │   └───────────────────────────────────────────────────────────────────┘   │
-  └──────────┬───────────────────────────────────────────┬────────────────────┘
-             │ model side                                 │ retrieval side
-  ┌─ Providers ▼──────────────────────┐     ┌─ Retrieval (packages/retrieval) ▼─┐
-  │  anthropic · openai · fallback ·  │     │  EmbeddingProvider + VectorStore   │
-  │  local(guard) · ★ gemma (Ollama,  │     │  contracts · InMemoryVectorStore   │
-  │  EMULATED tool-calling)           │     │  (cosine) · search_knowledge_base  │
-  └──────────┬────────────────────────┘     └──────────────┬─────────────────────┘
-             │                                              │ same VectorStore contract
-  ┌─ External ▼───────────────────┐         ┌─ buffr (companion repo) ▼──────────┐
-  │  Anthropic · OpenAI ·         │         │  PgVectorStore (Postgres/pgvector  │
-  │  Ollama (gemma2:9b, nomic)    │         │  + HNSW) · agents schema · persist │
-  └───────────────────────────────┘         │  CONSUMES @rlynjb/aptkit-core@npm  │
-                                            └────────────────────────────────────┘
-  Evals (packages/evals) cut across: precision@k/recall@k · rubric-judge (Claude
-  judges Gemma — anti-circular) · replay/fixture golden-master
+  ┌──────────────────────────────────────────────────────────────┐
+  │  THE OPENER (first 10 minutes)                                 │
+  │                                                                │
+  │   01 the pitch ────────► 10s / 30s / 90s, no rambling          │
+  │   02 the architecture ─► whiteboard the system in 90s          │
+  │                                                                │
+  ├──────────────────────────────────────────────────────────────┤
+  │  THE DRILL (the middle, where it's won or lost)                │
+  │                                                                │
+  │   03 the choices ──────► defend every load-bearing decision    │
+  │   04 the scale story ──► what breaks first at 10x              │
+  │   05 the failure story ► what happens when it goes wrong       │
+  │   06 the hard parts ───► hardest bug · proudest · weakest      │
+  │                                                                │
+  ├──────────────────────────────────────────────────────────────┤
+  │  THE CLOSE (senior signal)                                     │
+  │                                                                │
+  │   07 the counterfactuals ► what you'd change, volunteered      │
+  │   08 the AI question ────► owning how you built it in 2026     │
+  └──────────────────────────────────────────────────────────────┘
+
+  read top to bottom once. then live in 03–06.
 ```
 
-The two load-bearing ideas in that picture: **one `ModelProvider.complete()` contract** (swap any model, inject fixtures, chain fallbacks without touching an agent) and **the same contract shape reused for retrieval** (`VectorStore` — in-memory in aptkit, pgvector in buffr, one-line swap). If you can defend those two seams, you can defend the system.
+That's the spine. The opener gets you taken seriously; the drill is where
+the offer is decided; the close is where you separate from the other senior
+candidates who can't volunteer a regret without sounding apologetic.
 
-Two things grew in since this diagram first settled, and both reinforce the same two seams rather than adding new ones. First, `@aptkit/memory` — episodic conversation memory — now rides the *exact same* `EmbeddingProvider` + `VectorStore` contracts as retrieval, which is the clearest proof the abstraction paid off (the honest caveat: no aptkit agent wires it into its loop yet — buffr's chat runtime is the only consumer). Second, Studio grew off-shell pages beyond trace replay: an in-browser `rag-query` demo that runs the whole retrieval path deterministically and scores it live (precision@1 / recall@k), plus rendered doc pages (api-docs, user-guide). Neither changes the spine — they're more consumers of the contracts you already defend.
+## The system you're defending — the master diagram
 
-## The eight chapters
+This is the picture you return to whenever you lose your place. Every chapter
+is a zoom into one band of it. Memorize this and you can re-anchor mid-answer.
 
-| Ch | Title | The question it answers | Read it for |
-|----|-------|-------------------------|-------------|
-| 01 | The pitch | "Tell me about a project." | The 10s / 30s / 90s answer; the AdvntrCue→aptkit growth arc |
-| 02 | The architecture | "Walk me through the system." | The whiteboard + one request traced end-to-end |
-| 03 | The choices | "Why this stack?" | **6 load-bearing decisions** defended (the densest chapter) |
-| 04 | The scale story | "What breaks at 10x/100x?" | Bottleneck *order* + how you'd measure; honest deferral |
-| 05 | The failure story | "What happens when it goes wrong?" | Ollama down, bad JSON, dimension mismatch, the retrieval-miss war story |
-| 06 | The hard parts | "Hardest bug? Proudest? Weakest?" | Answering honestly without collapsing |
-| 07 | The counterfactuals | "What would you do differently?" | The 4 reconsiderable calls + when each flips |
-| 08 | The AI question | "Did you use AI to build this?" | The calibrated-honest answer — judgment, not typing |
+```
+THE APTKIT SYSTEM — one library, one durable runtime
+
+  ┌─ STUDIO (apps/studio, React 18 + Vite) ──────────────────────────┐
+  │  in-browser RAG playground · trace replay · doc pages            │
+  │  static GitHub Pages build — no server                           │
+  └───────────────────────────────┬──────────────────────────────────┘
+                                  │  uses
+  ┌─ AGENTS (6 capabilities) ─────▼──────────────────────────────────┐
+  │  rag-query · recommendation · anomaly-monitoring                 │
+  │  diagnostic-investigation · query · rubric-improvement           │
+  │  each = prompt package + tool policy + loop config + validator   │
+  └───────────────────────────────┬──────────────────────────────────┘
+                                  │  runs on
+  ┌─ RUNTIME (packages/runtime) ──▼──────────────────────────────────┐
+  │  runAgentLoop — bounded turns, forced synthesis on last turn     │
+  │  CapabilityEvent trace · ModelProvider.complete() contract       │
+  └──────────────┬──────────────────────────────┬─────────────────────┘
+                │                               │
+  ┌─ PROVIDERS ─▼────────────┐    ┌─ RETRIEVAL ─▼────────────────────┐
+  │  gemma (local default,   │    │  EmbeddingProvider + VectorStore │
+  │   EMULATED tool-calling) │    │   contracts                       │
+  │  anthropic · openai      │    │  InMemoryVectorStore (cosine)    │
+  │  fallback · local guard  │    │  nomic-768 · search_knowledge_base│
+  └──────────────────────────┘    └───────────────┬───────────────────┘
+                                                  │  same contracts
+  ┌─ DEPLOYMENT SEAM ─────────────────────────────▼───────────────────┐
+  │  aptkit = deployment-agnostic LIBRARY (published bundle)          │
+  │  buffr  = durable RUNTIME — PgVectorStore implements VectorStore  │
+  │           over Supabase pgvector + HNSW; agents schema in reindb  │
+  │           consumes @rlynjb/aptkit-core ^0.4.1 (one-line swap)     │
+  └────────────────────────────────────────────────────────────────────┘
+```
+
+The two things to never lose under pressure: **the whole system hangs off two
+contracts** (`ModelProvider.complete()` and `VectorStore`/`EmbeddingProvider`),
+and **the library/runtime split is the thesis** — aptkit ships the slots,
+buffr fills them.
+
+## What this is, in one breath
+
+aptkit is a TypeScript monorepo that packages the reusable parts of an AI
+agent system — a bounded agent loop, swappable model providers including a
+*local* Gemma, a from-scratch RAG pipeline behind two contracts, and a Studio
+UI — into one published npm bundle (`@rlynjb/aptkit-core`), so a separate
+deployment ("buffr") can fill in the durable Postgres/pgvector binding without
+the core ever knowing it exists.
 
 ## How to use this book
 
 ```
-  FIRST READ ────────► front to back, in order. Each chapter builds on the last.
-                       Chapter 1 sets the pitch; 8 closes the loop on how it was built.
+  FIRST READ      one chapter per sitting, in order. the openers
+                  (01, 02) build the spine; the drill (03–06) is
+                  where you'll spend the real prep time.
 
-  REVIEW PASS ───────► skim only the chapter-opening diagram + the pull quotes
-                       (┃ / ▸ lines) + the strong/weak tables. ~70% of the book.
+  REVIEW          skim the chapter-opening diagrams, the pull quotes,
+                  and the "I don't know" boxes. that's ~70% of it.
 
-  NIGHT BEFORE ──────► read only each chapter's one-page summary. Eight pages total.
-
-  IN THE ROOM ───────► the diagrams are what you draw; the pull quotes are what you say.
+  NIGHT BEFORE    read ONLY the one-page summary at the end of each
+                  chapter. eight pages, tight, every claim walkable.
 ```
 
-Two register notes that run through every chapter:
-- **Strong answers are in your voice** — first person, present tense, speakable. "I built RAG from contracts because…", not "the developer chose…". Read them out loud.
-- **AI-honesty is woven throughout, not quarantined in Chapter 8.** The 2026 baseline assumes you used AI heavily. The differentiator is owning *which* decisions were yours (deliberate), which the AI proposed and you judged (evaluated-and-accepted), and which you defaulted to (and how you'd check them). Chapter 8 makes that explicit; the other seven model it.
+## The six visual treatments you'll see throughout
 
-## The one place you'll get pushed past your depth
+Each is a recurring motif so your eye finds it on a re-read:
 
-Be ready for it: **the internals of an ANN vector index (HNSW — how the navigable-small-world graph actually works).** You use it (buffr's pgvector), you can explain *why* (linear scan doesn't scale, the `VectorStore` contract lets it drop in), but the graph-construction internals are a real gap. Chapter 4's "I don't know" recovery box is built for exactly this question — and the honest answer there ("I treat it as a swappable index behind the contract; here's what I'd verify with recall@k") is *stronger* than a hand-wavy fake. Embedding-model internals (why nomic, how it compares on MTEB) is the second such spot — Chapters 1 and 3 cover the recovery.
+- **Chapter-opening diagram** — the visual anchor for the whole chapter.
+- **"What they're really asking" callout** (`┌─┐`) — the probe under the
+  question.
+- **Strong / weak side-by-side** — the contrast does the teaching.
+- **"When you don't know" box** (`╔═╗`, double border) — the recovery line
+  for territory you can't fake. These lean toward your real gaps: no
+  distributed scale, no HNSW internals, no fine-tuning, single-user/no-RLS.
+- **Follow-up decision tree** — the 2–4 branches the conversation takes after
+  your answer.
+- **Pull quote** (`┃` or `▸`) — the line you carry into the room.
 
-## Where this connects
+## The honesty posture (this runs through every chapter)
 
-This book is the **wide opener** — the whole-project defense. The **deep dives** live in the concept-level "Interview defense" blocks inside `.aipe/study-system-design/` (the architectural seams) and `.aipe/study-ai-engineering/` (RAG, embeddings, agentic retrieval, evals). When a chapter here points at a seam and says "the deep walk is in the study guide," that's where it goes. Read this book to defend the project; read those to defend the concepts underneath it.
+You built this with heavy AI assistance. So did everyone else interviewing in
+2026, and senior interviewers know it. What separates you is whether you
+understand what you shipped well enough to own it. Throughout the book I'll
+tag decisions by *how* they were made:
 
----
-Updated: 2026-06-24 — Bundle is now 16 packages at `@rlynjb/aptkit-core@0.4.1` (added `@aptkit/memory`); noted memory reusing the retrieval contracts and Studio's new off-shell pages (rag-query demo + doc pages).
+```
+  deliberate              you chose it, you can defend the criteria
+  evaluated-and-accepted  AI suggested it, you weighed it, you kept it
+  defaulted-to            AI's default, you didn't deeply evaluate it
+```
+
+The third mode is the riskiest to own and the strongest senior signal when
+owned well. We'll name which decisions fall where, especially in Chapter 8.
+
+## Connection to the rest of your study system
+
+This is the *project-level* defense — the wide opener, "walk me through what
+you built." The *concept-level* defenses (one decision in depth — provider
+abstraction, the retrieval contracts) live in the Interview-defense blocks
+inside `.aipe/study-system-design/` and `.aipe/study-ai-engineering/`. Use
+both: the concept files prepare the deep dive, this book prepares the opener.
+
+```
+  this book           the concept files
+  ─────────           ─────────────────
+  "walk me through    "why did you make the
+   your project"       VectorStore a contract
+  the wide opener      and not a class?"
+                       the deep dive
+```
+
+Now turn to Chapter 1. The first sixty seconds decide how the next forty-five
+minutes feel.

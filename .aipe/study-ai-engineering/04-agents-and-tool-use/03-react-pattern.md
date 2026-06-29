@@ -1,392 +1,277 @@
-# The bounded agent loop (ReAct + budget + forced synthesis)
+# The ReAct pattern
 
-**Industry names:** ReAct (Reason + Act), tool-use loop, agentic loop · *Industry standard*
+**Subtitle:** Reason + Act (thought / action / observation) · the loop's iteration shape · *Industry standard (aptkit's loop IS this)*
 
 ## Zoom out, then zoom in
 
-Every agent in AptKit — query, anomaly-monitoring, diagnostic, recommendation,
-rubric-improvement — is the same engine with a different prompt and a different
-tool allowlist. That engine is `runAgentLoop`. Here's where it sits.
+ReAct is the pattern where a model alternates *reasoning* (think about what to do)
+and *acting* (call a tool), reading each tool's result as an *observation* before
+the next thought. It's not a library aptkit imports — it's the literal shape of one
+turn in `runAgentLoop`. Every iteration is one Thought → Action → Observation step,
+and the trace events make that trajectory something you can *see* in Studio.
 
 ```
-  Zoom out — where the agent loop lives
+  Zoom out — ReAct is the loop's iteration shape
 
-  ┌─ Agent layer (packages/agents/*) ───────────────────────────┐
-  │  RecommendationAgent.propose()  builds system + tool schemas │
-  └───────────────────────────────┬──────────────────────────────┘
-                                   │  calls
-  ┌─ Runtime layer (packages/runtime) ─▼──────────────────────────┐
-  │   ★ runAgentLoop()  ←── THIS CONCEPT                          │
-  │     loops: model.complete → run tools → feed results back     │
-  └───────────────────────────────┬──────────────────────────────┘
-                                   │  ModelProvider.complete()
-  ┌─ Provider layer ───────────────▼──────────────────────────────┐
-  │  anthropic / openai / fixture — returns text + tool_use blocks │
-  └────────────────────────────────────────────────────────────────┘
+  ┌─ runAgentLoop (run-agent-loop.ts) ─────────────────────────────┐
+  │  for turn in 0..maxTurns:                                       │
+  │    ★ THOUGHT  — model text (emitted as a 'step' event) ★        │ ← we are here
+  │    ★ ACTION   — tool_use block → callTool ★                     │
+  │    ★ OBSERVE  — tool_result appended as the next message ★      │
+  │  (forced-synthesis turn ends the loop with a final answer)      │
+  └─────────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: a **chain** is steps you hard-code. An **agent** is a loop where the
-*model* decides each step and how many — but a raw "loop until the model stops"
-is a foot-gun (it loops forever, burns tokens, or never produces a parseable
-answer). AptKit's loop is the ReAct pattern with three guardrails bolted on:
-a turn budget, a tool-call budget, and a forced synthesis turn. That's the
-concept.
+Now zoom in. The original ReAct paper interleaved free-text reasoning traces with
+actions. aptkit gets the same structure for free from native-style tool calling:
+the model's text *is* the thought, the `tool_use` block *is* the action, the
+`tool_result` message *is* the observation the model reads next turn. You don't
+prompt "Thought:/Action:/Observation:" — the loop's three moves already are ReAct.
 
 ## Structure pass
 
-**Layers.** Two: the *outer* agent (sets the budget, owns the prompt and the
-allowlist) and the *inner* loop (runs turns until the model stops or the budget
-runs out).
+**Layers.** Loop (drives turns) → model (produces thought + action) → tool
+(produces observation) → trace sink (records each move as an event).
 
-**Axis — who decides control flow?** The outer agent decides the *bounds*
-(`maxTurns`, `maxToolCalls`). Inside the bounds, the *model* decides each move.
-On the last turn, control flips back to *code*: the tools are yanked away and
-the model is forced to answer.
+**Axis — state of the conversation across turns.** What carries from one turn to
+the next? Trace it: the `messages` array is the state. A thought + action gets
+pushed as an `assistant` message (`run-agent-loop.ts:124`); the observation gets
+pushed as a `user` message holding `tool_result` blocks (`run-agent-loop.ts:189`).
+Next turn, `model.complete` sees the whole array — so the observation *becomes
+input* to the next thought. The axis "how does an observation reach the next
+reasoning step?" flips at the `messages.push` of the tool result.
 
-**Seams.** The load-bearing seam is the `forceFinal` boundary inside the loop —
-that single boolean is where control flips from "LLM free to query" to "code
-compels an answer." Get that seam wrong and the agent either loops to the budget
-ceiling every time or stops one query short of an answer.
+**Seam.** `messages.push({ role: 'user', content: toolResults })`
+(`run-agent-loop.ts:189`). Before it, the observation is just a returned value;
+after it, it's part of the conversation the model reasons over. That push is what
+closes ReAct's act → observe → think loop.
 
 ## How it works
 
-You already know the shape from a `fetch()` retry loop: you try, you check a
-condition, you either continue or break. The agent loop is that, but each
-iteration is a full model round-trip, and the "condition" is *did the model ask
-to use a tool?*
-
 ### Move 1 — the mental model
 
-```
-  The ReAct loop — Thought / Action / Observation
-
-  ┌─────────────┐
-  │  Thought    │ ← model reads context, decides next move
-  └──────┬──────┘
-         │ emits a tool_use block?
-    ┌────┴────┐
-    │   yes   │ no ─────────────► finalText = its text, BREAK
-    ▼
-  ┌─────────────┐
-  │   Action    │ ← code runs the tool (model can't run it itself)
-  └──────┬──────┘
-         ▼
-  ┌─────────────┐
-  │ Observation │ ← tool result fed back as the next user message
-  └──────┬──────┘
-         └──────────► loop, UNLESS budget spent → force final answer
-```
-
-The model is the brain; your code is the hands. The brain says "call
-`get_metric_timeseries`"; the loop runs it and hands the result back. The model
-never executes anything itself.
-
-### Move 2 — the load-bearing skeleton
-
-This concept has a kernel. Strip it to the minimum that's still the pattern:
+You know a REPL: read input, evaluate it, print the result, loop — and the printed
+result informs what you type next. ReAct is a REPL where the *model* is the user. It
+"types" a thought and a tool call (read), the loop runs the tool (eval), the result
+goes back into the transcript (print), and the model reads it to decide the next
+line (loop). The conversation transcript is the REPL's accumulating session state.
 
 ```
-  Kernel (pseudocode)
+  ReAct ≈ a REPL with the model as the user
 
-  messages = [user prompt]
-  for turn in 0 .. maxTurns-1:
-    budgetSpent  = toolCalls.length >= maxToolCalls      // ← guard 1
-    forceFinal   = (turn == maxTurns-1) OR budgetSpent    // ← guard 2
-
-    response = model.complete(
-      system = forceFinal ? system + synthesisInstruction : system,
-      tools  = forceFinal ? NONE : toolSchemas             // ← yank tools
-    )
-    append response to messages
-
-    toolUses = tool_use blocks in response
-    if toolUses is empty:                                  // model is done
-      finalText = response text
-      break
-
-    for each toolUse:                                      // ACTION
-      result = tools.callTool(name, args)   // (or capture the error)
-      record it; emit trace events
-    append tool results to messages as the next user turn  // OBSERVATION
+  model types:  thought + tool call      ← read
+       │
+  loop runs:    callTool(...)             ← eval
+       │
+  result back:  appended to transcript    ← print
+       │
+  model reads transcript → next thought   ← loop
 ```
 
-**Name each part by what breaks without it:**
+### Move 2 — one turn, three moves
 
-- **The message accumulator (`messages`).** Drop it and every turn starts blind —
-  the model never sees the tool results it just asked for. This is the
-  Observation half of ReAct.
-- **The turn budget (`maxTurns`).** Drop it and a model that keeps emitting tool
-  calls loops forever. This is the hard ceiling.
-- **The tool-call budget (`maxToolCalls`).** Drop it and a single turn can fan
-  out 20 tool calls; the budget caps *total* spend across turns, independent of
-  turn count.
-- **The forced synthesis turn (`forceFinal`).** This is the part people forget,
-  and it's the most load-bearing. On the last turn, the code sets `tools =
-  undefined` and appends a synthesis instruction ("you have NO more tool calls
-  available; output your final answer"). Without it, a model that hits the turn
-  ceiling mid-investigation just emits *another* tool call you have no budget to
-  run — and you get back a tool request instead of an answer. The fence forces a
-  conclusion.
+**Move A — Thought (model text → a `step` event).** The model's natural-language
+output is the reasoning trace. The loop extracts it and emits it as a `step` trace
+event so the thought is observable (`run-agent-loop.ts:126`):
 
-**Skeleton vs. hardening.** The four parts above are the skeleton. Layered on
-top as hardening: trace emission (every step, tool call, and token count
-becomes a `CapabilityEvent`), tool-result truncation (a 16k-char cap so one
-giant result can't blow the context), and the recovery turn below.
-
-### Move 2.5 — the fallback recovery turn
-
-After the loop, if the agent needs structured output, it parses `finalText`. If
-that parse returns `null` *and* a `recoveryPrompt` is supplied, the loop fires
-**one more** model call — a clean-slate turn with a strict system prompt
-("output ONLY the structured answer; never ask for more data") and the
-completed tool results stuffed into the prompt as evidence.
-
-```
-  Recovery: when the final answer won't parse
-
-  loop ends ──► parseResult(finalText)
-                     │
-                ┌────┴────┐
-                │ null?   │ no ──► return parsed
-                ▼ yes
-          recoveryPrompt(toolCalls)   ← repackage evidence
-                     │
-                     ▼
-          one more model.complete()   ← tools OFF, strict system
-                     │
-                     ▼
-          parseResult(recoveryText)   ← last chance, else null
+```ts
+const text = textFromContent(response.content);
+if (text) {
+  trace?.emit({ type: 'step', capabilityId, role: 'assistant', content: text, timestamp: timestamp() });
+}
 ```
 
-This is the difference between "the agent failed" and "the agent produced messy
-prose on its last turn but we salvaged the answer." Cheap insurance: one extra
-call, only on parse failure.
+That `step` event is the Thought made visible. In Studio it's the line that shows
+*why* the model is about to call the tool it calls.
+
+```
+  Thought — model text becomes a visible step
+
+  model.complete ─► response.content ─► textFromContent
+                                            │ text?
+                                            ▼
+                                   emit {type:'step', content: <reasoning>}
+```
+
+**Move B — Action (tool_use block → callTool).** The model's `tool_use` blocks are
+the actions. The loop pulls them out and runs each one, bracketing it with
+`tool_call_start`/`tool_call_end` events (`run-agent-loop.ts:131`):
+
+```ts
+const toolUses = toolUsesFromContent(response.content);
+if (toolUses.length === 0) { finalText = text; break; }   // no action → the thought IS the answer
+for (const toolUse of toolUses) {
+  trace?.emit({ type: 'tool_call_start', capabilityId, toolName: toolUse.name, args: toolUse.input, ... });
+  const { result, durationMs } = await tools.callTool(toolUse.name, toolUse.input, { signal });
+  trace?.emit({ type: 'tool_call_end', capabilityId, toolName: toolUse.name, result, durationMs, ... });
+}
+```
+
+Note the branch: *no* `tool_use` block means the model chose not to act — its
+thought is the final answer, and the loop breaks. Action is optional; reasoning
+isn't.
+
+```
+  Action — tool_use block drives a tool call
+
+  toolUsesFromContent(content)
+       │ none                          │ ≥1
+       ▼                               ▼
+  finalText = text; break        tool_call_start ─► callTool ─► tool_call_end
+  (thought was the answer)            (the Action, traced both ends)
+```
+
+**Move C — Observation (tool_result → next message).** The tool's output becomes a
+`tool_result` block appended to `messages`, so the *next* `model.complete` reads it
+(`run-agent-loop.ts:181`):
+
+```ts
+toolResults.push({
+  type: 'tool_result',
+  toolUseId: toolUse.id,
+  content: resultContent,                    // truncated JSON of the result (or the error)
+  ...(isError ? { isError: true } : {}),
+});
+// ...after the loop over tool uses:
+messages.push({ role: 'user', content: toolResults });   // ← the observation enters the transcript
+```
+
+This single push is the heart of ReAct: it turns a returned value into something the
+model reasons over next turn. An *error* observation works the same way (it carries
+`isError: true`), so a failed action becomes feedback the model reads — that's
+recovery riding on the observation step (see `06-error-recovery.md`).
+
+```
+  Observation — result re-enters the conversation
+
+  callTool result (or error) ─► tool_result block ─► messages.push (role:user)
+                                                          │
+                                                          ▼
+                                       next turn: model.complete sees it ─► next Thought
+```
+
+**The trajectory you can see.** Because every move emits an event, the whole ReAct
+trajectory is a stream. The `CapabilityEvent` union — `step`, `tool_call_start`,
+`tool_call_end`, `model_usage` (`events.ts:1`) — is streamed as NDJSON and rendered
+in Studio, so you watch thought → action → observation unfold per turn:
+
+```
+  The trace IS the ReAct trajectory (Studio view)
+
+  step           ── "I should search the knowledge base for ORM setup"   (Thought)
+  tool_call_start── search_knowledge_base {query:"ORM setup"}            (Action)
+  tool_call_end  ── 4 chunks, 120ms                                      (Observation)
+  step           ── "The docs say to run migrate; let me answer"         (Thought)
+  (no tool_use)  ── final text                                          (Stop)
+```
 
 ### Move 3 — the principle
 
-An agent is a loop the *model* drives inside a fence the *code* controls. The
-freedom (which tool, how many, in what order) belongs to the model; the bounds
-(how long, how much, and the compelled final answer) belong to you. A loop with
-no fence isn't an agent — it's an unbounded liability.
+ReAct is just "let the model see the consequence of its action before its next
+action" — and the cheapest way to implement it is to append the result as a message.
+aptkit doesn't reinvent the pattern; it *falls out* of native-style tool calling
+plus a message array. The engineering value is making each move a trace event so the
+trajectory is debuggable: when an agent gives a wrong answer, you replay the
+thought/action/observation sequence and see exactly which observation it
+misread or which action it skipped. The forced-synthesis turn (tools dropped on the
+last iteration) is what ends the ReAct loop with an answer instead of another action.
 
 ## Primary diagram
 
-The full loop, every box and budget labelled.
-
 ```
-  runAgentLoop — full picture
+  ReAct in runAgentLoop — one turn, three traced moves
 
-  RunAgentLoopOptions { system, userPrompt, toolSchemas,
-                        maxTurns=8, maxToolCalls?, synthesisInstruction,
-                        parseResult?, recoveryPrompt? }
-        │
-        ▼
-  messages = [{ role: user, content: userPrompt }]
-        │
-        ▼
-  ┌──────────────────────── for turn in 0..maxTurns-1 ───────────────────────┐
-  │  budgetSpent = toolCalls >= maxToolCalls                                  │
-  │  forceFinal  = last turn OR budgetSpent                                   │
-  │       │                                                                   │
-  │       ▼                                                                   │
-  │  model.complete({ system(+synthesis if forceFinal),                       │
-  │                   tools: forceFinal ? none : toolSchemas })               │
-  │       │                                                                   │
-  │       ├─► emit model_usage trace (tokens)                                 │
-  │       ▼                                                                   │
-  │  toolUses empty? ──yes──► finalText = text; BREAK                         │
-  │       │ no                                                                │
-  │       ▼                                                                   │
-  │  run each tool (truncate result to 16k), emit tool_call_* trace,          │
-  │  append results as next user message ──► loop                            │
-  └───────────────────────────────────────────────────────────────────────────┘
-        │
-        ▼
-  parseResult(finalText) → null? → recoveryPrompt → one strict call → parse
-        │
-        ▼
-  return { finalText, toolCalls, parsed }
+  ┌─ turn ─────────────────────────────────────────────────────────────────┐
+  │  model.complete(messages, tools)                                         │
+  │        │                                                                 │
+  │        ├─ THOUGHT:  text  ──────────────► emit 'step'                    │
+  │        │                                                                 │
+  │        ├─ ACTION:   tool_use? ─none─► finalText=text; break (stop)       │
+  │        │                  │ ≥1                                           │
+  │        │                  ▼                                              │
+  │        │            'tool_call_start' ─► callTool ─► 'tool_call_end'     │
+  │        │                                                                 │
+  │        └─ OBSERVE:  tool_result ─► messages.push(role:user) ─────────────┼─┐
+  └─────────────────────────────────────────────────────────────────────────┘ │
+        ▲  next turn reads the observation as input ──────────────────────────┘
+        bounded by maxTurns; final turn drops tools → forced synthesis ends it
 ```
-
-## Implementation in codebase
-
-**Use cases.** Every agent calls this. `RecommendationAgent.propose()` runs it
-with `maxTurns: 6, maxToolCalls: 4` to turn a diagnosis into ≤3 grounded
-recommendations
-(`packages/agents/recommendation/src/recommendation-agent.ts:77-93`). The query
-agent runs it with `maxTurns: 8, maxToolCalls: 6` to answer NL questions over
-~49 read-only tools (`packages/agents/query/src/query-agent.ts:85-99`). The
-anomaly monitor runs it to scan 10 ecommerce categories
-(`packages/agents/anomaly-monitoring/src/monitoring-agent.ts:66-83`).
-
-**The loop core**, `packages/runtime/src/run-agent-loop.ts:98-190`:
-
-```
-  packages/runtime/src/run-agent-loop.ts  (lines 98-109)
-
-  for (let turn = 0; turn < maxTurns; turn += 1) {     ← the turn ceiling
-    signal?.throwIfAborted();                           ← cancellation seam
-    const budgetSpent =
-      maxToolCalls !== undefined && toolCalls.length >= maxToolCalls;
-    const forceFinal = turn === maxTurns - 1 || budgetSpent;  ← THE flip
-    const response = await model.complete({
-      system: forceFinal && synthesisInstruction
-        ? `${system}\n\n${synthesisInstruction}`        ← append the nudge
-        : system,
-      messages,
-      tools: forceFinal ? undefined : toolSchemas,      ← yank the tools
-      maxTokens,
-      signal,
-    });
-       │
-       └─ `forceFinal` is the load-bearing line. When true, the model gets
-          NO tools and a "you have no more calls" instruction, so it must
-          answer. Without it, the last turn could emit another unrunnable
-          tool call and you'd return a request instead of an answer.
-```
-
-```
-  packages/runtime/src/run-agent-loop.ts  (lines 131-135)
-
-  const toolUses = toolUsesFromContent(response.content);
-  if (toolUses.length === 0) {     ← model emitted no tool call…
-    finalText = text;              ← …so it's done. Capture and break.
-    break;
-  }
-       │
-       └─ The natural exit. The budget is the *unnatural* exit (forced).
-          Most turns end here; the fence only fires when the model would
-          otherwise keep going.
-```
-
-The tool execution + error capture is at `:139-189`: each tool runs inside a
-`try/catch`, errors become a `{ error: message }` result fed back to the model
-as an observation (so the model can recover by trying a different tool), and
-results are truncated to `MAX_TOOL_RESULT_CHARS = 16_000` (`:52-57`).
-
-**The forced-synthesis helper**, `packages/runtime/src/run-agent-loop.ts:72-74`:
-
-```
-  export function buildSynthesisInstruction(middle: string): string {
-    return `You have NO more tool calls available. ${middle}`
-         + ` Do not say you need more queries.`;
-  }
-```
-
-Each agent passes its own `middle` — e.g. recommendation says "Respond with ONLY
-a JSON array of at most 3 recommendation objects…"
-(`packages/agents/recommendation/src/recommendation-agent.ts:88-90`).
-
-**The recovery turn**, `packages/runtime/src/run-agent-loop.ts:192-228`: runs
-`parseResult`, and on `null` fires `runRecoveryTurn` with a hardcoded strict
-system prompt ("You are concluding a completed investigation. Output ONLY the
-structured answer… Never ask for more data.") at `:211-213`.
 
 ## Elaborate
 
-ReAct (Yao et al., 2022) named the Thought/Action/Observation interleaving that
-makes tool-using models debuggable — the model externalizes its reasoning
-between actions, so a bad trace is readable. AptKit's contribution on top is
-purely operational: the budgets and the forced-synthesis turn are the scar
-tissue of running these loops against real providers, where "the model decides
-when to stop" is not a guarantee you can ship on.
-
-The forced-synthesis turn connects directly to the eval layer: because the loop
-*always* produces a `finalText` (never an open-ended tool request), the parse +
-validate step downstream (`05-evals-and-observability/`) always has something
-concrete to check. The fence and the eval are designed together.
-
-Adjacent concepts: tool calling (`02-tool-calling.md`), error recovery
-(`06-error-recovery.md`), structured outputs (`01-llm-foundations/04-structured-outputs.md`).
-The multi-agent *orchestration* on top of this loop (monitor → diagnose →
-recommend) is agent-architecture territory — see `.aipe/study-agent-architecture/`.
+ReAct (Yao et al., 2022) showed that interleaving reasoning and acting beats either
+alone — reasoning keeps the actions on track, actions ground the reasoning in real
+observations. The classic implementation parses `Thought:/Action:/Observation:`
+out of free text; the modern implementation (aptkit's) gets the same loop from
+structured tool calls, which is more robust because the action is a typed block, not
+a parsed string. The thing most people miss: the *observation* step is where
+recovery and grounding both happen — the model only stays honest because it reads
+the real tool output next turn. Read `01-agents-vs-chains.md` for why this loop is an
+agent and not a chain, `02-tool-calling.md` for how the Action block is produced
+(emulated on Gemma), and `06-error-recovery.md` for the error-as-observation path.
 
 ## Project exercises
 
-*Provenance: Phase 4 — Agents and tool use (C4.x). No `aieng-curriculum.md`
-present; IDs are by-phase convention. Case A — the loop is implemented; these
-harden it.*
-
-### Exercise — loop-detection guard
-
-- **Exercise ID:** `[B4.x]` Phase 4, error-recovery concept
-- **What to build:** Add detection of repeated identical tool calls inside
-  `runAgentLoop` — track `(toolName, JSON.stringify(args))` per turn; if the
-  same pair fires N times, inject a "you already ran that; try a different
-  approach" observation instead of re-running it.
-- **Why it earns its place:** The spec's error-recovery table lists "LLM loops
-  on same tool repeatedly" as a named failure mode AptKit doesn't yet handle.
-  Naming and fixing it is a strong interview signal.
-- **Files to touch:** `packages/runtime/src/run-agent-loop.ts`,
-  `packages/runtime/test/run-agent-loop.test.ts`.
-- **Done when:** A fixture that returns the same tool call 3× triggers the
-  injected message and the loop terminates within budget; a unit test proves it.
+### Render the ReAct trajectory as a turn-numbered timeline in Studio
+- **Exercise ID:** —  (no curriculum file in repo)
+- **What to build:** group the NDJSON `CapabilityEvent` stream by turn and render
+  each turn as a Thought/Action/Observation triple, so a run reads as a clear ReAct
+  trace instead of a flat event list.
+- **Why it earns its place:** the single most useful agent-debugging view is "what
+  did it think, do, and see, per turn"; building it proves you understand the loop's
+  iteration shape, not just its output.
+- **Files to touch:** the Studio trace UI under `packages/studio/` (or wherever the
+  NDJSON viewer lives), reading `packages/runtime/src/events.ts`.
+- **Done when:** a rag-query run shows numbered turns, each with its thought, the
+  tool it called, and the observation it got back.
 - **Estimated effort:** `1–4hr`
 
-### Exercise — surface budget exhaustion in the trace
-
-- **Exercise ID:** `[B4.x]` Phase 4, observability of agents
-- **What to build:** Emit a distinct `warning` `CapabilityEvent` when
-  `forceFinal` fires because of `budgetSpent` (vs. natural last turn), so Studio
-  can show "this run hit its tool-call ceiling."
-- **Why it earns its place:** Distinguishing "finished naturally" from "ran out
-  of budget" is the difference between a healthy run and a near-miss — exactly
-  the kind of operational visibility interviewers probe for.
-- **Files to touch:** `packages/runtime/src/run-agent-loop.ts`,
-  `packages/runtime/src/events.ts` (no shape change needed — reuse `warning`),
-  `apps/studio` trace rendering.
-- **Done when:** A budget-exhausted replay artifact contains the warning event
-  and Studio renders it.
-- **Estimated effort:** `1–4hr`
+### Add a `turn` index to every CapabilityEvent
+- **Exercise ID:** —  (no curriculum file in repo)
+- **What to build:** thread the loop's `turn` counter into each emitted event so
+  consumers don't have to infer turn boundaries from event ordering.
+- **Why it earns its place:** making the turn explicit is the difference between a
+  best-effort grouping and a reliable one; it's the small schema change that makes
+  the trajectory view above trustworthy.
+- **Files to touch:** `packages/runtime/src/events.ts`,
+  `packages/runtime/src/run-agent-loop.ts`, `packages/runtime/test/`.
+- **Done when:** every event from a multi-turn run carries the correct `turn` index
+  and a test asserts thought/action/observation in one turn share it.
+- **Estimated effort:** `<1hr`
 
 ## Interview defense
 
-**Q: Walk me through your agent loop. What stops it running forever?**
-Three things, and I'd sketch the fence:
+**Q: "Is your agent a ReAct agent? Where's the thought/action/observation?"**
+Yes — the loop's iteration *is* ReAct. The model's text is the Thought, emitted as a
+`step` trace event. Its `tool_use` block is the Action; the loop runs it via
+`callTool`, bracketed by `tool_call_start`/`tool_call_end`. The Observation is the
+`tool_result` pushed back onto the `messages` array, which the next `model.complete`
+reads. I don't prompt the Thought/Action/Observation strings — native-style tool
+calling plus a message array gives the structure for free, and the trace makes the
+trajectory visible.
 
 ```
-  budget        forced synthesis      natural exit
-  maxTurns ───►  last turn:       ──►  model emits no
-  maxToolCalls   tools OFF + nudge      tool_use → break
+  text → 'step' (Thought) · tool_use → callTool (Action) · tool_result → messages.push (Observation)
 ```
+Anchor: *ReAct isn't a library — it's one turn of the loop, made observable by trace events.*
 
-"`maxTurns` is the hard ceiling. `maxToolCalls` caps total spend independent of
-turn count. And the part people miss — on the last turn I strip the tools and
-append a synthesis instruction, so the model is *forced* to answer instead of
-emitting one more tool call I can't run. That's `forceFinal` in
-`run-agent-loop.ts:102`."
-*Anchor: the flip from LLM-decides to code-decides happens on one boolean.*
+**Q: "Where exactly does the observation feed back into reasoning?"**
+At `messages.push({ role: 'user', content: toolResults })`. Before that push the
+tool's result is just a returned value; after it, it's part of the conversation, so
+the next turn's `model.complete` sees it and reasons over it. That one line closes
+the act → observe → think loop. It's also where a tool *error* re-enters — the
+error is appended as a `tool_result` with `isError: true`, so a failed action becomes
+feedback the model can recover from.
 
-**Q: The model's final answer comes back as prose, not the JSON you need. Then
-what?**
-"One recovery turn. I re-call the model with the tools off, a strict
-'output only the structured answer' system prompt, and the tool results I
-already gathered repackaged as evidence — `runRecoveryTurn`,
-`run-agent-loop.ts:204`. If *that* doesn't parse, I return null and the caller
-handles the empty case. One extra call, only on failure."
-*Anchor: parse failure is a recoverable state, not a dead end.*
-
-## Validate
-
-- **Reconstruct:** From memory, write the loop kernel — the four skeleton parts.
-  Check against `packages/runtime/src/run-agent-loop.ts:98-190`.
-- **Explain:** Why does `forceFinal` set `tools: undefined` rather than just
-  appending the instruction? (Because a model with tools available will use them
-  even when told not to; removing the tools makes it structurally impossible.)
-  See `:108`.
-- **Apply:** The recommendation agent sets `maxToolCalls: 4`. A diagnosis needs
-  5 lookups to ground fully. What happens? (On the 4th tool call,
-  `budgetSpent` becomes true; the next turn is forced-final with the evidence so
-  far.) Trace it through `recommendation-agent.ts:86-92`.
-- **Defend:** Why truncate tool results to 16k chars
-  (`run-agent-loop.ts:52`) rather than let them flow? (A single large tool
-  result can crowd out the rest of the context window and spike cost; truncation
-  bounds per-observation context growth.)
+```
+  result/error → tool_result block → messages.push → next turn reads it → next Thought
+```
+Anchor: *the observation becomes the next reasoning step at the tool_result push — that's the loop closing.*
 
 ## See also
 
-- [02-tool-calling.md](02-tool-calling.md) — what a tool call is, the brain/hands split
-- [06-error-recovery.md](06-error-recovery.md) — the full failure-mode table
-- [01-agents-vs-chains.md](01-agents-vs-chains.md) — when to reach for a loop at all
-- [../01-llm-foundations/04-structured-outputs.md](../01-llm-foundations/04-structured-outputs.md) — what `parseResult` validates
-- [../05-evals-and-observability/04-llm-observability.md](../05-evals-and-observability/04-llm-observability.md) — the trace events the loop emits
+- `01-agents-vs-chains.md` — why this loop is an agent
+- `02-tool-calling.md` — how the Action (tool_use block) is produced
+- `06-error-recovery.md` — the error-as-observation recovery path
+- `04-tool-routing.md` — which actions the model is allowed to take
+- `05-evals-and-observability/` — reading the trajectory to debug a bad answer

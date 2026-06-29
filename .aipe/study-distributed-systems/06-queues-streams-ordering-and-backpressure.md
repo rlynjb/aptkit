@@ -1,249 +1,274 @@
-# 06 — Queues, streams, ordering, backpressure
+# 06 — Queues, Streams, Ordering, and Backpressure
 
-**Industry name(s):** message queues / event streams / consumer groups / message
-ordering / poison messages (DLQ) / backpressure. **Type:** Industry standard.
-**Status in AptKit:** `not yet exercised` (no broker, no async hand-off);
-the in-process turn loop and the NDJSON trace stream are the closest shapes.
+**Industry names:** in-process work queue · event stream (NDJSON) · ordering guarantees · backpressure · poison message · fan-in / batched flush — *Industry standard.*
 
 ## Zoom out, then zoom in
 
-AptKit has no message broker, no queue, no consumer group, no async producer/
-consumer split. Everything is synchronous and in-process. The two shapes that
-*rhyme* with this topic: the agent loop processing turns in strict order (a
-synchronous, in-memory "queue of one"), and the NDJSON trace that streams events
-out — but that's a one-way log, not a queue with consumers and acks.
+There is no Kafka, no Redis Streams, no message broker here — that's `not yet
+exercised`. But there are two real stream-shaped things worth studying: the
+**NDJSON trace stream** (the agent emits events that flow to the Studio UI or to
+Postgres) and the **`pending[]` write queue** inside `SupabaseTraceSink` (sync
+emits buffered, then drained by `flush()`). Both raise the core stream questions:
+ordering, backpressure, and what happens to a bad message.
 
 ```
-  Zoom out — where queues would live (none here)
+  Zoom out — the two stream-shaped things in the repo
 
-  ┌─ UI layer (Studio) ──────────────────────────────────────────┐
-  │  NDJSON stream of trace events ── one-way log, NOT a queue     │ ← stream analog
-  └─────────────────────────────┬────────────────────────────────┘
-                               │ in-process, synchronous
-  ┌─ Service layer ─────────────▼────────────────────────────────┐
-  │  runAgentLoop ── strict in-order turns ── "queue of one"       │ ← ordering analog
-  └───────────────────────────────────────────────────────────────┘
-
-  no broker · no consumer group · no DLQ · no backpressure · no async hand-off
+  ┌─ App: runAgentLoop ─────────────────────────────────────────────────┐
+  │  emit(CapabilityEvent) ── synchronous, in-order ──┐                  │ ← producer
+  └────────────────────────────────────────────────────┼─────────────────┘
+                                                        │
+            ┌───────────────────────────────────────────┴──────────────┐
+            ▼ (aptkit)                                                  ▼ (buffr)
+  ┌─ NDJSON stream → Studio UI ─┐              ┌─ SupabaseTraceSink.pending[] ─┐
+  │  one JSON object per line    │              │  push() each event's write,   │ ← we are here
+  │  ordered by emit             │              │  then flush() drains them all │
+  └──────────────────────────────┘              └───────────────┬───────────────┘
+                                                                │ Promise.all (racing inserts!)
+                                                  ┌─ agents.messages ────────────┐
+                                                  │  order rebuilt from created_at│
+                                                  └───────────────────────────────┘
 ```
 
-Zoom in: a **queue** decouples a producer from a consumer in time — the producer
-drops a message and moves on; the consumer picks it up later. That decoupling
-buys you load smoothing and retries, and it forces you to confront **ordering**
-(do messages arrive in order?), **poison messages** (one bad message blocking the
-queue), and **backpressure** (what happens when the producer outruns the
-consumer?). AptKit does none of this because nothing is async — the "consumer" is
-the same call stack as the "producer."
+Zoom in: a **stream** is an ordered sequence of events a producer emits and a
+consumer processes. The hard questions are always the same three — does the consumer
+see events *in order*? what happens when the producer outruns the consumer
+(**backpressure**)? and what happens to one event the consumer *can't* process (a
+**poison message**)? aptkit answers the first with a clever timestamp trick and
+mostly dodges the other two — which is fine at its scale, and exactly what to name.
 
-## Structure pass — layers, axis, seam
+## Structure pass
 
-Trace the **control axis** — "who drives the next unit of work, and when?":
+**Layers.** Producer (agent emits) → buffer (`pending[]` / NDJSON line buffer) →
+consumer (Postgres insert / Studio render).
+
+**Axis — trace `is order preserved?` from producer to consumer.**
 
 ```
-  "who drives the next unit, and when?" — down the layers
+  Axis — "is emit order == consumer order?" — producer to consumer
 
-  ┌────────────────────────────────────────────┐
-  │ agent turn loop                             │ → SYNCHRONOUS: the loop drives the
-  │                                             │   next turn immediately. no waiting
-  │                                             │   queue, no separate consumer.
-  └────────────────────┬───────────────────────┘
-      ┌────────────────▼─────────────────────────┐
-      │ NDJSON trace stream                        │ → PUSH: producer writes events as
-      │                                            │   they happen; reader consumes live.
-      │                                            │   one-way, no ack, no replay-on-fail
-      └────────────────────────────────────────────┘
+  ┌─ producer: emit(event) ────────────────────┐
+  │  synchronous, single-threaded → emit order  │  → STRICTLY ordered at the source ✓
+  │  is the truth                               │
+  └──────────────────────┬──────────────────────┘
+       ┌─────────────────▼────────────────────────┐
+       │ buffer: pending[] (array, push order)     │  → push order == emit order ✓
+       └─────────────────┬────────────────────────┘
+            ┌────────────▼──────────────────────────┐
+            │ consumer: Promise.all(pending) inserts │  → INSERT order is a RACE ✗
+            └─────────────────────────────────────────┘     (fixed by created_at, see below)
 ```
 
-There's no producer/consumer seam because there's no time-decoupling anywhere —
-the control axis never flips from "caller drives" to "queue drives." That
-absence is the whole finding: a synchronous system has no queue problems because
-it has no queue.
+**Seam.** Order is preserved at the producer and in the buffer, then *lost* at the
+consumer — `Promise.all` fires all the inserts concurrently, so whichever Postgres
+write wins the race lands first. The seam where order breaks is the concurrent
+flush. The fix doesn't restore insert order; it makes insert order *irrelevant* by
+carrying the emit timestamp into the row. That's the lesson, and it's
+file 07's subject too.
 
 ## How it works
 
-### Move 1 — the mental model: a buffer between two speeds
+### Move 1 — the mental model: a stream is a conveyor belt; order is the belt's promise
 
-You know the shape from a debounced input or a `ReadableStream` with
-backpressure: a buffer sits between something fast and something slow. A queue is
-that buffer made durable and remote — the producer enqueues, the consumer
-dequeues at its own pace.
-
-```
-  The queue kernel (general) — decouple producer from consumer in time
-
-  producer ──enqueue──► [ m1 | m2 | m3 | ... ] ──dequeue──► consumer
-                              the buffer                      (slower)
-                         absorbs bursts                  acks each message
-                                                         on success
-```
-
-Three parts, each breaking something if removed:
-
-- **The buffer** — without it, a burst of work overwhelms the consumer
-  immediately (no smoothing).
-- **The ack** — without it, the queue can't tell a processed message from a lost
-  one; a crash mid-process either drops work (at-most-once) or replays it
-  (at-least-once → needs idempotency, see `03`).
-- **Backpressure** — without it, an unbounded buffer grows until it runs out of
-  memory; the producer must be *told to slow down* when the queue fills.
-
-### Move 2 — the analogs, and the absences
-
-**Analog 1: ordering, via the synchronous turn loop.** The agent loop processes
-turns in strict sequence — turn N+1 can't start until turn N's tool results are
-appended. That's total ordering for free, because there's no concurrency to
-reorder anything. A real queue has to *work* for ordering (partition keys,
-single-consumer-per-partition); AptKit gets it by being synchronous.
+You know this from the event loop: callbacks queued in order, drained in order. A
+trace stream is a conveyor belt of events — the agent drops events on in the order
+they happen, and *something* downstream picks them up. The whole design question is
+whether the picking-up preserves the dropping-on order.
 
 ```
-  In-order turns — total ordering for free (synchronous)
+  The stream kernel — produce in order, buffer, drain
 
-  turn 0 ──► tool results appended ──► turn 1 ──► ... ──► turn N
-       strictly sequential. no message can overtake another because there's
-       no queue and no concurrency. ordering is a non-problem here.
+  producer:  e1 ─► e2 ─► e3 ─► e4   (emit order = ground truth)
+                  │
+                  ▼  push into buffer
+  buffer:   [ e1, e2, e3, e4 ]      (array preserves order)
+                  │
+                  ▼  drain
+  consumer:  ?? depends on HOW you drain ??
+             sequential await → e1,e2,e3,e4  (order kept)
+             Promise.all      → e?,e?,e?,e?  (order RACED) ← aptkit does this
 ```
 
-**Analog 2: streaming, via NDJSON.** Trace events are written to an NDJSON stream
-as they occur and consumed live by Studio. It's a *stream* in the loose sense —
-ordered, append-only — but it's one-way: no consumer ack, no redelivery on
-failure, no offset to resume from. It's a log you tail, not a queue you process.
+The load-bearing realization: a buffer keeps order, but *how you drain it* decides
+whether the consumer sees order. Drain sequentially and order survives; drain
+concurrently for speed and you trade order away — unless each event carries its own
+position.
+
+### Move 2 — walking the mechanism
+
+**Step 1 — the producer emits synchronously, in order.** The agent loop calls
+`trace.emit()` at each step, and emit is *synchronous by contract* — it returns
+immediately, so the loop never blocks on the sink:
+
+```ts
+// packages/runtime/src/run-agent-loop.ts:147-179 (the emit calls, in loop order)
+trace?.emit({ type: 'tool_call_start', capabilityId, toolName, args, timestamp: timestamp() });
+// ... run the tool ...
+trace?.emit({ type: 'tool_call_end', capabilityId, toolName, result, error, durationMs, timestamp: timestamp() });
+```
+
+Single-threaded, sequential — so the *emit order* is the ground truth for "what
+happened when." `start` always emits before its `end`. This ordering is free here
+because there's one producer and JS is single-threaded; it's the consumer side that
+gets interesting.
+
+**Step 2 — the buffer: a sync emit that queues an async write.** Here's the clever
+contract bridge. aptkit's sink must be *synchronous* (`emit(): void`), but a Postgres
+write is *async*. The `SupabaseTraceSink` reconciles them by pushing the write
+*promise* into an array and returning immediately:
+
+```ts
+// buffr/src/supabase-trace-sink.ts:49-93
+export class SupabaseTraceSink implements CapabilityTraceSink {
+  private readonly pending: Promise<void>[] = [];      // ← the in-process "queue"
+
+  emit(event: CapabilityEvent): void {                 // ← sync: satisfies aptkit's contract
+    switch (event.type) {
+      case 'step':
+        this.push(persistMessage(pool, conversationId, event.role, event.content, { createdAt: at }));
+        // ↑ persistMessage returns a Promise; we push it, don't await it
+        return;
+      // ... one case per CapabilityEvent variant ...
+    }
+  }
+  private push(p: Promise<void>): void { this.pending.push(p); }
+
+  async flush(): Promise<void> {
+    await Promise.all(this.pending);                   // ← drain CONCURRENTLY → inserts race
+  }
+}
+```
+
+The annotation that matters: `emit` doesn't await — it *fires* the write and stashes
+the promise. So emits are non-blocking (the agent runs at full speed), and the writes
+happen in the background. Then `flush()` (called once after the turn, in
+`session.ts:63`) awaits them all. This is a fan-in: many emits, one drain.
+
+**Step 3 — the ordering problem `Promise.all` creates, and the timestamp fix.**
+`Promise.all` starts every pending write concurrently. Postgres applies them in
+whatever order they arrive — a *race*. Without intervention, `tool_call_end` could
+land in the table *before* its `tool_call_start`. The fix (called out in the sink's
+own comment) is to stop relying on insert order entirely:
+
+```ts
+// buffr/src/supabase-trace-sink.ts:53-55, and persistMessage:26-30
+const at = event.timestamp;                            // ← the EMIT-time ISO timestamp
+// ...persistMessage writes it into created_at:
+//   values (..., coalesce($8::timestamptz, now()))    ← created_at = emit time, NOT insert time
+```
+
+Now replay orders by `created_at` (emit order), and the insert race is *irrelevant* —
+whoever wins the race, the row carries its true position. This is the single best
+piece of distributed-systems engineering in the two repos: it converts an ordering
+problem into a non-problem by attaching a logical position to each event instead of
+trusting physical arrival order. (The clocks angle is file 07.)
+
+**Step 4 — what's NOT handled: backpressure and poison messages.**
 
 ```
-  NDJSON trace — a one-way log, not a queue
+  Layers-and-hops — backpressure: who slows down when the consumer can't keep up?
 
-  loop emits: step → tool_call_start → tool_call_end → model_usage → ...
-                            │ written as newline-delimited JSON
-                            ▼
-  Studio reads the stream live (display only) — no ack, no replay, no DLQ
+  ┌─ producer (agent) ─┐  emit, emit, emit...   ┌─ pending[] ─┐   inserts...  ┌─ Postgres ─┐
+  │  never blocks       │ ─────────────────────► │ grows       │ ────────────► │ may lag    │
+  │  (emit is sync)     │                        │ UNBOUNDED   │               │            │
+  └─────────────────────┘                        └─────────────┘               └────────────┘
+       ▲                                              ▲
+       └─ no signal flows back ──────────────────────┘
+          if Postgres is slow, pending[] just grows; nobody is told to slow down
 ```
 
-**The absences (`not yet exercised`), each with its trigger:**
-
-- **Message queue / broker:** none. *Trigger: making agent runs async — enqueue
-  a run, process it on a worker, return a job id.*
-- **Consumer groups / offsets:** none. *Trigger: multiple workers sharing one
-  queue.*
-- **Poison messages / DLQ:** none. *Trigger: a durable queue where a malformed
-  message could be redelivered forever — you need a dead-letter queue to quarantine
-  it after N failures.*
-- **Backpressure:** none. *Trigger: a producer that can enqueue faster than the
-  consumer drains — you need a bounded buffer + a "slow down" signal.*
+There is **no backpressure**: `emit` always succeeds instantly, so if Postgres is
+slow, `pending[]` grows without bound and memory grows with it. At aptkit's scale
+(one agent run, a few dozen events) this never bites — the buffer is tiny and bounded
+by the turn. But it's the textbook gap: a real queue has a *bounded* size and pushes
+back (blocks or drops) when full. And there's **no poison-message handling**: if one
+`persistMessage` rejects, `Promise.all` rejects the whole `flush()`, and that throws
+out of `ask` — one bad event fails the entire turn's trace persistence rather than
+being isolated and skipped. Both are correct trades *at this scale* and would need
+attention only if the trace volume grew or the writes moved to a real broker.
 
 ### Move 3 — the principle
 
-**A queue is a time machine for work — and every benefit it buys (smoothing,
-retries, decoupling) comes with a problem to solve (ordering, poison messages,
-backpressure).** Synchronous systems like AptKit dodge all of it by never
-decoupling producer from consumer. The senior instinct: don't add a queue for
-its buzzword value; add it only when you genuinely need to decouple two
-components in *time*, and be ready to own ordering and backpressure when you do.
+Ordering, backpressure, and poison handling are the three questions every stream
+must answer, and you can answer each one *cheaply* if you understand what you're
+trading. aptkit answers ordering brilliantly (carry the position with the event, so
+the consumer never has to preserve it) and *defers* backpressure and poison handling
+by keeping the queue small and per-turn. The general principle: **don't trust the
+transport to preserve order — make each message self-positioning.** A logical
+timestamp or sequence number on every event means you can drain as fast and as
+concurrently as you like and still reconstruct the truth.
 
 ## Primary diagram
 
 ```
-  Queue/stream landscape — AptKit's position
+  The trace stream — sync emit, buffered, concurrent drain, order via timestamp
 
-  SYNCHRONOUS (AptKit) ─────────── ASYNC QUEUE ─────────── EVENT STREAM
-   in-order turn loop                                       (Kafka-style)
-   one-way NDJSON log                                        partitions, offsets,
-      ▲                                                      consumer groups
-      │                                                          ▲
-   here: no decoupling,                                  not yet exercised
-   ordering & backpressure          not yet exercised     (trigger: durable
-   are NON-problems                 (trigger: async         event log + replay)
-                                     run hand-off)
+  ┌─ Producer: runAgentLoop (single-threaded) ──────────────────────────┐
+  │  emit(e, timestamp=NOW)  e1 → e2 → e3 ... in emit order ✓            │
+  └──────────────────────────────┬───────────────────────────────────────┘
+                                 │ emit() is SYNC — never blocks (no backpressure)
+  ┌─ Buffer: SupabaseTraceSink.pending[] ─▼──────────────────────────────┐
+  │  push(persistMessage(...))  → [ p1, p2, p3, ... ]  (unbounded)        │
+  └──────────────────────────────┬───────────────────────────────────────┘
+                                 │ flush(): Promise.all → inserts RACE
+  ┌─ Consumer: agents.messages ──▼───────────────────────────────────────┐
+  │  insert order = nondeterministic, BUT created_at = emit timestamp     │
+  │  → replay ORDER BY created_at → emit order recovered ✓                │
+  │  gaps: no backpressure (pending grows), no poison isolation (1 bad    │
+  │        write fails the whole flush)                                   │
+  └─────────────────────────────────────────────────────────────────────┘
 ```
-
-## Implementation in codebase
-
-**Use cases.** The in-order turn loop runs in every agent. The NDJSON trace
-streams during live runs and is persisted into replay artifacts.
-
-**In-order turns — ordering for free.**
-
-```
-  packages/runtime/src/run-agent-loop.ts  (lines 98, 189)
-
-  for (let turn = 0; turn < maxTurns; turn += 1) {   ← strictly sequential turns
-    ...
-    messages.push({ role: 'user', content: toolResults });  ← turn N's output feeds N+1
-  }
-       │
-       └─ no concurrency → no reordering → total ordering with zero machinery.
-          a real queue would need partition keys to guarantee this.
-```
-
-**The trace as a one-way log.**
-
-```
-  packages/runtime/src/events.ts  (lines 1-28)
-
-  type CapabilityEvent = step | tool_call_start | tool_call_end
-                       | model_usage | warning | error   ← the event vocabulary
-  type CapabilityTraceSink = { emit(event: CapabilityEvent): void };  ← push-only sink
-       │
-       └─ emit() is fire-and-forget — no ack, no backpressure, no redelivery.
-          it's a log you append to, not a queue you consume with guarantees.
-```
-
-The NDJSON stream helpers (in `packages/runtime`) serialize these events
-newline-delimited; the Studio Vite middleware (`apps/studio`) tails them for
-display. No consumer offset, no DLQ, no broker.
-
-**`not yet exercised`:** no broker dependency in any `package.json` (no Kafka,
-no Redis, no SQS, no RabbitMQ client), no worker process, no async job table.
 
 ## Elaborate
 
-The ordering-vs-throughput tension is the heart of stream systems: Kafka gives
-you total order only *within a partition*, trading global ordering for parallel
-throughput — and choosing the partition key is the same hard problem as choosing
-a shard key (`05`). Backpressure as a first-class concept comes from Reactive
-Streams / TCP flow control: the consumer signals capacity upstream so the
-producer doesn't overrun it. The dead-letter queue is the operational answer to
-poison messages — the one malformed message that, without a DLQ, gets redelivered
-forever and wedges the whole consumer. AptKit has none of these because it never
-decouples in time; Rein's `me.md` explicitly names hot-path queue infra (Kafka,
-Redis Streams) as the gap, so this file teaches the foundation without
-pretending the repo exercises it.
+The sync-emit / async-write split is a beautifully pragmatic answer to an impedance
+mismatch: aptkit's `CapabilityTraceSink` contract is sync (so the core never depends
+on a durable store), but durability is async. Buffering promises and draining once is
+the bridge. The risk it accepts — unbounded `pending[]` — is the same risk every
+"fire and forget then flush" buffer accepts; real systems bound it with a max size
+and a flush threshold (flush every N events or every T ms), which is exactly what a
+log shipper or a metrics agent does.
+
+The poison-message gap is worth naming because it's a classic stream failure: in a
+real broker, one un-processable message shouldn't block or fail the whole stream — it
+goes to a dead-letter queue and the consumer moves on. Here, one rejected insert
+fails the whole `flush()`. The move, if trace volume grew, would be
+`Promise.allSettled` instead of `Promise.all` — persist what you can, collect the
+failures, and don't let one bad row lose the rest of the trajectory.
 
 ## Interview defense
 
-**Q: "How does your system handle message ordering and backpressure?"**
-
-"It doesn't need to — it's fully synchronous. The agent loop processes turns in
-strict order on one call stack, so ordering is free and there's no queue to
-overflow. The trace is a one-way NDJSON log, not a queue: no acks, no offsets, no
-DLQ. The day we make runs async with a worker, ordering and backpressure become
-real problems and I'd reach for partition keys and a bounded buffer."
+**Q: "How do you guarantee trace events are in order if the writes race?"**
+"I don't try to make the *writes* ordered — that's the trick. `SupabaseTraceSink`
+fires all the inserts concurrently with `Promise.all`, so insert order is a race. But
+every event carries its emit-time ISO timestamp, and that's written into
+`created_at`. So replay does `ORDER BY created_at` and recovers the true emit order
+regardless of which insert won. I moved the ordering guarantee from the transport to
+the data — each event is self-positioning, so concurrent draining is safe."
 
 ```
-  synchronous loop → ordering free, no backpressure problem
-  add async worker  → need partition keys (order) + bounded buffer (backpressure)
+  sketch
+
+  emit(e, t=NOW) → pending[] → Promise.all (RACE) → rows with created_at=t
+                                                     replay ORDER BY created_at ✓
+  ordering lives on the EVENT, not the transport
 ```
 
-**Q: "What's a poison message and when would AptKit get one?"**
+**Q: "What breaks if the trace volume gets large?"** — the load-bearing gaps:
+"Two things, both fine today and both fixable. One, no backpressure — `emit` is sync
+and never blocks, so if Postgres lags, `pending[]` grows unbounded and so does
+memory. A real queue bounds itself and pushes back. Two, no poison-message isolation
+— `Promise.all` means one rejected insert fails the entire `flush`, losing the whole
+turn's trace. I'd switch to `Promise.allSettled` and a bounded buffer with periodic
+flushing. At one-agent-run scale neither bites, which is why I haven't built them."
 
-"A message that fails processing every time and, in an at-least-once queue, gets
-redelivered forever — wedging the consumer. You quarantine it in a dead-letter
-queue after N failures. AptKit can't have one today: no durable queue, no
-redelivery. It's `not yet exercised` until there's an async run queue."
-
-## Validate
-
-1. **Reconstruct:** Name the three load-bearing parts of a queue and what breaks
-   if each is removed.
-2. **Explain:** Why does AptKit get total message ordering "for free"
-   (`run-agent-loop.ts:98,189`)?
-3. **Apply:** You make agent runs async (enqueue → worker). Name three new
-   problems you've just signed up for.
-4. **Defend:** Argue that the synchronous design is correct for a library, and
-   name the exact trigger that justifies adding a broker.
+*Anchor:* ordering via `created_at` (the win); unbounded `pending[]` and
+`Promise.all`-fails-all (the deferred gaps).
 
 ## See also
 
-- `03-idempotency-deduplication-and-delivery-semantics.md` — why at-least-once
-  queues need idempotent consumers.
-- `05-replication-partitioning-and-quorums.md` — partition keys, shared with
-  stream partitioning.
-- `study-runtime-systems` — the synchronous loop and NDJSON streaming mechanics.
+- `07-clocks-coordination-and-leadership.md` — the timestamp-as-logical-position idea, in full
+- `02-partial-failure-timeouts-and-retries.md` — a poison write is a per-message failure to classify
+- **study-debugging-observability** — the trace as evidence; reading it back in order
+- **study-runtime-systems** — the event loop, microtask ordering, `Promise.all` vs `allSettled`
+```

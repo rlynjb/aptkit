@@ -1,109 +1,53 @@
-# Chapter 1 — The pitch
+# Chapter 1 — The Pitch
 
-## Opening hook
+In the first ten minutes of every senior interview someone asks you to
+describe a project. Most candidates ramble — they start in the middle, name
+six technologies, and lose the room before the first follow-up. This chapter
+is about saying what aptkit is in three calibrated lengths — ten seconds,
+thirty seconds, ninety seconds — without rambling, and landing the one idea
+that makes an interviewer lean in.
 
-In the first ten minutes of every senior interview, someone leans back and says "tell me about a project you built." That moment is yours to lose. Most candidates take it as an invitation to narrate — they start at "so there's a monorepo" and forty-five seconds later they're describing their CSS strategy and the interviewer has stopped listening. The pitch is a compression problem, and aptkit gives you a hard one: it's a published TypeScript toolkit, a from-scratch RAG stack running a local model, an eval harness, and a second repo proving it works end to end. Four impressive things, and if you try to say all four at once you'll say none of them.
+The discipline here is compression, and compression is harder than it looks.
+You know too much about aptkit. The pitch is the act of throwing away 95% of
+what you know and keeping the 5% that earns the next question.
 
-This chapter teaches you to pitch aptkit at three lengths — 10 seconds, 30 seconds, 90 seconds — and to pick the right one for the room. The discipline is the same one you already run when you decide how much of a system to put on screen versus behind a `fetch()`: say the load-bearing thing, hide the rest behind a clean boundary, and reveal more only when asked. We'll also land the angle that makes this project read as growth and not a repeat: this is your **second** RAG system. AdvntrCue was cloud RAG — Next.js, pgvector, GPT-4. aptkit is the contracts-and-local-open-weights version of the same idea, built from scratch. That arc is the story.
+## The chapter-opening diagram — the pitch as a funnel
 
-## The chapter-opening diagram
-
-Here is aptkit at a glance — the shape you're compressing into three sentences, with the load-bearing seam (`ModelProvider.complete()`) marked so you can find it under pressure.
+Here's the shape of a good pitch: it narrows from a one-line frame to the
+single idea you want them to remember, and only then opens into detail *if
+they ask*. You control the funnel; you don't dump the whole bucket.
 
 ```
-  aptkit AT A GLANCE — what you're pitching
+THE PITCH FUNNEL — compression, then expansion on demand
 
-  ┌─ PUBLISHED SURFACE ─────────────────────────────────────────┐
-  │  @rlynjb/aptkit-core @ 0.4.1 on npm                          │
-  │  one tarball, 16 internal @aptkit/* packages bundled         │
-  └───────────────────────────┬─────────────────────────────────┘
-                              │ re-exports
-  ┌─ AGENT LAYER ─────────────▼─────────────────────────────────┐
-  │  rag-query (capstone) · recommendation · query · diagnostic │
-  │  each = prompt pkg + tool policy + runAgentLoop + validator  │
-  └───────────────────────────┬─────────────────────────────────┘
-                              │ every call goes through ONE contract
-  ┌─ THE SEAM ───────────────▼──────────────────────────────────┐
-  │      ★ ModelProvider.complete(request) ★   ← we are here     │
-  │   swap anthropic / openai / gemma / fixture, agents untouched│
-  └──────┬─────────────────────────────────────┬────────────────┘
-         │                                      │
-  ┌─ PROVIDERS ──────────────┐   ┌─ RETRIEVAL (from scratch) ───┐
-  │ anthropic · openai       │   │ EmbeddingProvider (nomic-768)│
-  │ gemma (LOCAL, Ollama,    │   │ VectorStore (cosine scan)    │
-  │   emulated tool-calling) │   │ search_knowledge_base tool   │
-  │ fallback · context-guard │   │ precision@k / recall@k evals │
-  └──────────────────────────┘   └──────────────────────────────┘
-         │                                      │
-  ┌─ PROOF: buffr (companion repo) ─────────────▼───────────────┐
-  │  consumes @rlynjb/aptkit-core from npm; supplies            │
-  │  PgVectorStore (implements VectorStore over Supabase/pgvector)│
-  │  live: index → ask (cited) → eval p@1 = r@3 = 1.0 → persist │
-  └─────────────────────────────────────────────────────────────┘
+  10 SECONDS  ┌────────────────────────────────────────────┐
+  the frame   │ "aptkit is a published npm bundle of the    │
+              │  reusable parts of an AI agent system —     │
+              │  agent loop, swappable providers, RAG."     │
+              └───────────────────┬────────────────────────┘
+                                  │  if they nod, go on
+  30 SECONDS  ┌───────────────────▼────────────────────────┐
+  + the thesis│ "...the thesis is a clean split: aptkit is  │
+              │  a deployment-agnostic LIBRARY; a separate  │
+              │  app, buffr, is the durable RUNTIME that    │
+              │  fills the storage slot."                   │
+              └───────────────────┬────────────────────────┘
+                                  │  if "tell me more"
+  90 SECONDS  ┌───────────────────▼────────────────────────┐
+  + the proof │ two contracts (ModelProvider, VectorStore), │
+              │  a local Gemma taught to call tools, RAG    │
+              │  from scratch, scored with precision@k,     │
+              │  buffr swaps in pgvector in one line.       │
+              └─────────────────────────────────────────────┘
+
+  the money idea (carry it the whole interview):
+  ▸ aptkit ships the slots; buffr fills them.
 ```
 
-Everything in that picture funnels through the one starred box — and that's the secret to the pitch: you don't describe four things, you describe one contract and the four things it makes possible.
+The funnel is the technique. Each level is a complete, satisfying answer on
+its own — you stop where they stop nodding. Now let's build each one.
 
-## The three pitches
-
-### The 10-second elevator
-
-You have one breath. No architecture, no package count, no npm. One sentence that makes the interviewer want the next ninety seconds.
-
-> ▸ "aptkit is a published TypeScript toolkit for building LLM agents
->   without vendor lock-in — every agent talks to one provider
->   contract, so I can swap Claude for a local Gemma model without
->   touching the agent."
-
-That's it. It names what (a toolkit for agents), the differentiator (no lock-in, one contract), and a concrete payoff (swap cloud for local). If they say "huh, how?" — you've earned the 30. If they nod and move on, you didn't waste their time.
-
-### The 30-second hallway
-
-Now you add the hard part and the proof, still without a whiteboard.
-
-> ▸ "It's published on npm as @rlynjb/aptkit-core — sixteen internal
->   packages bundled into one. The core idea is that everything routes
->   through a single ModelProvider.complete() contract, so providers
->   are swappable adapters. To prove the abstraction holds, I built a
->   RAG stack from scratch that runs a LOCAL Gemma model through Ollama
->   — and Gemma has no native tool-calling, so I emulated it. Then a
->   second repo, buffr, consumes the npm package and swaps the
->   in-memory vector store for Postgres/pgvector. Same contracts, runs
->   live."
-
-Thirty seconds, four proof points: published, the contract, the hard part (local + emulated tools), and the end-to-end proof. Every clause earns its place.
-
-### The 90-second answer — "tell me about a project you built"
-
-This is the real one. It has a shape: **problem → architecture → the hard part → the proof**, in that order, because that's the order an interviewer scores you on. Here's the whole thing, speakable, with the beats marked.
-
-**Beat 1 — the problem (≈15s).**
-
-> I kept rebuilding the same agent plumbing in every app — a provider client, a tool loop, retrieval — and every time it was wired straight to one vendor's SDK. So aptkit is me extracting the reusable parts of an LLM agent into a TypeScript toolkit that doesn't lock you to a provider. The problem it solves is: build the agent once, run it against any model.
-
-**Beat 2 — the architecture (≈25s).**
-
-> The load-bearing idea is a single contract. Every model call in the system goes through `ModelProvider.complete()` — it lives in `packages/runtime/src/model-provider.ts`, and it's a tiny type: an `id`, a `defaultModel`, and a `complete(request)` that returns content blocks. Agents only know that contract. Anthropic, OpenAI, a local Gemma provider, and a fixture provider for tests are all just adapters behind it. I reused the same adapter shape for retrieval — `EmbeddingProvider` and `VectorStore` are vendor-neutral contracts too, so the vector store is swappable the same way the model is.
-
-**Beat 3 — the hard part (≈30s).**
-
-> The part I'm proudest of is the RAG stack, because I built it from scratch against a *weak* model on purpose. The provider is Gemma 2:9b running locally through Ollama — no API key, no cloud. Gemma has no native tool-calling, so in `packages/providers/gemma/src/gemma-provider.ts` I emulate it: I render the tool schemas into the system prompt, demand a single JSON object back, parse it into a `tool_use` block, and if the JSON is malformed I append a corrective nudge and retry once. The retrieval pipeline is the classic shape — doc → chunk → embed → upsert, then query → embed → search → rank — with cosine similarity over nomic-768 embeddings, exposed to the agent as a `search_knowledge_base` tool. And I measured it: precision@k and recall@k scorers in `packages/evals/src/precision-at-k.ts`, plus a rubric-judge that has Claude grade Gemma so the judge isn't the same model being judged.
-
-**Beat 4 — the proof (≈20s).**
-
-> It's not a demo that only runs on my machine. It's published — `@rlynjb/aptkit-core@0.4.1` on npm, sixteen packages in one bundled tarball. And there's a companion repo, buffr, that consumes it from npm and supplies a `PgVectorStore` implementing my `VectorStore` contract against Supabase/pgvector. I ran it live: index a folder of notes, ask a grounded and cited question, run the eval — precision@1 and recall@3 both came back 1.0 — and the trajectory persisted to Postgres. That's the whole loop, end to end, against a real database.
-
-Land the arc at the end if they give you room:
-
-> ▸ "This is my second RAG system. The first, AdvntrCue, was cloud
->   RAG — Next.js, pgvector, GPT-4. aptkit is the same idea rebuilt
->   around contracts and local open-weights. The first one taught me
->   RAG works; this one taught me how to make it portable and
->   measured."
-
-### Now — what they're actually testing with each
-
-The pitch question looks like an icebreaker. It isn't.
+### Question 1 — "Tell me about a project you've built"
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -111,162 +55,202 @@ The pitch question looks like an icebreaker. It isn't.
 │   "Tell me about a project you built."              │
 │                                                     │
 │ WHAT THEY'RE TESTING                                │
-│   Can you compress? Do you know what's load-bearing │
-│   in your own system versus incidental? Do you lead │
-│   with the problem or with the tech? A senior        │
-│   engineer names the ONE idea the system turns on.   │
-│   A junior lists features.                           │
+│   Can you compress? Do you lead with the idea or    │
+│   the tech list? Is there ONE clear thesis, or is   │
+│   it a pile of features? A senior candidate has a   │
+│   spine; a junior has a feature tour.               │
 └─────────────────────────────────────────────────────┘
 ```
 
-The trap is breadth. You have four impressive things and the instinct is to mention all four immediately so none gets missed. That instinct fails you — it reads as someone who can't tell what matters. The fix is to lead with the single contract and let the other three hang off it.
+Here's what I'd say at ninety seconds — the full answer to the open prompt.
+Read it aloud; it should sound like you talking, not a brochure:
 
-Here's the contrast that does the teaching:
+> "I built aptkit — a TypeScript monorepo that packages the reusable guts of
+> an AI agent system into one published npm bundle, `@rlynjb/aptkit-core`.
+> The core idea is a clean library-versus-deployment split. aptkit is the
+> library: a bounded agent loop, model providers behind a single
+> `complete()` contract — including a *local* Gemma I taught to call tools
+> since Gemma has no native tool-calling — and a RAG pipeline I built from
+> scratch behind two swappable contracts, a `VectorStore` and an
+> `EmbeddingProvider`. It runs entirely local by default, on Ollama, no cloud
+> key.
+>
+> The deployment lives in a separate repo, buffr. buffr consumes the
+> published bundle and fills the storage slot — it implements that same
+> `VectorStore` contract over Supabase pgvector with an HNSW index. So the
+> swap from my in-memory store to a durable Postgres one is a single line,
+> because they satisfy the same contract. That's the whole thesis: aptkit
+> ships the slots, buffr fills them."
+
+That's it. Two contracts, a local model doing something it normally can't, a
+one-line swap that proves the boundary was real. I stop there and let them
+pick the thread.
+
+### The thirty-second version
+
+When the room is moving fast — a recruiter screen, a hallway — drop to thirty:
+
+> "aptkit is a published npm bundle of the reusable parts of an AI agent
+> system — a bounded agent loop, model providers behind one contract
+> including a local Gemma, and a from-scratch RAG pipeline. The thesis is a
+> library/deployment split: aptkit stays deployment-agnostic, and a separate
+> app called buffr fills in the durable Postgres storage by implementing my
+> `VectorStore` contract. The boundary is real enough that swapping stores is
+> one line."
+
+### The ten-second version
+
+For "what have you been working on lately" in passing:
+
+> "A published npm bundle of the reusable parts of an AI agent system — agent
+> loop, swappable model providers including a local one, RAG from scratch —
+> built so a separate deployment can fill in the storage without the core
+> knowing."
+
+```
+┃ You stop where they stop nodding. The pitch is a funnel
+┃ you control, not a bucket you empty.
+```
+
+### Strong vs weak — the same project, two pitches
+
+The contrast is the whole lesson here. Watch what the weak pitch signals.
 
 ```
 ┌──────────────────────────────┬──────────────────────────────┐
-│ WEAK ANSWER                  │ STRONG ANSWER                │
+│ WEAK PITCH                   │ STRONG PITCH                 │
 ├──────────────────────────────┼──────────────────────────────┤
-│ "So it's a TypeScript        │ "aptkit extracts the reusable│
-│ monorepo with sixteen        │ parts of an LLM agent into a │
-│ packages — there's a runtime,│ toolkit with no vendor       │
-│ tools, context, retrieval,   │ lock-in. The whole thing     │
-│ prompts, evals, workflows,   │ turns on one contract —      │
-│ five agents, a Studio UI,    │ ModelProvider.complete(). I  │
-│ providers for Anthropic and  │ swap Claude for a local      │
-│ OpenAI and Gemma, and it's   │ Gemma model without touching │
-│ published to npm, and I also │ the agent. To prove that, I  │
-│ built a second repo, and..." │ built a from-scratch RAG     │
-│                              │ stack on a local model and   │
-│                              │ a second repo that runs it   │
-│                              │ live against pgvector."      │
+│ "It's a TypeScript monorepo  │ "It's a published npm bundle │
+│  with npm workspaces, it     │  of the reusable parts of an │
+│  uses Ollama and Anthropic   │  AI agent system. The idea   │
+│  and OpenAI, it's got React  │  is a library/deployment     │
+│  18 and Vite for the Studio, │  split — aptkit is the       │
+│  pgvector, HNSW, a bunch of  │  library, buffr is the       │
+│  agents, evals with          │  runtime that fills the      │
+│  precision@k, fixtures..."   │  storage slot. One contract  │
+│                              │  swap proves the boundary."  │
 ├──────────────────────────────┼──────────────────────────────┤
 │ Why it's weak:               │ Why it works:                │
-│ A package inventory. The     │ Leads with the problem, then │
-│ interviewer can't tell what  │ the ONE load-bearing idea,   │
-│ the project IS or why it's   │ then uses the hard part and  │
-│ hard. Breadth with no spine. │ the proof as evidence FOR    │
-│ Sounds like a tour, not a    │ that idea. Has a spine. You  │
-│ system.                      │ could draw it on a napkin.   │
+│ It's a parts list. No        │ Leads with the IDEA. The     │
+│ thesis. The interviewer      │ tech is evidence FOR the     │
+│ can't tell what you cared    │ thesis, summoned only when    │
+│ about or what's load-        │ asked. The interviewer knows │
+│ bearing. You sound like you  │ exactly what you cared about │
+│ assembled it, not designed   │ and has a clear thread to    │
+│ it.                          │ pull.                        │
 └──────────────────────────────┴──────────────────────────────┘
 ```
 
-The strong answer isn't shorter because it's lazier. It's shorter because it knows what to cut.
-
-> ┃ "Breadth is the enemy of the pitch. Name the one contract
-> ┃  the system turns on, and let everything else be evidence for it."
+The weak pitch isn't *wrong* — every fact in it is true. It fails because it
+has no spine. An interviewer hears a parts list and concludes you don't know
+which parts matter. Lead with the idea; let the parts earn their way in.
 
 ### Where the conversation goes next
 
-Once you've given the 90-second answer, the interviewer picks a thread. You can predict which threads. Here's the map — walk these branches before the interview and you'll never be caught flat.
+After a good ninety-second pitch, the follow-ups are predictable. Walk the
+branches now so none of them surprises you:
 
 ```
-  You finish the 90-second pitch.
-        │
-        ▼
-  Interviewer picks ONE thread:
-        │
-        ├─► "Why provider-neutral? Isn't that premature abstraction?"
-        │     → Go to the cost answer. The contract is ONE type
-        │       (model-provider.ts) — it cost me almost nothing, and
-        │       it bought the local-Gemma swap and fixture-based tests.
-        │       Don't oversell it as architecture; it's a small seam
-        │       that pays off. (Chapter 3 drills this.)
-        │
-        ├─► "Walk me through the RAG flow on the whiteboard."
-        │     → Switch to the architecture diagram: doc→chunk→embed→
-        │       upsert, query→embed→search→rank, search_knowledge_base
-        │       as the tool the agent calls. (Chapter 2 owns this.)
-        │
-        ├─► "Why a LOCAL model? Why make it harder on yourself?"
-        │     → The honest answer: to prove the contract holds against
-        │       a model with no native tool-calling. If the abstraction
-        │       survives Gemma, it survives anything. Plus: no key, no
-        │       cloud cost, runs offline. Then mention the emulation.
-        │
-        └─► "How do you know the RAG actually works?"
-              → This is the eval question — your strongest ground.
-                precision@k / recall@k scorers, rubric-judge with
-                Claude grading Gemma (anti-circular), and the live
-                buffr run: p@1 = r@3 = 1.0 over a real pg corpus.
+You give the library/deployment-split pitch.
+      │
+      ├─► IF THEY ASK "why split it that way?"
+      │     The reusable agent code shouldn't carry a
+      │     storage decision. aptkit ships the VectorStore
+      │     CONTRACT; buffr ships PgVectorStore that
+      │     implements it. → full answer in Ch03 + Ch07.
+      │
+      ├─► IF THEY ASK "what's the local Gemma about?"
+      │     Gemma via Ollama has no native tool-calling.
+      │     I emulate it: prompt it to emit a JSON tool
+      │     call, parse it, feed the result back. → Ch06.
+      │
+      ├─► IF THEY ASK "how do you know the RAG works?"
+      │     precision@k / recall@k scorers in
+      │     packages/evals/src/precision-at-k.ts, plus a
+      │     Claude-judges-Gemma rubric. → Ch03, Ch08.
+      │
+      └─► IF THEY ASK "is this in production?"
+            Honest: it's a portfolio system. buffr runs it
+            on a laptop against Supabase, single-user, no
+            RLS yet. I say "single-user" plainly. → Ch04.
 ```
 
-The branch you want them to take is the last one. Most candidates can't answer "how do you know it works" with a number. You can. If they don't ask it, volunteer it.
-
-> ┃ "Most candidates demo. You measure. 'precision@1 and recall@3
-> ┃  both came back 1.0 on a live pg corpus' is the line that
-> ┃  separates 'played with an LLM' from 'does AI engineering.'"
-
-## When you don't know
-
-The pitch invites a deep follow-up, and the most likely place you get pushed past your depth is the embedding model — you picked `nomic-embed-text` because it runs locally in Ollama and is 768-dimensional, not because you benchmarked its retrieval quality against alternatives. Own that cleanly.
+Notice the last branch. "Is this in production" is a trap if you oversell.
+The honest answer — "it's a portfolio system, buffr runs it single-user on a
+laptop" — costs you nothing and buys you credibility on every later claim.
 
 ```
-╔═══════════════════════════════════════════════════════╗
-║ WHEN YOU DON'T KNOW                                   ║
-║                                                       ║
-║   They ask: "Why nomic-embed-text? How does it       ║
-║   compare to OpenAI's text-embedding-3 or BGE on      ║
-║   retrieval benchmarks?"                              ║
-║                                                       ║
-║   You picked it for one reason: it runs locally in    ║
-║   Ollama and the whole point was no cloud. You did    ║
-║   NOT benchmark it head-to-head. Don't pretend you    ║
-║   did.                                                 ║
-║                                                       ║
-║   Say:                                                ║
-║   "I picked nomic for one operational reason — it     ║
-║    runs locally in Ollama, which was the whole        ║
-║    constraint. I didn't benchmark it against          ║
-║    text-embedding-3 or BGE on MTEB-style retrieval    ║
-║    numbers. What I did do is put it behind an          ║
-║    EmbeddingProvider contract with a fixed dimension, ║
-║    so swapping it is a one-file change — and the      ║
-║    dimension mismatch fails loud at wiring time so I  ║
-║    can't silently mix corpora. If retrieval quality   ║
-║    were the bottleneck, that's the first knob I'd     ║
-║    turn, and the contract is built to let me."        ║
-║                                                       ║
-║   What this signals: you know exactly why you chose   ║
-║   it, you know what you DIDN'T evaluate, and you      ║
-║   built the seam that makes the gap cheap to close.   ║
-║   That's three senior signals in one answer.          ║
-║                                                       ║
-║   Do NOT say:                                         ║
-║   "nomic is one of the best open embedding models,    ║
-║    it scores really well on the benchmarks."          ║
-║   You'll get asked "which benchmarks, what score"     ║
-║   and you have nothing. Fake specificity is worse     ║
-║   than honest ignorance.                              ║
-╚═══════════════════════════════════════════════════════╝
+╔════════════════════════════════════════════════════════╗
+║ WHEN YOU DON'T KNOW                                     ║
+║                                                         ║
+║   They push on the pitch: "What's your daily active     ║
+║   user count? What traffic does this handle?"           ║
+║                                                         ║
+║   You don't have those numbers because this isn't a     ║
+║   production product with users. Don't invent a         ║
+║   number. Don't get defensive.                          ║
+║                                                         ║
+║   Say:                                                  ║
+║   "It's not a production product with live users —      ║
+║    it's a portfolio system I built to work through the  ║
+║    AI-engineering substrate. buffr runs it single-user  ║
+║    on a laptop against Supabase. So I don't have        ║
+║    traffic numbers. What I CAN walk you through is the  ║
+║    architecture and how I'd reason about scaling it —   ║
+║    want me to do that?"                                 ║
+║                                                         ║
+║   What this signals: you know the difference between a  ║
+║   portfolio project and a production system, you don't  ║
+║   pad your story, and you redirect to where you're      ║
+║   strong (the design) without dodging the question.     ║
+║                                                         ║
+║   Do NOT say:                                           ║
+║   "Well, it could scale to thousands of users           ║
+║    easily..." — you can't back that and they'll spend   ║
+║    the next ten minutes proving you can't.              ║
+╚════════════════════════════════════════════════════════╝
 ```
 
-The move here is the same one you'd make defending any frontend choice you defaulted on: name the real reason you picked it, name what you didn't measure, and name the cheap path to fixing it if it mattered. The contract (`EmbeddingProvider` in `packages/retrieval/src/contracts.ts`) is what makes that last part true and not a hand-wave.
+```
+        ▸ A pitch is a thesis with evidence on call —
+          never a parts list read at speed.
+```
 
 ## What you'd change
 
-If you were pitching this project a second time, the thing to reconsider is **where you put the "second RAG system" line.** Right now it's the closer, and that's the safe spot. But if the interviewer's first question is "what have you built in AI before this," lead with it instead — open on "I've now built two RAG systems, a cloud one and a local one, and the second taught me the part the first hid: portability and measurement." That reframes the whole conversation from "here's a project" to "here's an arc," which is the more senior posture. The pitch content doesn't change; the placement of the growth story does, and placement is most of what a pitch is.
+If I were pitching this today I'd lead even harder on the *one-line swap* as
+the proof point and hold the tech stack further back. The first time I
+pitched aptkit I front-loaded "TypeScript monorepo, npm workspaces, 16
+bundled packages" — true, but it's plumbing, and plumbing first signals you
+think the plumbing is the achievement. The achievement is that the
+`VectorStore` boundary was clean enough that a *different repo* slotted in a
+production store without touching the core. That's the line I'd open the
+expansion with now.
 
-## One-page summary
+## One-page summary — Chapter 1
 
-**Core claim:** The pitch is a compression problem. Lead with the one contract the system turns on — `ModelProvider.complete()` — and let the published package, the from-scratch local RAG, and the live buffr proof be evidence for it. Breadth kills the pitch.
+```
+CORE CLAIM
+  A pitch is a funnel you control: lead with the idea
+  (library/deployment split), let the tech earn its way in.
 
-**The three lengths:**
-- **10s** — "A published TypeScript toolkit for LLM agents with no vendor lock-in: every agent talks to one provider contract, so I swap Claude for local Gemma without touching the agent."
-- **30s** — Add: published as `@rlynjb/aptkit-core` (16 packages bundled), built a from-scratch RAG stack on a *local* Gemma model with *emulated* tool-calling, and a second repo (buffr) that swaps in pgvector. Runs live.
-- **90s** — problem (reusable agents, no lock-in) → architecture (everything behind `ModelProvider.complete()`, `packages/runtime/src/model-provider.ts`) → hard part (from-scratch RAG + emulated tool-calling for a weak local model, `packages/providers/gemma/src/gemma-provider.ts`, measured with precision@k in `packages/evals/src/precision-at-k.ts`) → proof (npm + buffr's `PgVectorStore`, live eval p@1 = r@3 = 1.0).
+QUESTIONS COVERED
+  Q: Tell me about a project you built.
+     A: aptkit — published bundle of reusable AI-agent parts;
+        thesis is library (aptkit) vs runtime (buffr); two
+        contracts; one-line VectorStore swap proves the boundary.
+  Q: Is this in production?
+     A: No — portfolio system, buffr runs it single-user on a
+        laptop against Supabase. State it plainly.
+  Q: 10s / 30s / 90s versions?
+     A: Frame → thesis → proof. Stop where they stop nodding.
 
-**Questions covered:**
-- "Tell me about a project you built." → Lead with the contract; problem → architecture → hard part → proof.
-- "Why provider-neutral / why local / how do you know it works?" → the three follow-up branches; steer toward the eval numbers.
-- "Why nomic-embed-text?" → the "I don't know" recovery: operational reason, honest about no benchmark, cheap to swap behind the contract.
+PULL QUOTES
+  ▸ aptkit ships the slots; buffr fills them.
+  ▸ You stop where they stop nodding.
+  ▸ A pitch is a thesis with evidence on call, not a parts list.
 
-**Pull quotes:**
-- "Breadth is the enemy of the pitch. Name the one contract the system turns on, and let everything else be evidence for it."
-- "Most candidates demo. You measure. 'precision@1 and recall@3 both came back 1.0' is the line that separates 'played with an LLM' from 'does AI engineering.'"
-- "This is my second RAG system. The first taught me RAG works; this one taught me how to make it portable and measured."
-
-**What you'd change:** Move the "second RAG system" line from the closer to the opener when the interviewer asks about your AI background first — pitch the arc, not just the project.
-
----
-Updated: 2026-06-24 — Published version `0.4.0 → 0.4.1` and bundle count `15 → 16` (added `@aptkit/memory`) across the at-a-glance diagram and all three pitch lengths.
+WHAT YOU'D CHANGE
+  Open the expansion on the one-line contract swap, not the
+  monorepo plumbing — the boundary is the achievement.
+```

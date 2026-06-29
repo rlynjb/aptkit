@@ -1,61 +1,39 @@
-# Study — Debugging & Observability (AptKit)
+# Study — Debugging & Observability (aptkit)
 
-How this repo reveals its own behavior. AptKit is an LLM-agent toolkit, so "behavior"
-means *what the agent did across a run* — which model turns fired, which tools it
-called, what they returned, how many tokens it burned, and whether the final output
-passed its shape check. The whole observability story is built on one primitive: a
-typed, timestamped **trace event** emitted at every agent action.
+How this repo reveals its own behavior in development and production: reproduction, evidence, structured events, traces, durable trajectories, and the gaps. Audit-style: one lens sweep plus pattern files for what aptkit actually exercises.
 
-The question this guide answers: **when an agent run goes wrong, what evidence exists
-to explain it — and to reproduce it deterministically later?**
+The one thing to take away: **aptkit has no logger.** Its observability is a single typed event stream — the `CapabilityEvent` trace — emitted by the agent loop and read by three independent consumers (a visual debugger, a durable Postgres audit log, a cost ledger). Debugging this codebase means reading the trace, not grepping logs.
 
 ## Reading order
 
-1. `00-overview.md` — the evidence map, ranked findings, what's `not yet exercised`.
-2. `audit.md` — Pass 1. The 8-lens debugging-and-observability audit, grounded in
-   real `file:line`. Read this to see which lenses the repo exercises and which it
-   doesn't.
-3. Pass 2 — the discovered pattern files, in dependency order:
-   - `01-structured-trace-events.md` — `CapabilityEvent`, the load-bearing primitive.
-     Every other pattern reads from the stream this produces.
-   - `02-replay-artifact-as-snapshot.md` — the full run captured as one JSON file:
-     reproduction + evidence in a single artifact.
-   - `03-usage-metrics-ledger.md` — tokens, cost, and turn count *derived from* the
-     trace, not separately instrumented.
-   - `04-live-trace-stream.md` — the same events serialized as NDJSON and streamed to
-     the Studio UI while the run is still in flight.
-   - `05-degradation-warning-traces.md` — `warning` events that explain *why* a
-     provider switched or a local model was skipped.
-   - `06-eval-as-embedded-evidence.md` — the pass/fail verdict stamped onto every
-     snapshot, and the secret-scan that guards artifacts before they're shared.
-   - `07-reproduction-spike-harness.md` — a forward-looking de-risk spike
-     (`scripts/gemma-toolcall-spike.mjs`): run a flaky component N times, measure the
-     pass rate, band it into a build / harden / no-go decision *before* building on it.
-   - `08-retrieval-miss-diagnosis.md` — a real war story: a silent "not available" on a
-     good corpus, diagnosed by reading the trajectory backward to a hallucinated tool
-     argument. The local-incident loop run end to end, with the regression guard.
+| # | File | What it covers |
+|---|------|----------------|
+| — | `00-overview.md` | The map, ranked findings, and the `not yet exercised` gaps. **Start here.** |
+| — | `audit.md` | Pass 1 — the 8-lens sweep, each boundary's evidence, red-flags ranked. |
+| 01 | `01-capability-event-trace.md` | The event spine. **Read before any other pattern file.** |
+| 02 | `02-trace-replay-as-debugger.md` | Studio's `TracePanel` — the dev-time visual debugger over the stream. |
+| 03 | `03-persisted-trajectory-backward-read.md` | The war story: buffr's durable trajectory, diagnosed by reading backward. |
+| 04 | `04-silent-empty-result-blind-spot.md` | The root-cause blind spot — zero-hit retrieval is silent. The unbuilt fix. |
+| 05 | `05-deterministic-replay-reproduction.md` | Making the bug reproducible offline via `FixtureModelProvider`. |
+| 06 | `06-model-usage-accounting.md` | Tokens and USD cost, derived from the trace (and where cost goes `$n/a`). |
 
-## Where this sits — partition
+Read 01 first — every other file is a *reader* of the thing 01 builds. Then 02→03→04 form one continuous arc (visual debugger → durable trajectory → the silence that hid the bug). 05 and 06 are the reproduction and accounting tails.
+
+## The spine in one line
 
 ```
-  study-testing                 catches known failures before release (evals, fixtures).
-  study-debugging-observability explains unknown behavior with evidence (this guide).
-  study-performance-engineering measures cost/latency budgets from the same metrics.
+  runAgentLoop ──emit(CapabilityEvent)──► [ Studio panel · buffr Postgres · cost ledger ]
+       01                                       02            03            06
 ```
 
-A finding belongs to the generator that owns the mechanism. This guide owns the
-*evidence* — the trace, the snapshot, the metrics derived from them. It cross-links
-rather than re-teaching its neighbors.
+## What's NOT here (honest gaps)
 
-## Cross-links
+No metrics system · no distributed tracing/spans/`traceId` · no log aggregation · no alerting/incidents/runbooks · no timeout instrumentation. Each is `not yet exercised` and explained in `audit.md` and `00-overview.md`. The single most teachable gap — empty retrieval emits no warning — is `04`.
 
-- **`study-testing`** — the `eval` block, the fixture-replay backbone, and the
-  promote-to-fixture loop. The trace is the *input* to those evals; the eval verdict
-  is the *evidence* this guide reads. See `06-eval-as-embedded-evidence.md`.
-- **`study-performance-engineering`** — `usage-ledger.ts` (tokens, USD cost, latency
-  attribution). This guide treats those numbers as diagnostic signals;
-  performance-engineering treats them as budgets. See `03-usage-metrics-ledger.md`.
-- **`study-ai-engineering`** — the trace as eval input and the model-output JSON
-  extraction path. The trace is how you *see* the reasoning that AI engineering tunes.
-- **`study-agent-architecture`** — the agent loop in `run-agent-loop.ts`. The trace is
-  that loop made observable: every turn and tool call is one event.
+## Cross-links to neighboring guides
+
+- **`study-testing`** — owns the fixture/replay *correctness* mechanism (eval scorers, fixture promotion). This guide borrows replay for *reproduction* only.
+- **`study-performance-engineering`** — owns latency/throughput budgets. `durationMs` and token counts are shared evidence; the budgets live there.
+- **`study-system-design`** — owns the provider/retrieval/sink seams this guide reads.
+- **`study-ai-engineering`** — owns RAG retrieval quality (precision@k). The war story's *fix quality* lives there; its *diagnosis* lives here (`03`/`04`).
+- **`study-data-modeling`** — owns the `agents.messages` schema that backs the durable trajectory.

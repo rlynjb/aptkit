@@ -1,45 +1,64 @@
-# System Design — AptKit
+# Study — System Design (aptkit)
 
-A per-repo system-design study guide for the AptKit monorepo: where components live, how data and work move, where boundaries fail, and what changes at scale. Audit-style two-pass output — one audit walking eight lenses, plus ten discovered-pattern files named after the architecture this repo actually exercises.
+This is the per-repo system-design guide for **aptkit** — the provider-neutral
+TypeScript agent toolkit published as one npm bundle (`@rlynjb/aptkit-core@0.4.1`)
+and consumed by its deployment "body", **buffr** (`/Users/rein/Public/buffr`).
 
-AptKit is a TypeScript ESM npm-workspace monorepo of 16 internal packages of reusable AI-agent capabilities (published as `@rlynjb/aptkit-core` 0.4.1). No SQL database, no horizontal scale, no queues — the "data" is file-, stream-, and (now) in-memory-vector-shaped (trace events, replay artifacts, fixtures, an embedded corpus, episodic memory rows). The default model is *local*: Gemma + nomic embeddings over Ollama. Read that honestly: the interesting architecture here is the **provider-neutral seam**, the **bounded agent loop**, the **capability-as-policy** model, the **replay→eval→fixture** testing backbone, the **single-tarball publish boundary**, a **from-scratch retrieval (RAG) pipeline** that adds two more provider-neutral seams, and the newest addition — **episodic memory** that reuses those retrieval seams as a *second consumer* (zero new infrastructure) and is the first thing in the repo to make agent state persist across runs. The horizontal-scale lenses still come back `not yet exercised`; the one real internal bottleneck is the in-memory vector store's linear scan.
+It is written in the audit-style two-pass shape:
+
+- **Pass 1 — `audit.md`** walks the 8 system-design lenses across the live repo,
+  every lens checked, `not yet exercised` named honestly.
+- **Pass 2 — the numbered files** are the architectural patterns aptkit actually
+  exercises. The file names are the lesson: read the list and you already know
+  what this repo is.
 
 ## Reading order
 
-Start at the top, then read pattern files in the order that builds on what came before.
-
 ```
-  1. 00-overview.md   ← the whole system in one diagram. Skim only this and you have the map.
-  2. audit.md         ← Pass 1: eight lenses walked against real file:line evidence.
-
-  Pass 2 — discovered patterns (read in this order):
-  3. 01-provider-abstraction.md      the central seam: everything talks to ModelProvider.complete()
-  4. 02-bounded-agent-loop.md        the kernel that turns "call an LLM" into a terminating capability
-  5. 03-fallback-chain.md            cross-provider recovery + the context-window guard
-  6. 04-capability-as-tool-policy.md per-agent read-only allowlists (least privilege)
-  7. 05-multi-agent-pipeline.md      monitor → diagnose → recommend composition
-  8. 06-replay-eval-pipeline.md      live run → artifact → eval → promote-to-fixture → deterministic replay
-  9. 07-ndjson-stream-handoff.md     runtime emits trace events; Studio streams them to a React UI
- 10. 08-monorepo-bundle-boundary.md  16 internal packages → one published tarball, no app logic leaks
- 11. 09-retrieval-pipeline-seam.md   from-scratch RAG: two swappable adapters (embed + vector store) behind a tool
- 12. 10-memory-store-topology.md     episodic memory reuses the retrieval seams; shared-vs-dedicated store, state across runs
+  1. 00-overview.md   ← the whole system in one diagram + legend
+  2. audit.md         ← the 8-lens sweep; jumps into the pattern files
+  3. 01 → 07          ← the discovered patterns, load-bearing first
 ```
 
-If you only have ten minutes: read `00-overview.md` and `02-bounded-agent-loop.md`. The bounded loop is the load-bearing mechanism of the whole repo. If you have a few more, `09-retrieval-pipeline-seam.md` shows how the same seam pattern lets a whole RAG capability drop in with no new control flow — and `10-memory-store-topology.md` shows the *same seam* taking a second consumer (memory) with no new infrastructure, the clearest proof the boundary was right.
+1. `00-overview.md` — one-page orientation. The full-system map across Studio →
+   agents → runtime → providers → retrieval/memory, and the library/deployment
+   seam to buffr. Skim only this and you have the map.
+2. `audit.md` — Pass 1. Eight `##` sections, one per lens, each grounded in
+   `file:line` or marked `not yet exercised`. Cross-links into the pattern files.
+3. The pattern files (Pass 2), ranked by how load-bearing they are:
+   - `01-provider-neutral-model-seam.md` — the `ModelProvider.complete()` contract
+     that the entire toolkit is built around. The one seam that, removed, dissolves
+     the project's reason to exist.
+   - `02-retrieval-contracts-as-the-swap-point.md` — the `EmbeddingProvider` /
+     `VectorStore` contracts; how `InMemoryVectorStore` and buffr's `PgVectorStore`
+     are the same shape, and how memory rides the same boundary for free.
+   - `03-library-vs-deployment-split.md` — aptkit (deployment-agnostic) vs buffr
+     (the durable Postgres body). Where the seam is drawn and what crosses it.
+   - `04-bounded-agent-loop.md` — `runAgentLoop`: the iteration budget, the forced
+     synthesis turn, the per-tool failure containment.
+   - `05-capability-event-trace.md` — the `CapabilityEvent` trace stream; one
+     observability contract, three sinks (Studio NDJSON, buffr Postgres, in-memory).
+   - `06-fixture-replay-evals.md` — live run → artifact → eval → promote → replay.
+     The deterministic test backbone over a non-deterministic model.
+   - `07-single-bundle-publishing.md` — 16 internal packages collapsed into one
+     `bundledDependencies` tarball; the published API as a compatibility contract.
 
 ## Cross-links to neighboring guides
 
-System-design owns architectural boundaries and tradeoffs. Mechanism-level teaching lives in the foundation guides. Where a seam touches another discipline, this guide points there:
+System-design owns architectural boundaries and tradeoffs only. Mechanism-level
+teaching lives in the foundation guides:
 
-- **`.aipe/study-data-modeling/`** — the *shape* of the persistent data (CapabilityEvent union, replay-artifact keys, fixture structure, WorkspaceDescriptor). This guide cites those shapes; that guide normalizes them.
-- **`.aipe/study-dsa-foundations/`** — the reusable data-structure/algorithm vocabulary. The Map-backed registry, the Set-backed allowlist, the linear fallback scan live here as *architecture*; their algorithmic cost lives there.
-- **study-software-design** (`.aipe/study-software-design/` when generated) — APOSD primitives: deep modules, information hiding, layering. The `ModelProvider` contract as a deep module belongs there too.
-- **`.aipe/study-agent-architecture/`** — reasoning patterns inside the loop (ReAct, synthesis turns, agentic retrieval), and multi-agent orchestration as an *agent* concern rather than a *system* concern. The rag-query agent's "always search first, then synthesize with citations" reasoning belongs there; the *seam* it plugs into belongs here (`09-retrieval-pipeline-seam.md`).
-- **`.aipe/study-ai-engineering/`** — the eval methodology (structural-diff, detection-scorer, rubric-judge) as an AI-quality discipline, plus RAG *quality* (chunking strategy, embedding choice, retrieval relevance). This guide treats the eval pipeline as observability infrastructure and the retrieval pipeline as an architectural seam; that guide treats both as model quality.
-- **study-distributed-systems** (when generated) — `not yet exercised` here. No coordination crosses a process boundary except the synchronous HTTP call to a provider SDK.
-
-## What this guide does not cover
-
-- Database engine internals — there is no database.
-- Network/transport mechanics (TLS, connection pooling, DNS) — owned by study-networking; the only wire hop is the provider SDK's HTTPS call.
-- Horizontal scale, load balancing, multi-region, queues — `not yet exercised`. The audit names this honestly rather than inventing it.
+- **`study-database-systems`** — pgvector storage, HNSW indexing, cosine distance
+  operators, transaction mechanics inside buffr's `PgVectorStore`.
+- **`study-data-modeling`** — the shape of the `agents` schema (chunks, documents,
+  conversations, messages), the `app_id` partition key, the dropped FK that lets
+  memory rows live without a parent document.
+- **`study-distributed-systems`** — coordination correctness once buffr runs more
+  than one process; what the current single-process design does *not* yet handle.
+- **`study-runtime-systems`** — the single-process event-loop execution model the
+  agent loop runs inside; cancellation via `AbortSignal`.
+- **`study-ai-engineering`** / **`study-agent-architecture`** — RAG mechanics,
+  agentic retrieval, the reasoning loop as an AI pattern (this guide treats the
+  loop as an *architectural boundary*; those treat it as an AI pattern).
+- **`study-software-design`** — module/interface quality of the same contracts
+  (deep modules, information hiding) that this guide treats as system boundaries.

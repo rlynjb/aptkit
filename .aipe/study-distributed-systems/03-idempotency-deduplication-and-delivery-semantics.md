@@ -1,401 +1,258 @@
-# 03 — Idempotency, deduplication, delivery semantics
+# 03 — Idempotency, Deduplication, and Delivery Semantics
 
-**Industry name(s):** idempotency keys / deduplication / at-most-once /
-at-least-once / effective exactly-once. **Type:** Industry standard.
+**Industry names:** idempotency keys · upsert (insert-or-update) · at-most-once / at-least-once / effective-exactly-once · deduplication — *Industry standard.*
 
 ## Zoom out, then zoom in
 
-This concept lives at the same seam as `02` — but where `02` asked "what do we
-do when the call fails?", this one asks the harder follow-up: **"is it safe to
-do that thing again?"** Retries and delivery semantics are two sides of one
-coin; you can't retry safely without knowing whether the operation is
-idempotent.
+Once you have retries (file 02), you have a new problem: a retry might re-apply a
+write that already succeeded. The defense is **idempotency** — making an operation
+safe to run twice — and the repo has exactly one strong instance of it: the
+`upsert ... on conflict (id)` in `PgVectorStore`.
 
 ```
-  Zoom out — where "is it safe to retry?" gets answered
+  Zoom out — where deduplication lives
 
-  ┌─ Service layer ──────────────────────────────────────────────┐
-  │  runAgentLoop ── re-prompt on parse failure (the one retry)    │ ← we are here
-  │  usage-ledger ── counts work across calls (dedup-ish)          │
-  └─────────────────────────────┬────────────────────────────────┘
-                               │ complete()  (each call = a "delivery")
-  ┌─ Provider boundary ─────────▼────────────────────────────────┐
-  │  Fallback chain — a retry across providers                    │
-  └─────────────────────────────┬────────────────────────────────┘
-                               │ HTTPS
-  ┌─ External provider ─────────▼────────────────────────────────┐
-  │  no idempotency key sent → each call is at-most-once          │
-  └───────────────────────────────────────────────────────────────┘
+  ┌─ App layer ─────────────────────────────────────────────────────────┐
+  │  pipeline.index(doc) → chunks with DETERMINISTIC ids "<docId>#<n>"   │ ← key chosen here
+  └──────────────────────────────┬───────────────────────────────────────┘
+                                 │ store.upsert(chunks)
+  ┌─ Storage adapter ────────────▼───────────────────────────────────────┐
+  │  InMemoryVectorStore: Map.set(id, chunk)  — last write wins by key    │
+  │  PgVectorStore: insert ... on conflict (id) do update  ← ★ idempotent │ ← we are here
+  └──────────────────────────────┬───────────────────────────────────────┘
+                                 │ TCP
+  ┌─ Postgres ───────────────────▼───────────────────────────────────────┐
+  │  agents.chunks — primary key (id) enforces the dedup                  │
+  └─────────────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: **delivery semantics** name the three guarantees a message system can
-offer. At-most-once: the message is delivered zero or one times (you might lose
-it, never duplicate it). At-least-once: delivered one or more times (never lost,
-might duplicate). Exactly-once: the holy grail — delivered precisely once. The
-brutal truth is that true exactly-once *delivery* is impossible across a
-network; what real systems achieve is **effective exactly-once** = at-least-once
-delivery + idempotent processing. AptKit's calls are at-most-once and *not*
-idempotent at the provider, which is exactly why its retry story is limited.
+Zoom in: an operation is **idempotent** when running it N times leaves the system
+in the same state as running it once. A keyed upsert is the cleanest idempotent
+write there is: the *identity* of the row is the dedup mechanism, so a re-run
+overwrites rather than duplicates. The trick is choosing the key so that "the same
+logical thing" always lands on the same key.
 
-## Structure pass — layers, axis, seam
+## Structure pass
 
-Trace the **guarantees axis** — "how many times can this run, and is that safe?"
-— across three layers:
+**Layers.** Key construction (app) → upsert (adapter) → primary-key constraint (DB).
+
+**Axis — trace `delivery guarantee` across the writes in the repo.**
 
 ```
-  "how many times, and is repeating it safe?" — down the layers
+  Axis — "if this runs twice, what happens?" — across the three write paths
 
-  ┌────────────────────────────────────────────┐
-  │ provider call (complete())                  │ → AT-MOST-ONCE. NOT idempotent:
-  │                                             │   re-running costs money + may
-  │                                             │   give a different answer (LLMs
-  │                                             │   are non-deterministic)
-  └────────────────────┬───────────────────────┘
-      ┌────────────────▼─────────────────────────┐
-      │ parse-failure re-prompt (recovery turn)    │ → runs 0 or 1 extra time;
-      │                                            │   safe because it's read-only
-      │                                            │   (produces text, mutates nothing)
-      └────────────────┬───────────────────────────┘
-          ┌────────────▼─────────────────────────┐
-          │ replay (FixtureModelProvider)         │ → fully idempotent + deterministic:
-          │                                       │   same recorded log → same output,
-          │                                       │   every time, free
-          └───────────────────────────────────────┘
+  ┌─ chunk upsert (PgVectorStore.upsert) ──────┐
+  │  same id → overwrites                       │  → EFFECTIVELY EXACTLY-ONCE ✓
+  └──────────────────────┬──────────────────────┘   (idempotent by primary key)
+       ┌─────────────────▼────────────────────────┐
+       │ trace insert (persistMessage)            │  → AT-LEAST-ONCE-ish, NO dedup ✗
+       └─────────────────┬────────────────────────┘   (no key; a retry doubles the row)
+            ┌────────────▼──────────────────────────┐
+            │ memory.remember (best-effort)         │  → AT-MOST-ONCE (swallowed on fail) ✗
+            └─────────────────────────────────────────┘   (a failure drops it silently)
 ```
 
-The seam that matters: **the provider call is the only non-idempotent,
-non-deterministic, costs-money operation in the system.** Everything above it in
-the process is pure functions over in-memory state — safe to repeat. That's why
-the only "retry" AptKit dares is the read-only re-prompt, and why replay (which
-replaces the provider with a deterministic stub) is the testing backbone.
+**Seam.** The guarantee flips hard across these three writes: the chunk upsert is
+idempotent, the trace insert is not (no unique key — re-running would duplicate
+rows), and the memory write is at-most-once by design (the `catch {}` swallows
+failures). Three different delivery semantics in one codebase — knowing which is
+which is the lesson.
 
 ## How it works
 
-### Move 1 — the mental model: the same request arriving twice
+### Move 1 — the mental model: the key IS the dedup
 
-You already know idempotency from HTTP verbs: `GET` and `PUT` are idempotent
-(call them 5 times, same result), `POST` usually isn't (5 `POST`s = 5 orders).
-An idempotency key is how you make a `POST` safe to retry — the server
-remembers the key and dedupes.
-
-```
-  Idempotency key — the dedup kernel (the textbook pattern)
-
-  client                              server
-    │  POST /charge {key: "abc"} ──────►  seen "abc" before?
-    │  (request lost on the way back) │     ├─ no  → do work, store key→result
-    │                                 │     └─ yes → return stored result (no re-do)
-    │  retry POST {key: "abc"}   ──────►  seen "abc"? YES → return same result
-    │  ◄─────────────────────────────┘     (charged ONCE despite two requests)
-```
-
-Three parts make idempotency work, each breaking something if removed:
-
-- **A stable key** identifying "the same logical operation." Without it the
-  server can't tell a retry from a new request — you get duplicates.
-- **A store mapping key → result.** Without it the server forgets it already did
-  the work — the second call re-does it.
-- **A check-before-act.** Without it the store exists but nobody reads it — the
-  work runs twice anyway.
-
-### Move 2 — the walkthrough, mapped to AptKit
-
-**Step 1 — the provider call is at-most-once, no key.** Bridge from a fire-and-
-forget `POST` with no retry. AptKit sends a `complete()` and gets a response or
-an error. It sends **no idempotency key.** So if the request reaches the provider,
-the provider generates the response, and *then* your connection dies — you've
-been charged, you got nothing, and you don't know whether to retry.
+You already do this in React: a list `.map()` needs a stable `key` so React can
+tell "this is the same item, updated" from "this is a new item." An idempotent
+write is the same idea at the database: a stable row id so the database can tell
+"this is the same chunk, re-embedded" from "this is a new chunk." Same primitive,
+different layer.
 
 ```
-  At-most-once with no key — the ambiguous failure
+  The idempotency kernel — stable key → upsert → one row no matter how many writes
 
-  your process ── complete() ──► provider: generates response (charged!)
-       │         ◄── connection dies ──┘
-       │
-       └─ did it run? you can't tell. retrying = pay twice + maybe different answer.
-          this is why AptKit fails OVER (new node, fresh call) rather than retrying.
+  write #1: upsert(id="doc:42#0", vector=v1) ─┐
+  write #2: upsert(id="doc:42#0", vector=v1) ─┤──► row "doc:42#0" exists ONCE
+  write #3: upsert(id="doc:42#0", vector=v2) ─┘    (last write wins; never duplicated)
+
+  the id is computed from (docId, chunkIndex) — same input → same key → same row
 ```
 
-This is the load-bearing honesty: **AptKit can't safely retry the same provider
-call** because (a) there's no idempotency key to dedupe and (b) LLM output is
-non-deterministic, so even a "successful" retry gives a different answer. Failing
-over to a *different* provider sidesteps both — you're not re-running the same
-op, you're running a fresh one elsewhere.
+### Move 2 — walking the mechanism
 
-**Step 2 — the safe retries: parse-failure re-prompts.** The repo has two
-same-target retries, and both are safe for the *same* reason — they're
-**read-only**, so re-running mutates nothing. (1) The agent loop's recovery turn:
-when the model's final text doesn't parse into the expected JSON shape, it
-re-prompts once for just the structured answer. (2) The Gemma provider's
-tool-call nudge (`packages/providers/gemma/src/gemma-provider.ts:62-91`): when a
-local model returns a malformed tool call, it re-asks the same model with a
-corrective nudge, bounded by `maxToolCallAttempts`. Neither is a network retry
-and neither needs an idempotency key — re-asking a model to *read* and answer is
-inherently safe; the danger only appears when a retried call has a side effect.
+**Step 1 — deterministic chunk ids.** The id isn't random; it's derived from the
+document and the chunk's position, so re-indexing the same document produces the
+*same* ids:
 
 ```
-  The re-prompt — safe retry because it mutates nothing
-
-  loop ends → parseResult(finalText) → null?
-                                        ├─ no  → done
-                                        └─ yes → run ONE recovery turn:
-                                                 "output ONLY the structured answer"
-                                                 → parse again → final result or null
+  // chunk id shape, from packages/retrieval (VectorChunk): "<docId>#<index>"
+  index("doc:42", text) → chunks: ["doc:42#0", "doc:42#1", "doc:42#2", ...]
+  re-index("doc:42", text)  → SAME ids → upsert overwrites, no duplicates
 ```
 
-Why is this safe to repeat when the provider call isn't? Because the recovery
-turn produces *text*, mutates no external state, and runs at most once. It's the
-distributed-systems instinct applied in-process: a retry is only safe if the
-operation is idempotent, and "generate some text" is idempotent in its *effects*
-(it changes nothing) even though it's non-deterministic in its *output*.
+This is the load-bearing choice. A random UUID per chunk would make every re-index
+*append* a fresh copy of the whole document — the corpus would grow without bound.
+The deterministic id is what makes re-indexing idempotent.
 
-**Step 3 — at-least-once vs at-most-once, the choice.** The general framing:
+**Step 2 — the in-memory store dedups by Map key.** The simplest possible upsert:
 
-```
-  Delivery semantics — the three guarantees
-
-  AT-MOST-ONCE   send, don't retry      → may lose, never duplicate
-                 ◄── AptKit's provider calls live here (no retry of same call)
-
-  AT-LEAST-ONCE  retry until ack         → never lose, may duplicate
-                 ◄── requires idempotent processing to be safe (NOT here)
-
-  EXACTLY-ONCE   at-least-once delivery  → the goal; impossible as pure delivery,
-                 + idempotent processing    achieved only as "effective"
+```ts
+// packages/retrieval/src/in-memory-vector-store.ts:18-23
+async upsert(chunks: VectorChunk[]): Promise<void> {
+  for (const chunk of chunks) {
+    this.assertDimension(chunk.vector, `chunk "${chunk.id}"`);
+    this.chunks.set(chunk.id, chunk);   // ← Map.set: same key overwrites. Idempotent for free.
+  }
+}
 ```
 
-AptKit chooses at-most-once at the provider deliberately: the work is expensive
-and non-idempotent, so "try once, fail over if it errors, give up cleanly" beats
-"retry and risk double-charging for a different answer." That's the correct
-call for this workload — but it means **at-least-once and effective-exactly-once
-are `not yet exercised`.**
+`Map.set` *is* an upsert — second write to the same key replaces the first. No
+duplicates possible. This is idempotency falling out of the data structure.
 
-**Step 4 — the usage ledger: accounting across calls (dedup-ish).** The closest
-thing to "tracking work across nodes" is the ledger folding every `model_usage`
-event into one summary. It's not deduplication — it's the opposite, *aggregation*
-— but it's the same family: reconciling a stream of per-call records into one
-authoritative total.
+**Step 3 — the durable store enforces it at the database.** `PgVectorStore` does
+the same thing with SQL's `on conflict`:
 
-```
-  Usage ledger — fold per-call events into one row
-
-  trace = [ usage(in:100,out:50), usage(in:80,out:40), usage(in:200,out:90) ]
-                            │ reduce, summing only type==='model_usage'
-                            ▼
-  summary = { inputTokens: 380, outputTokens: 180, totalTokens: 560, turns: 3 }
+```ts
+// buffr/src/pg-vector-store.ts:47-56
+await client.query(
+  `insert into agents.chunks (id, document_id, app_id, chunk_index, content, embedding, ...)
+   values ($1, $2, $3, $4, $5, $6::vector, ...)
+   on conflict (id) do update set            -- ← idempotency key = primary key (id)
+     document_id = excluded.document_id, app_id = excluded.app_id,
+     chunk_index = excluded.chunk_index, content = excluded.content,
+     embedding = excluded.embedding, ...`,
+  [c.id, docId, this.appId, chunkIndex, content, toVectorLiteral(c.vector), ...],
+);
 ```
 
-**Step 5 — replay: deterministic re-execution (the idempotency/recovery analog).**
-The strongest idempotency story in the repo isn't at the provider — it's in
-*testing*. Replay swaps the live provider for a `FixtureModelProvider` that
-returns recorded `ModelResponse[]` in order. Same recorded log → same output,
-every time, for free.
+`on conflict (id) do update` is the database guaranteeing "one row per id" — the
+primary key constraint is the dedup. Re-run the whole index ten times: the chunk
+table is identical to running it once. This is *effectively exactly-once* for the
+chunk write, achieved without any distributed coordination — just a stable key and
+a uniqueness constraint. That combination is the cheapest exactly-once you can buy.
 
-```
-  Replay — recovery from a recorded log (idempotency analog)
+**Step 4 — where it's NOT idempotent: the trace.** `persistMessage` is a bare
+`insert` with no unique key on the message content:
 
-  recorded responses: [ r0, r1, r2 ]   ◄── the "write-ahead log"
-       │
-  FixtureModelProvider.complete():
-       ├─ call 1 → return r0
-       ├─ call 2 → return r1
-       └─ call 3 → return r2   (index past end → throw "exhausted")
-       │
-       └─ deterministic + idempotent: re-run the whole capability, get byte-identical
-          output. this is the SHAPE of event-replay recovery, used for tests.
+```ts
+// buffr/src/supabase-trace-sink.ts:27-37 (paraphrased shape)
+insert into agents.messages (conversation_id, role, content, ..., created_at)
+values ($1, $2, $3, ..., coalesce($8::timestamptz, now()))
+// ← no "on conflict" — re-running this INSERTS A SECOND ROW
 ```
 
-This is the same idea a database uses to recover from a write-ahead log:
-re-apply a recorded sequence of operations to reach a known state. AptKit uses
-it to make non-deterministic agents testable — but the mechanism is pure
-distributed-systems recovery.
+There's no idempotency key here. If `flush()` were ever retried after a partial
+failure, you'd get duplicate trace rows. Today that doesn't happen (flush runs once
+per turn, and a failure throws out of `ask`), so the *delivery semantic* is "at most
+once, and if the process survives, exactly once" — but it's not *guaranteed*
+exactly-once, because nothing dedups a retry. Naming that honestly matters: the
+chunk write is idempotent by construction; the trace write is not.
+
+### Move 2.5 — the three delivery semantics, side by side
+
+```
+  Comparison — three writes, three guarantees, in this repo
+
+  write              key / dedup            on retry          semantic
+  ─────────────────  ────────────────────   ───────────────   ─────────────────────
+  chunk upsert       primary key (id)        overwrites        effectively exactly-once ✓
+  trace insert       none                    duplicates row    at-least-once (no dedup) ✗
+  memory.remember    id memory:<cid>:<n>     overwrites...     at-most-once (swallowed) ⚠
+                     (idempotent IF reached)  ...but a failure  on failure it's silently
+                                              is caught & dropped  gone (best-effort)
+```
+
+The memory write is the subtle one. Its *id* (`memory:<convId>:<n>`) is
+deterministic, so the *write itself* is idempotent like the chunk write. But
+`session.ts:64-69` wraps it in `try { ... } catch {}` — a failure is swallowed so a
+lost memory never costs the user the answer they already got. That's a deliberate
+*at-most-once* choice for a best-effort side-effect. Idempotent-when-it-runs, but
+not retried-until-it-succeeds.
 
 ### Move 3 — the principle
 
-**A retry is only safe if the operation is idempotent.** That single rule
-explains every choice in this file: AptKit retries the read-only re-prompt (safe),
-fails *over* rather than *back* on provider errors (avoids retrying a
-non-idempotent call), and leans on replay for determinism (the one place it gets
-true idempotency). If you remember one thing: never bolt at-least-once delivery
-onto a non-idempotent operation — you'll just reliably do the wrong thing twice.
+"Exactly-once delivery" across a network is impossible — the sender can never know
+if a lost ack means "the write failed" or "the write succeeded and the ack was
+lost." What you *can* build is **at-least-once delivery + idempotent processing =
+effectively exactly-once.** Retry until you get an ack (at-least-once), and make the
+operation safe to apply twice (idempotent), and the duplicates the retries cause are
+harmless. aptkit gets the idempotent half right for chunks via the keyed upsert; it
+just doesn't pair it with at-least-once retry on the trace, which is fine because
+the trace is best-effort.
 
 ## Primary diagram
 
-The full picture — where each delivery guarantee and retry lives.
-
 ```
-  Idempotency & delivery across AptKit
+  Idempotency in aptkit — the key carries the guarantee
 
-  ┌─ Service layer (in-process, pure → safe to repeat) ───────────┐
-  │                                                                │
-  │  parseResult(finalText) → null?                                │
-  │     └─ recovery turn (re-prompt) ── runs ≤1×, read-only, SAFE   │
-  │                                                                │
-  │  usage-ledger.summarizeUsage() ── folds N call-events → 1 row  │
-  │                                                                │
-  │  REPLAY: FixtureModelProvider ── recorded log → deterministic   │
-  │          re-execution (idempotent, free)                       │
-  └────────────────────────────┬───────────────────────────────────┘
-                              │ complete()  ◄── the unsafe-to-retry op
-  ┌─ Provider boundary ─────────▼────────────────────────────────┐
-  │  AT-MOST-ONCE · NO idempotency key · NON-deterministic         │
-  │  → fail OVER (fresh call, new node) not BACK (retry same call) │
-  └───────────────────────────────────────────────────────────────┘
+  ┌─ App: pipeline.index(doc) ────────────────────────────────────────┐
+  │  deterministic id = "<docId>#<chunkIndex>"   ← same input → same key│
+  └────────────────────────────────┬──────────────────────────────────┘
+                                   │ upsert(chunks)
+            ┌──────────────────────┴───────────────────────┐
+            ▼                                               ▼
+  ┌─ InMemoryVectorStore ─┐                  ┌─ PgVectorStore (buffr) ───────┐
+  │  Map.set(id, chunk)   │                  │  insert ... on conflict (id)  │
+  │  same key overwrites  │                  │  do update                    │
+  │  → idempotent         │                  │  → idempotent (PK constraint) │
+  └───────────────────────┘                  └───────────────┬───────────────┘
+                                                             │ TCP
+                                              ┌─ Postgres: agents.chunks ─────┐
+                                              │  PRIMARY KEY (id) = the dedup  │
+                                              └────────────────────────────────┘
 
-  not yet exercised: idempotency keys, at-least-once, effective-exactly-once,
-                     dedup store, request-id-based deduplication.
+  contrast: agents.messages (trace) has NO such key → retries would duplicate
 ```
-
-## Implementation in codebase
-
-**Use cases.** The re-prompt fires whenever an agent's final text fails to parse
-into its expected shape (a recommendation list, a diagnosis object) — common
-when a model trails off or wraps JSON in prose. The ledger runs at the end of
-every capability to attach a usage/cost row to the replay artifact. Replay runs
-in the eval pipeline and in Studio's "re-run this artifact" flow.
-
-**The one safe retry — the re-prompt.**
-
-```
-  packages/runtime/src/run-agent-loop.ts  (lines 192-199)
-
-  let parsed: T | null = null;
-  if (options.parseResult) {
-    parsed = options.parseResult(finalText);      ← first parse attempt
-    if (parsed === null && options.recoveryPrompt) {  ← failed to parse?
-      const recoveryText = await runRecoveryTurn(   ← ONE recovery turn (≤1 retry)
-        options, options.recoveryPrompt(toolCalls));
-      parsed = recoveryText === null ? null : options.parseResult(recoveryText);
-    }
-  }
-       │
-       └─ this is the ONLY retry in the loop, and it's safe ONLY because the
-          recovery turn (lines 204-228) mutates nothing external — it just asks
-          the model to restate the answer. A retry of a tool that wrote to disk
-          would NOT be safe here.
-```
-
-**The recovery turn is read-only by construction.**
-
-```
-  packages/runtime/src/run-agent-loop.ts  (lines 204-228)
-
-  async function runRecoveryTurn(options, userPrompt) {
-    options.signal?.throwIfAborted();              ← cancellation still wins
-    const response = await options.model.complete({
-      system: 'You are concluding ... Output ONLY the structured answer ...',
-      messages: [{ role: 'user', content: userPrompt }],  ← fresh, no tools given
-      maxTokens: 2048, signal: options.signal,
-    });
-    return textFromContent(response.content);       ← returns TEXT only — no side effects
-  }
-       │
-       └─ no tools passed → the model can't call anything that mutates state.
-          that's what makes re-running it idempotent in effect.
-```
-
-**Accounting across calls — the ledger fold.**
-
-```
-  packages/runtime/src/usage-ledger.ts  (lines 25-42)
-
-  export function summarizeUsage(trace) {
-    return trace.reduce((summary, event) => {
-      if (event.type !== 'model_usage') return summary;  ← only count call events
-      const inputTokens = event.inputTokens ?? 0;
-      ...
-      return { inputTokens: summary.inputTokens + inputTokens, ...
-               turns: summary.turns + 1, ... };           ← one row across all calls
-    }, { inputTokens: 0, ..., turns: 0, estimated: false });
-  }
-       │
-       └─ the closest analog to "track work across nodes" — except the "nodes"
-          are sequential calls to one external API. it's aggregation, not dedup,
-          but the same reconcile-a-stream-into-a-total shape.
-```
-
-**Deterministic replay — the recovery analog.**
-
-```
-  packages/agents/recommendation/src/fixture-provider.ts  (lines 11-17)
-
-  async complete(request) {
-    this.requests.push(request);              ← records what was asked (for assertions)
-    const response = this.responses[this.index];  ← returns the NEXT recorded response
-    this.index += 1;
-    if (!response) throw new Error(`fixture model exhausted ...`);  ← past the log end
-    return response;                          ← same log → same output, deterministically
-  }
-```
-
-The replay driver that consumes these:
-`packages/evals/src/replay-runner.ts:30-94` lists artifacts in deterministic
-filename order and re-evaluates each — re-execution from a recorded log.
-
-**`not yet exercised` here, with triggers:**
-
-- **Idempotency keys / dedup store:** none. *Trigger: an external operation with
-  side effects that must run exactly once (e.g. a tool that posts to a webhook).*
-- **At-least-once delivery:** none. *Trigger: a durable queue between producer
-  and consumer where messages must not be lost.*
-- **Effective-exactly-once:** none. *Trigger: at-least-once delivery + a
-  side-effecting consumer — then you'd add idempotency keys to the tool calls.*
 
 ## Elaborate
 
-The "exactly-once is impossible, effective-exactly-once is achievable" result is
-the load-bearing theorem of message systems — it comes from the Two Generals
-Problem (you can never be *certain* a message was received across an unreliable
-channel). Kafka's "exactly-once semantics" and Stripe's idempotency keys are
-both the same trick: at-least-once delivery plus a dedup store keyed on a stable
-id. AptKit doesn't need it because its one external op is non-idempotent *and*
-non-essential to repeat — it just fails over. The replay machinery is closest in
-spirit to event sourcing (covered as an analog in `08`), where state is
-recovered by replaying a log rather than read from a snapshot.
+Idempotency keys in their full form — a client-generated UUID sent with a request so
+the *server* can dedup retries (Stripe's `Idempotency-Key` header is the canonical
+example) — are `not yet exercised` here, and they don't need to be: aptkit's
+idempotency is *natural* (the chunk's identity is its key) rather than *synthetic*
+(a key minted just for dedup). Synthetic keys matter when the operation has no
+natural identity — "charge this card $10" has no inherent id, so you invent one.
+"Store the embedding for chunk doc:42#0" already has an identity, so you reuse it.
+
+This is the cheaper, better version when you can get it. The move would attach if
+buffr ever exposed an HTTP endpoint that clients retried — then a synthetic
+idempotency key on the request would dedup retries at the boundary, the way the
+primary key dedups them at the storage layer today.
 
 ## Interview defense
 
-**Q: "Can you safely retry a model call? Why or why not?"**
-
-"No — for two reasons. There's no idempotency key, so the provider can't dedupe a
-retry, and LLM output is non-deterministic, so even a successful retry gives a
-different answer. That's why we fail *over* to a different provider instead of
-retrying the same one — a fresh call on a new node, not a re-run."
+**Q: "Is your indexing safe to retry?"**
+"Yes, for the chunk writes — and it's safe for a specific reason. Chunk ids are
+deterministic, `<docId>#<chunkIndex>`, and `PgVectorStore` does `insert ... on
+conflict (id) do update`. So re-indexing the same document upserts the same rows
+instead of appending duplicates — effectively exactly-once via a natural
+idempotency key. The trace writes are *not* idempotent — `persistMessage` has no
+unique key, so a retried flush would duplicate rows. That's acceptable because the
+trace is best-effort and flush runs once, but I wouldn't retry it without adding a
+dedup key first."
 
 ```
-  retry SAME provider:  no key + non-deterministic → unsafe
-  fail OVER:            fresh call, new node        → the safe move
-  retry the re-prompt:  read-only, ≤1×              → safe (mutates nothing)
+  sketch
+
+  chunk:  upsert(id) on conflict do update   → retry-safe ✓ (PK is the key)
+  trace:  insert (no key)                     → retry doubles rows ✗
+  memory: deterministic id, but catch{}        → at-most-once by choice ⚠
 ```
 
-Anchor: "The one retry we *do* have is the parse-failure re-prompt at
-`run-agent-loop.ts:192-199`, and it's safe only because the recovery turn passes
-no tools — it can't mutate anything."
+**Q: "Why can't you just have exactly-once delivery?"** — the load-bearing answer:
+"Because the sender can't distinguish a failed write from a successful write with a
+lost acknowledgment. So you build it from two halves you *can* have: at-least-once
+delivery (retry until acked) plus idempotent processing (safe to apply twice). The
+duplicates the retries cause become harmless. My chunk upsert is the idempotent
+half; the keyed primary constraint is what absorbs the duplicate."
 
-**Q: "How would you make agent runs effectively exactly-once if tools had side
-effects?"**
-
-"At-least-once delivery plus idempotency keys on the side-effecting tool calls,
-backed by a dedup store. The key would be a stable hash of the tool name plus
-args plus a run id. Right now that's `not yet exercised` — the tools are
-read-only, so there's nothing to dedupe."
-
-## Validate
-
-1. **Reconstruct:** Name the three delivery semantics and which one AptKit's
-   provider calls use.
-2. **Explain:** Why is the recovery turn (`run-agent-loop.ts:204-228`) safe to
-   run when a direct provider retry isn't? Point to the specific design choice.
-3. **Apply:** Someone adds a tool that POSTs to a Slack webhook, then enables
-   same-provider retry. What breaks, and what do you add to fix it?
-4. **Defend:** Argue that at-most-once is the correct delivery choice for the
-   provider boundary in *this* repo (`fallback-provider.ts` + the
-   non-determinism argument).
+*Anchor:* `on conflict (id) do update` (`pg-vector-store.ts:49`) is the natural
+idempotency key; the trace insert has none.
 
 ## See also
 
-- `02-partial-failure-timeouts-and-retries.md` — the retry mechanism whose
-  safety this file governs.
-- `08-sagas-outbox-and-cross-boundary-workflows.md` — replay as an
-  event-sourcing analog, in depth.
-- `study-runtime-systems` — the bounded loop and `AbortSignal`.
+- `02-partial-failure-timeouts-and-retries.md` — retries are why idempotency matters
+- `08-sagas-outbox-and-cross-boundary-workflows.md` — idempotent steps make sagas safe to re-run
+- **study-database-systems** — primary keys, unique constraints, `on conflict` internals
+- **study-data-modeling** — the `agents.chunks` schema and its key design
+```

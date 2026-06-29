@@ -1,328 +1,221 @@
-# Sampling parameters — temperature, and only temperature
+# Sampling parameters — the knobs on the next-token guess
 
-**Industry names:** sampling parameters, temperature / top-p / top-k, decoding controls · *Industry standard*
+**Subtitle:** temperature / top-p / top-k · shaping the output distribution · *Industry standard*
 
 ## Zoom out, then zoom in
 
-The model emits a probability distribution over the next token; sampling
-parameters decide how you pick from it. AptKit exposes exactly one of those
-knobs — `temperature` — and plumbs it straight through to whichever vendor is
-behind the contract. Here's where the knob lives.
+Before you tune anything, see where the "knobs" live: they ride along with the
+request, get passed to the model, and do nothing in your code at all.
 
 ```
-  Zoom out — where the sampling knob sits
+  Zoom out — where sampling knobs travel
 
-  ┌─ Caller (agent / structured gen / judge) ───────────────────────┐
-  │  passes temperature?  →  request.temperature                    │
-  └───────────────────────────────┬──────────────────────────────────┘
-                                   │  ModelRequest { temperature? }
-  ┌─ Runtime contract ─────────────▼──────────────────────────────────┐
-  │  ★ request.temperature ★  ←── THIS CONCEPT (one optional field)    │
-  └───────────────────────────────┬──────────────────────────────────┘
-                                   │  conditionally forwarded
-  ┌─ Adapter layer ────────────────▼──────────────────────────────────┐
-  │  anthropic: ...(temp !== undefined ? { temperature } : {})         │
-  │  openai:    ...(temp !== undefined ? { temperature } : {})         │
-  └───────────────────────────────┬──────────────────────────────────┘
-                                   │  if omitted →
-  ┌─ Vendor default ───────────────▼──────────────────────────────────┐
-  │  provider's own default temperature                               │
-  └─────────────────────────────────────────────────────────────────────┘
+  ┌─ Capability ────────────────────────────────────────────────┐
+  │  classifyIntent / rubric judge — wants ONE deterministic ans │
+  └───────────────────────────┬─────────────────────────────────┘
+                              │ ModelRequest { temperature? }
+  ┌─ Runtime contract ────────▼─────────────────────────────────┐
+  │  complete(request) — carries temperature through untouched  │
+  └───────────────────────────┬─────────────────────────────────┘
+                              │ HTTP / SDK
+  ┌─ The model ───────────────▼─────────────────────────────────┐
+  │  ★ sampler ★  reshapes the next-token probability cloud     │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: temperature scales how sharp the next-token distribution is before
-sampling. Low temperature (→0) makes the model nearly deterministic — it picks
-the highest-probability token almost every time. High temperature (→1+) flattens
-the distribution, so lower-probability tokens get picked more often: more varied,
-more creative, less reliable. `top_p` and `top_k` are alternative ways to clip
-the distribution — and AptKit exposes *neither*. One knob, honestly.
+Every time the model picks the next token, it actually produces a *probability
+distribution* over the whole vocabulary — thousands of candidate tokens, each
+with a likelihood. Sampling parameters decide how that cloud gets collapsed into
+one choice. `temperature` flattens or sharpens the cloud; `top-p`/`top-k` chop
+off the unlikely tail before picking. Low temperature → it almost always grabs
+the single most-likely token (near-deterministic). High temperature → it gambles
+on rarer tokens (creative, sometimes wrong).
 
 ## Structure pass
 
-**Layers.** Three: the *caller* (may set `temperature`), the *contract* (carries
-it as one optional field), the *adapter* (forwards it conditionally to the SDK).
+**Layers.** Capability (decides it needs determinism) → request field
+(`temperature`) → provider adapter (passes it down or ignores it) → sampler
+(inside the model).
 
-**Axis — control: who decides the sampling temperature?** Trace it down. At the
-caller layer: usually nobody — most call sites leave it unset. At the contract:
-it's just an optional number passing through. At the adapter: a ternary decides
-*whether to forward it at all* — and if the caller didn't set it, the adapter
-sends nothing and the **vendor's default wins**. So the control answer flips:
-caller-or-nobody → vendor-default.
+**Axis — determinism.** Trace how repeatable the output is. The capability wants
+high repeatability for classifiers; it expresses that as a low/zero temperature
+*intent*; the adapter forwards `temperature` only if set; the sampler honors it.
+In aptkit, most call sites **don't set temperature at all** — determinism comes
+from the *task being narrow* plus *fixture replay in tests*, not a hard lock.
 
-**Seam.** The seam is that ternary in each adapter:
-`...(temperature !== undefined ? { temperature } : {})`. On one side, AptKit's
-"I have no opinion" (undefined). On the other, the vendor's default. The
-load-bearing decision is *not setting* temperature — letting the provider choose.
+**Seam.** The flip is at the request boundary: above it, "I want one stable
+answer" is a design decision; below it, it's a float the sampler obeys. aptkit
+leaves that float mostly unset and leans on the task shape instead — an honest
+gap, not a feature.
 
 ## How it works
 
-You've used a `?? defaultValue` to mean "use mine if I gave one, else fall back."
-Temperature handling is exactly that, expressed as a conditional spread: forward
-the caller's value if present, otherwise send nothing and let the vendor's
-default apply.
-
 ### Move 1 — the mental model
 
-Temperature reshapes the distribution before the dice roll. Picture the same
-next-token distribution at two temperatures:
+Think of `Math.random()` versus a fixed seed. With no constraint, repeated calls
+wander. Sampling is the model's `random()`, and `temperature` is how wide it's
+allowed to wander. Temperature 0 is "always take the top choice" — as close to a
+pure function as the model gets.
 
 ```
-  Temperature reshapes the next-token distribution
+  Temperature reshaping the next-token cloud
 
-  logits → softmax(logits / T) → sample
-
-  T → 0  (sharp):     ████████████ "increased"   ← almost always picks the top
-                      ▏ "rose"                      token; near-deterministic
-                      ▏ "spiked"
-
-  T = 1  (flat-ish):  ██████ "increased"          ← lower-probability tokens get
-                      ███ "rose"                     real chances; more varied
-                      ██ "spiked"
+  low temp (≈0)                 high temp (≈1.0)
+  ┌───────────────┐             ┌───────────────┐
+  │ ▓▓▓▓▓▓▓ "It"  │ ◄ peaked    │ ▓▓▓ "It"      │ ◄ flat
+  │ ▓ "Honestly"  │   pick top  │ ▓▓ "Honestly" │   pick anything-ish
+  │ . "Frankly"   │   always    │ ▓▓ "Frankly"  │
+  └───────────────┘             └───────────────┘
+  repeatable, "boring"          varied, "creative", riskier
 ```
 
-Same model, same prompt, same logits — temperature alone decides whether you get
-the safe top token nearly every time or a more adventurous spread. For a
-classifier ("reply with one word") you want the sharp end. For brainstorming you
-want the flat end.
+### Move 2 — the moving parts
 
-### Move 2 — the step-by-step walkthrough
+**The knob is just an optional field.** aptkit models temperature as one optional
+number on the request. From `packages/runtime/src/model-provider.ts:39`:
 
-#### One field on the request
-
-Temperature enters as a single optional number on `ModelRequest`. No `top_p`, no
-`top_k`, no stop sequences — the contract carries the one knob the repo uses.
-
-```
-  ModelRequest — the sampling surface (pseudocode)
-
-  request = {
-    system?, messages, tools?, maxTokens?,
-    temperature?,    // ← the ONLY sampling parameter in the contract
-    signal?
-  }
+```ts
+export type ModelRequest = {
+  system?: string;
+  messages: ModelMessage[];
+  tools?: ModelTool[];
+  maxTokens?: number;
+  temperature?: number;   // ← optional. unset means "provider default", NOT zero
+  signal?: AbortSignal;
+};
 ```
 
-The boundary condition: if you reach for `top_p`, it's not there. That's not an
-oversight to work around — it's the contract declining to promise a knob nothing
-in the repo turns.
-
-#### The adapter forwards it conditionally
-
-Each adapter spreads `temperature` into the SDK call *only if it's defined*. This
-is the crux: omitting it is meaningfully different from setting it to a number.
-
 ```
-  Adapter forwarding (layers-and-hops)
-
-  ┌─ AptKit request ─────┐                    ┌─ Vendor SDK call ───────┐
-  │ temperature = 0      │ ─ defined? yes ──► │ { ..., temperature: 0 } │
-  ├──────────────────────┤                    ├─────────────────────────┤
-  │ temperature = undef  │ ─ defined? no  ──► │ { ... }  (no temp field)│
-  └──────────────────────┘                    │   → VENDOR DEFAULT wins  │
-                                              └─────────────────────────┘
+  temperature?  →  set: sampler obeys it
+                →  unset: provider's own default (often ~0.7–1.0)
 ```
 
-Send `0` and you pin near-deterministic decoding. Send nothing and the vendor
-picks (typically ~1.0 for chat models). AptKit's call sites overwhelmingly send
-nothing — so in practice AptKit runs at the *provider default* temperature, by
-omission, not by choice.
+The trap: `temperature?` being optional means "I didn't say" — and "I didn't say"
+is *not* the same as deterministic. The Anthropic adapter, for instance, only
+sends temperature when it's defined (`anthropic-provider.ts:36`).
 
-#### What that means for the reliability-sensitive paths
+**The classifier wants one word, not low temperature.** The clearest "I need
+determinism" site in the repo is intent classification — and notice how it gets
+there. From `packages/agents/query/src/intent.ts:12`:
 
-Here's the tension. The reliability-sensitive paths — the intent classifier
-("reply with ONLY one word"), the rubric judge, structured generation — all *want*
-low or zero temperature, because you want the same input to score the same way
-twice. `generateStructured` and the rubric judge both *accept* a `temperature`
-option and thread it through. But they default it to `undefined` — so unless a
-caller passes `0`, those paths inherit the vendor's chattier default and lean on
-**retry** (`04-structured-outputs.md`) to absorb the variance instead of
-suppressing it at the source.
+```ts
+const response = await model.complete({
+  system: 'Classify the user query as exactly one word: monitoring …',  // ← narrow task
+  messages: [{ role: 'user', content: query }],
+  maxTokens: 16,                                                         // ← can't ramble
+  signal: options.signal,
+});                                                                      // ← NO temperature set
+return parseIntent(text);                                               // ← forgiving parser anyway
+```
 
 ```
-  The reliability gap, made concrete
+  How aptkit gets near-deterministic WITHOUT a temp lock
 
-  intent classifier / rubric judge / structured gen
-        │ wants: temperature 0 (repeatable)
-        │ gets:  undefined → vendor default (~1.0, varied)
-        ▼
-  variance shows up → absorbed downstream by parse + retry,
-                      NOT by pinning temperature to 0
+  narrow task ─┐
+  maxTokens:16 ─┼─► output space so small that sampling barely matters
+  forgiving    ─┘   + parseIntent() collapses fuzz to one of 3 labels
+  parser
 ```
+
+Determinism here is *engineered into the task*: a one-word answer cap of 16
+tokens, plus `parseIntent` keyword-matching the result down to one of three
+labels. Even a slightly varied phrasing lands on the same intent. That's robust,
+but it is **not** a temperature lock — and aptkit does not set one.
+
+**The structured/judge path threads temperature but doesn't force it.**
+`generateStructured` and the rubric judge accept `temperature` and pass it
+through (`structured-generation.ts:72`, `rubric-judge.ts:77`), but it defaults to
+`undefined`. So even the JSON-grading paths rely on task narrowness + retry +
+fixture replay, not a hard determinism setting. `not yet exercised`: explicit
+temperature tuning across call sites.
 
 ### Move 3 — the principle
 
-Expose only the knobs your system actually turns, and be explicit about defaults.
-AptKit exposes one sampling parameter because one is all it uses; promising
-`top_p` and `top_k` it never sets would be a contract it doesn't keep. But the
-flip side is a real lesson: *relying on the vendor default* for classifier and
-structured paths trades determinism for a retry loop. That's a defensible choice
-(retry also catches malformed JSON, which temperature 0 wouldn't), but it's a
-choice — and naming it is the point.
+You get reliable output two ways: clamp the *sampler* (temperature 0) or clamp the
+*task* (tiny output space + a forgiving parser). aptkit chose the second. It's
+cheaper to reason about and survives a provider that ignores temperature, but be
+honest in interviews — the determinism is a property of the task and the tests,
+not a config value.
 
 ## Primary diagram
 
-The full path of the one knob, from caller to vendor default.
-
 ```
-  temperature — the only sampling parameter, end to end
+  Two routes to a stable answer
 
-  ┌─ Caller ──────────────────────────────────────────────────────┐
-  │  classifyIntent: (no temperature) → undefined                  │
-  │  RubricJudge:    temperature?      → undefined unless set       │
-  │  generateStructured: temperature?  → undefined unless set       │
-  └───────────────────────────────┬─────────────────────────────────┘
-                                   │  ModelRequest.temperature
-  ┌─ Adapter ──────────────────────▼─────────────────────────────────┐
-  │  anthropic-provider.ts:36   ...(temp !== undefined ? {temp} : {}) │
-  │  openai-provider.ts:45      ...(temp !== undefined ? {temp} : {}) │
-  └───────────────────────────────┬─────────────────────────────────┘
-              defined ─────────────┤───────────── undefined
-                  │                              │
-                  ▼                              ▼
-        SDK uses caller value          SDK uses VENDOR DEFAULT
-
-  NOT in the contract: top_p, top_k, stop sequences, seed.
+  Route A — clamp the sampler          Route B — clamp the task (aptkit)
+  ┌─────────────────────┐              ┌──────────────────────────┐
+  │ temperature: 0      │              │ tiny prompt, maxTokens:16 │
+  │ sampler always tops │              │ + parseIntent() squeeze  │
+  └─────────┬───────────┘              └────────────┬─────────────┘
+            ▼                                       ▼
+   deterministic by config             deterministic by design + fixtures
+   (aptkit: mostly UNSET)              (aptkit: this is what's real)
 ```
-
-## Implementation in codebase
-
-**Use cases.** Temperature is *accepted* by every structured path — `generateStructured`
-threads `options.temperature` into the model call; `RubricJudge` exposes it as a
-constructor option. But it's *set* almost nowhere: the intent classifier doesn't
-pass it, and the agents that build rubric judges don't set it either, so the
-effective temperature across the repo is the provider default.
-
-**The contract field**, `packages/runtime/src/model-provider.ts:44`: a single
-`temperature?: number` on `ModelRequest`. No companion `topP` or `topK`.
-
-**Anthropic forwarding**, `packages/providers/anthropic/src/anthropic-provider.ts:36`:
-
-```
-  packages/providers/anthropic/src/anthropic-provider.ts  (line 36)
-
-  ...(request.temperature !== undefined ? { temperature: request.temperature } : {}),
-       │
-       └─ Conditional spread. If the caller set temperature, forward it; if
-          not, send no temperature field at all and let Anthropic's default
-          apply. Omission ≠ zero — this line is where "I have no opinion"
-          becomes "the vendor decides."
-```
-
-**OpenAI forwarding**, `packages/providers/openai/src/openai-provider.ts:45`:
-
-```
-  packages/providers/openai/src/openai-provider.ts  (line 45)
-
-  ...(request.temperature !== undefined ? { temperature: request.temperature } : {}),
-       │
-       └─ Identical pattern. Both adapters agree: undefined means "don't
-          send the field," which is the only way to actually get the
-          vendor default rather than overriding it.
-```
-
-**Structured gen threads it through**,
-`packages/runtime/src/structured-generation.ts:72`: inside the attempt loop, the
-model call passes `temperature: options.temperature` — so a caller *can* pin it to
-0 per structured call, but the option defaults to `undefined`.
-
-**The classifier that wants 0 but doesn't set it**,
-`packages/agents/query/src/intent.ts:17-23`: `classifyIntent` builds a request
-with `maxTokens: 16` and a "reply with ONLY one word" system prompt — a textbook
-temperature-0 use case — yet passes no temperature, inheriting the vendor default.
 
 ## Elaborate
 
-Temperature, top-p (nucleus sampling), and top-k are three knobs on the same
-mechanism: how much of the probability mass you let the sampler reach for.
-Temperature rescales the whole distribution; top-p keeps the smallest set of
-tokens whose probabilities sum to *p* and renormalizes; top-k keeps the *k*
-highest and drops the rest. They compose, and most APIs expose all three. AptKit
-exposes only temperature because that's the only one any call site would turn —
-and even temperature is left to the vendor default in practice.
-
-The deeper lesson is the interaction with the retry loop. Classic advice says
-"set temperature 0 for classifiers and structured output." AptKit instead leaves
-temperature alone and hardens the *parse* step with a retry-once nudge
-(`04-structured-outputs.md`). That works because retry catches more than
-nondeterminism — it also catches a model that wrapped JSON in prose or a markdown
-fence, which temperature 0 wouldn't fix. So the two approaches aren't substitutes;
-pinning temperature *and* keeping retry would be strictly more robust. The repo
-ships the retry half.
-
-Adjacent: structured outputs and the retry that absorbs sampling variance
-(`04-structured-outputs.md`); the rubric judge that accepts temperature
-(`../05-evals-and-observability/`); prompt-side determinism techniques like
-few-shot anchoring live in prompt engineering (`.aipe/study-prompt-engineering/`,
-*not yet generated*).
+Temperature scales the logits before softmax; top-k keeps only the k highest-
+probability tokens; top-p (nucleus) keeps the smallest set whose cumulative
+probability exceeds p. Production classifiers and JSON generators almost always
+run at temperature 0 in the wild. aptkit's choice to lean on task shape + fixture
+replay is pragmatic for a local-first, fixture-tested repo, but a real gap if you
+ship to a vendor that defaults hot. Read `04-structured-outputs.md` next — the
+retry loop there is the safety net that lets aptkit get away with not locking
+temperature.
 
 ## Project exercises
 
-*Provenance: Phase 1 — LLM foundations (C1.x). No `aieng-curriculum.md` present;
-IDs are by-phase convention. Case B — the knob exists but reliability paths don't
-set it; this closes that.*
-
-### Exercise — pin temperature 0 on the deterministic paths
-
-- **Exercise ID:** `[C1.3]` Phase 1, sampling parameters
-- **What to build:** Pass `temperature: 0` from the paths that need
-  repeatability — `classifyIntent` and the agents that construct `RubricJudge` /
-  call `generateStructured` for scoring. Keep it configurable, defaulting to 0
-  for those paths only.
-- **Why it earns its place:** It demonstrates you understand that omission means
-  "vendor default," not "zero," and that classifier/judge reliability wants the
-  sharp end of the distribution. The before/after eval (does the judge score the
-  same input identically twice more often?) is a clean measurable win.
+### Make the classifier explicitly deterministic
+- **Exercise ID:** —  (no curriculum file in repo)
+- **What to build:** add `temperature: 0` to the `classifyIntent` request and add
+  a test that runs the same query N times against a fixture provider asserting one
+  stable label.
+- **Why it earns its place:** closes the honest gap — turns "deterministic by luck
+  of task shape" into "deterministic by config," and teaches the difference.
 - **Files to touch:** `packages/agents/query/src/intent.ts`,
-  the rubric-judge call sites in `packages/evals/` /
-  `packages/agents/rubric-improvement/`, plus tests asserting the request carries
-  `temperature: 0`.
-- **Done when:** A test confirms `classifyIntent`'s request has `temperature: 0`,
-  and a repeated-judgment eval shows reduced verdict variance.
-- **Estimated effort:** `1–4hr`
+  `packages/agents/query/test/intent.test.ts`.
+- **Done when:** the request carries `temperature:0` and the repeat test passes.
+- **Estimated effort:** `<1hr`
+
+### Audit every call site for an unset temperature
+- **Exercise ID:** —  (no curriculum file in repo)
+- **What to build:** a grep-driven note listing each `model.complete` / structured
+  call and whether it sets temperature, then a one-paragraph recommendation.
+- **Why it earns its place:** surfaces the repo-wide reliance on task shape and
+  makes the gap explicit — the kind of audit a staff engineer runs before a vendor
+  swap.
+- **Files to touch:** read across `packages/agents/*/src`, `packages/runtime/src`,
+  `packages/evals/src`; write nothing into code.
+- **Done when:** you can name every deterministic-intent call site and its temp.
+- **Estimated effort:** `<1hr`
 
 ## Interview defense
 
-**Q: How does your code control sampling, and what's the default?**
-"One knob — `temperature`, an optional field on `ModelRequest`. No top-p, no
-top-k; the contract only promises what the repo uses. The key detail is the
-adapter forwards it *conditionally*:"
+**Q: "Does aptkit use temperature 0 for its classifier?"**
+No — and that's the interesting part. It gets near-determinism from a one-word
+task, a 16-token cap, and a forgiving `parseIntent` parser, plus fixture replay in
+tests. There's no temperature lock anywhere in most call sites.
 
 ```
-  temperature defined? ── yes ──► SDK gets it
-                       ── no  ──► SDK gets nothing → VENDOR DEFAULT
+  expected:  temperature:0
+  actual:    maxTokens:16 + narrow prompt + parseIntent() + fixtures
+             (temperature: unset)
 ```
+Anchor: *the determinism is in the task and the tests, not a config float.*
 
-"So when a call site omits it — which most do — we run at the provider's default
-temperature. That's `anthropic-provider.ts:36` and `openai-provider.ts:45`."
-*Anchor: omitting temperature is a choice — it hands control to the vendor.*
+**Q: "When would you reach for low temperature?"**
+Classifiers, structured/JSON output, anything you'll parse or assert on. High
+temperature is for ideation and copy. The rule: if a downstream parser depends on
+it, clamp it.
 
-**Q: Your intent classifier wants deterministic one-word answers. Is temperature
-set to 0?**
-"No — and that's a gap. `classifyIntent` in `intent.ts:17` builds a one-word
-classifier prompt but passes no temperature, so it inherits the vendor default.
-The reliability is currently carried by the `parseIntent` heuristic that maps the
-output back to a known label and defaults to `diagnostic` on anything unexpected,
-not by pinning temperature. I'd set `temperature: 0` there."
-*Anchor: the determinism is recovered downstream by a parser, not at the source.*
-
-## Validate
-
-- **Reconstruct:** Write the conditional-spread line both adapters use. Check
-  `packages/providers/anthropic/src/anthropic-provider.ts:36` and
-  `packages/providers/openai/src/openai-provider.ts:45`.
-- **Explain:** Why does omitting `temperature` differ from setting it to `0`?
-  (Omitting sends no field, so the vendor default applies; `0` pins
-  near-deterministic decoding — `anthropic-provider.ts:36`.)
-- **Apply:** You want the rubric judge to score identically across runs. Which
-  knob, set where? (`temperature: 0` via `RubricJudgeOptions` — it threads to
-  `generateStructured`'s model call at `structured-generation.ts:72`.)
-- **Defend:** Why expose only `temperature` and not `top_p` / `top_k`? (Nothing
-  in the repo turns them; a contract that promises unused knobs is one every
-  adapter and fixture must honor for no benefit — `model-provider.ts:44`.)
+```
+  parse/assert downstream?  ──► temperature low (clamp the sampler)
+  human reads it for ideas? ──► temperature high (let it wander)
+```
+Anchor: *if code reads the output, sample cold.*
 
 ## See also
 
-- [01-what-an-llm-is.md](01-what-an-llm-is.md) — the function whose output this knob shapes
-- [04-structured-outputs.md](04-structured-outputs.md) — the retry loop that absorbs sampling variance
-- [07-heuristic-before-llm.md](07-heuristic-before-llm.md) — the classifier that wants temperature 0
-- [08-provider-abstraction.md](08-provider-abstraction.md) — the adapters that forward the knob
+- `04-structured-outputs.md` — the retry net that compensates for hot sampling
+- `07-heuristic-before-llm.md` — `parseIntent`, the forgiving squeeze used here
+- `01-what-an-llm-is.md` — the function these knobs tune

@@ -1,424 +1,178 @@
-# 03 — B-tree, hash, and secondary indexes
+# 03 · B-tree, Hash, and Secondary Indexes
 
-**Subtitle:** Index structures / B-tree vs hash / secondary / ANN indexes —
-*Industry standard* (taught), *analogs: the filename sort (on disk) and a
-linear cosine scan in `InMemoryVectorStore` (in memory)* (in-repo)
-
----
+**Industry name(s):** secondary indexes, b-tree, ANN index (HNSW). **Type:** Industry standard.
 
 ## Zoom out, then zoom in
 
-An index is the data structure that turns "scan every row to find one" into
-"jump straight to it." Databases live or die on theirs — B-trees for range
-scans, hash indexes for point lookups, secondary indexes for querying by a
-non-key column. AptKit has exactly one index, and it isn't a data structure
-at all: it's the *order the filenames sort in*. That single, accidental index
-is powerful enough to make "list runs newest-first" instant and fragile
-enough to break the moment a filename stops leading with a timestamp.
+You know an index as "the thing that makes `WHERE id = x` fast instead of scanning every row." That intuition holds. What's unusual in this repo: the hot query isn't `WHERE id = x` — it's "find the 5 vectors *nearest* to this one," and a b-tree can't answer that. So buffr carries **two different index structures** over the same `agents.chunks` table.
 
 ```
-  Zoom out — where the "index" lives
+  Zoom out — where indexes sit
 
-  ┌─ Service layer (the read path) ───────────────────────────┐
-  │  readdir(dir) → filter → ★ .sort() ★ → read each          │ ← we are here
-  │                          the ONLY index in the whole repo  │
-  └───────────────────────────┬───────────────────────────────┘
-  ┌─ Storage layer ───────────▼───────────────────────────────┐
-  │  filenames: 2026-06-18T19-29-11-225Z-...-studio.json      │
-  │  the timestamp PREFIX is what makes the sort meaningful    │
-  └───────────────────────────────────────────────────────────┘
+  ┌─ Pipeline (aptkit) ────────────────────────────────────┐
+  │  store.search(vector, k)  /  store.upsert(chunks)       │
+  └────────────────────────────┬────────────────────────────┘
+                               │
+  ┌─ Store layer ──────────────▼────────────────────────────┐
+  │  InMemory: NO index — linear scan + sort every query     │
+  │  Postgres: ★ HNSW (nearest-vector) + b-tree (id, app_id)★│ ← we are here
+  └────────────────────────────┬────────────────────────────┘
+                               │
+  ┌─ Disk ─────────────────────▼────────────────────────────┐
+  │  HNSW graph · b-tree on id PK · b-tree on app_id         │
+  └──────────────────────────────────────────────────────────┘
 ```
 
-**Zoom in.** The question: *how does AptKit find or order records without an
-index structure?* Answer: it doesn't find by anything but a full scan, and it
-orders by sorting filenames lexicographically. Because the filenames start
-with a zero-padded ISO-8601 timestamp, a *string* sort happens to equal a
-*chronological* sort. That coincidence is the index. Understand why it holds
-and exactly when it fails.
+Zoom in: the concept is **index selection** — which structure answers which query, and what each one costs on write. aptkit's answer is "no index, scan everything." buffr's answer is HNSW for the similarity search, a b-tree primary key for upsert-by-id, and a second b-tree for the `app_id` filter. Three structures, three jobs.
 
----
+## The structure pass
 
-## Structure pass
+**Layers.** The query layer asks one of two questions: "give me row with this exact id" (upsert) or "give me rows nearest this vector" (search). Each maps to a different index. The index layer is where the question shape decides the structure.
 
-The layers: the **logical query** ("give me runs, newest first" or "give me
-the run for capability X") and the **physical lookup** (what the code does to
-satisfy it). Axis to hold constant: **lookup cost — how many records must I
-touch to answer the query?**
+**Axis — trace "what does this index cost on a write?" because that's the index tradeoff that bites:**
 
 ```
-  One axis — "records touched per query" — across the index layers
+  One question across the indexes: "cost to maintain on insert?"
 
-  ┌───────────────────────────────────────────┐
-  │ query: "newest run first"                 │  → answered by filename sort:
-  └───────────────────────────────────────────┘    touch all N to sort, but the
-                                                    sort key needs no file read
-      ┌───────────────────────────────────────┐
-      │ query: "the run for capability=query" │  → NO index: must read +
-      └───────────────────────────────────────┘    parse all N, then filter
-                                                    (full scan, O(N) reads)
-
-  the seam: ordering by time is cheap (filename-encoded); ordering or
-  filtering by ANY other attribute is a full scan. That asymmetry IS the
-  index design.
+  ┌─ b-tree on id (PK) ─────────────┐  → O(log n) — cheap, balanced tree insert
+  ┌─ b-tree on app_id ──────────────┐  → O(log n) — cheap
+  ┌─ HNSW on embedding ─────────────┐  → EXPENSIVE — graph link rewiring per insert
+  ┌─ InMemory (no index) ───────────┐  → ZERO write cost; ALL cost moved to read
 ```
 
-The load-bearing seam is between "queryable from the filename alone"
-(timestamp ordering) and "requires opening the record" (everything else).
-Anything you want fast must be encoded in the filename; anything not in the
-filename costs a full scan. That's the entire index story, and it's why the
-N+1 in file `04` exists.
-
----
+**Seam.** The boundary is `upsert` vs `search`. Above the seam the pipeline doesn't know an index exists. Below it, the *same insert* touches three index structures in Postgres (and pays HNSW's graph-maintenance cost), while in aptkit the insert touches none and the read pays everything. The axis — where the cost lives — flips hard across the in-memory/Postgres seam.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know how a phone book is sorted by last name, so you binary-search to a
-name instead of reading every entry? A B-tree is that, kept balanced as you
-insert, so lookups and range scans stay logarithmic. The mental model: **an
-index is a sorted (or hashed) copy of one column plus pointers back to the
-rows, so you search the small sorted thing instead of the big table.**
+You've built a `BinarySearchTree` from scratch (`BinarySearchTree.ts`) — a b-tree is that idea, fattened to many keys per node so it stays shallow on disk. HNSW is a different animal: it's a **navigable graph** you greedily walk toward the query vector, like a multi-level skip list pointing through high-dimensional space. A b-tree gives you *exact* ordering on a scalar; HNSW gives you *approximate* nearness in 768 dimensions.
 
 ```
-  the real mechanism: a B-tree index (sorted, balanced, pointers to rows)
+  Two index shapes for two questions
 
-                 ┌──────── [ M ] ────────┐         ← root: one comparison
-                 ▼                        ▼            picks a subtree
-          ┌──[ D | H ]──┐          ┌──[ T | X ]──┐  ← internal nodes
-          ▼      ▼      ▼          ▼      ▼      ▼
-        [A..C][E..G][I..L]      [N..S][U..W][Y..Z] ← leaves → row pointers
-
-  point lookup "H":  root → right of D, left of T... → leaf → row   (O(log N))
-  range scan "D..L": find D in leaf, walk leaves rightward          (sequential)
+  b-tree (exact, ordered scalar)        HNSW (approximate nearest neighbor)
+        [m]                                 layer 2:  o ──────► o
+       /   \                                layer 1:  o ─► o ─► o ─► o
+     [d]   [t]                              layer 0:  o-o-o-o-o-o-o-o-o
+    / \    / \                                        ▲ enter top, greedily
+  ...  ...                                            hop toward query vector
+  answers: id = "x"                        answers: nearest(vector, k)
 ```
 
-A hash index drops the ordering: it hashes the key to a bucket for O(1) point
-lookups, but loses range scans entirely. AptKit's filename sort is neither a
-B-tree nor a hash — it's a sort performed fresh on every query, over keys
-that happen to live in the filenames.
+The kernel of HNSW: **start at a sparse top layer, greedily hop to the closest node, descend a layer, repeat.** Lose the layered shortcuts and it degrades to a flat graph walk — slow. Lose the "stop when no neighbor is closer" termination and it never converges.
 
-### Move 2 — the parts that matter
+### Move 2 — the walkthrough
 
-**The clustered "index": filename order.** A clustered index decides the
-physical order records are stored in. AptKit's records are stored in a
-directory with no inherent order, so the *query* imposes order by sorting
-filenames. Because each filename is `<ISO-timestamp>-<slug>-<provider>.json`,
-and ISO-8601 timestamps are designed to sort lexicographically the same as
-chronologically, `.sort()` gives newest-or-oldest-by-time for free. What
-concretely happens: `listReplayArtifacts` calls `.sort()` (ascending string
-order); `listReplaySummaries` calls `createdAt.localeCompare` descending.
-Boundary condition: **this only works because of the timestamp prefix.** Drop
-it, pad a month without a leading zero, or switch to UUID filenames, and the
-"index" returns garbage order with no error.
+**aptkit: no index, the scan IS the query.** The in-memory store has zero index structures. Every search recomputes cosine against every chunk and sorts:
 
-```
-  the filename IS the index key — and it's a string sort, not a date sort
-
-  2026-06-18T16-45-45-185Z-...   ┐
-  2026-06-18T16-53-02-698Z-...   │  string sort  ==  chronological sort
-  2026-06-18T17-18-41-781Z-...   │  ONLY because ISO-8601 is zero-padded
-  2026-06-18T19-29-11-225Z-...   ┘  and fixed-width
-
-  break it:  "6-18-..." vs "12-18-..."  → "12" sorts before "6"  → WRONG
+```ts
+// packages/retrieval/src/in-memory-vector-store.ts:25-33
+async search(vector: number[], k: number): Promise<VectorHit[]> {
+  const hits: VectorHit[] = [];
+  for (const chunk of this.chunks.values())                    // O(n) — touch every chunk
+    hits.push({ id: chunk.id, score: cosineSimilarity(vector, chunk.vector), meta: chunk.meta });
+  hits.sort((a, b) => b.score - a.score);                      // O(n log n) — sort the lot
+  return hits.slice(0, Math.max(0, k));                        // take top-k
+}
 ```
 
-**The missing secondary index.** A secondary index lets you query by a
-non-primary column (find all runs where `capabilityId = 'query-agent'`).
-AptKit has none. To answer "give me the query-agent runs," `listReplaySummaries`
-reads and parses *every* file, then you'd filter in memory. What breaks
-without a secondary index: every by-attribute query is a full scan. This is
-`not yet exercised` as a real index — the trigger is "you query artifacts by
-`capabilityId`/`provider`/`fixture` often enough that scanning all of them
-hurts."
+This is *exact* nearest-neighbor (it considers everything) at O(n) per query. Writes are free (`Map.set`), reads are linear. It's the right call for tests and small corpora — and a non-starter at scale, which is the whole reason HNSW exists.
 
-**The missing secondary index, the in-memory case: `kind`.** The vector store
-has the *same* gap, and it's now load-bearing because `@aptkit/memory` depends
-on it. Memory rows are written tagged `meta.kind = 'memory'`
-(`packages/memory/src/conversation-memory.ts:84`) so they're distinguishable
-from document chunks when both share one collection. But the `VectorStore`
-contract (`packages/retrieval/src/contracts.ts:33-37`) has *no metadata index
-and no metadata predicate* — `search(vector, k)` cannot say "only rows where
-`kind='memory'`." So `kind` is a **logical partition with no index behind it**:
-a column you'd want to filter on, stored, but un-indexed and un-pushdownable.
-The consequence shows up in `04` as over-fetch-then-filter — recall reads a
-wider window and filters in the application, because the engine can't narrow the
-scan to the partition. What breaks without a `kind` index: a shared memory+doc
-collection where documents outnumber memory rows can push the real memory
-matches past the fetch window — a silent under-return. The trigger to add a
-real indexed metadata filter is exactly that shared, skewed collection.
+**buffr: three index structures, declared in the schema.**
 
-```
-  the `kind` partition has no index — so the filter can't be pushed down
-
-  one collection, two row types tagged by meta.kind:
-
-   [ doc ][ doc ][ mem ][ doc ][ mem ][ doc ][ doc ][ mem ] ...
-                   ▲             ▲                   ▲
-                   └─ want only these, but no index on `kind` ─┘
-
-  in-memory (aptkit):  search(vector, k) → returns BOTH types interleaved
-                       → recall over-fetches, filters kind==='memory' in app
-  postgres (buffr):    where app_id = $2 → app partition IS pushed down ✓
-                       but NO `where kind = ...` → kind still filtered post-scan
-  the fix (neither):   an index on `kind` + a pushed-down predicate
+```sql
+-- buffr/sql/001_agents_schema.sql:14, 28-30
+id text primary key,                                           -- (1) b-tree on id, implicit from PK
+...
+create index if not exists chunks_embedding_hnsw
+  on agents.chunks using hnsw (embedding vector_cosine_ops);   -- (2) HNSW for nearest-vector
+create index if not exists chunks_app_id on agents.chunks (app_id);  -- (3) b-tree on app_id
 ```
 
-**The missing point-lookup (hash) index.** There's no "fetch the artifact
-with id X in O(1)." The closest the repo gets is the `FixtureModelProvider`
-serving responses by an integer `index` (`fixture-provider.ts:13`) — a
-direct array-offset lookup, which is the degenerate case of a hash index
-(perfect hashing by position). But that's over an in-memory array, not the
-on-disk artifacts. The new `InMemoryVectorStore` *does* hold a true hash index
-for point lookups — its chunks live in a `Map<string, VectorChunk>`
-(`in-memory-vector-store.ts:11`), so `upsert` replacing an id is an O(1) hash
-write. But that hash is only used for upsert dedup, never for read: the read
-path (`search`) ignores the `Map`'s keys entirely and scans all values.
+Three jobs:
 
-**The vector "index" that is really a full scan (the new one).** This is the
-load-bearing addition. `@aptkit/retrieval`'s `InMemoryVectorStore.search`
-(`in-memory-vector-store.ts:25-33`) answers a similarity query — "give me the k
-chunks closest to this query vector" — and the way it does it is the entire
-lesson of this file in miniature. It computes `cosineSimilarity` against
-*every* stored chunk, pushes them all into an array, sorts descending by score,
-and slices the top k. That is `ORDER BY similarity LIMIT k` executed as a
-**sequential scan with a sort** — no index assist at all. The right structure
-for this query is an **ANN index** (Approximate Nearest Neighbor), of which
-**HNSW** (Hierarchical Navigable Small World) is the standard: a multi-layer
-graph you greedily walk to land near the answer in `O(log N)` hops instead of
-touching all N vectors.
+- **(1) b-tree on `id` (the primary key).** Powers the upsert: `on conflict (id) do update` needs to find the existing row by id, which is a b-tree probe — O(log n). This is what makes "upsert this chunk" cheap regardless of corpus size.
+- **(2) HNSW on `embedding` with `vector_cosine_ops`.** Powers the search. `vector_cosine_ops` tells pgvector to build the graph using cosine distance, matching the `<=>` operator the query uses. This is the index that turns the in-memory O(n) scan into an approximate sub-linear graph walk.
+- **(3) b-tree on `app_id`.** Powers the multi-tenant filter `where app_id = $2`. Without it, the `app_id` predicate would scan.
 
-```
-  scan (what aptkit does)  vs  HNSW ANN index (what a real store does)
+**The surprising part: HNSW is approximate, and the query uses it AND a separate filter.** The search query is:
 
-  query vector q, N stored chunks, dimension d
-
-  InMemoryVectorStore.search:
-    for each of N chunks:  score = cosine(q, chunk)   ← touch ALL N, O(N·d)
-    sort N scores                                     ← O(N log N)
-    slice top-k                                       ← O(k)
-    total: O(N·d + N log N)  — linear in corpus size
-
-  HNSW (buffr's PgVectorStore, "using hnsw"):
-            ┌── top layer (few nodes, long hops) ──┐
-            │   enter ──► greedy-walk toward q       │
-            └────────────────┬─────────────────────┘
-                 descend to denser layer, repeat
-            ┌── base layer (all nodes, short hops) ─┐
-            │   land in q's neighborhood, return k   │
-            └───────────────────────────────────────┘
-    total: ~O(log N) nodes visited — sub-linear, the whole point of an index
+```ts
+// buffr/src/pg-vector-store.ts:70-77
+const { rows } = await this.pool.query(
+  `select id, content, chunk_index, document_id, meta,
+          1 - (embedding <=> $1::vector) as score              -- cosine distance → similarity
+   from agents.chunks
+   where app_id = $2                                           -- b-tree on app_id (or filter)
+   order by embedding <=> $1::vector                           -- HNSW on embedding
+   limit $3`,
+  [toVectorLiteral(vector), this.appId, k],
+);
 ```
 
-What breaks without the ANN index: nothing, until the corpus grows. At a few
-hundred chunks the scan is microseconds and an index would be pure overhead —
-which is exactly why the in-memory store skips it. The trigger to need HNSW is
-"the corpus is large enough that touching every vector per query hurts," and
-that trigger is met in the **buffr** repo, not here:
-`buffr/sql/001_agents_schema.sql:28-29` builds a real HNSW index
-(`using hnsw (embedding vector_cosine_ops)`) and `buffr/src/pg-vector-store.ts:67-78`
-queries it with pgvector's `<=>` cosine-distance operator behind the *same*
-`VectorStore` contract aptkit defines. The adapter is swappable; the index
-lives in the durable store.
+Here's the rub the planner has to resolve, and it's the most important index interaction in the repo: **the `where app_id` filter and the `order by embedding` use different indexes.** HNSW returns approximate-nearest rows in embedding space; the `app_id` filter then has to apply on top. If HNSW returns its top candidates and most belong to a *different* app_id, the post-filter can leave you with fewer than `k` results — the classic "filtered ANN" problem. Whether Postgres handles this well (filtered HNSW scan) or poorly (over-fetch then filter) is **`not yet exercised`** — no `EXPLAIN` has been run, and with `app_id` defaulting to `'laptop'` for everything in a single-tenant laptop deployment, the filter is effectively a no-op today. The risk is latent until a second app_id appears.
+
+**Write cost — the HNSW tax.** Every `upsert` of a chunk inserts into all three indexes. The b-trees are cheap O(log n). HNSW is not: inserting a vector means finding its place in the navigable graph and rewiring neighbor links, which is markedly more expensive than a b-tree insert. The `upsert` loop inserts chunks one row at a time inside the transaction (`buffr/src/pg-vector-store.ts:43-57`), so a 50-chunk document pays the HNSW insertion cost 50 times. `ef_construction` (how hard HNSW works to build good links) is left at the pgvector default — **not tuned** — so build quality vs build speed is whatever the default trades.
+
+```
+  Layers-and-hops — one upsert touching three indexes (buffr)
+
+  ┌─ PgVectorStore ─┐ hop: INSERT ... ON CONFLICT (id)   ┌─ Postgres ──────────┐
+  │ upsert (txn)    │ ──────────────────────────────────►│ heap tuple written  │
+  └─────────────────┘                                    └──────┬──────────────┘
+                                                                │ then maintain:
+                                          ┌─────────────────────┼─────────────────────┐
+                                          ▼                     ▼                     ▼
+                                   b-tree(id) O(log n)   b-tree(app_id) O(log n)   HNSW(embedding)
+                                   cheap probe           cheap                     EXPENSIVE rewire
+```
 
 ### Move 3 — the principle
 
-An index is a precomputed answer to a query you'll ask repeatedly, traded
-against the cost of maintaining it on every write. AptKit precomputed exactly
-one: time order, encoded into the filename for free at write time. Everything
-else is a scan. The generalizable rule: **you get the queries your indexes
-were built for cheaply, and pay full-scan for the rest — so index the queries
-you actually run, and encode the cheap ones into the key if you can.**
-
----
+Index selection is question-driven: a b-tree answers "exact / ordered," an ANN index answers "approximately nearest." You pay for every index on every write, and HNSW's write tax is the steep one — it buys sub-linear similarity search at the cost of expensive inserts and *approximate* (not exact) results. The general lesson: each index is a bet that a read pattern is worth a write cost, and an ANN index additionally trades correctness for speed.
 
 ## Primary diagram
 
 ```
-  AptKit indexing — one index (time), everything else a scan
+  Full index picture — agents.chunks, three structures + the in-memory control
 
-  QUERY                         MECHANISM                       COST
-  ─────                         ─────────                       ────
-  newest run first         →   .sort() on filenames        →   sort N keys,
-                               (replay-runner.ts:43)            no file reads
-                               localeCompare(createdAt)         O(N log N)
-                               (vite.config.ts:983)
-
-  run by capabilityId      →   read+parse every file,      →   FULL SCAN
-                               filter in memory                 O(N) file reads
-                               (no secondary index)
-
-  artifact by id           →   not supported on disk;      →   would be O(N)
-                               in-memory cursor by index        (in-mem: O(1))
-                               (fixture-provider.ts:13)
+  ┌─ aptkit InMemoryVectorStore ─┐      ┌─ buffr Postgres: agents.chunks ──────────┐
+  │ NO index                     │      │  ┌ b-tree(id PK) ──► upsert by id O(logn)│
+  │ search = O(n) scan + sort    │      │  ├ b-tree(app_id) ─► WHERE app_id filter │
+  │ exact NN, free writes        │      │  └ HNSW(embedding, cosine)               │
+  │                              │      │       └► ORDER BY embedding <=> $1       │
+  │                              │      │          approximate NN, sub-linear read │
+  │                              │      │          EXPENSIVE per-insert rewire     │
+  └──────────────────────────────┘      │  ef_search / ef_construction: DEFAULT    │
+                                         │  filtered-ANN interaction: NOT EXERCISED │
+                                         └──────────────────────────────────────────┘
 ```
-
----
-
-## Implementation in codebase
-
-**Use cases.** The time-order index is hit every time Studio lists prior runs
-(newest first) and every time the CLI eval walks the directory (ascending).
-There is no by-attribute lookup in the repo today — every consumer that wants
-a subset reads all and filters.
-
-**The only index — CLI side** — `packages/evals/src/replay-runner.ts:40-44`:
-
-```
-  return entries
-    .filter((entry) => entry.isFile() && extname(entry.name) === '.json')
-    .map((entry) => join(dir, entry.name))
-    .sort();   ← THE INDEX. Lexicographic ascending. Correct ordering depends
-               │  entirely on filenames starting with a sortable ISO timestamp.
-               └─ no comparator, no date parse — pure string compare
-```
-
-**The only index — Studio side** — `apps/studio/vite.config.ts:983`:
-
-```
-  return summaries.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
-                                          │         │
-                                          │         └─ uses the parsed createdAt
-                                          │            field, not the filename
-                                          └─ DESCENDING (newest first) for the UI
-       │
-       └─ subtle: this sorts on the createdAt STRING inside the record, while
-          the CLI sorts on the FILENAME. Both rely on ISO-8601 being
-          lexicographically chronological. They agree today because the
-          filename is derived from createdAt (vite.config.ts:376) — but they
-          are two separate "indexes" that could drift if naming changes.
-```
-
-**The degenerate point-lookup** — `fixture-provider.ts:11-16`:
-
-```
-  async complete(request) {
-    this.requests.push(request);
-    const response = this.responses[this.index];  ← O(1) lookup by integer offset
-    this.index += 1;                               ← cursor advances; sequential
-    if (!response) throw new Error(`fixture model exhausted ...`);
-    return response;
-  }
-       │
-       └─ this is a positional index over an in-memory array — the simplest
-          possible "index." It's how deterministic replay finds the next
-          response (file 08), not how on-disk artifacts are found.
-```
-
-**The vector "index" = a full scan** — `packages/retrieval/src/in-memory-vector-store.ts:25-33`:
-
-```
-  async search(vector, k) {
-    this.assertDimension(vector, 'query vector');  ← integrity guard: a wrong-length
-                                                      query throws (ranking would be
-                                                      garbage otherwise)
-    const hits = [];
-    for (const chunk of this.chunks.values()) {    ← SCAN: touch EVERY chunk —
-      hits.push({ id: chunk.id,                       no index narrows it, O(N)
-        score: cosineSimilarity(vector, chunk.vector),← O(d) per chunk → O(N·d) total
-        meta: chunk.meta });
-    }
-    hits.sort((a, b) => b.score - a.score);        ← ORDER BY similarity DESC, O(N log N)
-    return hits.slice(0, Math.max(0, k));          ← LIMIT k
-  }
-       │
-       └─ the Map<id> buys O(1) UPSERT dedup, but read ignores its keys and
-          scans all values. This is the exact query an ANN index (HNSW) exists
-          to make sub-linear — buffr's PgVectorStore does, behind this same
-          contract. Here it's a deliberate full scan: correct while N is small.
-```
-
----
 
 ## Elaborate
 
-Encoding the sort key into the object's name is an old, good trick — it's
-why log files are named with dates and why S3 keys are designed with sortable
-prefixes. It gives you an index with zero maintenance cost because the write
-path names the file and the read path sorts names. The price is that you get
-*one* ordering, fixed at write time, and any other query degrades to a scan.
-Real engines pay write-time cost to maintain B-trees precisely so they can
-offer many orderings and point lookups. AptKit chose zero index maintenance
-and one ordering, which is correct while N is small and time-ordering is the
-only query. The trigger to add a real index: you find yourself parsing every
-artifact to answer "which runs match attribute X," and N is no longer small.
-
-The repo now holds *two* "index" stories at once, and the contrast is the
-lesson. On disk: one ordering encoded into a filename, everything else a scan.
-In memory: the new `InMemoryVectorStore` is a similarity store whose "index" is
-a linear cosine scan — deliberately no ANN structure, because at a few hundred
-chunks a scan beats the overhead of building and walking an HNSW graph. The
-genuine ANN version of the *same* `VectorStore` contract ships in the **buffr**
-repo: `buffr/sql/001_agents_schema.sql:28-29` declares
-`create index ... using hnsw (embedding vector_cosine_ops)` and
-`buffr/src/pg-vector-store.ts` queries it with pgvector. So aptkit teaches the
-naive scan and the contract; buffr supplies the real index behind that contract.
-That boundary is the whole adaptability argument: the pipeline code never names
-a store, so swapping the scan for HNSW is a one-line wiring change and zero
-pipeline change. The trigger to make that swap is corpus size — the same
-"queries you actually run × N grew large" rule, applied to similarity search
-instead of attribute lookup.
-
-There's a second index gap worth separating from the ANN one: the *metadata*
-index. The ANN index is about *ranking* faster (sub-linear nearest-neighbor);
-a metadata index is about *filtering* a subset before you rank. `@aptkit/memory`
-needs the second — top-k *where `kind='memory'`* — and neither store provides
-it. buffr's `PgVectorStore` is the proof the pushdown shape works: it pushes
-`where app_id = $2` into the scan so ranking never touches another app's rows
-(`/Users/rein/Public/buffr/src/pg-vector-store.ts`). But it stops there — there's
-no `where kind = ...` and no index on `kind`. So even the durable store would
-over-fetch on `kind` for a shared memory+doc collection today. The indexed
-metadata filter is the one piece of real-database machinery that *neither* repo
-ships — the ANN index lives in buffr, the metadata-`kind` index lives nowhere.
-That's the honest state: aptkit's in-memory store has no ANN index and no
-metadata index; buffr adds the ANN index and an `app_id` pushdown but still no
-`kind` index.
-
----
+HNSW (Hierarchical Navigable Small World) became the default ANN index in pgvector 0.5+ because it offers better recall/latency than IVFFlat without a training step. The cosine-distance operator `<=>` and the `vector_cosine_ops` opclass must agree — index built for cosine, query ordered by cosine — or the index won't be used; buffr gets this right. Two knobs are left default and are the obvious next tuning target: `ef_construction` (build-time graph quality) and `ef_search` (query-time candidate breadth, which trades recall for latency). Raising `ef_search` is the lever if retrieval starts missing relevant chunks. Read next: 04 for how the planner actually executes this query and the N+1 risk on the index side.
 
 ## Interview defense
 
-**Q: "How do you look up a stored run, and what happens when you need to
-query by something other than time?"**
-
-> Time is free — filenames start with an ISO timestamp, so `.sort()` on
-> filenames is a chronological index with zero maintenance. Anything else is a
-> full scan: to find runs by `capabilityId` I read and parse every file. The
-> fragile part people miss is that the "index" is a *string* sort that only
-> equals a *date* sort because ISO-8601 is zero-padded — change the filename
-> format and the order silently breaks with no error.
+**Q: Why two index types on one table?**
 
 ```
-  filenames:  2026-06-18T16-45-...  ┐  string sort == time sort
-              2026-06-18T19-29-...  ┘  ONLY while ISO-prefixed & zero-padded
+  question shape  →  index
+  "id = x"        →  b-tree (exact)         ← upsert
+  "app_id = x"    →  b-tree (exact)         ← tenant filter
+  "nearest(vec)"  →  HNSW (approximate)     ← the RAG search
 ```
 
-**Anchor:** "The index is `.sort()` at `replay-runner.ts:43` — and it's
-load-bearing on the filename format."
+Answer: "The table answers two question shapes. Upsert and the tenant filter are exact-match — b-trees, O(log n). But the RAG search is 'nearest 5 vectors,' which a b-tree fundamentally can't do; you need an ANN index, so it's HNSW with `vector_cosine_ops` to match the `<=>` cosine operator. Different questions, different structures (`001_agents_schema.sql:28-30`)." Anchor: *b-tree is exact, HNSW is nearest — the question picks the index.*
 
----
+**Q: What does HNSW cost you that a b-tree doesn't?**
 
-## Validate
-
-1. **Reconstruct:** Draw a B-tree point lookup, then draw AptKit's filename
-   sort, and label which queries each makes cheap.
-2. **Explain:** Why do `replay-runner.ts:43` and `vite.config.ts:983` agree on
-   ordering today, and what would make them disagree?
-3. **Apply:** You add 10,000 artifacts and need "all runs for provider=openai"
-   on every page load. Describe the current cost and the index you'd add.
-4. **Defend:** Argue why one filename-encoded index is the right amount of
-   indexing for AptKit now, and name the trigger to add a secondary index.
-
----
+Answer: "Two things. Write cost — inserting a vector rewires graph neighbor links, far pricier than a balanced-tree insert, and the upsert pays it per chunk. And correctness — HNSW is *approximate*; it can miss a true nearest neighbor. `ef_search` trades recall for latency, and we've left it at default, so we haven't tuned that tradeoff yet." Anchor: *HNSW trades write cost and exactness for sub-linear nearest-neighbor reads.*
 
 ## See also
 
-- `02-records-pages-and-storage-layout.md` — why a scan reads the whole record
-- `04-query-planning-and-execution.md` — the scan-and-filter "plan", the N+1,
-  the cosine top-k scan, and over-fetch-then-filter (the `kind` predicate that
-  can't be pushed down)
-- `08-replication-and-read-consistency.md` — the in-memory cursor as a lookup
-- `09-database-systems-red-flags-audit.md` — the vector store's no-durability
-  / linear-scan risk, ranked
-- `study-data-modeling` → the `createdAt`/`capabilityId` fields the index uses,
-  and the `VectorChunk` shape
+- `02-records-pages-and-storage-layout.md` — the `embedding` column the HNSW index covers.
+- `04-query-planning-and-execution.md` — how the planner runs the HNSW + filter query.
+- `09-database-systems-red-flags-audit.md` — the filtered-ANN and untuned-HNSW risks.
+- study-dsa-foundations — b-trees and graph search, the structures under these indexes.

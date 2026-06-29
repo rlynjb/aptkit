@@ -1,65 +1,68 @@
-# Study — Data Modeling · AptKit
+# Study — Data Modeling (aptkit + buffr)
 
-The question this guide answers: **does the data's shape match how it's actually read and written — and can it stay correct over time?**
+The question this guide answers: **does the data's shape match how it's
+actually read and written — and can it stay correct?**
 
-Before anything else, the honest verdict: **AptKit has no SQL/relational database.** No ORM, no migrations, no foreign keys, no SQL DDL. So if you came here for "show me the schema and the migration files," there are none, and you should not pretend otherwise in an interview.
-
-But "no relational database" is not "no data model." AptKit has a data model that is *type-shaped*, *file/stream-shaped*, and — since `@aptkit/retrieval` landed — *store-shaped*. The `@aptkit/retrieval` package adds the repo's first genuine corpus: a vector store that models a corpus as `(id, vector, meta)` rows you `upsert` and `search` (in-memory now, the same shape as pgvector). That's covered in `06-vector-store-row-model.md`. And `@aptkit/memory` now puts a *second kind of row* — a remembered conversation turn — into that **same store**, told apart from documents only by a `kind` tag: a logical partition over one physical collection. That's `07-memory-row-model.md`, and it's the richest data-modeling case in the repo. Four things carry the modeling weight:
+This repo has *two* data models, and the interesting part is the seam
+between them. aptkit defines vendor-neutral, in-memory shapes
+(`VectorChunk`, `VectorHit`, memory rows, the `CapabilityEvent` trace).
+buffr is the deployment "body" that turns those shapes into a persistent
+Postgres `agents` schema (`documents`, `chunks` with a pgvector column,
+`conversations`, `messages`, `profiles`). The schema is shaped to be a
+*drop-in implementation of aptkit's `VectorStore` contract* — and that
+single design pressure explains almost every non-obvious choice in the
+DDL (the dropped FK, the JSON `meta` bag, the rebuilt-on-read shape).
 
 ```
-  AptKit's data model — where the schema actually lives
+  the two-model seam — where this guide lives
 
-  ┌─ TYPE schema (compile-time) ───────────────────────────────┐
-  │  WorkspaceDescriptor   — the domain entity model           │
-  │  CapabilityEvent       — the event-log (tagged union)      │
-  │  ModelRequest/Response — the provider wire schema          │
-  │      packages/context, packages/runtime                    │
-  └────────────────────────┬───────────────────────────────────┘
-                           │ serialized to disk as JSON
-  ┌─ FILE schema (on disk) ▼────────────────────────────────────┐
-  │  artifacts/replays/*.json     — versioned read-models       │
-  │  packages/agents/*/fixtures/  — recorded inputs + baselines │
-  │      schemaVersion: 1  ← the migration story lives here     │
-  └────────────────────────┬───────────────────────────────────┘
-                           │ validated against
-  ┌─ INTEGRITY layer ──────▼────────────────────────────────────┐
-  │  packages/evals/{assertions,structural-diff}.ts             │
-  │      shape assertions = the constraint layer the DB would   │
-  │      normally enforce (NOT NULL, type, required path)       │
-  └──────────────────────────────────────────────────────────────┘
-
-  ┌─ STORE schema (in-memory rows — TWO kinds, ONE store) ──────┐
-  │  VectorChunk { id, vector, meta } / VectorHit { id,score,…} │
-  │      packages/retrieval — document rows  "<docId>#<i>"      │
-  │      packages/memory    — memory rows    "memory:<cid>:<n>" │
-  │      meta.kind = the soft partition splitting the two       │
-  │      dimension = the first WRITE-time CHECK constraint      │
-  └──────────────────────────────────────────────────────────────┘
+  ┌─ aptkit (deployment-agnostic, in-memory) ───────────────┐
+  │  VectorChunk {id, vector:number[], meta}                │
+  │  VectorHit   {id, score, meta}                          │
+  │  MemoryTurn / MemoryHit   (meta.kind='memory')          │
+  │  CapabilityEvent  (discriminated union, NDJSON)         │
+  └───────────────────────────┬─────────────────────────────┘
+                              │  VectorStore contract
+                              │  (upsert / search)
+  ┌─ buffr (Supabase Postgres "body") ─▼────────────────────┐
+  │  agents.documents · agents.chunks (vector(768)+HNSW)    │
+  │  agents.conversations · agents.messages · agents.profiles│
+  │  PgVectorStore implements VectorStore, rebuilds meta     │
+  └──────────────────────────────────────────────────────────┘
 ```
 
-The TypeScript compiler is the schema enforcer at write time; `packages/evals` is the constraint enforcer at read time; `schemaVersion: 1` is the only versioning primitive in the whole repo. The one exception to "no write-time enforcement" is `@aptkit/retrieval`'s dimension check — the first invariant in the repo that fires synchronously, on write, with a throw (see `06`).
+## Two partition seams (what's NOT in this guide)
 
-## The two partition seams
-
-This guide is data **shape**. Two neighbors own the things it does not:
-
-- **vs `study-system-design`** — "should AptKit use Postgres? shard by tenant? add a replica? move the vector store to pgvector + an ANN index? *where* should the memory/document partition filter run — client over-fetch or SQL `WHERE`?" is *architecture* and lives there. "This artifact is shaped wrong / this read-model duplicates a fact / this corpus row should be `(id, vector, meta)` / memory and documents should be told apart by a `kind` tag" is *shape* and lives here. AptKit's storage choices (flat JSON files on disk; an in-memory `Map` for the corpus, shared by documents and memory) are system-design calls; the *shape* of what goes in them is this guide.
-- **vs `study-software-design`** — normalization is information-hiding for data: one fact, one home, no duplication. That principle is taught in `study-software-design`'s information-hiding concept; this guide *applies* it to the data (and finds a real duplication, see `02-tagged-union-event-log.md` and the audit) rather than re-teaching the principle.
+- **vs `study-system-design`** — *which* datastore and how it scales
+  (Postgres choice, Supabase, sharding, replicas) is architecture → that
+  guide. *How the table is shaped and indexed* is here.
+- **vs `study-database-systems`** — the HNSW index *as a storage-engine
+  mechanism* (graph layout, recall/latency knobs) is engine-internals →
+  that guide. *Whether the index matches the query* is here.
+- **vs `study-dsa-foundations`** — the in-memory cosine scan as an
+  algorithm is DSA. The on-disk vector column + index is data modeling.
+- Normalization is information-hiding for data (single source of truth).
+  The CODE analog lives in `study-software-design`; not re-taught here.
 
 ## Reading order
 
-1. **`00-overview.md`** — the whole data model in one diagram; the entity model drawn from the real types; the honest "no DB" framing.
-2. **`audit.md`** — the seven data-modeling lenses walked against AptKit. Most come back `not yet exercised` (you have no DB). This file is where the honesty lives, and where each relational concept is mapped to its nearest in-repo analog.
-3. **The discovered pattern files** — the modeling that AptKit *does* exercise, each load-bearing:
+```
+  00-overview.md                          one-page orientation + schema map
+  audit.md                                Pass 1 — the 7-lens audit, this repo
 
-| File | Pattern | What it is |
-| --- | --- | --- |
-| `01-type-as-schema.md` | type-as-schema | TypeScript types as the domain schema (`WorkspaceDescriptor`, the wire types) — the relational-table analog |
-| `02-tagged-union-event-log.md` | tagged-union event log | `CapabilityEvent` discriminated union — an append-only event-log schema |
-| `03-versioned-artifact-schema.md` | versioned artifact schema | `schemaVersion: 1` on replay artifacts — the migration story, made explicit |
-| `04-fixture-promotion-lifecycle.md` | fixture promotion lifecycle | live run → artifact → promoted fixture — a data-lifecycle / versioning pattern |
-| `05-structural-diff-integrity.md` | structural-diff integrity | `assertions.ts` + `structural-diff.ts` — the integrity-constraint layer over the artifacts |
-| `06-vector-store-row-model.md` | vector-store row model | `@aptkit/retrieval`'s `VectorChunk`/`VectorHit` — the repo's first store-shaped model: `(id, vector, meta)` rows, deterministic ids `"<docId>#<i>"`, soft docId linkage, dimension-as-invariant |
-| `07-memory-row-model.md` | memory row model | `@aptkit/memory`'s remembered turns — a *second* row kind in the SAME store: composite id `"memory:<convId>:<n>"`, the `kind` discriminator as a soft partition, over-fetch-then-filter recall forced by no metadata index |
+  Pass 2 — the patterns this repo actually exercises:
+  01-dropped-fk-for-drop-in-parity.md     the FK that was deliberately removed
+  02-metadata-as-json-bag.md              meta jsonb vs typed columns
+  03-embedding-dimension-one-way-door.md  the dimension integrity constraint
+  04-app-id-tenancy-without-rls.md        soft multi-tenancy, no RLS yet
+  05-kind-tag-logical-partition.md        memory + docs in one collection
+  06-trace-as-append-only-log.md          agents.messages as the trajectory
+```
 
-Each pattern file uses the full concept template: zoom out → structure pass → how it works → implementation in the real code → interview defense → validate.
+## Cross-links
+
+- `study-system-design` — the provider/retrieval-neutral seams, the
+  aptkit↔buffr split as architecture.
+- `study-database-systems` — pgvector HNSW internals, transactions.
+- `study-security` — `app_id` tenancy and the deferred RLS gap
+  (04 here cross-links there; the security audit owns the trust call).

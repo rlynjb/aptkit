@@ -1,317 +1,186 @@
-# 09 — Chain-of-thought
+# 09 — Chain-of-thought (CoT)
 
-**Industry name(s):** chain-of-thought / reasoning prompting / structured
-reasoning. **Type:** Industry standard.
+**Industry name:** chain-of-thought / step-by-step reasoning — *Industry standard*
 
 ## Zoom out, then zoom in
 
-Some tasks need the model to reason step by step before answering; some don't, and
-asking for reasoning there just burns tokens. AptKit's diagnostic agent is the
-reasoning case — it must generate competing hypotheses, test them, and conclude.
-Its intent classifier is the opposite — one word, no reasoning. Look at where
-reasoning is asked for and where it's banned.
+"Let's think step by step" was the magic phrase of 2023. In 2026 it's more
+nuanced: frontier models reason internally now, so explicitly asking for CoT
+helps cheaper models (like the Gemma this repo defaults to) more than it helps
+the big ones. The trap I've hit: asking for reasoning on a *simple* task wastes
+tokens and, worse, asking for free-form reasoning when you also need structured
+output pollutes your JSON. **The discipline: prompt for reasoning where the task
+is genuinely multi-step, and when you need both reasoning and a structured
+answer, put the reasoning in a field of the structured output — never in
+free-form prose around it.**
 
 ```
-  Zoom out — where reasoning is invited vs suppressed
+  Zoom out — reasoning in the agent prompts
 
-  ┌─ Agent layer ───────────────────────────────────────────────┐
-  │  ★ diagnostic → "Generate 2-3 hypotheses before the first ★  │ ← reasoning invited
-  │     tool call" + hypothesesConsidered[] in output            │
-  │  intent classify → "Reply with ONLY the one word"            │ ← reasoning suppressed
-  └───────────────────────────┬──────────────────────────────────┘
-                             │  reasoning lands in a JSON field, not loose prose
-  ┌─ Runtime/Eval layer ─────▼──────────────────────────────────┐
-  │  hypothesesConsidered drives confidence inference            │
-  └───────────────────────────────────────────────────────────────┘
+  ┌─ Authoring ───────────────────────────────────────────────┐
+  │  diagnostic.ts: "Generate 2-3 hypotheses BEFORE the first  │ ← we are here
+  │     tool call" + "Recommended approach: 1. ... 2. ..."     │
+  │  rubric-judge: reasoning field IN the structured output    │
+  └───────────────────────────┬────────────────────────────────┘
+  ┌─ Runtime ─────────────────▼────────────────────────────────┐
+  │  agent loop: reasoning happens across turns (think→tool→...)│
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-Now zoom in. The pattern: when a task is multi-step, prompt for the reasoning —
-but capture it in a *structured field*, not free prose, so you keep both the
-reasoning and a parseable answer. When a task is a simple lookup or classifier,
-skip reasoning entirely. The diagnostic agent's `hypothesesConsidered` array is
-chain-of-thought made structured and gradeable.
+Zoom in: the diagnostic agent is the repo's clearest CoT — its prompt
+*sequences* the reasoning ("generate hypotheses, then query to falsify each").
+The rubric judge shows the structured-CoT move: a `reasoning` field inside the
+validated JSON, not loose prose.
 
-## Structure pass
+## The structure pass
 
-**Layers.** Two: the *reasoning request* (the prompt's "generate hypotheses first"
-step) and the *captured reasoning* (the `hypothesesConsidered` field in the typed
-output).
+**Layers:** the prompt (asks for or forbids reasoning) → the model (emits
+reasoning, internally or visibly) → the consumer (must not choke on the
+reasoning).
 
-**Axis — held constant: "does this task benefit from explicit reasoning?"**
+**Axis — is reasoning free-form prose or a structured field?** This is the axis
+that decides whether CoT and structured output can coexist:
 
 ```
-  One question across tasks: reason explicitly or not?
+  Axis: "where does the reasoning go?"
 
-  ┌─ diagnostic ──────────────┐  → YES: multi-step, hypotheses tested → CoT helps
-  │ "2-3 hypotheses first"    │
-  └───────────────────────────┘
-  ┌─ intent classify ─────────┐  → NO: one-word lookup → CoT wastes tokens
-  │ "ONLY the one word"       │
-  └───────────────────────────┘
-  ┌─ recommendation ──────────┐  → MIXED: reason from diagnosis, but output is the actions
+  ┌─ Free-form CoT prose ──┐   seam    ┌─ Structured reasoning field ─┐
+  │ "Let's think... <prose>│ ══╪══════► │ {"reasoning":"...",          │
+  │  then {json}"          │ flips     │  "verdict":"pass", ...}      │
+  │ → POLLUTES the parser  │           │ → parser-safe, still reasons │
+  └────────────────────────┘           └───────────────────────────────┘
 ```
 
-**Seam — reasoning into a field.** The load-bearing seam is where reasoning meets
-output. In the diagnostic agent it flips from "think freely" to "but emit your
-thinking as `hypothesesConsidered`, not loose prose." That seam is what lets you
-have reasoning *and* a structured answer the parser can read.
+**Seam:** the boundary between reasoning and answer. If reasoning is free-form
+prose wrapped around a JSON object, `parseAgentJson` has to carve the JSON out of
+the prose (it can, via substring scan — `json-output.ts:17` — but it's fragile).
+If reasoning is a *field*, the whole output is one clean object. **What breaks at
+the seam:** "think step by step, then return JSON" produces prose-then-JSON that
+fights your structured-output contract.
 
 ## How it works
 
-#### Move 1 — the mental model
+### Move 1 — the mental model
 
-You already separate working notes from the final commit message: the scratch
-thinking helps you, but the commit message is the artifact. Chain-of-thought with
-structured output does the same — the reasoning helps the model, but you capture
-it in a named field instead of letting it pollute the answer you parse.
-
-```
-  Reasoning into a structured field — the pattern
-
-  prompt: "Generate hypotheses, test them, then conclude."
-        │
-        ▼  model reasons...
-  output: { conclusion, evidence,
-            hypothesesConsidered: [ {hypothesis, supported, reasoning} ] }
-                                       │
-                                       └─ the reasoning lives HERE, parseable,
-                                          not in loose prose before the JSON
-```
-
-#### Move 2 — the walkthrough
-
-**Prompt for reasoning when the task is multi-step.** The diagnostic prompt's
-"Recommended approach" is an explicit CoT scaffold: "1. Generate 2-3 hypotheses
-before the first tool call. 2. Query to falsify each hypothesis. 3. ... 4. Conclude
-with the hypothesis that best fits." This forces the model to reason before acting,
-which for root-cause investigation measurably improves the conclusion. **Breaks if
-missing:** the model jumps to the first plausible cause without considering
-alternatives — the single-hypothesis trap.
+You already do this in code reviews: you don't want just the answer, you want the
+reasoning that justifies it — but you want it in a structured place (the PR
+description), not scrawled across the diff. CoT is asking the model to show its
+work; structured CoT is giving the work a designated field so it doesn't bleed
+into the answer.
 
 ```
-  CoT scaffold — reason before acting
+  Pattern — reasoning placement
 
-  1. hypotheses first  →  2. query to falsify  →  3. locate the change in time
-                                                →  4. conclude with best fit
-        │
-        └─ step 1 BEFORE any tool call is the load-bearing part: it forces
-           consideration of alternatives, not commitment to the first guess
+  TASK simple?  ──► skip CoT (wastes tokens)
+  TASK multi-step + prose output? ──► "think step by step" inline
+  TASK multi-step + structured output? ──► reasoning as a FIELD:
+       { "reasoning": "...", "answer": ... }   ← one object, parser-safe
 ```
 
-**Capture the reasoning in a field, not loose prose.** The diagnostic output shape
-has `hypothesesConsidered: [{ hypothesis, supported, reasoning }]`. The model's
-step-by-step thinking goes *there*, structured, while `conclusion` holds the
-answer. This is the interaction with output validation: you want reasoning AND a
-parseable answer, so the reasoning becomes a field. **Breaks if missing:** loose
-chain-of-thought prose before the JSON either gets parsed as garbage or forces you
-to choose between reasoning and structure.
+### Move 2 — walking the two reasoning styles
 
-**The reasoning becomes a gradeable signal.** Because hypotheses are structured,
-the diagnostic agent infers confidence from them: high confidence requires at least
-one supported hypothesis AND every hypothesis tested (non-empty reasoning); errors
-during tool calls downgrade high to medium. The captured reasoning isn't just for
-the model — it drives a downstream decision. **Breaks if missing:** confidence
-would be the model's self-report, not derived from whether it actually tested its
-hypotheses.
+**Sequenced CoT (the diagnostic agent).** `diagnostic.ts:17` lays out a
+"Recommended approach": *"1. Generate 2-3 hypotheses before the first tool call.
+2. Query to falsify each hypothesis. 3. … 4. Conclude with the hypothesis that
+best fits the evidence."* This is CoT as an explicit procedure — the prompt
+doesn't just say "reason," it scripts the reasoning steps. **Why here:** root-cause
+diagnosis *is* multi-step (hypothesize → test → conclude), so the reasoning
+earns its tokens. **What breaks without it:** the model jumps to a conclusion and
+never falsifies competing hypotheses — the single-hypothesis trap.
 
-```
-  hypothesesConsidered drives confidence
+**Cross-turn CoT (the agent loop).** In `runAgentLoop`, reasoning is distributed
+across turns: the model emits a thought, calls a tool, sees the result, reasons
+again (`run-agent-loop.ts:98` loop). Each assistant turn's text is the visible
+reasoning, traced as a `step` event (`:128`). The loop *is* a chain-of-thought
+spread over tool calls — the ReAct pattern (see `../study-agent-architecture/`).
 
-  supported >= 1 AND all tested  → high
-  supported >= 1                 → medium
-  none supported                 → low
-  (any tool error)               → downgrade high → medium
-        │
-        └─ structured reasoning is auditable; the code checks the model's work
-```
-
-**Suppress reasoning for classifiers.** The intent classifier says "Reply with
-ONLY the one word" and caps `maxTokens` at 16. No reasoning, no preamble — a
-one-word lookup doesn't benefit from CoT, and asking for it would waste tokens and
-risk a verbose answer the parser has to strip. **Breaks if missing:** a classifier
-that "thinks out loud" returns "Well, this seems like a diagnostic question
-because..." and your `parseIntent` keyword match gets noisier.
-
-#### Move 2.5 — current state vs the modern caveat
+**Structured reasoning (the rubric judge).** The judgment shape includes a
+`reasoning` field and a per-dimension `reason` (`rubric-judge.ts:46`,
+`RubricJudgment`). The reasoning lives *inside* the validated JSON:
 
 ```
-  Then (CoT as explicit prompt)        Now (frontier models)
-  ────────────────────────────        ──────────────────────
-  "think step by step" required        models do CoT internally
-  cheaper models still need it         reasoning models reason unprompted
-  diagnostic scaffold = explicit CoT   the scaffold still shapes the OUTPUT structure
+  Inline annotation — rubric-judge.ts:135 output shape
+
+  const outputShape = {
+    dimensions: { <dim>: { score: 0, reason: '' } },  ← per-dimension reasoning
+    verdict: '...',
+    fix: '',
+    reasoning: '',                                     ← overall reasoning, a FIELD
+  };
+  // → the model reasons AND returns clean JSON; parser never sees loose prose
 ```
 
-The modern caveat the spec names: frontier models do chain-of-thought internally
-now, so asking for it explicitly is less necessary than it was for the *quality* of
-reasoning. But the diagnostic agent's scaffold earns its place anyway — it's not
-just asking the model to think, it's *structuring what the model emits*
-(`hypothesesConsidered`), which a model's internal reasoning doesn't give you. The
-scaffold survives the model upgrade because it shapes output, not just cognition.
+This is the move the spec calls out: want both reasoning and a structured answer?
+The reasoning goes in a field, not in free prose. The validator (`:206`) even
+checks `reasoning` is a string when present.
 
-#### Move 3 — the principle
+**When CoT hurts.** The intent classifier (`intent.ts:19`) deliberately forbids
+reasoning: *"Reply with ONLY the one word"* with `maxTokens: 16`. Asking a
+one-word classifier to reason would waste tokens and risk it emitting the
+reasoning instead of the label (an output-mode mismatch, concept 07). Simple
+lookups and structured classifiers should *suppress* CoT.
 
-Reason explicitly only where the task is multi-step, and when you do, capture the
-reasoning in a structured field so you keep both the thinking and a parseable
-answer. For lookups and classifiers, suppress reasoning — it's pure token cost. On
-frontier models the quality benefit of explicit CoT shrinks, but the
-output-structuring benefit (reasoning as a field) does not.
+### Move 3 — the principle
+
+**Reasoning is a token spend you make only when the task is multi-step, and you
+give it a structured home when you also need a parseable answer.** The modern
+caveat matters: on frontier models internal reasoning means explicit CoT buys
+less than it used to, but on the cheaper local models this repo targets (Gemma)
+it still pays. The durable rule is placement — free-form CoT and structured
+output don't mix, so route the reasoning into a field.
 
 ## Primary diagram
 
-The diagnostic agent's structured CoT, end to end.
-
 ```
-  Diagnostic agent — structured chain-of-thought
+  Chain-of-thought — placement decision across the repo
 
-  prompt scaffold:
-    "1. Generate 2-3 hypotheses before the first tool call
-     2. Query to falsify each   3. locate change in time   4. conclude"
-        │
-        ▼  bounded tool loop (maxToolCalls 6)
-  output (validated):
-    { conclusion: "...",
-      evidence: ["..."],
-      hypothesesConsidered: [ {hypothesis, supported, reasoning} ] }  ← CoT captured here
-        │
-        ▼  diagnosisConfidence(diagnosis)
-    supported≥1 & all tested → high  | supported≥1 → medium | else low
-        │  (any tool error → downgrade high→medium)
-        ▼
-    Diagnosis { ..., confidence }
-```
+  intent classifier      → NO CoT  ("one word only", maxTokens:16)
+                            simple task, reasoning would waste/pollute
 
-## Implementation in codebase
+  diagnostic agent        → SEQUENCED CoT in the prompt
+                            "1. hypothesize 2. falsify 3. locate 4. conclude"
 
-**Use cases.** The diagnostic agent is the structured-CoT case. The intent
-classifier is the suppressed-reasoning case. Recommendation reasons internally but
-outputs only the actions.
+  agent loop (any)        → CROSS-TURN CoT (think → tool → think), ReAct
+                            each assistant turn = a reasoning step (trace)
 
-The CoT scaffold in the diagnostic prompt:
-
-```
-  packages/prompts/src/diagnostic.ts  (lines 16–21)
-
-  Recommended approach:
-  1. Generate 2-3 hypotheses before the first tool call.
-  2. Query to falsify each hypothesis.
-  3. Spend one call locating when the change happened with a time-series query...
-  4. Conclude with the hypothesis that best fits the evidence.
-       │
-       └─ step 1 "before the first tool call" forces consideration of alternatives.
-          This is CoT as an explicit scaffold, not a vibe.
-```
-
-The structured reasoning field in the output contract:
-
-```
-  packages/prompts/src/diagnostic.ts  (lines 30–38)
-
-  { "conclusion": "string", "evidence": ["string"],
-    "hypothesesConsidered": [ { "hypothesis": "string", "supported": true, "reasoning": "string" } ],
-    ... }
-       │
-       └─ reasoning lives in a field, parseable, not as loose prose. This is the
-          reasoning-AND-structure interaction (02) made concrete.
-```
-
-The reasoning driving a real decision — confidence inference:
-
-```
-  packages/agents/diagnostic-investigation/src/diagnostic-agent.ts  (lines 82–98)
-
-  const diagnosis = parsed ?? FALLBACK_DIAGNOSIS;
-  const confidence = diagnosisConfidence(diagnosis);
-  const hadErrors = toolCalls.some((call) => call.error);
-  return { ...diagnosis, confidence: confidence === 'high' && hadErrors ? 'medium' : confidence };
-  ...
-  export function diagnosisConfidence(diagnosis: Diagnosis): 'high'|'medium'|'low' {
-    const hypotheses = diagnosis.hypothesesConsidered ?? [];
-    const supported = hypotheses.filter((item) => item.supported).length;
-    const tested = hypotheses.filter((item) => item.reasoning.trim().length > 0).length;
-    if (supported >= 1 && tested === hypotheses.length) return 'high';   ← audits the CoT
-    if (supported >= 1) return 'medium';
-    return 'low';
-  }
-       │
-       └─ confidence is DERIVED from whether the model tested its hypotheses, not
-          self-reported. Structured reasoning is what makes that audit possible.
-```
-
-The opposite — reasoning suppressed for the classifier:
-
-```
-  packages/agents/query/src/intent.ts  (lines 17–23)
-
-  system: 'Classify the user query as exactly one word: monitoring (...),
-           diagnostic (...), or recommendation (...). Reply with ONLY the one word.',
-  messages: [{ role: 'user', content: query }],
-  maxTokens: 16,   ← no room to ramble; reasoning would be pure waste here
-       │
-       └─ a one-word lookup gains nothing from CoT. maxTokens 16 enforces brevity.
+  rubric judge            → STRUCTURED CoT: reasoning in a JSON FIELD
+                            {dimensions:{reason}, reasoning} — parser-safe
 ```
 
 ## Elaborate
 
-The diagnostic agent is a textbook case of why CoT survived the move to reasoning
-models: the value isn't only "the model thinks better when asked to," it's "I get
-the model's reasoning as structured data I can audit." `diagnosisConfidence` reads
-the `hypothesesConsidered` array and downgrades confidence when hypotheses weren't
-tested — that audit is impossible if the reasoning is loose prose or hidden inside
-the model's internal chain. So even as frontier models reason unprompted, the
-*output-structuring* half of this scaffold keeps earning its place.
-
-The honest note: AptKit doesn't use a separate "thinking" field that's discarded
-before parsing — the reasoning is load-bearing data (`hypothesesConsidered`),
-which is arguably better than a throwaway scratchpad. There's no use of provider
-extended-thinking modes either; the CoT is plain prompt scaffolding. For the
-cheaper models in the fallback chain (04), the explicit scaffold still does real
-work on reasoning quality, which is another reason it's worth keeping
-provider-neutral.
-
-Where it connects: 02 (reasoning-as-a-field is structured output), 06 (the
-diagnostic stage's single job is *why*, which is the reasoning-heavy stage), and 05
-(the confidence inference is a deterministic scorer on the model's own reasoning).
+The CoT result (Wei et al., 2022) showed step-by-step prompting unlocks
+multi-step reasoning in large models; the 2024–2025 shift is that
+reasoning-tuned models (the o-series, Claude's extended thinking) do this
+internally, so the *explicit* "think step by step" instruction is increasingly
+redundant on frontier models but still load-bearing on small/local ones. The
+structured-reasoning-field pattern is the production reconciliation of CoT with
+tool calling and JSON mode — Anthropic's guidance is exactly this: use a
+`<thinking>` region or a dedicated field so reasoning doesn't contaminate the
+answer. The agent loop here is the ReAct variant of CoT (reason+act
+interleaved), covered at depth in `../study-agent-architecture/`.
 
 ## Interview defense
 
-**Q: When does chain-of-thought help and when does it hurt?**
-Helps on multi-step problems — root-cause diagnosis, where the diagnostic agent
-generates and tests competing hypotheses before concluding. Hurts on simple
-lookups and classifiers, where it's pure token cost and risks a verbose answer the
-parser has to strip — so the intent classifier says "ONLY the one word" with
-`maxTokens` 16. On frontier models the reasoning-quality benefit shrinks, but if I
-capture reasoning in a structured field, the output-structuring benefit survives.
+**Q: You need the model to reason AND return JSON — how?** Put the reasoning in a
+field of the structured output (`{"reasoning": "...", "answer": ...}`), never as
+free-form prose around the JSON. Free prose + JSON fights your parser; a field
+keeps one clean object that still carries the reasoning.
 
 ```
-  multi-step  → CoT, captured in a field (hypothesesConsidered)
-  lookup      → suppress (ONLY the one word, maxTokens 16)
+  ✗ "think step by step\n\n{...}"   → parser carves JSON out of prose (fragile)
+  ✓ {"reasoning":"...", "verdict":"..."}  → one object, reasons + parses
 ```
-Anchor: "diagnostic scaffold `diagnostic.ts:16`; classifier `intent.ts:19`."
+*Anchor: `rubric-judge.ts:135` (reasoning field) vs `intent.ts:19` (no CoT).*
 
-**Q: Where does the reasoning go if you want it AND a parseable answer?**
-Into a structured field, not loose prose. The diagnostic output is
-`{ conclusion, evidence, hypothesesConsidered: [{hypothesis, supported,
-reasoning}] }` — the thinking is in the array, the answer in `conclusion`. Bonus:
-the code then audits it, deriving confidence from whether hypotheses were actually
-tested.
-Anchor: "`hypothesesConsidered` at `diagnostic.ts:33`, audited in
-`diagnosisConfidence`, `diagnostic-agent.ts:89`."
-
-## Validate
-
-- **Reconstruct:** Draw where reasoning goes when you want both reasoning and a
-  structured answer.
-- **Explain:** Why does `diagnosisConfidence` (`diagnostic-agent.ts:89`) check
-  `tested === hypotheses.length` rather than trusting a self-reported confidence?
-- **Apply:** You're adding a step to the diagnostic scaffold. Where in
-  `diagnostic.ts` does it go, and does it change the output shape?
-- **Defend:** A teammate adds "think step by step" to the intent classifier.
-  Argue against it using the `maxTokens: 16` constraint and the classifier's job.
+**Q: When does CoT hurt?** Simple lookups and structured classifiers — it wastes
+tokens and risks the model emitting reasoning where you wanted a bare label
+(output-mode mismatch). The intent classifier forbids it on purpose. On frontier
+models explicit CoT also buys less now that reasoning is internal.
 
 ## See also
 
-- [02-structured-outputs.md](02-structured-outputs.md) — reasoning as a JSON field.
-- [06-single-purpose-chains.md](06-single-purpose-chains.md) — the diagnostic stage is the reasoning-heavy one.
-- [05-eval-driven-iteration.md](05-eval-driven-iteration.md) — confidence inference as a scorer on reasoning.
-- [08-few-shot.md](08-few-shot.md) — the one-word classifier and its example.
+- `02-structured-outputs.md` — the structured output the reasoning field lives in.
+- `07-output-mode-mismatch.md` — free-form CoT + JSON is a mode collision.
+- `04-token-budgeting.md` — CoT is a deliberate token spend.
+- `../study-agent-architecture/` — the agent loop as ReAct-style CoT.

@@ -1,271 +1,277 @@
-# 08 — Sagas, outbox, cross-boundary workflows
+# 08 — Sagas, Outbox, and Cross-Boundary Workflows
 
-**Industry name(s):** distributed transactions / two-phase commit (2PC) / sagas
-/ compensating transactions / transactional outbox / event sourcing /
-reconciliation. **Type:** Industry standard.
-**Status in AptKit:** `not yet exercised` for sagas/2PC/outbox; the
-`CapabilityEvent` trace + deterministic replay are an **event-sourcing /
-recovery analog**.
+**Industry names:** dual write · saga · compensating transaction · transactional outbox · reconciliation · best-effort side-effect — *Industry standard.*
 
 ## Zoom out, then zoom in
 
-A saga coordinates a multi-step workflow that spans systems that *can't* share a
-transaction — when step 3 fails, you can't `ROLLBACK`, so you run *compensating*
-steps to undo 1 and 2. AptKit has no such workflow: there's one external call per
-turn, no second system to commit to, nothing to compensate. But it *does* have
-the building block sagas are built on — an append-only event log (the trace) and
-the ability to replay it deterministically. That's the event-sourcing substrate,
-used here for testing rather than for recovery or compensation.
+A saga is what you reach for when one logical operation spans *multiple systems* that
+can't share a single transaction. The repo has one real instance: `indexDocumentRow`
+writes a `documents` row to Postgres, then calls `pipeline.index()` which embeds via
+Ollama and upserts chunks in a *separate* transaction. That's a **dual write** — two
+commits, no shared atomicity — and it's the latent saga seam (finding #3). Full
+sagas with compensation and a transactional outbox are `not yet exercised`; this file
+shows the seam where they'd attach.
 
 ```
-  Zoom out — where cross-boundary workflows would live
+  Zoom out — the one multi-system workflow
 
-  ┌─ Service layer ──────────────────────────────────────────────┐
-  │  CapabilityEvent trace ── append-only log (event-sourcing analog)│ ← real analog
-  │  replay-runner + FixtureModelProvider ── deterministic re-run    │ ← recovery analog
-  └─────────────────────────────┬────────────────────────────────┘
-                               │ complete() — ONE external call/turn
-  ┌─ Provider boundary ─────────▼────────────────────────────────┐
-  │  no second system to commit to → no saga, no 2PC, no outbox    │
-  └───────────────────────────────────────────────────────────────┘
+  ┌─ buffr: indexDocumentRow(doc) ──────────────────────────────────────┐
+  │  STEP 1: insert agents.documents row ──── commit #1 (Postgres)       │ ← write A
+  │  STEP 2: pipeline.index(doc):                                        │
+  │            embed(text) ──── Ollama HTTP (can fail/hang)              │ ← network call
+  │            store.upsert(chunks) ──── commit #2 (Postgres txn)         │ ← write B
+  └──────────────────────────────┬───────────────────────────────────────┘
+                                 │  ★ no transaction spans STEP 1 and STEP 2 ★
+  ┌─ Postgres ───────────────────▼───────────────────────────────────────┐
+  │  documents row committed; chunks may or may not follow                │ ← we are here
+  └─────────────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: **2PC** tries for atomicity across systems (prepare → commit) but blocks
-forever if the coordinator dies — so distributed systems mostly avoid it.
-**Sagas** replace atomicity with *compensation*: do step, record it; on failure,
-run the inverse of each completed step. **Transactional outbox** solves the
-"write to DB *and* publish a message atomically" problem by writing the message
-into the same DB transaction, then relaying it. **Event sourcing** stores state
-as an append-only log of events and rebuilds state by replaying them. AptKit
-touches only the last one, and only for tests.
+Zoom in: a single ACID transaction guarantees all-or-nothing — but only *within one
+database*. The moment a workflow touches a second system (a second DB, an HTTP
+service, a queue), you can't wrap them in one transaction, so you get a **partial
+commit**: step 1 succeeds, step 2 fails, and now the systems disagree. A **saga** is
+the pattern for that: break the workflow into steps, and for each step define a
+**compensating action** that undoes it if a later step fails.
 
-## Structure pass — layers, axis, seam
+## Structure pass
 
-Trace the **state axis** — "how is state recorded, and can it be reconstructed?":
+**Layers.** The workflow (`indexDocumentRow`) → step 1 (Postgres write) → step 2
+(Ollama embed + Postgres write).
+
+**Axis — trace `atomicity` across the workflow's steps.**
 
 ```
-  "how is state recorded and reconstructed?" — down the layers
+  Axis — "is this all-or-nothing?" — within a step vs across steps
 
-  ┌────────────────────────────────────────────┐
-  │ CapabilityEvent trace                       │ → APPEND-ONLY log of what happened.
-  │                                             │   never mutated, only emitted.
-  └────────────────────┬───────────────────────┘
-      ┌────────────────▼─────────────────────────┐
-      │ replay artifacts (artifacts/replays/*.json)│ → the log persisted; the
-      │                                            │   recorded ModelResponse[] is the
-      │                                            │   "event store" to replay from
-      └────────────────┬───────────────────────────┘
-          ┌────────────▼─────────────────────────┐
-          │ FixtureModelProvider replay           │ → re-execute from the log →
-          │                                       │   deterministic reconstruction
-          └───────────────────────────────────────┘
+  ┌─ STEP 2's chunk upsert (PgVectorStore) ────┐
+  │  begin / inserts / commit / rollback        │  → ATOMIC within itself ✓
+  └──────────────────────┬──────────────────────┘   (file 03's transaction)
+       ┌─────────────────▼────────────────────────┐
+       │ STEP 1 + STEP 2 together                  │  → NOT atomic ✗
+       └─────────────────┬────────────────────────┘   (two separate commits)
+            ┌────────────▼──────────────────────────┐
+            │ if STEP 2 fails after STEP 1 committed │  → orphan: doc with no chunks
+            └─────────────────────────────────────────┘
 ```
 
-The seam is the boundary between *recording* (emit events) and *replaying*
-(re-execute from the record). The state axis flips across it: on the recording
-side, state is mutable and live; on the replay side, it's a frozen log you
-deterministically re-derive output from. That flip is the event-sourcing pattern,
-even though AptKit uses it to make non-deterministic agents testable rather than
-to recover production state.
+**Seam.** Atomicity holds *inside* each step (the chunk upsert is a clean
+transaction) but is *lost between* the steps — there's no transaction, saga, or
+outbox spanning the documents-write and the chunks-write. That gap between steps is
+where a partial commit lives, and it's the exact seam a saga or outbox would close.
 
 ## How it works
 
-### Move 1 — the mental model: undo by doing the opposite
+### Move 1 — the mental model: a saga is a transaction you have to undo by hand
 
-You know transactions from a DB: `BEGIN ... COMMIT`, and on error `ROLLBACK`
-erases everything. A saga is what you do when the steps span systems that have no
-shared `ROLLBACK` — you record each completed step and, on failure, run its
-*compensating* action (the manual undo).
-
-```
-  Saga — compensation instead of rollback (general)
-
-  step 1: reserve inventory   ──ok──►  step 2: charge card  ──ok──► step 3: ship
-       │                                    │                            │ FAIL
-       │  on step-3 failure, run compensations IN REVERSE:               │
-       └─ unreserve inventory ◄── refund card ◄─────────────────────────┘
-
-  no global ROLLBACK exists across 3 systems → you UNDO each completed step.
-```
-
-The load-bearing part people forget: **every forward step needs a defined
-compensating step** — and compensation can itself fail, so it must be idempotent
-and retryable (back to `03`). A saga with a missing or non-idempotent compensation
-is a saga that strands state.
-
-### Move 2 — the event-sourcing analog, and the absences
-
-**The analog: trace as event log + replay as reconstruction.** AptKit records
-what happened as a stream of `CapabilityEvent`s (append-only, never mutated),
-persists the model responses into an artifact, and can re-execute the whole
-capability deterministically by feeding those recorded responses back through a
-`FixtureModelProvider`. Same log → same output. That's the event-sourcing
-recovery shape: don't store the *result*, store the *events*, and rebuild by
-replaying.
+A database transaction gives you `ROLLBACK` for free — fail anywhere, everything
+reverts. Across systems you lose that, so a saga gives each step an *explicit undo*.
+You know this shape from a multi-step form with a "back" button that has to clean up
+what each step created: book the flight, book the hotel, charge the card — and if the
+charge fails, *cancel the hotel and cancel the flight* (the compensations), because
+the database can't roll them back for you.
 
 ```
-  Event sourcing analog — record events, rebuild by replay
+  The saga kernel — forward steps, each with a compensation, undo in reverse
 
-  LIVE RUN:    loop ──emits──► [step, tool_call, model_usage, ...]  ──persist──┐
-                                                                                │
-  ARTIFACT:    { provider, trace[], modelTurns[], output } ◄────────────────────┘
-                                  │ the recorded ModelResponse[] = the event store
-  REPLAY:      FixtureModelProvider returns recorded responses in order
-                                  │ deterministic re-execution
-                                  ▼
-               same output, every time — reconstruction from the log
+  forward:   step1 ──► step2 ──► step3 ✗ (fails here)
+                                  │
+  compensate: undo1 ◄── undo2 ◄───┘   (run compensations in REVERSE order)
+
+  the kernel: every step that has a side effect needs a matching "undo this step"
+              — because no ROLLBACK spans the systems
 ```
 
-Why this is genuinely the pattern and not a stretch: the artifact is the *source
-of truth*, the output is *derived* from replaying it, and replay is
-deterministic. Swap "tests" for "production recovery" and you have event sourcing
-verbatim. AptKit uses it to pin non-deterministic agents to a correctness
-baseline (promoted fixtures), which is arguably a *better* use than recovery.
+The load-bearing part: the *compensation*. Without it, a failed step 3 leaves steps 1
+and 2 applied — an inconsistent state with no automatic cleanup. That's exactly
+`indexDocumentRow`'s gap.
 
-**The absences (`not yet exercised`), each with its trigger:**
+### Move 2 — walking the mechanism
 
-- **Sagas / compensating transactions:** none. *Trigger: a multi-step workflow
-  with side effects across systems where a late step can fail (e.g. tool 1 posts
-  to system A, tool 2 to system B, and B fails).*
-- **2PC / distributed transactions:** none. *Trigger: a write that must commit
-  atomically across two stores — almost always the wrong choice; prefer a saga.*
-- **Transactional outbox:** none. *Trigger: needing to write to a DB and publish
-  an event atomically.*
-- **Reconciliation:** none. *Trigger: two systems holding related state that can
-  drift, needing a periodic job to detect and repair divergence.*
+**Step 1 — the dual write, exactly as written.** Here's the workflow. Two writes, no
+transaction between them:
+
+```ts
+// buffr/src/runtime.ts (indexDocumentRow)
+export async function indexDocumentRow(pool, appId, pipeline, doc): Promise<void> {
+  await pool.query(
+    `insert into agents.documents (id, app_id, source_type, source_path, content)
+     values ($1, $2, 'markdown', $3, $4)
+     on conflict (id) do update set content = excluded.content, ...`,   // ← COMMIT #1
+    [doc.id, appId, doc.sourcePath ?? null, doc.text],
+  );
+  await pipeline.index({ id: doc.id, text: doc.text });   // ← embed (Ollama) + COMMIT #2 (chunks)
+}
+```
+
+The annotation that matters: the `documents` insert commits *immediately* (it's a
+`pool.query`, auto-committed). Then `pipeline.index` runs — which calls Ollama to
+embed (a network call that can hang or fail, per file 02) and *then* upserts chunks in
+`PgVectorStore`'s own transaction. There is no `begin`/`commit` wrapping both. So if
+the embed throws, you've already committed a `documents` row that has no chunks.
+
+**Step 2 — the partial-commit failure, traced.** Walk what happens when step 2 fails:
+
+```
+  Layers-and-hops — partial commit when the embed fails
+
+  ┌─ indexDocumentRow ─┐  hop 1: insert documents  ┌─ Postgres ─┐
+  │                     │ ───────────────────────► │ documents  │ ← COMMITTED ✓
+  │                     │ ◄──── ok ──────────────── │  row exists│
+  │                     │                           └────────────┘
+  │  pipeline.index():  │  hop 2: embed(text)       ┌─ Ollama ───┐
+  │                     │ ───────────────────────► │  /api/embed│
+  │                     │ ◄──── ERROR / hang ────── │  fails ✗   │ ← step 2 dies here
+  │                     │                           └────────────┘
+  │  throws ✗           │  hop 3: upsert chunks     ┌─ Postgres ─┐
+  │  (never reached)    │      NEVER HAPPENS        │  chunks: 0 │ ← orphan: doc, no chunks
+  └─────────────────────┘                           └────────────┘
+
+  result: agents.documents has the row, agents.chunks has nothing → searchable doc
+          that returns no chunks. No rollback undid the documents write.
+```
+
+The document row exists but is *unsearchable* (no chunks to match a query). There's no
+compensation (no "delete the documents row if indexing failed") and no
+reconciliation (no background job that finds docs-without-chunks and re-indexes
+them). Today the blast radius is one local document and the caller sees the throw, so
+it's an acceptable trade — but it *is* a partial commit across two systems, which is
+the definition of the problem sagas solve.
+
+**Step 3 — the best-effort side-effect: a deliberate non-saga.** Contrast the
+`memory.remember` call (file 03/04), which is the *opposite* choice — explicitly
+accept the partial outcome:
+
+```ts
+// buffr/src/session.ts:64-69
+const answer = await agent.answer(question);
+await trace.flush();
+try {
+  await memory.remember({ conversationId, question, answer });   // ← step that may fail
+} catch {
+  // swallow: memory is best-effort, the turn already succeeded   ← NO compensation, BY DESIGN
+}
+return answer;
+```
+
+This is a saga step with the compensation deliberately set to *nothing*: if remember
+fails, don't undo the answer (the user already has it), don't retry, just drop it.
+That's a valid choice for a best-effort side-effect — the cost of losing one memory is
+low, the cost of failing the whole turn is high. Naming it as a *chosen* non-saga
+(rather than an oversight) is the point: not every cross-boundary step needs
+compensation; some side-effects are correctly fire-and-forget.
+
+### Move 2.5 — current state vs the saga/outbox it would become
+
+```
+  Phase A: today (dual write, sync, local)   Phase B: if indexing went async
+  ────────────────────────────────────────   ────────────────────────────────────
+  insert documents (commit #1)                insert documents + outbox row
+  embed + upsert chunks (commit #2)             IN ONE transaction (commit #1)
+  fail in step 2 → orphan doc                 worker reads outbox → embed → upsert
+  caller sees the throw                         chunks → mark outbox done
+                                              fail → outbox row stays → RETRIED
+  acceptable: 1 local doc, sync caller        reconciliation: orphans get fixed
+```
+
+The **transactional outbox** is the standard fix and it's elegant: instead of two
+separate commits, write the documents row *and* an "index this doc" outbox row in
+*one* transaction. A separate worker reads the outbox, does the embed+chunk-upsert,
+and marks the outbox row done. If the worker dies mid-way, the outbox row is still
+there, so it gets retried — at-least-once + idempotent upsert (file 03) =
+effectively-once indexing. The documents-write and the intent-to-index become atomic,
+which is exactly the guarantee the dual write lacks. It would attach the moment
+indexing moved off the request path.
 
 ### Move 3 — the principle
 
-**When you can't have a transaction across a boundary, you record what you did so
-you can undo it or rebuild it.** Sagas (compensation) and event sourcing
-(replay-to-rebuild) are two faces of that idea — both replace atomic guarantees
-with a durable log of steps. AptKit only has the log-and-replay face, and only
-for testing — but recognizing that the trace *is* an event store, and replay *is*
-reconstruction, is what lets you say "I'd add compensation on top of this the day
-a tool gets a side effect."
+A single transaction is the cheapest consistency you can buy — use it whenever the
+whole operation lives in one database. The moment an operation spans two systems, that
+free atomicity is gone and you face a choice: accept the partial commit (best-effort,
+like `remember`), compensate it (a saga), or make the *intent* atomic and process it
+reliably later (an outbox). The mistake is *not noticing you've crossed the boundary*
+— writing two commits as if they were one transaction and being surprised by the
+orphan. aptkit's dual write is fine at its scale, but the discipline is to *name* it
+as a dual write so the day it scales, you reach for the outbox deliberately.
 
 ## Primary diagram
 
 ```
-  Cross-boundary workflow landscape — AptKit's position
+  Cross-boundary workflows in aptkit — one dual write, one best-effort step
 
-  EVENT LOG + REPLAY (AptKit) ──── SAGA ──── 2PC ──── OUTBOX/RECONCILIATION
-   trace (append-only)             compensation       atomic write+publish
-   FixtureModelProvider replay     on failure
-      ▲                                ▲                      ▲
-      │                                │                      │
-   here: record events,         not yet exercised      not yet exercised
-   rebuild by deterministic     (trigger: multi-step    (trigger: write to 2
-   replay (used for TESTS)       side-effecting          stores that must agree)
-                                 workflow)
+  ┌─ indexDocumentRow (the dual write — finding #3) ────────────────────┐
+  │  STEP 1: insert documents ─── commit #1 ──────────► Postgres ✓       │
+  │  STEP 2: embed (Ollama) ──► upsert chunks ─ commit #2 ─► Postgres    │
+  │          │                                                           │
+  │          └─ if embed fails: STEP 1 already committed → ORPHAN doc    │
+  │             no compensation, no reconciliation (acceptable @ 1 doc)  │
+  └─────────────────────────────────────────────────────────────────────┘
+
+  ┌─ session.ask → memory.remember (the deliberate non-saga) ───────────┐
+  │  step that may fail, compensation = NONE (try/catch swallow)         │
+  │  best-effort by design: losing a memory < failing the turn          │
+  └─────────────────────────────────────────────────────────────────────┘
+
+  NOT YET: transactional outbox (atomic intent + retrying worker),
+           explicit compensating transactions, reconciliation jobs
 ```
-
-## Implementation in codebase
-
-**Use cases.** The trace is emitted on every agent run. Artifacts are written
-after live runs and consumed by the eval pipeline and Studio replay. Promoted
-fixtures (recorded `ModelResponse[]`) are the correctness baselines re-run
-deterministically.
-
-**The append-only event log.**
-
-```
-  packages/runtime/src/events.ts  (lines 1-28)
-
-  type CapabilityEvent = step | tool_call_start | tool_call_end
-                       | model_usage | warning | error;   ← the recorded vocabulary
-  type CapabilityTraceSink = { emit(event): void };        ← append-only: emit, never edit
-       │
-       └─ each event carries capabilityId + ISO timestamp. it's never mutated after
-          emission — that immutability is what makes it an event LOG, not a state blob.
-```
-
-**Deterministic replay — reconstruction from the log.**
-
-```
-  packages/agents/recommendation/src/fixture-provider.ts  (lines 11-17)
-
-  async complete(request) {
-    this.requests.push(request);
-    const response = this.responses[this.index];  ← next recorded event (ModelResponse)
-    this.index += 1;
-    if (!response) throw new Error('fixture model exhausted ...');  ← log fully consumed
-    return response;                              ← replay in recorded order → deterministic
-  }
-```
-
-**The replay driver — re-evaluate from persisted artifacts.**
-
-```
-  packages/evals/src/replay-runner.ts  (lines 30-94)
-
-  listReplayArtifacts(dir)          ← reads the event stores in deterministic order (sort)
-    → for each: readFile → JSON.parse → evaluateReplayArtifact(...)
-       └─ re-derives the eval verdict from the recorded log, not a live run.
-          re-running the same artifacts yields the same report — reconstruction.
-```
-
-**`not yet exercised`:** no compensating-action code, no `BEGIN/COMMIT` across
-systems, no outbox table, no reconciliation job. The trace records but never
-*compensates* — because there are no external side effects to undo (tools are
-read-only, per the project context's least-privilege policy).
 
 ## Elaborate
 
-Sagas come from a 1987 Garcia-Molina & Salem paper on long-lived transactions;
-they're now the default pattern for microservice workflows precisely because 2PC
-blocks on coordinator failure and doesn't scale. The transactional outbox is the
-standard fix for the "dual-write problem" (write DB + publish message without a
-distributed transaction). Event sourcing — store events, derive state by replay —
-underpins systems like Kafka-as-source-of-truth and CQRS architectures; AptKit's
-replay-from-recorded-responses is a small, honest instance of exactly that idea,
-turned toward deterministic testing. The reason AptKit needs no sagas is the same
-reason it needs no idempotency keys (`03`): its one external operation has no
-durable side effect to undo. Add a side-effecting tool and the whole saga
-apparatus becomes relevant overnight.
+The dual-write problem is one of the most common ways real systems end up
+inconsistent, precisely because it's invisible: each individual write looks correct,
+and the bug only appears when step 2 fails after step 1 commits. The transactional
+outbox became the standard answer because it sidesteps distributed transactions (2PC,
+which is slow and has its own failure modes) entirely — you only ever commit to *one*
+database per transaction, and the "second system" reads the outbox asynchronously.
+It's the pattern behind reliable event publishing in most modern services.
+
+Sagas (the term comes from a 1987 paper on long-lived database transactions) generalize
+this to multi-step workflows where each step has a compensation. The key insight that
+trips people up: compensations aren't perfect rollbacks — you can't un-send an email,
+so the compensation is "send a correction." Sagas trade strict atomicity for
+*eventual* consistency with explicit cleanup, which is usually the right trade when a
+true distributed transaction is too expensive. aptkit's `remember` is a degenerate
+saga (one step, empty compensation); `indexDocumentRow` is a two-step workflow that
+*should* be a saga or outbox the day it leaves the request path.
 
 ## Interview defense
 
-**Q: "You've got a multi-step agent. How do you handle a failure halfway
-through?"**
-
-"Today there's nothing to compensate — the steps are read-only model and tool
-calls with no external side effects, so a mid-run failure just means we re-run.
-The trace is an append-only event log and replay is deterministic, so I already
-have the event-sourcing substrate. The day a tool gets a side effect, I'd layer a
-saga on top: each forward step gets a compensating action, run in reverse on
-failure."
+**Q: "Walk me through indexing a document — is it atomic?"**
+"It's a dual write, and no, it's not atomic across the two steps — I'll name that
+plainly. `indexDocumentRow` commits the `documents` row first, then `pipeline.index`
+embeds via Ollama and upserts chunks in a *separate* transaction. If the embed fails
+after the documents commit, I get an orphan — a document row with no chunks, so it's
+searchable but returns nothing. Each step is atomic internally (the chunk upsert is a
+proper `begin/commit/rollback`), but nothing spans them. At one-local-doc scale that's
+acceptable and the caller sees the error. If indexing moved async, I'd use a
+transactional outbox: write the documents row and an 'index me' outbox row in one
+transaction, then a worker does the embed+upsert and retries on failure — atomic
+intent plus at-least-once processing on an idempotent upsert."
 
 ```
-  read-only steps  → failure = re-run (no compensation needed)   ← AptKit today
-  side-effecting   → saga: record each step, compensate in reverse on failure
+  sketch
+
+  insert documents (commit) ─► embed (FAIL) ─► chunks NEVER written = orphan
+  fix: insert documents + outbox IN ONE TXN ─► worker drains outbox ─► retry-safe
 ```
 
-Anchor: "The trace at `events.ts:1-28` is the log; `FixtureModelProvider` at
-`fixture-provider.ts:11-17` replays it deterministically. That's event sourcing —
-I'd build compensation on the same recorded steps."
+**Q: "What's the difference between a saga and a transaction?"** — load-bearing:
+"A transaction gives you `ROLLBACK` for free but only within one database. A saga is
+for when the operation spans systems and you've lost that — so each step gets an
+explicit *compensation* to undo it, run in reverse if a later step fails. The catch
+people forget: compensations aren't true rollbacks — you can't un-charge a card
+instantly, so the compensation is a *new* action (a refund). My `memory.remember` is a
+one-step saga with an empty compensation by choice — best-effort, losing it is cheaper
+than failing the turn."
 
-**Q: "Why not 2PC for cross-system writes?"**
-
-"2PC blocks forever if the coordinator dies mid-commit, and it doesn't scale.
-Sagas trade atomicity for compensation and stay available. Both are `not yet
-exercised` here because there's no second system to write to."
-
-## Validate
-
-1. **Reconstruct:** Explain a saga's compensation flow and why every forward step
-   needs a defined, idempotent compensating step.
-2. **Explain:** In what concrete sense is AptKit's trace + replay an
-   event-sourcing instance? Cite the log (`events.ts:1-28`) and the replay
-   (`fixture-provider.ts:11-17`).
-3. **Apply:** A new tool POSTs an order to an external system. Sketch the saga:
-   the forward step, its compensation, and where the trace records it.
-4. **Defend:** Argue that no sagas is correct today, naming *why* there's nothing
-   to compensate (hint: the tool policy in the project context).
+*Anchor:* `indexDocumentRow` is a dual write (two commits, no atomicity); the outbox is
+the fix; `remember`'s `catch {}` is a deliberate empty compensation.
 
 ## See also
 
-- `03-idempotency-deduplication-and-delivery-semantics.md` — replay determinism
-  and why compensations must be idempotent.
-- `06-queues-streams-ordering-and-backpressure.md` — the event log as a stream.
-- `study-system-design` — replay-centric evaluation as an architectural backbone.
+- `03-idempotency-deduplication-and-delivery-semantics.md` — idempotent upsert makes outbox retries safe
+- `02-partial-failure-timeouts-and-retries.md` — the embed failure that triggers the partial commit
+- `04-consistency-models-and-staleness.md` — the orphan doc is an application-level inconsistency
+- **study-database-systems** — single-DB transactions, the atomicity the dual write loses
+```

@@ -1,254 +1,98 @@
-# 01 — Cross-turn caching
+# Cross-Turn Caching
 
-## Subtitle
+**Industry standard.** "Prefix caching," "cross-turn cache," "semantic cache." Type label: serving optimization. **In this codebase: not yet exercised** — aptkit has no cross-turn or cross-run cache. Its system prompt is stable per agent (prefix-cache-ready), but no caching layer is wired, and the local Gemma default makes per-token cost effectively zero, so the pressure is mild.
 
-Reusing work *across the turns of one run* and *across runs* — and why AptKit caches none of it in production, but has a cache-of-record hiding in its test harness.
+## Zoom out, then zoom in
 
----
-
-## Zoom out
-
-You already cache single calls. In the browser you keep the stable part of a request stable so the HTTP cache can reuse the response — same URL, same headers, cache hit, no network. The single-call version of LLM caching (prompt caching, response caching, semantic cache) lives in `.aipe/study-ai-engineering/06-production-serving/`. Go there for the per-call mechanics. This file is about what happens when the call is wrapped in a *loop*.
-
-Here is what the loop adds. The agent calls the model eight times in one run, and across many runs over days. The same expensive text — the system prompt, the tool schemas, a sub-result the model already derived — keeps getting re-sent or re-derived. Caching across the loop means *not paying twice for the same stable input*.
+Single-call caching keys on one request. An agent runs many turns per task, and many tasks repeat sub-steps — so caching for agents has two new scopes: within a run (the agent re-derives the same sub-result) and across runs (a later task's sub-step matches an earlier one). aptkit caches neither yet.
 
 ```
-Three layers where a loop can reuse work
-┌──────────────────────────────────────────────────────────────┐
-│  PREFIX        the system prompt + tool schemas are identical  │
-│  (per turn)    every turn → cache the prefix, pay once         │
-│                          │                                     │
-│                          ▼ widen the window                    │
-│  INTRA-RUN     the model derived sub-result X on turn 2 →      │
-│  (per run)     don't recompute it on turn 5                    │
-│                          │                                     │
-│                          ▼ widen the window                    │
-│  CROSS-RUN     run yesterday answered the same question →      │
-│  (per system)  replay the recorded answer, skip the model      │
-└──────────────────────────────────────────────────────────────┘
+  Zoom out — three cache layers (none wired in aptkit)
+
+  ┌─ prefix cache (provider-side) ──────────────────────────┐
+  │  stable system prompt + tool defs at the front          │ ← aptkit is READY
+  │  (aptkit's system prompt is stable per agent)            │   (not exploited)
+  └──────────────────────────────────────────────────────────┘
+  ┌─ intra-run memoization ─────────────────────────────────┐
+  │  same sub-step within one task → cache by tool+args      │ ← not exercised
+  └──────────────────────────────────────────────────────────┘
+  ┌─ cross-run semantic cache ──────────────────────────────┐
+  │  later task's sub-query ≈ earlier one → embed + reuse    │ ← not exercised
+  └──────────────────────────────────────────────────────────┘
 ```
-
-Each layer is a wider time window over which "I already have this" holds. AptKit implements *none* of the three for production serving. But the widest layer — cross-run — has a near-exact analog in the test harness, and that analog is worth studying.
-
----
 
 ## Structure pass
 
-The pattern has three layers (above). The seam in each is the same: *what stays stable, and who notices it's stable.*
-
-```
-The seam: stable input → reuse boundary
-┌─────────────┬─────────────────────────┬──────────────────────┐
-│ layer       │ what's stable            │ reuse boundary        │
-├─────────────┼─────────────────────────┼──────────────────────┤
-│ prefix      │ system + tool schemas    │ provider prompt cache │
-│ intra-run   │ a derived sub-result     │ in-context messages[] │
-│ cross-run   │ the whole question→answer│ a record store / cache│
-└─────────────┴─────────────────────────┴──────────────────────┘
-```
-
-In AptKit: the prefix *is* stable but is rebuilt and re-sent each turn (opportunity not taken). The intra-run sub-result lives in `messages[]` so the model can *see* it again, but it is never deduped or cached — it just rides along in context. The cross-run store exists only as test fixtures.
-
----
+**Axis: cache scope and staleness risk.** A single-call cache keys one request. An agent cache spans turns and runs — and the staleness risk is sharper, because a stale hit poisons the *whole trajectory*, not one response. Trace it: the agent reasons forward on a stale sub-result, and every downstream turn inherits the error. The seam: single-call caching (one request, one staleness window) vs cross-turn caching (one hit corrupts a multi-turn chain).
 
 ## How it works
 
-**Move 1 — mental model.** A cache is a bet that a *stable key* maps to a *reusable value*. The loop gives you three candidate keys at three widths. Pick the width where the input is reliably identical and the value is reliably still correct.
+### Move 1 — the mental model
+
+Three layers, cheapest to most useful. You know how an HTTP cache reuses a response keyed on the request, and how keeping a request's stable part stable lets a CDN cache it? Prefix caching is that for the token prefix; intra-run and cross-run caches are that for the agent's sub-steps.
 
 ```
-PATTERN: key stability vs value freshness
-                 narrow key                 wide key
-                 (prefix)                    (cross-run question)
-   stable?  ███████████████ very           ████░░░░░░░ depends
-   fresh?   ███████████████ always         ░░░░░░████░ can go STALE
-                 │                                │
-                 ▼                                ▼
-          cheap, safe, big win            cheap, but stale poisons
-                                          the whole trajectory
+  Cross-turn caching — three layers
+
+  Single-call cache:  request → hash → hit? return : call
+
+  Agent caches:
+    prefix:    stable system prompt at front → provider caches the prefix
+    intra-run: turn 3 repeats turn 1's tool call → cache by (tool, args)
+    cross-run: task B's sub-query ≈ task A's → embed, reuse if close
 ```
 
-The narrower the key, the safer the cache. Prefix caching is nearly free of staleness risk (the prompt didn't change). Cross-run caching is where you can poison a run by replaying an answer that is no longer true.
+### Move 2 — what aptkit has, and the three caches it could add
 
-**Move 2 — step by step.**
+**Prefix-cache-ready, not exploited.** aptkit assembles the system prompt *once* in the agent constructor (`rag-query-agent.ts:52-58`) — it's stable across every turn of a run, and the tool definitions are stable too. That's exactly the shape provider prefix-caching rewards: keep the stable system prompt and tool definitions at the front so the prefix is cached across every turn. aptkit doesn't *exploit* this (no provider prefix-cache header is set), but the prompt is structured for it.
 
-*Layer 1: prefix cache.* The stable prefix is the same bytes every turn. Mark it cacheable; the provider charges full price the first turn and a fraction thereafter.
+**Intra-run memoization — the would-be add.** Within one rag-query run, if the model searches "auth flow" on turn 1 and again on turn 3 (a real weak-model behavior), the second search re-embeds and re-scans the store. Memoizing by `(tool, args)` for the duration of the run would skip the second call. The hook exists — every tool call goes through `registry.callTool(name, args)` (`tool-registry.ts:50`), a clean place to wrap a per-run memo.
 
-```
-Prefix cache across turns of ONE run
-turn 1:  [SYSTEM+TOOLS] [msgs] → model      ← full price on prefix
-turn 2:  [SYSTEM+TOOLS] [msgs] → model      ← prefix = cache hit
-turn 3:  [SYSTEM+TOOLS] [msgs] → model      ← prefix = cache hit
-          └─ identical ─┘
-```
+**Cross-run semantic cache — the would-be add.** A later question semantically close to an earlier one could reuse the earlier retrieval. aptkit already has the embedder — `OllamaEmbeddingProvider` — so it could embed the sub-query and return a cached result if close enough. Same infra as RAG.
 
-```
-build request:
-  prefix = system + toolSchemas         # identical every turn
-  mark prefix as cache-eligible
-  send(prefix + growing messages[])
-  # provider returns cache-read tokens cheaper than fresh
-```
+**The staleness tradeoff, sharper for agents.** A stale cross-run cache hit poisons the *whole trajectory*: the agent reasons forward on a stale sub-result and every downstream turn inherits the error. So the rules are strict — gate the semantic cache on freshness (don't cache retrieval results whose underlying data can change mid-task), and never cache a tool call with side effects. aptkit's tools are read-only (no side-effect caching risk) but its corpus could change (so a semantic cache would need freshness gating). The reason aptkit hasn't built this: the local Gemma default makes per-call cost near-zero, so the cache wouldn't pay for its staleness risk yet.
 
-*Layer 2: intra-run memo.* If the model already computed something on an earlier turn, don't make it (or a tool) compute it again.
+### Move 3 — the principle
 
-```
-Intra-run reuse
-turn 2: derive subResult X ──┐
-                             ▼ stored in messages[] (in context)
-turn 5: needs X ── reads it from context, OR re-derives (no memo)
-```
-
-```
-on each turn:
-  if needed_value in run_memo:        # AptKit has NO such memo
-     reuse run_memo[needed_value]
-  else:
-     v = compute(); run_memo[key] = v
-```
-
-*Layer 3: cross-run cache-of-record.* Record a full run's model responses keyed by the run; on a matching future run, replay the records instead of calling the model.
-
-```
-Cross-run record / replay
-record:  run → [model resp 1, resp 2, ...] → store as artifact
-replay:  same run key → return stored resp[i] by index, model NEVER called
-```
-
-```
-class RecordedProvider:
-  responses[]            # captured from a prior real run
-  i = 0
-  complete(req):
-    return responses[i++]   # deterministic, no network, no model
-```
-
-**Move 3 — principle.** Cache at the *widest window where the value is still guaranteed correct*. Stable input is necessary but not sufficient — the cached value must also still be *true*. A stale cross-run answer doesn't just return a wrong byte; it feeds turn N of a loop and every downstream turn reasons from a lie. And: never cache a side-effecting operation, because a cache hit silently skips the effect. The corollary is the lever — if your operations are *read-only*, the side-effect risk vanishes and the only remaining risk is staleness.
-
----
+Prefix caching is the same instinct as keeping a request's stable part stable so an HTTP cache can reuse it — here it's the token prefix the provider caches. The agent-specific danger is that a stale hit corrupts a whole trajectory, not one response, so freshness gating matters more than for single calls. aptkit is prefix-cache-ready by construction (stable system prompt) but defers the actual caches because its local-model cost profile makes them not yet worth the staleness risk.
 
 ## Primary diagram
 
-The full picture: three layers, what AptKit does at each, and where the one real analog lives.
-
 ```
-Cross-turn caching in AptKit
-┌─────────────────────────────────────────────────────────────────┐
-│ PREFIX (per turn)                                                 │
-│   system prompt rebuilt via renderPromptTemplate EACH turn,       │
-│   re-sent as system arg → NO prefix cache. Opportunity skipped.   │
-│                                                                   │
-│ INTRA-RUN (per run)                                               │
-│   messages[] accumulates every turn (run-agent-loop.ts:94).       │
-│   A re-derived sub-result is IN CONTEXT but NOT memoized/deduped. │
-│   Tool results truncated to 16_000 chars (run-agent-loop.ts:52).  │
-│                                                                   │
-│ CROSS-RUN (per system)                                            │
-│   NO production cache. BUT: replay artifacts + FixtureModelProvider│
-│   = cache-of-record FOR TESTS. Recorded run replayed without the  │
-│   model. Closest analog — a test mechanism, not a serving cache.  │
-└─────────────────────────────────────────────────────────────────┘
+  Cross-turn caching for aptkit (would-be) — full frame
+
+  ┌─ Run (task A) ──────────────────────────────────────────┐
+  │  [stable system prompt + tool defs] ◄── PREFIX-cacheable │ (ready)
+  │  turn 1: search "auth flow"  ──┐                         │
+  │  turn 3: search "auth flow" ◄──┘ INTRA-RUN memo hit      │ (would add)
+  └──────────────────────────────────────────────────────────┘
+  ┌─ Run (task B, later) ─────────────────────────────────────┐
+  │  turn 1: search ≈ task A's ◄── CROSS-RUN semantic hit     │ (would add,
+  │          (embed sub-query, reuse if close + fresh)        │  freshness-gated)
+  └─────────────────────────────────────────────────────────────┘
+  staleness: a bad hit poisons the WHOLE trajectory, not one turn
 ```
-
-The only layer with a real implementation is the test analog at the bottom — and it is a test mechanism, not production serving.
-
----
-
-## Implementation in codebase
-
-**Use cases.** None in production. The relevant code is the loop's context accumulation, the truncation guard, and the replay/fixture harness.
-
-**Intra-run context accumulation.** The run starts one `messages[]` array and pushes to it every turn — assistant content, then tool results — so anything derived earlier stays visible:
-
-```ts
-// run-agent-loop.ts:94 — one array, lives for the whole run
-const messages: ModelMessage[] = [{ role: 'user', content: userPrompt }];
-```
-```ts
-// run-agent-loop.ts:124 — each turn's output appended (stays in context)
-messages.push({ role: 'assistant', content: response.content });
-// run-agent-loop.ts:189 — tool results appended, visible to later turns
-messages.push({ role: 'user', content: toolResults });
-```
-
-This is *reuse-by-context*, not caching: a sub-result derived on turn 2 is re-readable on turn 5 because it's in the array, but nothing dedupes or memoizes it — the model may simply re-derive it, paying again.
-
-**Truncation, not caching.** Tool results are capped so context doesn't explode:
-
-```ts
-// run-agent-loop.ts:52
-const MAX_TOOL_RESULT_CHARS = 16_000;
-// run-agent-loop.ts:54-57 — slice + "[truncated]" marker
-```
-
-This bounds context *growth*; it does not reuse anything. Note it because people confuse "context hygiene" with "caching" — this is the former.
-
-**Prefix opportunity, not taken.** Each agent rebuilds its system prompt every run via `renderPromptTemplate` (e.g. `diagnostic-agent.ts`, `monitoring-agent.ts`, `query-agent.ts`, `recommendation-agent.ts`) and passes it to `model.complete({ system, ... })` at `run-agent-loop.ts:103-104`. The prefix is stable but never marked cacheable — a prefix-cache win left on the table.
-
-**Cross-run analog: the replay harness.** This is the closest thing to a cross-run cache, and it's honest record/replay for tests:
-
-```ts
-// packages/agents/diagnostic-investigation/src/fixture-provider.ts:11-17
-async complete(request: ModelRequest): Promise<ModelResponse> {
-  this.requests.push(request);
-  const response = this.responses[this.index];
-  this.index += 1;                       // serve recorded response by index
-  if (!response) throw new Error(`fixture model exhausted ...`);
-  return response;                       // model NEVER called
-}
-```
-
-The recorded responses come from prior real runs, stored as artifacts under `artifacts/replays/*.json`. A `FixtureModelProvider` exists per agent (diagnostic, monitoring, query, recommendation, rubric). **Frame:** deterministic replay = a *cache-of-record for tests* — same shape as a cross-run cache (key → stored response, skip the model), but its purpose is reproducible eval, not production serving.
-
-**Not yet exercised:** AptKit implements no prefix cache, no intra-run memo, and no production cross-run cache. *See SECTION F (`../06-orchestration-system-design-templates/`) for where a cross-run cache would land in a system that re-answers the same questions at scale.*
-
----
 
 ## Elaborate
 
-Two things make caching unusually *safe* to add to AptKit later, and one thing makes it unusually *dangerous*.
-
-Safe: AptKit's tools are **read-only**. The classic caching footgun — a cache hit that skips a write — cannot happen here. So if AptKit ever added a cross-run cache, the only risk left is staleness, not lost side effects. That's a much smaller risk surface than most apps face.
-
-Dangerous: the loop *compounds* staleness. In a single fetch, a stale response is one wrong screen. In a loop, a stale cross-run answer feeds turn N, the model reasons from it, and every subsequent turn inherits the error. The blast radius is the whole trajectory, not one response. This is why cross-run caching of an *agent* needs a freshness key (data version, time bucket) far tighter than you'd use for a static asset.
-
-And the prefix layer is the free lunch nobody ate: the system prompt is identical across all turns of a run and largely identical across runs of the same agent. Marking it cacheable is low-risk (no staleness — the prompt is code) and high-savings (it's the biggest stable chunk of every request).
-
----
+Caching for agents is where single-call intuitions break: the unit isn't a request, it's a multi-turn trajectory, and a cache hit's blast radius is the whole chain. Prefix caching is the free win (most providers cache a stable prefix automatically), which is why structuring the prompt with the stable part first matters. Intra-run and cross-run caches are real savings on a paid model but carry trajectory-poisoning risk. aptkit's local-first default inverts the usual calculus — with near-zero per-token cost, the caches don't pay for their risk, so deferring them is correct. The moment aptkit runs against a paid provider at volume, prefix caching is the first thing to turn on.
 
 ## Interview defense
 
-**Q: "You replay fixtures in tests — isn't that just a cache? Why not use it in production?"**
+**Q: How do you cache for an agent?**
+Three layers, and I'll be honest that aptkit exploits none yet but is built for the first. Prefix caching — my system prompt and tool defs are assembled once and stable across every turn, which is exactly what provider prefix-caching rewards. Then intra-run memoization (cache a repeated tool call by args within a run) and a cross-run semantic cache (embed a sub-query, reuse a close earlier result). I haven't wired the last two because my local-model cost is near-zero, so they wouldn't pay for their staleness risk.
 
 ```
-record/replay (tests)        vs        production cache
-┌──────────────────────┐               ┌──────────────────────┐
-│ key = the run, by    │               │ key = question +      │
-│ index                │               │ data freshness        │
-│ value = frozen on    │               │ value = must stay TRUE│
-│ purpose (eval)       │               │ as data changes       │
-│ staleness = the point│               │ staleness = the enemy │
-└──────────────────────┘               └──────────────────────┘
+  prefix (ready) · intra-run memo (would add) · cross-run semantic (would add)
 ```
+*Anchor: a stale agent-cache hit poisons the whole trajectory, not one response — freshness gating matters more here.*
 
-They share the *mechanism* (skip the model, return a stored response) but invert the *intent*. Replay *wants* frozen answers — that's what makes the eval deterministic. A production cache must invalidate on data change or it poisons the loop. Anchor: `fixture-provider.ts:11-17` serves by index with no freshness check — correct for tests, wrong for serving.
-
-**Q: "Where's the cheapest caching win you're not taking?"** Prefix caching the stable system prompt re-sent every turn — anchor `run-agent-loop.ts:103-104`, rebuilt per agent via `renderPromptTemplate`.
-
----
-
-## Validate
-
-- **L1 (recognize):** Name the three caching layers and their time windows. → "Zoom out" diagram.
-- **L2 (trace):** Show where a turn-2 sub-result physically lives on turn 5 and why it's not a cache. → `run-agent-loop.ts:94`, `:124`, `:189`.
-- **L3 (judge):** Explain why read-only tools make caching safer and why the loop makes staleness worse. → "Elaborate."
-- **L4 (extend):** Distinguish the fixture replay from a production cache by key and intent. → `fixture-provider.ts:11-17`, `artifacts/replays/*.json`.
-
----
+**Q: What's the danger that's worse than for single calls?**
+Blast radius. A stale hit isn't one bad response — the agent reasons forward on it and every downstream turn inherits the error. So I'd gate any semantic cache on freshness and never cache a side-effecting tool call.
 
 ## See also
 
-- `.aipe/study-ai-engineering/06-production-serving/` — single-call prompt/response/semantic caching. Read for the per-call mechanics.
-- `02-fan-out-backpressure.md` — the next loop pressure.
-- `../01-reasoning-patterns/02-agent-loop-skeleton.md` — the `messages[]` accumulation this file refers to.
-- `../06-orchestration-system-design-templates/` — SECTION F, where a cross-run cache would land.
-- `../agent-patterns-in-this-codebase.md`
+- `02-agentic-retrieval/01-agentic-rag.md` — the loop these caches would serve
+- `02-fan-out-backpressure.md` — the next serving concern
+- `04-agent-infrastructure/01-context-engineering.md` — the stable prompt assembly
+- `study-ai-engineering/06-production-serving/` — single-call caching mechanics (cross-ref)

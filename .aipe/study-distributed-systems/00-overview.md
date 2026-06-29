@@ -1,254 +1,151 @@
-# 00 — Overview: the external-service edges
+# Study — Distributed Systems (applied to aptkit + buffr)
 
-## The verdict first
+## The honest verdict, up front
 
-AptKit is a **single-process library + local dev tool.** Run the agent loop and
-everything — prompt assembly, tool dispatch, JSON parsing, the usage ledger,
-the Studio replay UI — executes inside one Node runtime, on one machine, in one
-address space. There is no second node to coordinate with.
+aptkit is a **single-process TypeScript monorepo.** Most of the distributed-systems
+canon — consensus, replication, sharding, leader election, distributed
+transactions, exactly-once delivery — is `not yet exercised` here. There is no
+cluster, no quorum, no second replica, no message broker. Saying otherwise would
+be inventing infrastructure you didn't build.
 
-The system reaches across boundaries it doesn't control in exactly one *kind* of
-place: a call to an **external model/embedding service over HTTP**. That's the
-entire distributed-systems surface of this repo. As of the personal-agent
-packages (`@aptkit/provider-gemma`, `@aptkit/retrieval`) there are now **two
-flavors** of that boundary, and the distinction matters:
-
-- **Cloud APIs** — `api.anthropic.com`, `api.openai.com` over HTTPS. Someone
-  else's machine, someone else's rate limits and outages (fallacy #6).
-- **A local Ollama process** at `http://localhost:11434` — reached by
-  `GemmaModelProvider` (`/api/chat`) and `OllamaEmbeddingProvider` (`/api/embed`).
-  Same machine, plain HTTP, no TLS, no auth — but still a **separate process**
-  that can be not-running, mid-model-load, or slow, and whose failures surface as
-  thrown errors exactly like the cloud's.
-
-That second flavor is the new lesson: an external dependency doesn't have to be
-*remote* to be a separate failure domain. "Is Ollama up?" is a coordination
-question even though both processes share a laptop.
+But "single-process" is not "no coordination." The moment your code calls
+`fetch()` to Ollama, or buffr opens a `pg.Pool` to a Supabase Postgres across the
+network, you have crossed a boundary where the other side can be **slow,
+unavailable, wedged, or racing your other writes** — and your correctness now
+depends on what happens when it is. That is the entire subject of distributed
+systems, in miniature. This guide teaches the full concept set, then anchors each
+one to the *real* coordination seam in your repos where it lives — or marks it
+`not yet exercised` and tells you exactly where it would attach if aptkit scaled.
 
 ```
-  The whole system, one frame — find the boundaries
+  The whole coordinated system — what actually crosses a boundary
 
-  ┌─ Process boundary (your Node runtime, failure domain 1) ─────────────┐
-  │                                                                       │
-  │  ┌─ Service layer ────────────────────────────────────────────────┐  │
-  │  │  runAgentLoop  ── bounded turns, AbortSignal, JSON re-prompt     │  │
-  │  │  RagQueryAgent ── retrieval pipeline (embed → search → ground)   │  │
-  │  │       │                                                          │  │
-  │  │       ▼                                                          │  │
-  │  │  ModelProvider.complete()  ◄── the contract everything uses      │  │
-  │  │       │                                                          │  │
-  │  │   ┌───┴──────┬──────────┬──────────┬───────────┬─────────────┐  │  │
-  │  │   ▼          ▼          ▼          ▼           ▼             │  │  │
-  │  │  Anthropic  OpenAI   Fallback  ContextGuard  Gemma (Ollama)  │  │  │
-  │  │  adapter    adapter  (chain)   (pre-flight)  + Ollama embed   │  │  │
-  │  └───┬─────────┬──────────────────────────────────┬────────────┘  │  │
-  │      │         │                                   │               │  │
-  └──────┼─────────┼───────────────────────────────────┼───────────────┘
-         │ HTTPS   │ HTTPS    ★ EXTERNAL-SERVICE EDGES ★ │ HTTP (localhost)
-         ▼         ▼                                     ▼
-  ┌─ Cloud provider APIs (not yours) ─────────┐  ┌─ Local Ollama (domain 2) ──┐
-  │  api.anthropic.com    api.openai.com       │  │  :11434 /api/chat /api/embed│
-  │  timeout / 429 / 5xx / partial / garbage   │  │  down / loading / slow      │
-  └────────────────────────────────────────────┘  └─────────────────────────────┘
+  ┌─ Process: aptkit agent (single Node process) ──────────────────────┐
+  │                                                                     │
+  │   runAgentLoop ──► ModelProvider.complete()                         │
+  │       │                   │                                         │
+  │       │            ┌──────┴───────┐                                 │
+  │       │            ▼              ▼                                  │
+  │       │     FallbackModelProvider   ContextWindowGuardedProvider     │
+  │       │     (try A, then B,         (reject before the call         │
+  │       │      record attempts)        if input too big)              │
+  │       │            │                                                 │
+  │  emit(CapabilityEvent)  ── the in-process event log (the trace) ──┐  │
+  └───────┼─────────────┼────────────────────────────────────────────┼──┘
+          │             │ HTTP (no per-call timeout)                  │
+          │             ▼                                             │
+  ┌───── Network boundary ─────┐                                      │
+          │     ┌─ Ollama daemon :11434 ─┐  ← separate process/service│
+          │     │  POST /api/chat        │    partial failure lives here
+          │     │  POST /api/embed       │                            │
+          │     └────────────────────────┘                           │
+          │                                                          │
+  ┌─ Process: buffr runtime ───────────────────────────────────────┼──┐
+  │   ChatSession.ask() ──► PgVectorStore / SupabaseTraceSink       │  │
+  │       │                       │ pg.Pool (TCP)                   ▼  │
+  │       │              ┌────────┴────────┐         SupabaseTraceSink  │
+  │       │              ▼                 ▼         drains the trace   │
+  └───────┼──────── Network boundary ──────┼──── into agents.messages  │
+          │     ┌─ Supabase Postgres ──────▼─┐                         │
+          │     │  agents.{documents,chunks,  │  ← network DB:          │
+          │     │   conversations,messages}   │    pool, transactions,  │
+          │     │  + pgvector                 │    racing inserts       │
+          │     └─────────────────────────────┘                        │
 ```
 
-Everything to the left of the HTTP/HTTPS arrows is one process. The discipline
-this guide teaches applies to those arrows — and they all share the same shape:
-a `complete()`/`embed()` call that can throw because something you don't control
-misbehaved.
+## The real coordination seams (everything else is curriculum)
 
-**Not a distributed system itself.** This is still a single-process library with
-external-service dependencies — not a multi-node system. The multi-device,
-sync, and Supabase plane (laptop↔phone memory sync, a hosted `PgVectorStore`,
-the gateway) is explicitly **deferred and out of scope for aptkit** — it lives
-in the separate `buffr` repo (see `docs/personal-agent-packages.md:81-86`).
-aptkit ships the deployment-agnostic building blocks; the coordinated *body* is
-assembled elsewhere.
+There are exactly **four** places in these two repos where coordination crosses a
+boundary and partial failure is real. Learn these cold; they are your whole
+distributed-systems portfolio today.
 
-## Ranked findings — what's actually here
+```
+  Seam                          where it lives                       what can break
+  ────────────────────────────  ───────────────────────────────────  ──────────────────────────
+  1. app ↔ Ollama (HTTP)        gemma-provider.ts:201-215             daemon down / wedged;
+                                ollama-embedding-provider.ts:60-75    NO per-call timeout
+  2. provider fallback chain    fallback-provider.ts:47-89            one provider fails →
+                                                                      try next, record attempt
+  3. buffr ↔ Supabase Postgres  buffr/pg-vector-store.ts:38-65        pool exhaustion; per-doc
+                                buffr/supabase-trace-sink.ts:49-94    transaction; racing inserts
+  4. the trace as an event log  runtime/events.ts:1-32                ordering survives the race
+                                runtime/run-agent-loop.ts:111-187     only via event timestamp
+```
 
-The findings are ranked by how real they are in *this* repo, most-real first.
+## Ranked findings — read these first
 
-### 1. The fallback chain is the one true partial-failure pattern (★ real)
+1. **The Ollama HTTP calls have no per-call timeout (highest consequence).**
+   `gemma-provider.ts:201-215` and `ollama-embedding-provider.ts:60-75` call
+   `fetch()` with only an optional `AbortSignal` — no `AbortSignal.timeout()`, no
+   deadline. If the Ollama daemon wedges (model still loading, swap thrashing, a
+   hung GPU), `complete()` hangs until the caller aborts or the socket dies. In
+   the fallback chain this is worse: a *slow* provider never throws, so the chain
+   never advances to the next provider. Timeouts convert "infinitely slow" into
+   "failed fast," which is the only way the fallback logic and `maxTurns` budget
+   can actually protect you. → see `02-partial-failure-timeouts-and-retries.md`.
 
-`packages/providers/fallback/src/fallback-provider.ts:47-89` — `FallbackModelProvider.complete()`
-tries provider adapters **in sequence**; when one throws, it records the
-attempt and moves to the next. When all fail, it throws `ProviderFallbackError`
-(`:16-24`) carrying every attempt. This is exactly partial-failure handling
-against an unreliable external dependency: one node (provider) being down
-doesn't take the whole request down — you fail over. The `shouldFallback`
-predicate (`:44`, `:73`) classifies errors (retryable vs not), and the
-`AbortError` passthrough (`:65`, `:92-95`) makes cancellation win over
-failover. **This is the file to read first.** → see `02` and `05`.
+2. **The trace's monotonic ordering is reconstructed from event timestamps, not
+   insert order — and that's the one place you got distributed-systems-correct.**
+   `SupabaseTraceSink.emit()` is synchronous (aptkit's contract), but the Postgres
+   writes are queued promises drained by `flush()` via `Promise.all`
+   (`buffr/supabase-trace-sink.ts:49-94`). Those inserts race. The fix that makes
+   replay deterministic: the event's ISO `timestamp` is written into
+   `created_at`, so replay orders by *emit time*, not by *which insert won the
+   race*. This is logical-clock thinking applied to a real racing-writes problem.
+   → see `07-clocks-coordination-and-leadership.md` and
+   `06-queues-streams-ordering-and-backpressure.md`.
 
-### 2. The context-window guard is fail-fast before a doomed remote call (★ real)
+3. **`indexDocumentRow` is a dual write with no atomicity across the two systems
+   (a latent saga seam).** `buffr/runtime.ts` writes the `agents.documents` row in
+   one query, then calls `pipeline.index()` which embeds (Ollama) and upserts
+   chunks in a *separate* transaction. If the embed step throws after the
+   documents row is committed, you have a document with no chunks — a partial
+   commit across two operations. Today the blast radius is one local doc, so it's
+   acceptable; the moment indexing moves async or to a worker, this becomes a
+   textbook outbox/saga problem. → see `08-sagas-outbox-and-cross-boundary-workflows.md`.
 
-`packages/providers/local/src/context-window-guard.ts:57-71` — a pre-flight
-check that estimates input tokens and throws `ContextWindowExceededError`
-*before* dispatching to the wrapped provider if the request can't fit. This is
-the distributed-systems instinct of "validate locally before paying for a
-remote round-trip that will definitely fail." → see `02`.
+## Reading order
 
-### 3. Ollama is a second external dependency — local, but a separate failure domain (★ real, new)
+```
+  01  distributed-system-map ........... the coordination map (start here)
+  02  partial-failure-timeouts-retries .. the most consequential gap (finding #1)
+  03  idempotency-dedup-delivery ........ upsert-by-id is your one idempotency win
+  04  consistency-models-staleness ...... stale recall, read-your-writes
+  05  replication-partitioning-quorums .. mostly `not yet exercised`
+  06  queues-streams-ordering ........... the trace sink's pending-queue
+  07  clocks-coordination-leadership .... finding #2, timestamp-ordered replay
+  08  sagas-outbox-cross-boundary ....... finding #3, the dual-write seam
+  09  red-flags-audit ................... ranked risks, evidence per verdict
+```
 
-`packages/providers/gemma/src/gemma-provider.ts:201-215` and
-`packages/retrieval/src/ollama-embedding-provider.ts:60-75` — both default to a
-`fetch` transport against `http://localhost:11434` and **throw on a non-OK
-response** (`throw new Error(\`ollama HTTP ${res.status}: ...\`)`). If Ollama
-isn't running, `fetch` rejects with a connection error; if the model isn't
-pulled or is mid-load, you get a 404/500. Either way the error propagates up
-exactly like a cloud failure — and the same fallback chain catches it. The
-takeaway: an external dependency on `localhost` is still a coordination
-boundary. The RAG agent (`packages/agents/rag-query/scripts/ask.ts`) depends on
-Ollama being up for *both* embeddings and reasoning — two endpoints on one
-external process. → see `01` (the map now has three boxes), `02`.
+## What is `not yet exercised` (named honestly)
 
-### 3b. Memory's durability is an injected choice — and the id counter assumes one process (★ real, new)
-
-`packages/memory/src/conversation-memory.ts` adds episodic memory whose backing
-`VectorStore` is **injected** (`:18-31`, `:60-61`). The same `remember`/`recall`
-logic runs over two very different durability stories:
-
-- An ephemeral `InMemoryVectorStore` (`packages/retrieval/src/in-memory-vector-store.ts:10-12`,
-  a `Map`) — **lost on process exit.** This is what the tests use
-  (`packages/memory/test/conversation-memory.test.ts:27`).
-- A durable `PgVectorStore` that **survives restarts** — but that store lives in
-  the separate `buffr` repo (`/Users/rein/Public/buffr/src/pg-vector-store.ts`),
-  not aptkit. aptkit ships only the `VectorStore` contract
-  (`packages/retrieval/src/contracts.ts:33-37`) and the in-memory adapter.
-
-So the store choice *is* a state-durability axis — the first one in this repo
-where the answer isn't uniformly "lost on exit." But here's the subtle part: the
-memory engine also holds a **per-conversation counter `Map` in process**
-(`conversation-memory.ts:71,78-79`) to mint ids `memory:<convId>:<n>`. That
-counter is **ephemeral state that does not survive a restart** — after a restart
-it resets to 0. With the *ephemeral* store that's harmless (the rows died with
-the counter). With a *durable* store, resuming the **same conversation** after a
-restart would mint `memory:<convId>:0` again, **colliding** with a row already
-persisted under that id — an upsert that silently overwrites the earlier turn.
-**(Inference — not yet exercised in aptkit, which only wires the in-memory store;
-flagged because the durable path in `buffr` is exactly where it would bite.)**
-Memory also inherits the same external Ollama dependency: `remember` and `recall`
-both call `embedder.embed(...)` (`:75,90`), so a down Ollama breaks memory writes
-and reads, not just the chat/RAG path. → see `01` (state ownership), `04`
-(the resume-across-restart consistency risk), `09` (R7).
-
-### 4. Retry-on-parse is a local resilience pattern distinct from failover (★ real, new)
-
-`packages/providers/gemma/src/gemma-provider.ts:62-89` — Gemma2:9b has no native
-tool-calling, so the provider *emulates* it: it asks for a JSON tool call, and
-if the reply is a botched one (`looksLikeToolAttempt` — a stray `{`), it appends
-a corrective `RETRY_NUDGE` and asks again, up to `maxToolCallAttempts` (default
-2). This is a **same-target retry loop** — the one pattern the fallback chain
-deliberately *doesn't* have (it switches nodes instead). It's bounded
-(`maxAttempts`), it's a no-op for plain prose (a real answer isn't retried), and
-it gives up gracefully (returns the raw text). It's not failover and it's not a
-network retry — it's "the model fumbled the format, nudge it once." Closest
-in-repo cousin to the agent loop's JSON re-prompt. → see `02` (Step on
-same-target retry), `03`.
-
-### 5. Bounded turns + cancellation = the in-process safety rails (★ real, but in-process)
-
-`packages/runtime/src/run-agent-loop.ts:98` — the loop is hard-capped at
-`maxTurns` (default 8) and `maxToolCalls`. `:99`, `:209` — `signal.throwIfAborted()`
-checks the `AbortSignal` before every model call and recovery turn. The
-re-prompt on parse failure (`:192-199`) is the closest thing to an
-"idempotent retry" the repo has — it re-runs the conclusion step from the same
-recorded context. This is bounded work and cancellation (runtime-systems'
-territory) doing double duty as a partial-failure guard. → see `02`, `03`.
-
-### 6. The usage ledger is accounting across many provider calls (~ weak analog)
-
-`packages/runtime/src/usage-ledger.ts:25-42` — `summarizeUsage()` folds every
-`model_usage` event in a trace into one row (total input/output tokens, turn
-count). It's the nearest thing to "tracking work across nodes," except the
-"nodes" are sequential calls to the same external API from one process. → see `03`.
-
-### 7. Replay is deterministic re-execution from a recorded log (~ recovery/idempotency analog)
-
-`packages/evals/src/replay-runner.ts` + `FixtureModelProvider`
-(`packages/agents/recommendation/src/fixture-provider.ts:11-17`) — replay swaps
-the live provider for one that returns recorded `ModelResponse[]` in order. Same
-input log → same output, deterministically. That's the *shape* of recovery from
-a write-ahead log or event replay, used here for testing, not failure recovery.
-The `CapabilityEvent` trace (`packages/runtime/src/events.ts:1-24`) is an
-event-sourcing analog — an append-only log of what happened. → see `03`, `08`.
-
-## `not yet exercised` — the honest list
-
-These are real distributed-systems concepts AptKit has **no instance of.** The
-guide teaches each as a foundation and names the trigger that would make it
-real. Most of the topic surface lands here:
-
-| Concept | Status | Trigger that would make it real |
+| Concept | Status | Where it would attach if aptkit scaled |
 | --- | --- | --- |
-| Consensus / quorum | not yet exercised | A second replica of any state that must agree |
-| Replication | not yet exercised | Any state stored in >1 place that must converge |
-| Partitioning / sharding | not yet exercised | A dataset too big for one node |
-| Leader election | not yet exercised | >1 process that must pick one coordinator |
-| Message queues / streams | not yet exercised | Async hand-off between producer and consumer |
-| Backpressure | not yet exercised | A queue that can fill faster than it drains |
-| Poison messages / DLQ | not yet exercised | A durable queue with retry semantics |
-| Logical clocks / ordering | not yet exercised | Concurrent writers needing a happens-before order |
-| Distributed transactions / 2PC | not yet exercised | A write spanning two systems that must both commit |
-| Sagas / compensation | not yet exercised | A multi-step external workflow needing rollback |
-| Transactional outbox | not yet exercised | A DB write + a message publish that must be atomic |
-| Read-your-writes / session consistency | not yet exercised | A replicated read path with a write path |
-| Split-brain | not yet exercised | >1 node that could each think it's the leader |
+| Consensus (Raft/Paxos) | `not yet exercised` | only if multiple buffr nodes shared write authority |
+| Replication / replica reads | `not yet exercised` | a Supabase read replica behind `PgVectorStore.search` |
+| Partitioning / sharding | `not yet exercised` | `app_id` is *already* a partition key (logical, single-node) |
+| Leader election | `not yet exercised` | a singleton indexer across multiple workers |
+| Distributed transactions / 2PC | `not yet exercised` | the `indexDocumentRow` dual write (finding #3) |
+| Sagas / compensation | latent, not built | same dual write, if it went async |
+| Idempotency keys | partial | `upsert ... on conflict (id)` gives idempotent writes |
+| Exactly-once delivery | `not yet exercised` | impossible to claim; the trace flush is at-most-once |
+| Message queue / broker | `not yet exercised` | the in-process `pending[]` array is the only "queue" |
+| Quorum reads/writes | `not yet exercised` | requires ≥3 replicas; there is one Postgres |
 
-The single-process design is *why* none of these exist — and that's the right
-call for a library. You don't add Raft to a `.map()`. The trigger column is the
-load-bearing part: it tells you exactly when each concept stops being academic.
-Several of these triggers (a durable `PgVectorStore`, laptop↔phone memory sync,
-a multi-platform gateway) are already *built or planned* — but in the separate
-`buffr` repo, explicitly out of aptkit's scope
-(`docs/personal-agent-packages.md:81-86`; the `PgVectorStore` itself lives at
-`/Users/rein/Public/buffr/src/pg-vector-store.ts`). When that plane gets built,
-this table is the checklist of what becomes real. The new `@aptkit/memory`
-package is the first place aptkit ships code that *can* be wired to that durable
-plane — it speaks the `VectorStore` contract and doesn't care which store backs
-it (`packages/memory/src/conversation-memory.ts:18-31`). aptkit itself still only
-wires the ephemeral in-memory store; durability stays a `buffr` concern.
+## Cross-links to neighbor guides
 
-## The fallacies of distributed computing — which ones bite here
-
-The eight fallacies (Deutsch/Gosling) are the assumptions that quietly break
-distributed code. AptKit reaches across a network boundary in one *kind* of place
-(cloud HTTPS and localhost HTTP), so only the fallacies about *those hops* apply:
-
+- **study-networking** — the transport mechanics of the Ollama HTTP calls and the
+  `pg` TCP connection: DNS, connection reuse, TLS, the missing timeout at the
+  socket layer. This guide owns *coordination correctness*; networking owns *the wire*.
+- **study-database-systems** — the *datastore-local* consistency of Postgres: the
+  `begin/commit/rollback` in `PgVectorStore.upsert`, isolation levels, pgvector's
+  index. This guide owns coordination *across* the DB boundary; that one owns
+  what happens *inside* it.
+- **study-system-design** — the architectural shape and scale tradeoffs (why
+  local-first, why a single Postgres). This guide owns what stays correct when a
+  boundary is crossed.
+- **study-debugging-observability** — the trace as evidence for incident
+  reconstruction. This guide owns the trace's *ordering guarantees*; that one owns
+  reading it to debug.
 ```
-  The 8 fallacies — does AptKit's external-service edge violate it?
-
-  1. The network is reliable      ── YES, bites: provider/Ollama calls fail → fallback
-  2. Latency is zero              ── YES, bites: every complete()/embed() is a round-trip
-  3. Bandwidth is infinite        ── partial: large prompts → context guard
-  4. The network is secure        ── partial: cloud uses TLS; the Ollama hop is
-                                     plain HTTP on localhost (no TLS, no auth) →
-                                     security guide owns this
-  5. Topology doesn't change      ── n/a: one fixed endpoint per provider/host
-  6. There is one administrator   ── YES (cloud), bites: the provider's admin, not you
-  7. Transport cost is zero       ── YES (cloud): usage ledger tracks $ per call
-                                     (Ollama is free, so $ cost is local-only)
-  8. The network is homogeneous   ── partial: three API shapes (Anthropic, OpenAI,
-                                     Ollama) behind one ModelProvider contract
-```
-
-Fallacies 1, 2, 6, 7 are the ones AptKit actually has to handle. The fallback
-chain answers #1 for *both* flavors (a down Ollama fails over to cloud just like
-a 503 does), bounded turns + the ledger answer #2 and #7, and #6 is *the whole
-reason* the cloud fallback chain exists — the provider's rate limits and outages
-are decided by someone who isn't you. The Ollama hop softens #6 (you run that
-process) but not #1: a separate process can still be down.
-
-## How to use this guide
-
-Read `01` for the map. Read `02` and `03` slowly — they're the files grounded in
-real code. Skim `04`–`08` to know the foundations and recognize the triggers.
-Finish on `09` for the ranked risk audit. The goal is that you can walk into an
-interview, draw the map above, and say with a straight face: "this system is
-single-process by design; its distributed surface is external-service
-dependencies — cloud LLM APIs and a local Ollama process — handled by one
-fallback chain and a couple of bounded local retries. The multi-node,
-sync, and Supabase plane is deliberately deferred to a separate repo (`buffr`);
-aptkit stays a library. Here's exactly how it handles partial failure at those
-edges — and here's what I'd add the day it grows a real second node."

@@ -1,170 +1,108 @@
-# 08 — Runtime-Systems Red Flags (Audit)
+# Runtime-Systems Red-Flags Audit — ranked execution-model risks
 
-**Industry name:** execution-model risk audit · *Project-specific*
+**Industry name(s):** runtime risk audit · execution-model review · **Type:** Project-specific
 
-The ranked execution-model risks in AptKit, most consequential first. Each is grounded in `file:line`, distinguishes observed behavior from inference, and names the move. The honest headline: this is a clean single-threaded runtime where the bounds and cancellation are done well; the risks are all about *overload* and *time*, not correctness or concurrency.
-
-## Zoom out, then zoom in
+This file ranks the execution-model risks in aptkit by consequence, names the evidence for each verdict, and says what would change it. Verdict-first: **aptkit's runtime is low-risk because it's a single-threaded, I/O-bound library with rigorously bounded per-run work — most runtime failure modes are structurally impossible here.** The risks that remain are concentrated in two places: one synchronous CPU loop that blocks the event loop, and the system-wide controls a library deliberately doesn't own. Nothing here is a bug; they're the seams where aptkit ends and a deployment begins.
 
 ```
-  Zoom out — where the risks sit
+  Risk surface — where it concentrates
 
-  ┌─ Application/runtime layer ──────────────────────────────────┐
-  │  agent loop: bounded ✓  cancellable ✓  timeout ✗             │ ← R3
-  └──────────────────────────┬───────────────────────────────────┘
-  ┌─ Streaming layer ────────▼───────────────────────────────────┐
-  │  read backpressure ✓     write backpressure ✗               │ ← R1
-  └──────────────────────────┬───────────────────────────────────┘
-  ┌─ Retrieval / memory layer ─▼─────────────────────────────────┐
-  │  sync cosine scan (unbounded) · embed+recall cancel not wired │ ← R6, R7
-  │  memory counter Map: unbounded in-process, restart-ephemeral  │ ← R8
-  └──────────────────────────┬───────────────────────────────────┘
-  ┌─ Concurrency layer ──────▼───────────────────────────────────┐
-  │  serial tools (latency) · filesystem last-write-wins         │ ← R2, R4
-  └───────────────────────────────────────────────────────────────┘
+  HIGH ░░░░░░░░  (none — single thread eliminates the high-severity class)
+  MED  ████░░░░  event-loop blocking (cosine scan), no concurrency limit
+  LOW  ██░░░░░░  no graceful shutdown, no deadline, instance-state sharing
+  N/A  ────────  thread races, deadlocks, fd leaks (structurally absent)
 ```
 
-Zoom in: an execution-model risk is a place where the runtime behaves badly under conditions the happy path never hits — overload, a slow client, a hung dependency, contention. None of these break AptKit's *correctness*; they're throughput, latency, and resource-exhaustion risks. That's the right severity frame: ranked by "what happens under stress," not "is it wrong."
+## Ranked findings
 
-## Structure pass
+### 1. (MED) The cosine scan blocks the event loop — `async` signature, synchronous body
 
-**Axis — "what condition triggers this, and what's the blast radius?"** Holding that constant ranks the findings: a risk that triggers under common load with a process-wide blast radius outranks one that needs a rare collision and only affects one file.
+**Evidence:** `packages/retrieval/src/in-memory-vector-store.ts:25` — `search` is declared `async` but its body has no `await`: an O(n) loop over the corpus computing cosine similarity (`:28`), each cosine an O(d) inner loop (`:50`, d=768 for nomic), then a full `O(n log n)` sort (`:31`). The whole thing runs synchronously on the one event-loop thread.
 
-```
-  Ranking axis: trigger likelihood × blast radius
+**Consequence (concrete):** at corpus size n, a query freezes the event loop for the duration of `n × 768` multiply-adds plus the sort. At demo/test scale (dozens of chunks) that's microseconds — invisible. At n = 50,000 it's tens of milliseconds during which *no other task advances* — every concurrent agent run, every trace event, every HTTP response stalls.
 
-  R1 write backpressure   slow client (plausible) × process memory  → HIGH
-  R6 sync cosine scan     large corpus (when used) × frozen loop     → MED
-  R2 serial tool calls    every multi-tool turn    × per-run latency → MED
-  R3 no per-call timeout  hung provider (rare-ish) × one hung run    → MED
-  R7 embed+recall cancel  abort mid-embed (rare)   × one orphan req  → LOW
-  R8 memory counter Map   long-running process     × slow leak       → LOW
-  R4 fs last-write-wins   same-second collision    × one file        → LOW
-  R5 client trace heap    huge trace in browser    × one tab         → LOW
-```
+**Why it's acceptable today:** aptkit is a library with a dev/test in-memory store; real corpora live in buffr's `PgVectorStore`. At current scale the inline cost is right (no async overhead, trivially traceable).
 
-## The ranked findings
+**What changes it:** the day the in-memory store holds a large corpus in a long-lived process. The fix is behind the existing `VectorStore` contract (`pipeline.ts:73`), so it's a wiring change, not a rewrite: swap to `PgVectorStore` (scan becomes a network `await` in Postgres), offload to `worker_threads`, or move to a sub-linear ANN index. → `03`, `05`.
 
-### R1 — No write backpressure on the NDJSON stream (HIGH)
+### 2. (MED) No producer-side backpressure or concurrency limit
 
-**Observed.** `streamReplayResponse` calls `res.write(encodeNdjsonRecord(...))` per event and ignores the return value; there is no `await once(res, 'drain')`. `apps/studio/vite.config.ts:906–909`.
+**Evidence:** no `Promise.all`/`allSettled`/`race`, no `p-limit`, no semaphore, no queue anywhere in `packages/`. `runAgentLoop`'s bounds (`run-agent-loop.ts:98`, `:101`) are *per-run* — turn count and tool-call count — not system-wide.
 
-**Trigger and blast radius.** When the producer (agent emitting trace events) outpaces a slow or stalled HTTP client, `res.write` returning `false` is the kernel saying "send buffer full." Ignoring it means unsent data accumulates in the Node process heap, unbounded — a slow client can grow the dev server's memory until it's killed. Blast radius is process-wide (affects every request on that server), which is why it's ranked highest despite being unlikely in the current human-paced usage.
+**Consequence (concrete):** if a host fires N concurrent `runAgentLoop` calls, all N are in flight at once, all hammering Ollama/the cloud simultaneously. Nothing throttles them; a burst can overwhelm the model server or blow past a provider rate limit, and the failures come back as provider errors with no smoothing.
 
-**Inference vs observed.** Observed: the return value is ignored. Inferred: under a flood-to-slow-client it buffers unboundedly (standard Node stream behavior, not measured here).
+**Why it's acceptable today:** throughput control is a deployment concern, and aptkit is deliberately deployment-agnostic. The host (buffr) owns how many concurrent runs it admits.
 
-**The move.** Honor backpressure: `if (!res.write(line)) await once(res, 'drain')`. The NDJSON protocol, the `finally{ res.end() }`, and the client decoder all stay identical — it's a write-loop change only. See `06` Phase B.
+**What changes it:** embedding aptkit in a server taking concurrent traffic. The fix is a concurrency limiter at the *call site* (the host), not inside the loop. → `07`, `study-distributed-systems`.
 
-### R6 — In-memory vector search is an unbounded synchronous scan (MEDIUM)
+### 3. (LOW) No graceful shutdown — no SIGTERM/SIGINT handler
 
-**Observed.** `InMemoryVectorStore.search` iterates every stored chunk and computes `cosineSimilarity` (an O(dim) dot-product loop) inline, then sorts — all synchronously, no `await` in the scan. `packages/retrieval/src/in-memory-vector-store.ts:25-33`, `:46-57`. The `dimension` is fixed (768), but the chunk *count* is unbounded.
+**Evidence:** no `process.on('SIGTERM')` or `process.on('SIGINT')` anywhere in `packages/`, `apps/`, or `scripts/`.
 
-**Trigger and blast radius.** For the demo corpus (3 docs) this is microseconds. Index a large corpus and a single `search` call runs an O(N·768) scan with no yield point — the event loop is frozen for the whole scan, blocking every other request on that process. Blast radius is process-wide (it's a loop-freeze, like R1), which is why it outranks the latency-only R2/R3.
+**Consequence (concrete):** a `kill` (or a container stop) mid-run drops the run instantly — no drain of in-flight work, no flush of buffered trace events, no cleanup. Any partially-produced result is lost.
 
-**Inference vs observed.** Observed: the scan is synchronous and linear in chunk count. Inferred: at large N it freezes the loop (standard single-threaded behavior; the demo corpus is too small to measure it).
+**Why it's acceptable today:** runs are short-lived (a library, not a daemon), and there's no critical mutable state mid-write that a hard stop would corrupt. Graceful shutdown is the host process's job.
 
-**The move.** It's deliberately the "zero-cloud, from-scratch" adapter — the contract (`VectorStore`) already anticipates a `PgVectorStore` drop-in that pushes ranking into Postgres/pgvector, off the JS thread, behind the identical interface. (That pgvector store lives in a separate repo, not here.) Until then, the bound is operational: keep the in-memory corpus small. See `03`.
+**What changes it:** running aptkit inside a long-lived server. The fix uses the machinery that's *already there*: on SIGTERM, the host aborts the in-flight runs' `AbortSignal`s, and the existing cooperative-cancellation plumbing (`run-agent-loop.ts:99`, `:108`, `:159`) unwinds them cleanly. → `07`.
 
-### R2 — Tool calls execute serially, never fanned out (MEDIUM)
+### 4. (LOW) No wall-clock deadline on a run
 
-**Observed.** The tool loop is `for (const toolUse of toolUses) { await tools.callTool(...) }` — no `Promise.all`. `packages/runtime/src/run-agent-loop.ts:139–189`. Same serial shape in `scripts/replay-promoted-fixtures.mjs:28–40` and every other script.
+**Evidence:** `runAgentLoop` is bounded by turn *count* (`run-agent-loop.ts:98`), not elapsed time. A run with slow tools can take arbitrarily long in wall-clock terms within 8 turns.
 
-**Trigger and blast radius.** Any model turn that requests multiple *independent* tools pays the sum of their latencies instead of the max. Three independent 200ms tools take 600ms. Blast radius is per-run latency — no correctness impact.
+**Consequence (concrete):** a hung or very slow model/tool call leaves the run waiting at an `await` with no timeout — it'll wait as long as the underlying `fetch` does.
 
-**Inference vs observed.** Observed: serial execution. The latency cost is arithmetic, not measured.
+**Why it's acceptable today:** small, local, fast model calls in dev/test; the turn count is an effective practical bound.
 
-**The move.** This is a deliberate trade, not a bug: serial gives deterministic trace ordering and trivial cancellation. Fan out *only* when tools are provably independent, with a concurrency cap and per-tool error isolation, accepting nondeterministic trace order. The `AbortSignal` already threads into each `callTool` so cancellation survives the change. See `02` Phase B. Often the right call is to leave it serial — the latency is small relative to the model call itself.
+**What changes it:** production latency SLAs. The fix is trivial because cancellation is fully plumbed: pass `AbortSignal.timeout(ms)` as the run's `signal` — the existing `throwIfAborted` checks and signal-forwarding honor it with zero new code. → `07`.
 
-### R3 — No per-call timeout on the awaited model request (MEDIUM)
+### 5. (LOW) Instance state shared across runs is convention-guarded, not enforced
 
-**Observed.** `await model.complete({ ..., signal })` has no deadline; the loop bounds iterations, tokens, and tool count but not wall-clock time per call. `run-agent-loop.ts:103–109`. The only escape from a hung call is the externally-supplied `AbortSignal`.
+**Evidence:** `GemmaModelProvider.toolUseCount` (`gemma-provider.ts:44`) and `FallbackModelProvider.lastSelectedProvider` (`fallback-provider.ts:30`) are mutable instance fields.
 
-**Trigger and blast radius.** A provider that accepts the connection but never responds hangs that one run indefinitely (subject to the SDK's own internal defaults, which exist but aren't configured here). Blast radius is one run plus the resources it holds (a stuck stream socket, the live `messages` array).
+**Consequence (concrete):** not a torn-write race (the read-modify-write at `gemma-provider.ts:110` is synchronous, and there's one thread). But if one provider instance is *shared* across two concurrent agent runs, tool-use ids interleave across conversations and "last selected provider" becomes ambiguous — a logical collision, not memory corruption.
 
-**Inference vs observed.** Observed: no `Promise.race` against a timer, no configured SDK timeout. Inferred: a non-responsive provider hangs until the SDK's built-in timeout (if any) or an external abort.
+**Why it's acceptable today:** the repo's usage is one provider instance per run.
 
-**The move.** Compose a deadline into the existing signal: `AbortSignal.timeout(ms)` merged with the caller's signal at the top of the loop. Zero new plumbing — every layer already accepts and honors an `AbortSignal`. See `07` Phase B.
+**What changes it:** any host that pools and shares provider instances across concurrent runs. The fix is a usage convention (one instance per run) or making the providers stateless w.r.t. the counter — not a lock. → `04`.
 
-### R7 — The agent's AbortSignal never reaches the embedding or memory-recall call (LOW)
-
-**Observed.** Two instances of the same gap. (a) `OllamaEmbeddingProvider.embed` accepts an `AbortSignal` and threads it to the socket (`packages/retrieval/src/ollama-embedding-provider.ts:50-57`), but `pipeline.query` calls `embed([query])` with no options (`packages/retrieval/src/pipeline.ts:56`), so the agent's signal — which reaches the model call correctly — is dropped at the pipeline seam. (b) `@aptkit/memory` is the *worse* of the two: `recall(query, k?)` and `remember(turn)` take no signal argument at all (`packages/memory/src/conversation-memory.ts:36-38`), so there's no seam to thread one through — and the `search_memory` handler calls `await memory.recall(query, topK)` signal-less (`packages/memory/src/memory-tool.ts:52`). Both the `embed([query])` and `store.search(...)` inside `recall` run with no signal.
-
-**Trigger and blast radius.** Abort a RAG or memory-recall run while it's embedding: the model call tears down, but the in-flight HTTP request to localhost Ollama (or a slow `PgVectorStore` search) runs to completion as an orphan. Blast radius is one orphaned request that finishes unwatched — small, hence LOW.
-
-**Inference vs observed.** Observed: the embed provider accepts a signal but the pipeline doesn't pass one; the memory contract has no signal parameter at all. Inferred: an abort mid-embed leaves the request running (the provider's `throwIfAborted` only fires if a signal is supplied; memory has no checkpoint at all).
-
-**The move.** RAG side: one-line fix, thread `signal` through `RetrievalPipeline.query` → `embedder.embed(texts, { signal })` — the provider half is already built correctly. Memory side: slightly larger — add a `{ signal }` option to the `ConversationMemory` contract first, then thread it into `embed`/`search`. See `07`.
-
-### R8 — The memory counter Map is unbounded in-process state, lost on restart (LOW)
-
-**Observed.** `createConversationMemory` closes over `const counters = new Map<string, number>()` (`packages/memory/src/conversation-memory.ts:71`) that persists across `remember` calls to mint distinct ids per conversation (`memory:${conversationId}:${n}`). One entry per distinct `conversationId`, never evicted; the read-modify-write is atomic (synchronous, before the `await store.upsert` — no race, see `04`).
-
-**Trigger and blast radius.** Two distinct problems, both LOW. *Leak:* a long-running process that serves many conversations grows the `Map` without bound — one entry per conversation, forever, until restart. For a dev server this is negligible; for a long-lived production process it's a slow leak. *Durability:* the counter is in-process only, so a restart resets every conversation's `n` to 0 — a post-restart `remember` for a pre-existing conversation would mint `memory:conv:0` again and `upsert` over the first stored turn. Blast radius is one overwritten memory row (or unbounded process memory over a very long uptime).
-
-**Inference vs observed.** Observed: the `Map` never evicts and is closure-local (not persisted). Inferred: restart causes id reuse and a same-id upsert overwrite (the store's `upsert` is last-write-wins on id).
-
-**The move.** Accept it for the demo (single short-lived process, few conversations). If memory ever runs in a long-lived process: derive `n` from a durable source instead of an in-process counter — e.g. count existing rows for the conversation in the store, or use a content/UUID-based id that doesn't depend on a per-process counter. That removes both the leak and the restart-collision in one change. See `04`, `05`.
-
-### R4 — Filesystem writes are last-write-wins with no lock (LOW)
-
-**Observed.** Promote and save write JSON to a computed path with no file lock; collision avoidance is by embedding a timestamp + slug in the filename. `apps/studio/vite.config.ts:1356–1360`, `:374–377`.
-
-**Trigger and blast radius.** Two writers targeting the identical path (same fixture + provider + second) overwrite each other silently. Blast radius is one file; no in-memory corruption (see `04`).
-
-**Inference vs observed.** Observed: no `flock`, naming-based avoidance. Inferred: a same-second collision is last-write-wins (standard fs behavior).
-
-**The move.** Accept it — the contention pattern (manual Studio promotes, sequential script runs) makes a same-second same-name collision practically impossible, and the artifacts are append-mostly. If concurrent automated promotion ever appears, switch to write-temp-then-rename (atomic) or include a random suffix.
-
-### R5 — Client accumulates the full trace in component state (LOW)
-
-**Observed.** The browser consumes the stream record-by-record (flat memory in the decoder, `apps/studio/src/api.ts:138–161`), but the React layer collects events into state for display. A pathologically large trace would grow the *browser* tab's heap.
-
-**Trigger and blast radius.** Only a runaway trace (which the bounded loop in `07` prevents — `maxTurns` caps the event count) could grow this. Blast radius is one browser tab.
-
-**Inference vs observed.** Observed: streaming decode is flat. Inferred: the React-side accumulation is bounded *because the loop is bounded*, not because the UI caps it.
-
-**The move.** No action — the bound lives upstream in the agent loop. If unbounded external traces were ever loaded, virtualize the list.
-
-## What is NOT a red flag (deliberately clean)
-
-These are the things an auditor might flag in another codebase but which are correctly handled or correctly absent here:
+## Structurally absent (correctly) — do not flag these
 
 ```
-  Checked and clean
-  ─────────────────
-  in-memory races         ✓ run-to-completion + per-run state (04)
-  resource leaks          ✓ finally{ res.end() } + fs/promises (06)
-  cancellation reaching    ✓ signal threaded to the SDK socket (07)
-    the wire
-  unbounded message growth ✓ maxTurns + 16KB truncate (05, 07)
-  loop-blocking sync work  ✓ tool-result spans bounded; cosine scan = R6 (03)
-  fallback-on-abort bug    ✓ fallback re-throws aborts (07)
-  nested Gemma retry loop  ✓ maxToolCallAttempts caps it + signal checks (07)
+  Runtime failure classes that CANNOT occur here, and why
+
+  ┌─ thread data races / torn reads ─┐  one JS thread, run-to-completion
+  ┌─ deadlocks / lock-order bugs ────┐  no locks exist (none needed)
+  ┌─ file-descriptor leaks ──────────┐  fs.promises = acquire-use-release in one call;
+  │                                   │  the one held handle (stream reader) releases
+  │                                   │  in a finally (api.ts:177)
+  ┌─ unbounded agent runs ───────────┐  maxTurns + maxToolCalls + forced final turn
+  ┌─ runaway retry spins ────────────┐  retry loops hard-capped (gemma 2x, structured 2x)
+  ┌─ stack overflow ─────────────────┐  iterative everywhere, no deep recursion
+  └───────────────────────────────────┘
 ```
 
-## `not yet exercised`
+Calling any of these a "risk" would be cargo-culting concerns from threaded/streaming systems onto a single-threaded library that designed them out.
 
-Runtime-systems mechanisms absent from the repo (not risks — just untouched territory):
+## `not yet exercised` summary
 
-- **Worker threads / `Worker` / `worker_threads` / `cluster` / process pools** — no multi-threading or multi-process fan-out. Verified absent in source. Relevant only if CPU-bound work appears (the on-device ML in Rein's `contrl` is that workload — different repo).
-- **Mutexes / semaphores / `Atomics` / `SharedArrayBuffer`** — no shared mutable concurrent state to guard (`04`).
-- **Manual memory management / object pools / `Buffer` reuse / GC tuning** — V8 defaults suffice for the small, short-lived live set (`05`).
-- **Stream `drain`/`pipeline`/`highWaterMark` handling** — the missing piece behind R1 (`06`).
-- **Per-call deadlines / `Promise.race(timeout)` / graceful shutdown (`SIGTERM` drain)** — the missing piece behind R3 (`07`).
+| Concern | Status | Where it'd land | File |
+|---|---|---|---|
+| `worker_threads` / OS threads | absent | offload the cosine scan when n grows | `02`, `05` |
+| Producer backpressure / `p-limit` | absent | host call site (buffr), not the loop | `07` |
+| Rate limiting / wall-clock deadline | absent | `AbortSignal.timeout` into existing plumbing | `07` |
+| SIGTERM/SIGINT graceful shutdown | absent | host aborts run signals on shutdown | `07` |
+| Locks / atomics / channels | absent | only if `worker_threads` is added | `04` |
+| Parallel fan-out (`Promise.all`) | absent | within-turn tool calls, if latency demands | `02` |
+| Filesystem streaming | absent | only for files too big to buffer (none today) | `06` |
 
-## Validate
+## The one-line verdict
 
-1. **Reconstruct:** Rank R1–R7 by trigger-likelihood × blast-radius from memory; justify why R1 and R6 (both loop-freezes, process-wide) outrank the latency-only R2/R3.
-2. **Explain:** Why is "no in-memory races" not a finding here? (Run-to-completion + per-run state — `04`, `run-agent-loop.ts:94–95`.)
-3. **Apply:** A new endpoint streams a 100k-event export to a phone on a slow connection. Which finding bites, and what's the fix? (R1 — honor `drain`, `vite.config.ts:907`.)
-4. **Defend:** Argue why R2 (serial tools) might be left exactly as-is, and the one condition under which you'd fan out.
+aptkit's runtime is as safe as a single-threaded I/O-bound library can be: the per-run work is rigorously bounded and cleanly cancellable, the whole high-severity class of threaded-runtime bugs is structurally impossible, and the only real in-process risk — the inline cosine scan — is defused by small scale and swappable behind a contract. The remaining gaps (backpressure, deadlines, graceful shutdown) aren't defects; they're the deliberate seam where the library hands throughput and lifecycle to the deployment, and `AbortSignal` is the bridge that makes wiring them up cheap.
 
 ## See also
 
-- `00-overview.md` — the same findings in the overview's ranked list.
-- `06-filesystem-streams-and-resource-lifecycle.md` — R1, R4 in depth.
-- `07-backpressure-bounded-work-and-cancellation.md` — R3, R7 (both embed + memory-recall signal gaps), the nested Gemma loop, and the clean bounds/cancellation.
-- `04-shared-state-races-and-synchronization.md` — R8 (the memory counter `Map`) as state, and why it's not a race.
-- `03-event-loop-and-async-io.md` — R6 (the unbounded synchronous cosine scan) and memory's bounded sync filter in depth.
-- `02-processes-threads-and-tasks.md` — R2 in depth.
-- `.aipe/study-performance-engineering/` *(when generated)* — measuring R1/R2/R3 under load.
+- `00-overview.md` — the ranked findings in the context of the whole map
+- `03-event-loop-and-async-io.md` — finding 1, the blocking scan, in depth
+- `07-backpressure-bounded-work-and-cancellation.md` — findings 2-4, bounds and the missing controls
+- `04-shared-state-races-and-synchronization.md` — finding 5, instance-state sharing
+- `study-performance-engineering` · `study-distributed-systems` — the neighboring disciplines that own throughput and cross-process coordination

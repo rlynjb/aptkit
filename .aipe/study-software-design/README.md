@@ -1,107 +1,78 @@
-# Study — Software Design (AptKit)
+# Study — Software Design (aptkit)
 
-A per-repo software-design study guide. It reads the AptKit monorepo through
-the design primitives in John Ousterhout's *A Philosophy of Software Design*
-(APOSD) — **deep modules, information hiding, complexity, layering,
-readability** — and reports where the code honors each principle, where it
-violates it, and the specific move to fix it.
+*A Philosophy of Software Design* (John Ousterhout), applied to the **live
+aptkit repo**. Not the book — the findings about your code. This guide takes the
+book's primitives (deep modules, information hiding, complexity, layering,
+interface design, defining errors out of existence) and walks where aptkit
+honors them, where it leaks, and the single move to fix each.
 
-This is not the book. It teaches each primitive in one paragraph and spends
-its weight on findings about *your* files. For the full conceptual treatment,
-read APOSD itself (Ousterhout, 2nd ed.) — it is short, and it is the source
-every term here comes from.
-
----
+> **Source note.** Every primitive named here comes from Ousterhout's book.
+> This guide teaches the ideas in original words and spends its weight on the
+> code; for the full conceptual treatment of any primitive, read the book and
+> see `read-aposd` (the book-style framework guide). The value here is the
+> findings about *your* files — original by construction.
 
 ## The through-line
 
 ```
-  complexity is the enemy  ─────────►  deep modules are the weapon
+  complexity is the enemy   ──►   a deep module is the weapon
+  ─────────────────────────       ──────────────────────────────
+  change amplification             big behaviour
+  cognitive load              =     ÷  small interface
+  unknown-unknowns                 = depth
 
-  symptom            cause                   the fix
-  ──────             ──────                  ──────
-  change amplifies   knowledge leaks         hide the decision
-                     across modules          behind one interface
-  cognitive load     shallow modules         fold body into a
-  spikes             (interface ≈ body)      narrow contract
-  unknown-unknowns   special-case sprawl     define the case out
+  aptkit's bet: a few narrow contracts (ModelProvider, VectorStore,
+  EmbeddingProvider, CapabilityTraceSink) with deep, swappable bodies behind
+  each. The audit measures how well that bet held.
 ```
 
-AptKit's whole reason for existing — extract reusable agent parts so they
-ship as one npm bundle without app logic leaking in — *is* an information-
-hiding argument at the package level. The repo is unusually deliberate about
-one interface (`ModelProvider` — and now reuses that exact shape *three* times:
-the retrieval contracts, and conversation memory over those same contracts) and
-unusually repetitive about another (the six agent classes, newest being
-`RagQueryAgent`). Both are findings here.
-
----
-
-## What's in this folder
-
-```
-  README.md                        ← you are here: map + through-line
-  00-overview.md                   ← one-page orientation, depth ranking
-  audit.md                         ← Pass 1: the 8 APOSD lenses, every lens
-                                      checked, `not yet exercised` named honestly
-
-  01-model-provider-deep-module.md ← Pass 2: the canonical deep module
-  02-provider-decorator-stack.md   ← fallback + context-guard as wrappers
-  03-rules-as-data-validation.md   ← structural-diff: many rule types, one walk
-  04-capability-agent-template.md  ← the 5-agent duplication (the weak spot)
-  05-bundle-as-public-surface.md   ← @rlynjb/aptkit-core re-export boundary
-  06-retrieval-contracts-as-deep-  ← the deep-module move reused: Embedding +
-     seams.md                         VectorStore contracts, the dimension
-                                      one-way door, weak-caller defenses, Gemma
-  07-conversation-memory-deep-     ← the same move a THIRD time: ConversationMemory
-     module.md                        over the same contracts, injected store, and
-                                      the over-fetch-then-filter workaround for a
-                                      VectorStore that can't filter by metadata
-```
-
-**Pass 1** (`audit.md`) is fixed: one section per design lens, same shape every
-repo. **Pass 2** is the discovered patterns — named after design moves AptKit
-actually makes. The file list itself is a finding: a deep module, a decorator
-stack, a rules engine, a template that *should* be an abstraction but isn't,
-a public surface, the deep-module move *reused* for retrieval (`06`), and
-(newest) that move a *third* time for conversation memory (`07`). The trio
-`01`/`06`/`07` is the headline: `ModelProvider`'s narrow-contract-over-large-body
-shape applied to provider, retrieval, and memory — a confirmed house style. `07`
-also adds the one new design finding the memory package brings: an
-over-fetch-then-filter workaround for a `VectorStore` contract that has no
-metadata predicate, *named in a comment* at the line it bites, with an explicit
-trigger to deepen the contract instead (a second consumer needing the filter).
-
----
+The repo is young but the interface discipline is above the bar for its size.
+The strongest single piece of evidence isn't a module — it's that
+`@aptkit/memory` was built as a *second* consumer of the retrieval contracts
+with zero new infrastructure. Interfaces drawn at the right place let that
+happen.
 
 ## Reading order
 
-1. **`00-overview.md`** — the whole repo's design shape in one page, modules
-   ranked by depth. Start here.
-2. **`audit.md`** — the 8-lens walk. The capstone red-flags section at the end
-   is the actionable index; if you read one thing, read that.
-3. **`01`** then **`04`** — the best example (deep module) and the worst
-   (agent duplication), back to back. The contrast is the lesson.
-4. **`06`** then **`07`** right after `01` if the contracts are what you're here
-   for — they're the same deep-module move seen a second and third time, the
-   cleanest way to confirm you actually internalised `01`. `07` is also where the
-   one genuinely new design finding lives (the over-fetch-then-filter workaround).
-5. **`02`, `03`, `05`** — in any order.
+```
+  1. 00-overview.md          one-page orientation: the design shape at a glance
+  2. audit.md                Pass 1 — the 8-lens audit, ranked, with the
+                             red-flag checklist and the one-thing-to-fix-first
+  3. 01-…06-                 Pass 2 — deep walks of the six load-bearing moves
+```
 
----
+Read `00-overview.md` for the map, `audit.md` for the verdicts, then the
+pattern files for the move you care about.
+
+## The discovered patterns (Pass 2)
+
+Named after the design *moves* aptkit actually makes — the file list is itself a
+teaching artifact:
+
+| file | the move | book primitive |
+| --- | --- | --- |
+| `01-deep-provider-module.md` | one 3-method contract, many deep bodies | deep module / interface design |
+| `02-emulation-hidden-behind-complete.md` | tool-calling Gemma doesn't have, hidden behind `complete()` | information hiding |
+| `03-contract-as-the-product.md` | retrieval contracts that never name a vendor; memory reuses them | information hiding / abstraction |
+| `04-guard-rails-as-information-hiding.md` | the search tool absorbs model weakness so callers never see it | define errors out of existence |
+| `05-injectable-trace-seam.md` | one `emit()` interface, body injected (in-memory ↔ Supabase) | deep interface / a seam (and its honest weakness) |
+| `06-capability-as-composition.md` | agent = prompt + policy + loop + validator, composed | layering / pull complexity down |
+
+## The verdict, in one line
+
+Above the bar for a repo this size. Fix first: **add a metadata filter to
+`VectorStore.search`** — it collapses two duplicated over-fetch-then-filter
+implementations, pushes the work down into each store, and kills the
+`topK * 4` magic-number drift (audit lens 3 and 8).
 
 ## Cross-links
 
-- **`.aipe/study-system-design/`** — same repo, higher altitude. Where this
-  guide asks "is `runAgentLoop` a deep module?", system-design asks "where do
-  the package boundaries sit and how does a request flow through them?" Rule
-  of thumb: module/interface/complexity findings live here; service/
-  architecture/flow findings live there.
-- **`.aipe/study-ai-engineering/`** — the AI-specific reading of the same
-  code: why the agent loop forces a synthesis turn, how structured generation
-  retries, what the eval seam buys. This guide treats those as design objects
-  (is the loop deep? does the validator leak?); the AI guide treats them as AI
-  mechanics.
-- **APOSD** (Ousterhout) — the source. Every red flag named here is defined
-  there in ~15 pages. Read chapters 4 (deep modules), 5 (information hiding),
-  and the red-flags appendix first.
+- `../study-system-design/` — the same contracts at *service* altitude:
+  boundaries, the aptkit↔buffr split, where state lives. (Altitude rule:
+  module/interface here; service/architecture there.)
+- `../study-agent-architecture/` — `runAgentLoop` and agentic retrieval as
+  *reasoning* patterns, not just module shapes.
+- `../study-testing/` — the injectable-transport seam (`05-…`) is the same
+  boundary the tests mock; fixtures and replay live there.
+- `read-aposd` — the book-style framework guide that teaches these primitives
+  abstractly. Read it for depth; read this for your code.

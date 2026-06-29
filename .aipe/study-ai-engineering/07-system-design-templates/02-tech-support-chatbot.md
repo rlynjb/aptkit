@@ -1,83 +1,62 @@
-# Tech Support Chatbot System Design
+# Design a technical-support chatbot
 
-- **The prompt:** "Design a tech support chatbot for a product. It must answer customer questions, escalate when it can't, and learn from agent corrections."
+- **The prompt:** "Design a support chatbot that answers customer questions from a product knowledge base and escalates to a human when it can't."
 
-- **Standard architecture:**
+- **Standard architecture:** The whiteboard starts with the RAG spine — retrieve from the KB, ground the answer, cite — and then the two things that make it a support system rather than a Q&A toy: an escalation gate and a feedback loop.
 
-  ```text
-  Support chatbot pipeline
-  ────────────────────────────────────
-  User message
-    │
-    ▼
-  ┌──────────────────────────────────┐
-  │ Intent classification            │
-  │  (heuristic + LLM)               │
-  └──────────────┬───────────────────┘
-                 │
-                 ▼
-  ┌──────────────────────────────────┐
-  │ RAG over knowledge base          │
-  │  (docs, past tickets, runbooks)  │
-  └──────────────┬───────────────────┘
-                 │
-                 ▼
-  ┌──────────────────────────────────┐
-  │ LLM response generation          │
-  │  (constrained to retrieved KB)   │
-  └──────────────┬───────────────────┘
-                 │
-            ┌────┴─────┐
-            │          │
-   confident▼          ▼ unsure / out-of-scope
-       Respond     ┌──────────────────┐
-                   │ Escalate to      │
-                   │ human agent      │
-                   └────────┬─────────┘
-                            ▼
-                   Agent answer logged
-                   for KB update
+  ```
+  Support chatbot — grounded RAG with escalation gate
+  ┌────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐
+  │ user   │ → │ intent   │ → │ retrieve │ → │ grounded │
+  │ message│   │ classify │   │ from KB  │   │  answer  │
+  └────────┘   └────┬─────┘   └──────────┘   └────┬─────┘
+                    │                             ▼
+                    │                       ┌──────────┐
+                    │ (low confidence)      │confidence│
+                    └──────────────────────→│   gate   │
+                                            └────┬─────┘
+                              ┌──────────────────┴─────────────┐
+                              ▼ (pass)                         ▼ (fail)
+                        ┌──────────┐                    ┌────────────┐
+                        │  answer  │                    │ escalate   │
+                        │ + cites  │                    │ to human   │
+                        └────┬─────┘                    └────────────┘
+                             ▼
+                        ┌──────────┐
+                        │ feedback │ → KB freshness + correction log
+                        │   loop   │
+                        └──────────┘
   ```
 
+  The gate is the design point: a support bot that answers confidently when it shouldn't is worse than one that escalates.
+
 - **Data model:**
-  - Knowledge base: docs, FAQs, past ticket resolutions, each chunked, embedded, indexed.
-  - Conversation history per user with `{turn, role, content, tools_called, confidence_score, escalated}`.
-  - Escalation log linking bot conversations to human-resolved outcomes — the training signal for improvement.
-  - Feedback log: thumbs-up/down per response, free-text agent corrections.
+  - KB chunk index (vector store) — embedded doc chunks for retrieval, the answer's evidence.
+  - Conversation log — per-session message turns with the retrieved chunks and the cited chunk ids, for audit and replay.
+  - Confidence/escalation log — which turns hit the gate and why, to tune the threshold.
+  - Correction log — human edits to wrong answers, the label source for both KB gaps and answer-quality eval.
+  - KB freshness metadata — per-doc last-updated and source, to enforce a staleness SLA.
 
 - **Key components:**
-  - *Intent classification*: detect category (billing, technical, account, out-of-scope) before retrieval. Decision: heuristic keyword first, LLM classifier on ambiguous cases.
-  - *RAG retrieval*: hybrid retrieval over the KB, scoped by intent to reduce noise. Decision: chunk by section, not by token.
-  - *Response generation*: LLM constrained to cite retrieved chunks. Decision: refuse if no chunk clears the relevance threshold — escalate rather than hallucinate.
-  - *Escalation*: rule-based gate (out-of-scope intent, confidence below threshold, or "agent please") triggers handoff with full context.
-  - *Feedback loop*: agent corrections logged as gold-standard responses, fed back into the eval set, used to find KB gaps.
+  - Intent classifier routes the message (FAQ vs account-specific vs out-of-scope); choice: heuristic keyword match before the LLM so the common intents never pay for a model call.
+  - Retriever pulls candidate KB chunks for grounding; choice: vector top-k with a minimum-k floor so the answerer always has evidence to cite or explicitly nothing.
+  - Grounded answerer generates the reply constrained to retrieved chunks and emits citations; choice: cite-or-refuse — if no chunk supports the claim, say so rather than generate.
+  - Escalation gate compares answer confidence to a threshold and routes to a human on failure; choice: refuse-and-escalate beats a low-confidence guess because a wrong support answer costs more than a handoff.
 
 - **Scale concerns:**
-  - At ~10k conversations/day: LLM cost dominates. Cache common Q-A pairs, route easy questions to a cheaper model.
-  - At ~100 escalations/day: human agents become the bottleneck. Prioritize the queue by user value; surface the bot's draft so the agent edits instead of types.
-  - At ~1M KB chunks: retrieval latency grows. Tiered retrieval (intent-scoped first, full corpus on miss), pre-compute embeddings for hot entries.
+  - At ~1k KB docs retrieval quality drops if chunks overlap topics; you need per-product namespacing or metadata filters before the vector search.
+  - At ~100 concurrent sessions the LLM answerer is the latency and cost bottleneck; cache answers for repeated FAQ intents and reserve generation for novel queries.
+  - At weekly KB churn freshness becomes the dominant failure; without a reindex SLA the bot confidently cites superseded docs.
+  - At ~10k daily conversations the correction log is large enough to mine for systematic KB gaps and to fine-tune the gate threshold.
 
-- **Eval framing:**
-  - Offline: golden set of resolved tickets, bot answer vs human answer, rubric-scored.
-  - Online: resolution rate without escalation, time to resolution, CSAT.
-  - Adversarial set: prompt injection ("ignore previous instructions"), out-of-scope questions, hostile users.
+- **Eval framing:** Offline, run a labeled set of question→expected-answer pairs through the pipeline and score retrieval with precision@k/recall@k and answer quality with an LLM-as-judge rubric (grounded? cited? correct?). Online, watch deflection rate (resolved without human), escalation precision (escalations that genuinely needed a human), and thumbs-up/correction rate. The metric that matters is not answer rate — it's correct-or-escalated rate.
 
 - **Common failure modes:**
-  - Hallucinated answers when the KB has nothing relevant. Mitigation: relevance threshold gates the response, refuse + escalate.
-  - Prompt injection in user messages. Mitigation: sanitize, never let the LLM emit privileged actions (passwords, refunds).
-  - Stale KB — bot describes a deprecated feature. Mitigation: freshness SLA, re-embed on doc change within 24h.
-  - Tone drift across conversations. Mitigation: system prompt defines persona; eval rubric scores tone adherence.
+  - Hallucination — the answerer asserts facts not in the retrieved chunks; mitigate with cite-or-refuse and reject answers whose claims don't map to a chunk.
+  - Stale KB — the bot cites a superseded doc; mitigate with a freshness SLA and surfacing last-updated in the citation.
+  - Over-escalation — the gate is too conservative and dumps everything on humans; mitigate by tuning the threshold against the escalation-precision metric.
+  - Silent wrong answer — confident reply with no human ever correcting it; mitigate with a feedback loop that logs corrections back as labels.
 
-- **Applies to this codebase:** **Partially — this is AptKit's closest AI-side template match.** The **query agent** (`packages/agents/query/src/query-agent.ts`) is structurally the chatbot pattern minus the escalation half. It has:
-  - **Intent classification, heuristic + LLM**, exactly as the template draws it. `packages/agents/query/src/intent.ts` exposes `parseIntent()` (keyword heuristic: `monitoring` / `recommendation` / `diagnostic`) and `classifyIntent()` (a one-word LLM classification call). This is the "heuristic first, LLM on ambiguous cases" decision made real.
-  - **Tool-augmented answer generation** in place of RAG-over-KB. Instead of retrieving KB chunks, the agent calls a read-only allowlist of ~49 analytics tools (`queryToolPolicy`) inside `runAgentLoop` and synthesizes prose with a `synthesisInstruction` that tells it to "cite the key numbers you found."
-  - **A refuse-don't-hallucinate behavior.** When the loop produces nothing usable, the agent returns `FALLBACK_ANSWER = 'I was unable to find enough data to answer that question.'` That is the "better to escalate than hallucinate" instinct, expressed as an honest fallback.
-  - **Least-privilege as the injection defense.** The template says "never let the bot emit privileged actions." AptKit enforces this at the seam: every query tool is read-only (`list_*`, `get_*`, `execute_analytics`), filtered by `filterToolsForPolicy` (`packages/tools`). The model physically cannot mutate the workspace, which is the structural version of the chatbot's "no refunds/passwords" rule.
+- **Applies to this codebase:** `partially`. The rag-query agent (`packages/agents/rag-query/src/rag-query-agent.ts`) is the RAG-over-KB spine: agentic retrieval with maxTurns 6 and maxToolCalls 4, profile injection, and cited answers grounded in the retrieved chunks via `search_knowledge_base` (`search-knowledge-base-tool.ts:101`, with its minTopK floor and hallucination-tolerant matchesFilter). Intent classification exists as a heuristic+LLM pass (`packages/agents/query/src/intent.ts`), so the front of the funnel is partially shaped. What's missing is everything that makes it a support system: there is no confidence gate, no escalation-to-human path, no feedback/correction loop, and no KB freshness SLA. It answers and cites; it does not know when to stop and hand off.
 
-  What is missing, and why it is only partial: AptKit answers over **ecommerce analytics tools, not a support knowledge base** — the domain is "why did revenue drop," not "how do I reset my password." And there is **no escalation gate, no human handoff, and no feedback loop.** The agent never decides "I am unsure, route this to a human"; it just returns the fallback string. There is no conversation history persisted per user, no confidence score on the answer, and no agent-correction log feeding the eval set. So the left two-thirds of the diagram (intent → retrieve → answer → refuse) is built; the right third (escalate → human → log → learn) is absent.
-
-- **How to make it apply:** Two additive changes, both reusing infrastructure that already exists:
-  1. **Add an escalation gate.** Today the query agent returns either an answer or `FALLBACK_ANSWER`. Replace that binary with a confidence-tiered decision: when the loop exhausts its `maxToolCalls` (6) without grounding, or when `classifyIntent` returns low confidence, emit an escalation `CapabilityEvent` (extend the union in `packages/runtime/src/events.ts`) instead of swallowing it as the fallback string. The Studio UI (`apps/studio`) already renders trace events, so an "escalated" marker would surface for free.
-  2. **Add feedback logging.** Persist a per-answer feedback record (thumbs-up/down, optional correction) as NDJSON alongside the replay artifacts in `artifacts/replays/`. Then close the loop the same way AptKit already closes its eval loop: promote a corrected answer to a fixture via `scripts/promote-replay-to-fixture.mjs`, so the correction becomes a deterministic regression test through `FixtureModelProvider`. That is the chatbot's "agent corrections feed the eval set," implemented with AptKit's existing replay-to-fixture pipeline.
-
-  RAG itself (chunk + embed the support KB) is the third piece, and it lives in [`../03-retrieval-and-rag/`](../03-retrieval-and-rag/) — AptKit's "retrieval" is currently tool calls, not vector search, so swapping the tool layer for an indexed KB is what turns this from analytics Q&A into a true support chatbot.
+- **How to make it apply:** Add a confidence threshold to `rag-query-agent.ts` after the answer is assembled — if the cited chunks don't sufficiently cover the answer (or the agent exhausts maxToolCalls without grounding), return a refuse-and-escalate result instead of a guess. Wire corrections and escalations into buffr's `agents.messages` (the conversation log already living in `/Users/rein/Public/buffr/sql/001_agents_schema.sql`) so human edits become labels. Then the rubric-judge eval (`packages/evals/src/rubric-judge.ts`) can score grounded/cited/correct on real traffic. The escalation gate and feedback loop are `not yet exercised`; the RAG spine and intent routing are real.

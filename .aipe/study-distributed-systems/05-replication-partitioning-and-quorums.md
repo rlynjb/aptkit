@@ -1,220 +1,259 @@
-# 05 — Replication, partitioning, quorums
+# 05 — Replication, Partitioning, and Quorums
 
-**Industry name(s):** replication / sharding / partition keys / quorum reads &
-writes / failover. **Type:** Industry standard.
-**Status in AptKit:** `not yet exercised` for replication/sharding/quorums;
-the fallback chain is a *failover* analog only.
+**Industry names:** replication · sharding / partitioning · partition key · quorum (R + W > N) · failover · the connection pool as a bounded resource — *Industry standard.*
 
 ## Zoom out, then zoom in
 
-This is a foundations file — AptKit has none of the heavy machinery here. The
-one honest analog is **failover**: the fallback chain switches from a failed
-provider to a healthy one, which is the *availability* half of why you replicate.
-But there's no data being copied, no quorum being counted, no shard being routed
-to.
+This is the most `not yet exercised` file in the guide, and the honest move is to
+say so up front: aptkit has **no replication, no shards, no quorum.** There is one
+Postgres and one in-memory store. But there are two real things to study — the
+**connection pool** (a bounded shared resource that behaves like a tiny distributed
+system) and the **`app_id` column** (a partition key that's already there, just
+operating on a single node). The rest is curriculum: named, mapped to where it would
+attach, and labelled honestly.
 
 ```
-  Zoom out — replication's home (empty in AptKit)
+  Zoom out — what's real vs what's curriculum
 
-  ┌─ Service layer ──────────────────────────────────────────────┐
-  │  FallbackModelProvider ── FAILOVER analog (swap to healthy node)│ ← only analog
-  └─────────────────────────────┬────────────────────────────────┘
-                               │ complete()
-  ┌─ Provider boundary ─────────▼────────────────────────────────┐
-  │  two providers, but NOT replicas of each other —              │
-  │  they're independent services, not copies of one dataset      │
-  └───────────────────────────────────────────────────────────────┘
-
-  no replicas of data · no shards · no quorum · no leader/follower
+  ┌─ buffr process ─────────────────────────────────────────────────────┐
+  │  pg.Pool ──── REAL: a bounded set of connections, shared concurrently │ ← study this
+  └──────────────────────────────┬───────────────────────────────────────┘
+                                 │ TCP (N connections)
+  ┌─ Supabase Postgres (ONE node) ▼──────────────────────────────────────┐
+  │  agents.chunks WHERE app_id = $2  ── REAL: app_id is a partition key  │ ← study this
+  │                                       (logical; single-node today)    │
+  │  ┌─ replica? ─┐  ┌─ shard 2? ─┐  ┌─ quorum? ─┐                         │
+  │  │ NOT YET    │  │ NOT YET    │  │ NOT YET   │  ← curriculum only      │
+  │  └────────────┘  └────────────┘  └───────────┘                         │
+  └─────────────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: **replication** = keep N copies of the same data so a copy's failure
-doesn't lose it (durability) or block reads (availability). **Partitioning
-(sharding)** = split one dataset across N nodes by a key so it fits / scales.
-**Quorum** = require a majority of copies to agree on a read or write so you
-tolerate a minority failing. AptKit has data in one place (memory + local files),
-so none of these apply. The fallback chain looks like failover but it's failing
-over between *different services*, not *replicas of the same data*.
+Zoom in: **replication** keeps N copies of the data so a copy can fail; **partitioning**
+splits the data across nodes so no one node holds it all; **quorum** is the rule
+(`R + W > N`) that lets a majority of replicas agree without all of them being up.
+None of these exist here — but `app_id` shows you what a partition *key* looks like
+before you have multiple partitions, and the pool shows you bounded-resource
+contention, which is the same shape as a quorum running out of available nodes.
 
-## Structure pass — layers, axis, seam
+## Structure pass
 
-Trace the **dependency axis** — "if this node dies, what's lost, and is there a
-backup that has the same data?":
+**Layers.** Caller concurrency → pool (bounded connections) → single Postgres node →
+(hypothetical) replicas/shards.
+
+**Axis — trace `how many independent copies must agree?` down the layers.**
 
 ```
-  "if this dies, is there a copy with the same data?" — down the layers
+  Axis — "how many copies/nodes must cooperate for this op?" — top to bottom
 
-  ┌────────────────────────────────────────────┐
-  │ in-memory state                             │ → dies with the process. NO replica.
-  │                                             │   recovery = re-run, not failover.
-  └────────────────────┬───────────────────────┘
-      ┌────────────────▼─────────────────────────┐
-      │ provider 1 (Anthropic)                     │ → if down, fail over to provider 2
-      │                                            │   — but p2 is NOT a copy of p1's data
-      └────────────────┬───────────────────────────┘
-          ┌────────────▼─────────────────────────┐
-          │ provider 2 (OpenAI)                   │ → an independent service, not a
-          │                                       │   follower replica
-          └───────────────────────────────────────┘
+  ┌─ a chunk write ────────────────────────────┐
+  │  needs: ONE connection from the pool        │  → 1 of N connections (real contention)
+  └──────────────────────┬──────────────────────┘
+       ┌─────────────────▼────────────────────────┐
+       │ that connection → ONE Postgres node       │  → 1 node (no replicas to agree)
+       └─────────────────┬────────────────────────┘
+            ┌────────────▼──────────────────────────┐
+            │ (if replicated) → quorum of replicas   │  → NOT YET EXERCISED
+            └─────────────────────────────────────────┘
 ```
 
-The seam is the fallback boundary, and the axis *almost* flips — provider 1
-failing routes to provider 2 — but it's service redundancy, not data
-replication. No quorum is counted because there's no dataset that needs a
-majority to agree.
+**Seam.** The only place "how many must cooperate?" is greater than one today is the
+*pool*: a write needs one of N connections, and if all N are checked out, it waits.
+That's the real, studyable contention. Everything below it is single-copy, so the
+answer collapses to "one" — which is exactly why quorums are `not yet exercised`.
 
 ## How it works
 
-### Move 1 — the mental model: copies and the majority rule
+### Move 1 — the mental model: the pool is a bounded pile of borrowable connections
 
-You know replication from a read replica: writes go to a primary, reads can hit
-a follower copy. Quorum is the rule that makes a *set* of copies tolerate
-failure: with N copies, require W to ack a write and R to serve a read, and if
-**R + W > N**, every read is guaranteed to overlap a node that saw the latest
-write.
+You've built this shape: a fixed number of resources, borrowers take one, use it,
+return it; if none are free, borrowers wait. A connection pool is exactly that for
+TCP connections to Postgres.
 
 ```
-  Quorum — the majority-overlap kernel (general)
+  The pool kernel — borrow, use, return; wait when empty
 
-  N = 3 copies.  W = 2 (writes need 2 acks).  R = 2 (reads need 2 responses).
-  R + W = 4 > N = 3  → read set and write set MUST share ≥1 node
-                       → that shared node has the latest write → consistent read
+  pool: [ conn1 ][ conn2 ][ conn3 ]   (N = 3, say)
 
-  tolerates 1 node down (still reach 2 of 3). lose 2 → can't form a quorum.
+  caller A ──borrow──► conn1 ──query──► release ──► back in pool
+  caller B ──borrow──► conn2 ──query──► release
+  caller C ──borrow──► conn3 ──query──► release
+  caller D ──borrow──► (none free) ──► WAITS until A/B/C release
+                                         └─ if nobody releases → D hangs (pool exhaustion)
 ```
 
-The load-bearing part people forget: **R + W > N is the whole point** — it's the
-arithmetic that guarantees a read overlaps the latest write. Get it wrong (R + W
-≤ N) and reads can miss writes silently.
+The load-bearing part is the *wait*: when the pool is empty, the borrower blocks. A
+leaked connection (borrowed, never released) permanently shrinks the pool; leak all N
+and the whole app deadlocks waiting for a connection that's never coming back.
 
-### Move 2 — failover vs replication, and the absences
+### Move 2 — walking the mechanism
 
-**The analog: failover without replication.** The fallback chain gives you the
-*availability* benefit of replication (one node down doesn't kill the request)
-without any of the *data* machinery (no copies to keep in sync, no quorum to
-count). That's because the "data" is a fresh model response, regenerated by
-whichever provider answers — not a stored dataset that must survive.
+**Step 1 — the pool is created once, shared across the session.** buffr makes one
+pool per process and threads it everywhere:
 
-```
-  Failover (AptKit) vs replication (general) — the difference
-
-  REPLICATION:  write → all copies     read → quorum of copies (same data)
-                primary ──► follower1, follower2   (copies of ONE dataset)
-
-  AptKit FAILOVER: try p1 → fail → try p2   (p2 regenerates, doesn't hold p1's data)
-                   no copies, no sync, no quorum — just "next healthy service"
+```ts
+// buffr/src/db.ts:4-6
+export function createPool(databaseUrl: string): pg.Pool {
+  return new pg.Pool({ connectionString: databaseUrl });   // ← default max (10) connections
+}
 ```
 
-**The absences (`not yet exercised`), each with its trigger:**
+One pool, default size. Every `PgVectorStore` query and every `SupabaseTraceSink`
+insert borrows from this same pile. Note what's *not* set: no explicit `max`, no
+`connectionTimeoutMillis`. So under enough concurrent writes the pool can exhaust,
+and a borrower with no timeout waits indefinitely — the same "no deadline" hazard as
+the Ollama call, one layer down. (→ this is finding territory; see `09`.)
 
-- **Replication:** none. *Trigger: any state that must survive a single node's
-  loss — e.g. persisting artifacts to a store with replicas.*
-- **Partitioning / sharding + partition keys:** none. *Trigger: a dataset too
-  big for one node, needing a key to route rows to shards.*
-- **Quorum reads/writes:** none. *Trigger: ≥3 replicas where you tune R/W for the
-  consistency-vs-availability tradeoff.*
-- **Leader/follower roles:** none. *Trigger: a replicated store electing a
-  primary (see `07` for leader election).*
+**Step 2 — the upsert checks out one connection for a transaction.** This is the one
+place a connection is held across *multiple* queries, which makes it the one place a
+leak would hurt most:
+
+```ts
+// buffr/src/pg-vector-store.ts:40-64
+const client = await this.pool.connect();   // ← BORROW one connection
+try {
+  await client.query('begin');               // ← multi-statement: held for the whole txn
+  for (const c of chunks) { await client.query(`insert ... on conflict ...`, [...]); }
+  await client.query('commit');
+} catch (err) {
+  await client.query('rollback');
+  throw err;
+} finally {
+  client.release();                          // ← RETURN it — in finally, so even an error returns it
+}
+```
+
+The `finally { client.release() }` is the load-bearing line. It's the thing that
+prevents the leak: no matter how the try-block exits — success, thrown error,
+rollback — the connection goes back in the pool. Drop that `finally` and one failed
+upsert permanently burns one connection; enough failures exhaust the pool and the
+app wedges. This is correct, and it's the single most important defensive line in the
+buffr storage code.
+
+**Step 3 — the partition key that's already here: `app_id`.** Every query is scoped
+by `app_id`:
+
+```ts
+// buffr/src/pg-vector-store.ts:70-77 (the search)
+`select id, content, ..., 1 - (embedding <=> $1::vector) as score
+   from agents.chunks
+  where app_id = $2                          -- ← THE PARTITION KEY (logical)
+  order by embedding <=> $1::vector
+  limit $3`
+```
+
+`app_id` is a partition key in the *design* sense even though there's one physical
+node: it cleanly divides the data so that one app's chunks never mix with another's.
+The day this needs to scale, `app_id` is the natural shard key — route app A's data
+to shard 1, app B's to shard 2, and the query already carries the routing column.
+That's the value of choosing a partition key early: the *physical* partitioning is
+deferred, but the *logical* boundary is already enforced. The data is "pre-sharded"
+on a single node.
+
+### Move 2.5 — current state vs scaled state
+
+```
+  Phase A: today (single node)            Phase B: if buffr scaled
+  ──────────────────────────────          ──────────────────────────────────
+  one Postgres node                       primary + read replica(s)
+  pool → that one node                    pool → primary for writes,
+  app_id = logical partition                     replica(s) for reads (search)
+  no quorum (1 copy, trivially "agrees")  quorum: R + W > N for replica reads
+                                          app_id → physical shard key
+  what holds: idempotent upsert,          what BREAKS: read-your-writes (file 04),
+   the pool, the transaction               adds replica lag + failover + quorum
+```
+
+The takeaway is *what doesn't have to change*: the idempotent upsert, the
+per-document transaction, and the `app_id` scoping all survive the move to replicas
+and shards unchanged. What scaling *adds* is the staleness and coordination cost —
+which is precisely why you don't pay it until you must.
 
 ### Move 3 — the principle
 
-**Replication buys durability and availability; failover buys only
-availability.** AptKit needs availability at the provider boundary (so it fails
-over) but needs *no* durability of remote state (so it never replicates data).
-Knowing the difference — that switching to a backup *service* is not the same as
-reading from a *replica* of your data — is the distinction that separates "I've
-heard of failover" from "I understand what replication actually costs."
+Replication and partitioning are answers to two different questions:
+**availability** ("survive a node dying" → replication, keep copies) and
+**capacity** ("hold more than one node can" → partitioning, split the data). Quorum
+(`R + W > N`) is how replicas stay consistent without needing *all* of them up — a
+majority overlap guarantees reads and writes intersect. aptkit needs none of these
+yet because one node has the availability and capacity it needs. The skill is
+recognizing *which* problem you actually have before reaching for the mechanism — and
+choosing a partition key (`app_id`) early so the door stays open.
 
 ## Primary diagram
 
 ```
-  Replication spectrum — AptKit's position
+  Replication/partitioning in aptkit — one node, one real bounded resource
 
-  none ──────── failover ──────── replication ──────── quorum/sharding
-   │              ▲                     │                     │
-   │         AptKit HERE                │                     │
-  in-memory  (fallback chain:      not yet exercised   not yet exercised
-  state      swap to healthy       (no data copies)    (no shards, no R/W
-  (no copy)   SERVICE, not copy)                        quorum tuning)
+  ┌─ buffr process ─────────────────────────────────────────────────────┐
+  │  concurrent callers ──► pg.Pool [ c1 ][ c2 ]...[ cN ]  ← REAL: bounded │
+  │                            │ borrow/release (finally!)                 │
+  └────────────────────────────┼─────────────────────────────────────────┘
+                               │ TCP
+  ┌─ Supabase Postgres (ONE node) ▼──────────────────────────────────────┐
+  │  agents.chunks  WHERE app_id = $2   ← REAL: logical partition key      │
+  │                                                                        │
+  │  ┌╌ replica (NOT YET) ╌┐  ┌╌ shard 2 (NOT YET) ╌┐  ┌╌ quorum (NOT YET)╌┐│
+  │  ┊ would add staleness ┊  ┊ would use app_id    ┊  ┊ R+W>N agreement  ┊│
+  │  └╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┘  └╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┘  └╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┘│
+  └─────────────────────────────────────────────────────────────────────┘
+
+  studyable today: the pool (bounded), the app_id partition key.
+  curriculum only: replicas, shards, quorum, failover.
 ```
-
-## Implementation in codebase
-
-**Use cases.** The failover analog runs whenever a multi-provider chain is
-configured — provider 1 down → request served by provider 2. No data-replication
-code exists to cite.
-
-**Failover — the availability-without-data-copy pattern.**
-
-```
-  packages/providers/fallback/src/fallback-provider.ts  (lines 50-86)
-
-  for (let index = 0; index < this.providers.length; index += 1) {  ← the "replicas"
-    const provider = this.providers[index];                          ← (really: services)
-    try {
-      const response = await provider.complete(request);             ← try this node
-      return { ...response, ... };                                   ← first healthy wins
-    } catch (error) {
-      ... attempts.push(...); if (shouldFallback) continue;          ← node down → next
-    }
-  }
-       │
-       └─ this is failover, NOT replication: provider 2 regenerates the answer from
-          scratch — it does not hold a COPY of provider 1's data. there's no quorum
-          because there's no dataset that needs a majority to agree.
-```
-
-**`not yet exercised`:** no sharding, no partition keys, no replica reads, no
-R/W quorum config anywhere in the repo. The artifact files are single-copy on the
-local filesystem.
 
 ## Elaborate
 
-Quorum systems (Dynamo, Cassandra, Raft's log replication) all rest on the same
-R + W > N overlap arithmetic; the famous Amazon Dynamo paper popularized tunable
-N/R/W for trading consistency against availability. Sharding's hard problems —
-choosing a partition key that spreads load evenly, rebalancing when you add a
-shard, cross-shard queries — are exactly the problems Rein's `me.md` names as the
-gap ("distributed systems at horizontal scale ... multi-region replication").
-This guide teaches them as foundations precisely because the repo gives no place
-to anchor them; the honest move is to know the arithmetic cold and name the
-trigger.
+The connection pool is genuinely a miniature distributed-systems object and deserves
+the study time: it's a bounded resource shared by concurrent consumers with a
+queueing discipline, and pool exhaustion is one of the most common production
+incidents in any DB-backed service. The mechanics you learn here — borrow, hold for a
+transaction, release in `finally`, the danger of a leak, the need for a checkout
+timeout — transfer directly to thread pools, worker pools, semaphores, and rate
+limiters.
+
+Quorum (`R + W > N`) is worth understanding even though it's `not yet exercised`,
+because it's the elegant core of every replicated datastore: if writes go to a
+majority and reads come from a majority, the two majorities must overlap in at least
+one node, so a read always sees the latest acknowledged write. It's why Dynamo-style
+systems can tolerate node failures without losing consistency. It would attach here
+only if buffr ran multiple Postgres replicas with read traffic spread across them —
+at which point `app_id` becomes the shard key and the staleness from file 04 becomes
+real.
 
 ## Interview defense
 
-**Q: "Your fallback chain — is that replication?"**
-
-"No, and the distinction matters. It's *failover* between independent services.
-Replication keeps N copies of the *same data* and reads a quorum of them.
-Provider 2 doesn't hold provider 1's data — it regenerates the answer. There's no
-quorum because there's no dataset that needs a majority to agree."
+**Q: "How do you scale this?"**
+"Today I don't need to — one Postgres node has the capacity and availability buffr
+needs, so there's no replication, sharding, or quorum, and I won't pretend otherwise.
+What I *did* do is leave the door open: every query is scoped by `app_id`, which is a
+clean partition key, so physical sharding later is a routing change, not a data
+remodel. The one bounded resource I do reason about is the connection pool — it's the
+real contention point, and the `finally { client.release() }` in `PgVectorStore` is
+what keeps a failed upsert from leaking a connection and eventually wedging the pool."
 
 ```
-  replication: copies of ONE dataset, read R of N (R+W>N)
-  AptKit:      independent services, try next healthy one — no copies, no quorum
+  sketch
+
+  pool [c1..cN] ← borrow/RELEASE-in-finally (the real bounded resource)
+  agents.chunks WHERE app_id=$2 ← partition key, ready to become a shard key
+  replicas/quorum ← NOT YET; would add staleness (file 04) — the cost of scaling
 ```
 
-**Q: "Explain quorum. When would AptKit need it?"**
+**Q: "What does quorum buy you and why don't you have it?"** — the honest answer:
+"Quorum (`R + W > N`) lets a majority of replicas agree so the system survives a
+minority being down while staying consistent — reads and writes always overlap in at
+least one node. I don't have it because I have one copy of the data; there's nothing
+to form a majority of. It would matter the moment I replicated Postgres for
+availability, and that's also when read-your-writes would start to break — so I'd be
+buying consistency-under-failure at the cost of fresh-read simplicity."
 
-"R + W > N — require enough write acks and read responses that the read set
-overlaps the latest write. AptKit would need it the day it stores state across ≥3
-replicas and wants to tune the consistency/availability tradeoff. Today there's
-one copy of everything, so quorum is `not yet exercised`."
-
-## Validate
-
-1. **Reconstruct:** Write the quorum overlap rule and explain why R + W > N
-   guarantees a consistent read.
-2. **Explain:** Why is the fallback chain (`fallback-provider.ts:50-86`) failover
-   and not replication? What's the one-sentence difference?
-3. **Apply:** You move artifacts to a 3-replica store. Pick N/R/W for "reads must
-   always see the latest write" and justify the arithmetic.
-4. **Defend:** Argue that no replication is the right call for AptKit's state
-   today, and name the exact trigger that would change it.
+*Anchor:* one node, no quorum; the pool + `finally release` is the real bounded-
+resource lesson; `app_id` is the partition key already in place.
 
 ## See also
 
-- `02-partial-failure-timeouts-and-retries.md` — the failover mechanism in full.
-- `07-clocks-coordination-and-leadership.md` — leader election, the other half of
-  replicated stores.
-- `study-system-design` — the provider abstraction as an architectural choice.
+- `04-consistency-models-and-staleness.md` — replica lag is where staleness would enter
+- `02-partial-failure-timeouts-and-retries.md` — pool checkout needs a timeout, like the Ollama call
+- **study-database-systems** — pgvector index, MVCC, what a single Postgres node does inside
+- **study-system-design** — why one node was the right call (local-first, single user)
+```

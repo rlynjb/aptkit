@@ -1,241 +1,233 @@
-# 07 — Recursion, Backtracking, and Dynamic Programming
+# Recursion, Backtracking & Dynamic Programming
 
-**Industry name(s):** Recursion, tree/structural recursion, backtracking (constraint search), dynamic programming (memoization / tabulation). Type label: Language-agnostic foundation.
+**Industry name(s):** recursion · bounded iteration / state machines · backtracking · memoization / tabulation (DP) — *Industry standard*
+
+> **Status: partially exercised.** The agent loop is a **bounded iterative state machine** — the closest thing aptkit has to a recursion-shaped control flow, and it's deliberately *iterative*, not recursive. Backtracking and dynamic programming are `not yet exercised` — no overlapping-subproblem cache, no search-tree with undo, runs anywhere in aptkit. You've built recursion-with-call-stack visualizers and recursive BST traversals; this file grounds the iterative state machine that's real and labels DP/backtracking as honest curriculum.
+
+---
 
 ## Zoom out, then zoom in
 
-These three are a family: recursion is the base (a function calling itself on smaller input), backtracking is recursion that explores a state space and undoes choices, and dynamic programming is recursion that caches overlapping subproblems. AptKit uses exactly one of them, minimally: a single piece of *structural recursion* that flattens nested JSON into searchable text. Backtracking and DP are `not yet exercised` — there's no state-space search and no overlapping-subproblem optimization anywhere in the kit. You've built the harder members of this family in `reincodes` (recursion call-stack visualizers, the river-crossing state-space search in `PG.ts`), so the absence here is teachable against work you've done.
+The one control structure in aptkit that *could* have been recursive — the multi-turn agent loop — was written as a bounded `for` loop instead. That choice is the lesson.
 
 ```
-  Zoom out — recursion in AptKit
+  Zoom out — the loop that stands in for recursion
 
-  ┌─ Evals layer ────────────────────────────────────────┐
-  │  collectText(value): flatten nested JSON → one string │ ← the one recursion
-  │    recurse into arrays and objects, concat leaves      │
-  └───────────────────────────┬───────────────────────────┘
-                              │ used by containsText rule
-  ┌─ (absent) ────────────────▼───────────────────────────┐
-  │  backtracking (state-space search)  not yet exercised  │ ← your PG.ts
-  │  dynamic programming (memo/tab)     not yet exercised  │
-  └────────────────────────────────────────────────────────┘
+  ┌─ Service layer ─────────────────────────────────────────────┐
+  │  ★ runAgentLoop ★  (packages/runtime/src/run-agent-loop.ts)  │
+  │    for (turn = 0; turn < maxTurns; turn++)                   │
+  │      model.complete() → maybe run tools → append → repeat    │
+  │    a BOUNDED iterative state machine                        │
+  │    (recursion-shaped: "keep going until done or capped")    │
+  └───────────────────────────┬─────────────────────────────────┘
+                              │ recovery path
+  ┌─ one bounded retry, not a recursive descent ────────────────┐
+  │  runRecoveryTurn() — a SINGLE extra turn if parse fails      │
+  │  (NOT recursive backtracking; one shot, then give up)       │
+  └──────────────────────────────────────────────────────────────┘
+
+  not present anywhere: DP / memoization · backtracking search tree
 ```
 
-Zoom in: recursion solves a problem by reducing it to smaller instances of itself plus a base case. `collectText` does this over the *shape* of JSON — a value is a leaf (return it) or a container (recurse into children, combine). Backtracking adds "try a choice, recurse, undo if it fails" for searching a space of possibilities. DP adds a cache so you don't recompute the same subproblem. AptKit needs only the first, because its one recursive problem (flatten a tree) has no choices to undo and no overlapping subproblems to cache.
+Zoom in: recursion is "a function that calls itself on a smaller subproblem until a base case." An iterative state machine is the same idea unrolled into a loop with explicit state and an explicit termination bound. DP adds a cache so overlapping subproblems aren't recomputed; backtracking adds undo so you can explore a search tree and retreat. aptkit uses the loop; it has no use for the cache or the undo.
+
+---
 
 ## Structure pass
 
-**Layers.** One: the evals layer, where `collectText` recurses over a JSON value. The other two members of the family have no layer in the repo.
+**Layers:** the bounded loop (real), the single bounded recovery turn (real), backtracking (absent), DP (absent).
 
-**Axis — trace "subproblem structure": *what smaller problem does this reduce to, and do subproblems overlap?*** — the question that separates the three.
+**Axis — control flow / termination:** trace "what guarantees this stops?"
 
 ```
-  One axis — "subproblem structure" — across the family
+  One axis — "what guarantees termination?"
 
-  structural recursion  reduce to children, combine, no overlap
-  (collectText)         → tree recursion, O(nodes), each visited once
+  recursion          → a base case (smaller input each call)
+  aptkit agent loop  → a TURN COUNTER + forced-final escape   ← real
+  backtracking       → exhausted choices at every node        (absent)
+  DP                 → a finite filled table / memo            (absent)
 
-  backtracking          reduce to choices, recurse, UNDO on failure
-                        → explores a state space, prunes dead branches
-
-  dynamic programming   reduce to subproblems that OVERLAP → cache them
-                        → memoize/tabulate to avoid recomputation
-
-  the flip: collectText's subproblems are DISJOINT children (no
-  overlap → no DP needed) with NO choices (no undo → no backtracking).
-  it's the simplest member of the family.
+  the agent loop's guarantee is a HARD COUNT, not a base case —
+  because the LLM, not the code, decides whether to "recurse" again
 ```
 
-**Seam.** The boundary worth naming is between *disjoint subproblems* (a tree's children — `collectText`, no caching needed) and *overlapping subproblems* (the same input reached by different paths — what DP exists to handle). AptKit's recursion sits firmly on the disjoint side: each JSON node is visited exactly once, so there's nothing to cache and no choice to backtrack. That single property — disjoint, choice-free subproblems — is why neither backtracking nor DP appears.
+**Seam — code-bounded vs model-driven continuation.** Inside one turn, *code* decides the mechanics. But whether there's a *next* turn depends on whether the model emitted a tool call — the *model* drives the recursion-equivalent. The control axis flips at that seam: the loop is the code's, the recursion decision is the model's. That's why the bound must be a hard counter — you can't trust the model to hit a base case.
+
+---
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You built recursion call-stack visualizers, so the shape is familiar: a function that handles the base case directly and otherwise calls itself on smaller pieces, with the call stack tracking where to return. `collectText` is the cleanest kind — *structural* recursion that mirrors the shape of the data: a leaf returns its text, a container recurses into each child and joins the results.
+You've watched recursion build and unwind a call stack frame by frame. The agent loop is that pattern *unrolled*: instead of `solve(state)` calling `solve(smaller_state)`, it's `for each turn: advance(state)`. The "subproblem" is "what's left after this turn's tool results come back." It would be natural to write it recursively — `runTurn(messages)` calls `runTurn(messages + results)` — but aptkit makes it an explicit loop so the termination bound is dead obvious and there's no stack-depth risk from a model that won't stop.
 
 ```
-  The kernel — structural recursion over a tree
+  Pattern — bounded iterative state machine (recursion unrolled)
 
-  collectText(value):
-    if string  → return value           ← base case (leaf)
-    if array   → children.map(collectText).join('\n')   ← recurse, combine
-    if object  → values.map(collectText).join('\n')     ← recurse, combine
-    else       → return ''               ← base case (non-text leaf)
-
-  shape mirrors the data: leaves return, containers recurse+combine
+  state = [userPrompt]
+  ┌──────────────────────────────────────────────┐
+  │ turn 0: model.complete(state)                 │
+  │   tool_use? → run tools → append → continue   │──┐
+  │   no tool?  → finalText, BREAK                │  │
+  └──────────────────────────────────────────────┘  │ loop, not recurse
+  ┌──────────────────────────────────────────────┐  │
+  │ turn 1..maxTurns-1: same                      │◄─┘
+  │   last turn → forceFinal: strip tools,        │
+  │               demand the answer               │
+  └──────────────────────────────────────────────┘
+  termination: no-tool-use  OR  turn == maxTurns-1  OR  budget spent
 ```
 
-The strategy in one sentence: when a problem's structure is recursive (a tree of objects/arrays), write a function whose *cases* match the structure — one base case per leaf kind, one recursive case per container kind — and let the call stack handle the descent. No cache, no undo, because each node is independent and visited once.
+### Move 2 — the walkthrough
 
-### Move 2 — the one recursion, and the two absences
+#### The bounded loop and its three termination conditions
 
-**Structural recursion — `collectText`, flattening a tree to text.** Bridge from rendering nested JSON in the UI: to display arbitrary nested data you recurse, and `collectText` does the same to *search* it. The `containsText` eval rule needs to ask "does this subtree contain the word X anywhere?" — so it flattens the whole subtree into one string and does a substring check. The recursion is how it reaches every leaf regardless of nesting depth.
+The whole control structure is a counted loop with explicit exits — no recursion, no implicit base case:
 
-```
-  Execution trace — collectText flattening a subtree
-
-  value = {title: "Refund spike", tags: ["urgent", "billing"]}
-
-  collectText({...})              object → recurse into values
-    collectText("Refund spike")   string → "refund spike" (normalized)
-    collectText(["urgent","billing"])  array → recurse into items
-      collectText("urgent")       → "urgent"
-      collectText("billing")      → "billing"
-      join → "urgent\nbilling"
-    join → "refund spike\nurgent\nbilling"
-  ────────────────────────────────────────────────────────
-  result: one string; containsText then does .includes(needle)
-  each node visited exactly once → O(nodes), no cache needed
-```
-
-The load-bearing detail: the base cases. A string returns itself (optionally lowercased for case-insensitive search); a non-string, non-container leaf returns `''` (empty, contributes nothing). Without the `''` base case for numbers/booleans/null, the recursion would either throw or stringify them inconsistently. The base cases are what make the recursion *terminate* and stay well-typed at the leaves — drop them and you get either non-termination or garbage in the haystack. There's no visited set because JSON is a tree, not a graph — no cycles, so no risk of infinite recursion from revisiting.
-
-**Backtracking — `not yet exercised`.** Bridge from your `PG.ts` river-crossing solver: backtracking is recursion that *makes a choice, recurses, and undoes the choice if the branch dead-ends* — it searches a space of possibilities and prunes. AptKit has no such search. Every recursive descent here (`collectText`, `getPath`) is deterministic — there are no choices to try and undo, no constraints to satisfy by search. The trigger that would summon it: a constraint-satisfaction problem — e.g. selecting a valid combination of tools/parameters subject to rules, where you'd try a choice, recurse, and backtrack on conflict. None exists; the agent delegates "what to try next" to the *model*, not to a backtracking search.
-
-```
-  Backtracking shape (absent here) — try, recurse, undo
-
-  choose option →  recurse →  dead end? UNDO, try next option
-       │                              │
-       └──────── the UNDO is the defining move ───────┘
-
-  aptkit's recursion never undoes — it's deterministic descent.
-  the "search for what to do next" is the MODEL's job (the agent
-  loop), not a backtracking algorithm.
+```ts
+// packages/runtime/src/run-agent-loop.ts:98-109, 131-135
+for (let turn = 0; turn < maxTurns; turn += 1) {     // HARD bound (default 8)
+  signal?.throwIfAborted();
+  const budgetSpent = maxToolCalls !== undefined && toolCalls.length >= maxToolCalls;
+  const forceFinal = turn === maxTurns - 1 || budgetSpent;   // ← the escape
+  const response = await model.complete({
+    system: forceFinal && synthesisInstruction ? `${system}\n\n${synthesisInstruction}` : system,
+    messages,
+    tools: forceFinal ? undefined : toolSchemas,     // ← strip tools on final turn
+    maxTokens, signal,
+  });
+  // ...
+  const toolUses = toolUsesFromContent(response.content);
+  if (toolUses.length === 0) { finalText = text; break; }   // ← natural exit
+}
 ```
 
-**Dynamic programming — `not yet exercised`.** Bridge from memoized Fibonacci: DP applies when subproblems *overlap* — the same input is reached by many paths, so you cache (memoize) or build a table (tabulate) to compute each once. AptKit has no overlapping-subproblem structure. `collectText`'s subproblems are disjoint children; nothing recomputes the same input. The trigger: an optimization problem with optimal substructure and overlap — edit distance, longest common subsequence, optimal partitioning. The kit has no such problem; its "hard" decisions are made by the LLM, not by a DP table.
+Three ways the "recursion" stops: (1) the model emits no tool call → it answered, `break`; (2) `turn` reaches `maxTurns - 1` → forced final; (3) the tool-call budget is spent → forced final. Recursion would rely on the model "knowing" to stop (a base case). aptkit doesn't trust that — it caps the depth in code.
 
-### Move 2.5 — current state vs future state
+#### The load-bearing part: the forced-final turn (the base case the model can't be trusted to reach)
+
+Here's the skeleton, named by what breaks without each part:
 
 ```
-  Phase A (now)                  Phase B (would summon them)
-
-  RECURSION                      (already present, minimally)
-  collectText flattens JSON      more structural recursion as new
-  → disjoint, no cache, no undo  nested-data evals appear (same shape)
-
-  BACKTRACKING                   a constraint-satisfaction step done in
-  not present                    CODE rather than delegated to the model
-                                 (e.g. valid tool/param combination search)
-
-  DYNAMIC PROGRAMMING            an optimization with overlapping
-  not present                    subproblems (sequence alignment, optimal
-                                 partition) — none exists in an LLM kit
+  agent loop kernel        what breaks if removed
+  ───────────────────────  ────────────────────────────────────────────
+  turn counter (maxTurns)  no bound → model loops forever, never answers
+  forceFinal flag          model keeps calling tools, never synthesizes
+  strip tools on final     model calls a tool when it MUST answer → no text
+  synthesisInstruction     model says "I need more data" instead of answering
+  no-tool-use break        natural early exit when the model is done
 ```
 
-The honest read worth stating plainly: in an LLM orchestration kit, the *search and optimization* that backtracking and DP classically handle is delegated to the model. The agent loop doesn't backtrack through a state space — it asks the model what to do next and bounds the attempts (`maxTurns`). That architectural choice is *why* these two foundations have no code here, and it's unlikely to change unless a deterministic constraint/optimization step is pulled out of the model and into code.
+The part people forget is **forceFinal stripping the tools** (`run-agent-loop.ts:108`). Setting `tools: undefined` on the last turn *removes the option to call a tool*, so the model has no choice but to produce text. Without it, an agent can hit the turn cap still trying to call tools and return *no answer*. This is the iterative analog of a recursion's base case — except the code imposes it, because the model won't impose it on itself. Naming this in an interview signals you built a real agent loop, not a toy.
+
+#### The recovery turn: one bounded retry, NOT recursive backtracking
+
+When the final text won't parse into the required shape, there's a *single* recovery attempt — and it's pointedly not a recursive retry tree:
+
+```ts
+// packages/runtime/src/run-agent-loop.ts:192-201
+let parsed: T | null = null;
+if (options.parseResult) {
+  parsed = options.parseResult(finalText);
+  if (parsed === null && options.recoveryPrompt) {
+    const recoveryText = await runRecoveryTurn(options, options.recoveryPrompt(toolCalls));
+    parsed = recoveryText === null ? null : options.parseResult(recoveryText);  // ONE retry
+  }
+}
+```
+
+Backtracking would explore alternatives, fail, undo, and try another branch — potentially many times. This does *one* extra turn and then gives up (`parsed` stays `null`). That's a deliberate non-backtracking choice: an LLM retry tree is unbounded cost with no convergence guarantee, so aptkit caps it at one. The contrast teaches backtracking by its absence — aptkit's "search" has no undo and no branch exploration because the cost model (each step is an expensive model call) makes exhaustive search the wrong shape.
+
+#### The tolerant parser: recursion-free bounded scan
+
+`parseAgentJson` is where you might expect a recursive descent parser — and aptkit deliberately doesn't write one:
+
+```ts
+// packages/runtime/src/json-output.ts:7-28
+export function parseAgentJson(text: string): unknown {
+  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);   // 1. strip fences
+  const candidate = (fence ? fence[1] : text).trim();
+  try { return JSON.parse(candidate); } catch { /* fall through */ }   // 2. fast path
+  const objectStart = candidate.indexOf('{');                  // 3. bounded scan
+  const arrayStart = candidate.indexOf('[');
+  const start = /* min of the two non-negative starts */;
+  const end = Math.max(candidate.lastIndexOf('}'), candidate.lastIndexOf(']'));
+  if (start >= 0 && end > start) return JSON.parse(candidate.slice(start, end + 1));
+  throw new Error('no parseable json in model output');
+}
+```
+
+It tries `JSON.parse` (the standard library's parser does the real recursion), and on failure does a *bounded* substring scan — first brace/bracket to last — then parses that slice. No hand-rolled recursive grammar walk: it leans on `JSON.parse` for the recursion and adds only a tolerant outer envelope. The boundary condition it handles: a model wrapping JSON in prose or markdown fences. The lesson — don't write a recursive parser when a bounded scan plus the platform parser does the job.
 
 ### Move 3 — the principle
 
-Pick the simplest member of the recursion family that fits the problem's structure. If subproblems are disjoint children, plain structural recursion suffices — no cache, no undo. Add backtracking only when you're *searching* a space and must undo choices. Add DP only when subproblems *overlap* and recomputation is the cost. Reaching for memoization or backtracking on a problem with neither overlap nor choices is added machinery for nothing — exactly the trap `collectText` avoids by being a clean tree recursion. And in an LLM system, notice when the "search" has been delegated to the model instead of coded as an algorithm.
+**When the "recursion" is driven by an untrusted decider, unroll it into a bounded loop with an enforced base case.** aptkit's agent loop is recursion's shape — advance until done — but because the LLM decides whether to continue, the termination guarantee has to be a hard counter and a *forced* final turn, not a base case the recursion hopes to reach. Backtracking and DP are absent for the same cost reason: when each "step" is an expensive model call, you can't afford to explore-and-undo or fill a table of subproblems. The structure you reach for is shaped by who controls continuation and what each step costs.
+
+---
 
 ## Primary diagram
 
-The one recursion, framed against the two absent family members.
+The full control flow — the bounded state machine and its non-recursive recovery.
 
 ```
-  Recursion family in AptKit
+  runAgentLoop — bounded iterative state machine (recursion unrolled)
 
-  ┌─ EXERCISED: collectText, structural recursion ───────┐
-  │  string → return (base)                               │
-  │  array/object → map(collectText).join (recurse+combine)│
-  │  other → '' (base)                                    │
-  │  disjoint children, O(nodes), no cache, no undo        │
-  │  used by containsText to flatten a subtree for search  │
-  └────────────────────────────────────────────────────────┘
-  ┌─ NOT YET EXERCISED ─────────────────────────────────┐
-  │  backtracking — try/recurse/UNDO; search delegated to  │
-  │                 the MODEL (agent loop), not coded       │
-  │                 → your PG.ts is the from-scratch version │
-  │  dynamic prog  — needs overlapping subproblems; none in  │
-  │                 an LLM orchestration kit                 │
-  └────────────────────────────────────────────────────────┘
+  messages = [userPrompt]
+  ┌─ for turn in 0..maxTurns ───────────────────────────────────┐
+  │  forceFinal = (turn==maxTurns-1) OR budgetSpent              │
+  │  resp = model.complete(tools = forceFinal ? none : schemas)  │
+  │  append assistant message                                    │
+  │  toolUses empty? ──yes──► finalText = text; BREAK            │
+  │       │ no                                                   │
+  │       ▼                                                      │
+  │  run each tool → append tool_result → next turn             │
+  └──────────────────────────────────────────────────────────────┘
+       │ after loop
+       ▼
+  parseResult(finalText)
+       null? ──► runRecoveryTurn (ONE shot) ──► parseResult again
+                 (NOT backtracking — no branch tree, no undo)
+
+  absent by design: memoization/DP table · backtracking search tree
+  termination guarantee: HARD turn counter + forced-final (not a base case)
 ```
 
-## Implementation in codebase
-
-**Use cases.** `collectText` runs whenever a `containsText` structural-diff rule evaluates — the eval needs to check whether a word appears *anywhere* inside a (possibly nested) field of a replay artifact, so it flattens that field's subtree to one string first.
-
-The structural recursion — `packages/evals/src/structural-diff.ts` (lines 185–192, `collectText`):
-
-```
-  function collectText(value: unknown, normalize: boolean): string {
-    if (typeof value === 'string') return normalize ? value.toLowerCase() : value;  ← base: leaf string
-    if (Array.isArray(value))
-      return value.map((item) => collectText(item, normalize)).join('\n');          ← recurse: array
-    if (value && typeof value === 'object')
-      return Object.values(value).map((item) => collectText(item, normalize)).join('\n');  ← recurse: object
-    return '';                                                                       ← base: non-text leaf
-       │
-       └─ four cases, mirroring JSON's shape: two base cases (string leaf, non-text
-          leaf → '') and two recursive cases (array, object). The '' base case is
-          load-bearing — without it, numbers/booleans/null would break the join or
-          pollute the haystack. No visited set: JSON is a tree (no cycles), so the
-          recursion always terminates at leaves.
-  }
-```
-
-How it's consumed — same file, `assertContainsTextRule` (lines 144–160): it calls `getPath` (the tree *walk* from `04`) to address the field, then `collectText` (the tree *flatten* here) to turn that field's subtree into a searchable haystack, then a plain `.includes(needle)`. Two different tree operations — addressing then flattening — composed into one rule. That composition is the whole mechanism: walk to the node, recursively flatten it, substring-search the result.
-
-There is no backtracking and no dynamic-programming code anywhere in `packages/` — no choice/undo recursion, no memoization cache, no DP table. That absence is the finding, and it's structural: the search-and-optimize work an LLM kit would otherwise code is delegated to the model.
+---
 
 ## Elaborate
 
-Recursion, backtracking, and DP form a ladder of increasing structure. Plain recursion mirrors recursive data (trees, nested expressions) — `collectText` is the textbook clean case. Backtracking (the N-queens / Sudoku / your river-crossing solver pattern) is recursion over a *decision tree* where you prune invalid branches and undo — its power is systematic exhaustive search with early cutoff. DP (Fibonacci, edit distance, knapsack) is recursion where the recursion tree has *repeated nodes*, so you trade memory for time by caching; tabulation is the bottom-up version that fills a table instead of recursing.
+Tail-recursion-to-iteration is a classic transform: any "call myself on the rest" can become a loop with explicit state. aptkit applies it for a non-classic reason — not stack-depth optimization, but *trust*. A recursive agent (`runTurn` calling `runTurn`) would let a misbehaving model drive arbitrary depth; the explicit `for (turn < maxTurns)` makes the bound a visible constant. This is the same instinct behind iterative-deepening and depth-limited search: cap the depth when you can't trust the search to terminate.
 
-The reason AptKit only has the first rung is genuinely architectural, and it's worth internalizing for AI work: an agent loop *replaces* hand-coded search. Where a classical solver would backtrack through possibilities, the agent asks the model "what next?" and bounds the loop. Where a classical optimizer would fill a DP table, the model reasons. So an LLM orchestration kit naturally has rich structural recursion (data manipulation) and almost no backtracking/DP (the model absorbs that role). When you *do* see backtracking or DP in an AI codebase, it's usually a deterministic sub-problem deliberately pulled out of the model for correctness or cost — and that's the trigger to watch for here.
+Dynamic programming earns its place when subproblems *overlap* — the same sub-input recomputed many times (Fibonacci, edit distance, knapsack). aptkit has no such structure: each turn's input is the growing conversation, never a repeated sub-input, so there's nothing to memoize. Backtracking earns its place when a search has *cheap* steps and you need to explore-and-undo (N-queens, sudoku, the river-crossing search you built in `PG.ts`). aptkit's steps are *expensive* (model calls), so exhaustive exploration is the wrong shape — hence one bounded recovery, not a retry tree. The honest framing: DP and backtracking aren't missing because the author didn't know them; they're absent because the problem shape (no overlapping subproblems, expensive steps) doesn't call for them.
 
-For how the agent loop's bounded "search for the answer" relates to recursion's call stack, see `03` (the message log as the loop's accumulating state) and `study-runtime-systems`.
+---
 
 ## Interview defense
 
-**Q: "Where's the recursion in this codebase, and what kind is it?"**
+**Q: Is the agent loop recursive?**
 
-`collectText` in `structural-diff.ts` — structural recursion over JSON. Four cases mirroring the data: string leaf returns its text, non-text leaf returns empty string, array and object recurse into children and join. It flattens a subtree to one string so `containsText` can substring-search it. Disjoint children, each node visited once, O(nodes), no cache and no visited set because JSON is a cycle-free tree.
-
-```
-  string→return | array/object→recurse+join | other→''
-  tree recursion, O(nodes), terminates at leaves
-```
-
-Anchor: *it's clean structural recursion — the '' base case is the load-bearing part that keeps it terminating and well-typed at the leaves.*
-
-**Q: "Why no backtracking or dynamic programming here?"**
-
-Because the search-and-optimize work they handle is delegated to the model. The agent loop doesn't backtrack through a state space — it asks the model what to do next and bounds the attempts with `maxTurns`. And there's no overlapping-subproblem optimization (edit distance, knapsack) anywhere — the model does the reasoning. `collectText`'s subproblems are disjoint children, so even it needs neither a cache nor an undo.
+> No — it's a bounded iterative state machine. It's recursion's *shape* ("advance until done") unrolled into `for (turn = 0; turn < maxTurns; turn++)`, because the LLM, not the code, decides whether to continue. You can't trust an untrusted decider to hit a base case, so termination is a hard turn counter plus a forced-final turn, not a recursive base case. Each turn calls the model, runs any tools it requested, appends results, and loops; it breaks early when the model emits no tool call.
 
 ```
-  backtracking's "search" → delegated to the model (agent loop)
-  DP's "overlap" → no overlapping subproblems exist in the kit
+  recursion:  solve(state) → solve(smaller)   base case stops it
+  aptkit:     for turn<maxTurns: advance       counter stops it
 ```
 
-Anchor: *in an LLM kit the model absorbs the search/optimize role — so you get rich structural recursion and almost no backtracking/DP.*
+**Q: What's the part of that loop people forget?**
 
-**Q: "When would you add backtracking or DP to this codebase?"**
+> The forced-final turn — on the last iteration it sets `tools: undefined`, removing the model's option to call a tool, so it *must* produce an answer. Without it, an agent can burn through all its turns still calling tools and return no answer at all. It's the base case the code imposes because the model won't impose it on itself.
 
-When a deterministic constraint or optimization step gets pulled out of the model into code — for correctness or cost. Backtracking if there's a "find a valid combination subject to rules" search (try/recurse/undo); DP if there's an optimization with overlapping subproblems (sequence alignment, optimal partition). Neither exists today because every such decision is currently the model's job, bounded by the loop.
+**Q: Why no backtracking or DP in the retry logic?**
 
-```
-  pull a constraint search into code → backtracking
-  pull an overlapping-subproblem optimization into code → DP
-```
+> Cost. Backtracking and DP make sense when steps are cheap — explore, fail, undo, or fill a memo table. Here each step is an expensive model call with no convergence guarantee, so an LLM retry tree is unbounded cost for unclear gain. aptkit does exactly *one* recovery turn and then gives up. And there's no DP because no subproblem repeats — each turn's input is the growing conversation, never a recomputed sub-input, so there's nothing to memoize.
 
-Anchor: *they appear when you deliberately move search/optimization out of the model and into deterministic code — until then the loop replaces them.*
+Anchor: *the agent loop is recursion unrolled into a bounded loop with a forced base case, because an untrusted model drives continuation and each step is expensive.*
 
-## Validate
-
-**Reconstruct.** Write `collectText`'s four cases from memory and identify the two base cases and two recursive cases. Explain why no visited set is needed (JSON is a tree, no cycles → guaranteed termination at leaves).
-
-**Explain.** In `assertContainsTextRule` (`structural-diff.ts:144`), `getPath` and `collectText` are used together. What does each do, and why both? (Answer: `getPath` *addresses* the target field by dotted path; `collectText` *flattens* that field's subtree into a searchable string. Walk to the node, then recursively flatten it, then `.includes`.)
-
-**Apply to a scenario.** A new eval needs to compute the minimum edit distance between a generated answer and a reference answer. Is that a recursion/backtracking/DP problem, and does the repo have anything like it? (Answer: edit distance is the canonical DP problem — overlapping subproblems, optimal substructure, solved with a table. The repo has nothing like it today; adding it would be the first DP in the codebase, and a legitimate one because it's a deterministic optimization you'd *want* out of the model.)
-
-**Defend the decision.** Someone wants to memoize `collectText` "for performance." Defend leaving it uncached. (Answer: its subproblems are disjoint children — no node is ever recomputed, so there's nothing to memoize. A cache would add memory and bookkeeping for zero hits. Memoization helps only with *overlapping* subproblems, which a tree flatten doesn't have.)
+---
 
 ## See also
 
-- `04-trees-tries-and-balanced-indexes.md` — `getPath`, the tree *walk* that composes with this tree *flatten* in the `containsText` rule.
-- `03-stacks-queues-deques-and-heaps.md` — the call stack (recursion's backing structure) and the agent loop as bounded iterative "search."
-- `02-arrays-strings-and-hash-maps.md` — the substring `.includes` that consumes `collectText`'s flattened output.
-- `study-runtime-systems` (neighboring guide) — the agent loop as the bounded iteration that stands in for hand-coded search.
+- **01-complexity-and-cost-models.md** — the `O(maxTurns)` × (model-call cost) analysis of this loop.
+- **03-stacks-queues-deques-and-heaps.md** — why the loop isn't a work queue.
+- **05-graphs-and-traversals.md** — the traversal kernel (frontier/visited/terminate) the loop's termination echoes.
+- `study-agent-architecture` — the ReAct/agentic-retrieval reasoning pattern this loop implements.

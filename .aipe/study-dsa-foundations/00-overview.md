@@ -1,114 +1,105 @@
-# 00 — Overview: AptKit through a DSA lens
+# DSA Foundations — aptkit
 
-## The verdict first
+The reusable data-structures-and-algorithms vocabulary behind aptkit — and the foundations the repo deliberately does *not* exercise yet.
 
-AptKit is a small set of data structures used well, not a large set used badly. If you opened every `.ts` file and tallied the structures, the count is short: **`Map` (one, the tool registry), `Set` (allowlists, dedup, retrieval scoring), discriminated unions (the event and rule streams), arrays-as-logs (the message transcript), modulo round-robin (variant scheduling), `Array.prototype.sort` comparators (ranking), and — newly, in `@aptkit/retrieval` — a numeric vector dot-product (cosine similarity) and fixed-window string slicing (chunking).** That is the working vocabulary. The textbook structures most readers expect — balanced trees, heaps, graphs as traversal, binary search, dynamic programming — are still genuinely absent, and the absence is correct for what this codebase is: a stateless orchestration layer over an LLM, where the expensive thing is a model round-trip, not a CPU cycle.
+You've shipped a DSA portfolio already: `Graph.ts`, `BinaryHeap.ts`, `PriorityQueue.ts`, `BinarySearchTree.ts`, five animated sorters, BFS over a river-crossing state graph. This guide is **not** here to re-teach you BFS. It does two things instead:
 
-The one shift since the first pass: `@aptkit/retrieval` adds a *from-scratch RAG pipeline* that exercises three DSA primitives the rest of the kit never reached for — **cosine similarity** (a dot-product over float vectors with magnitude normalization), **linear-scan nearest-neighbor** (score every chunk, sort, take top-k), and **fixed-size character chunking** (a sliding window with overlap). Plus `packages/evals/precision-at-k.ts` adds **precision@k / recall@k** as `Set`-membership scoring. None of this is large-scale yet (the store is an in-memory `Map`), but it moves a few "not yet exercised" items closer to live — most importantly the linear-scan → ANN/HNSW tradeoff, which the code now explicitly gestures at instead of being purely hypothetical.
+1. Names which of those fundamentals aptkit actually *reaches for* in production code — and which it pointedly doesn't.
+2. Calibrates the gap: aptkit is a RAG/agent toolkit, so it lives almost entirely in the **array + map + linear-scan + ranking** corner of DSA. The graph/tree/heap/DP machinery you've built from scratch is, in this repo, `not yet exercised`.
 
-Newest delta: `@aptkit/memory` (`packages/memory/src/conversation-memory.ts`) layers *episodic memory* over the exact same cosine k-NN — no new algorithm, but one new **selection twist**. The `VectorStore.search` contract (`packages/retrieval/src/contracts.ts:33-37`) is `(vector, k)` only — **no metadata filter** — so `recall` can't filter-then-rank. Instead it **over-fetches** `fetchK = max(k*4, 20)` candidates, **filters** them by a `kind` predicate, then **slices** to `k`: fetch a wider window, post-filter, truncate. It also keeps a per-conversation counter `Map` for collision-free id generation. Both reuse structures already in this guide (the cosine sort+slice top-k, the hash map) — they're a variant, not a new chapter.
+---
 
-Here is the whole repo as one DSA picture before we zoom into any single structure.
-
-```
-  AptKit — the structures, by layer
-
-  ┌─ Agent capability (per-agent package) ───────────────────────────┐
-  │  message array  →  comparator sort + slice (top-k ranking)       │
-  │  (transcript log)     anomaly-monitoring, recommendation         │
-  └───────────────────────────┬──────────────────────────────────────┘
-                              │ calls
-  ┌─ Runtime (foundation) ────▼──────────────────────────────────────┐
-  │  bounded loop over message array   discriminated union           │
-  │  (turn budget = termination)       (CapabilityEvent stream)      │
-  │  bounded JSON substring scan       reduce over event log         │
-  │  (parseAgentJson)                  (usage-ledger)                 │
-  └───────────────────────────┬──────────────────────────────────────┘
-                              │ uses
-  ┌─ Tools / context / evals ─▼──────────────────────────────────────┐
-  │  Map<name,handler>   Set<allowedTools>   Set membership (coverage)│
-  │  (registry lookup)   (policy filter)     dotted-path walk (diff)  │
-  │  Set ops: precision@k / recall@k (evals/precision-at-k.ts)        │
-  └───────────────────────────┬──────────────────────────────────────┘
-                              │ retrieval (new package)
-  ┌─ Retrieval (@aptkit/retrieval) ───▼───────────────────────────────┐
-  │  chunkText: fixed-window string slice + overlap                   │
-  │  cosineSimilarity: dot-product / (‖a‖·‖b‖)  over float vectors    │
-  │  InMemoryVectorStore.search: linear scan + sort + slice (top-k)   │
-  │  ← linear scan O(n·d) is where an ANN/HNSW index would slot in    │
-  └───────────────────────────┬───────────────────────────────────────┘
-                              │ memory reuses search()
-  ┌─ Memory (@aptkit/memory) ─▼───────────────────────────────────────┐
-  │  recall: over-fetch max(k*4,20) → filter by kind → slice(0,k)     │
-  │  (post-filtered top-k: no metadata filter on search, so over-rank)│
-  │  remember: Map<conversationId, counter> for collision-free ids    │
-  └───────────────────────────────────────────────────────────────────┘
-```
-
-Read it from the bottom: the substrate is `Map` and `Set` lookups and a dotted-path JSON walk. The middle is a bounded loop over an array and a discriminated-union stream. The top is comparator sorts that rank and `slice` that caps. The newest layer, `@aptkit/retrieval`, is the one place the kit does *numeric* DSA — a cosine dot-product over float vectors and a sliding-window string chunker — and it's the one place a real scale tradeoff (linear scan vs. an approximate-nearest-neighbor graph index) becomes concrete rather than hypothetical. Everywhere else the data is small (≤10 anomalies, ≤3 recommendations, ~49 tools, a handful of events), so linear scans and hash lookups win on both simplicity and real-world speed.
-
-## Ranked findings — what's most consequential
-
-These are ordered by how much they shape the codebase, not alphabetically.
-
-**1. The `Map`-backed `InMemoryToolRegistry` is the most load-bearing structure in the repo.** `packages/tools/src/tool-registry.ts:34` holds `handlers = new Map<string, ToolHandler>()`, and `callTool` (`:50`) is an O(1) `Map.get` followed by an invocation with a wall-clock timing. Every tool the model calls routes through this one `Map`. It is the hot path's only real data-structure lookup. → `02-arrays-strings-and-hash-maps.md`.
-
-**2. `Set` is the repo's correctness primitive, not just a convenience.** Three independent places turn an allowlist or expected-list into a `Set` and ask membership questions: tool-policy least-privilege filtering (`tool-policy.ts:15`), coverage gating (`coverage-gate.ts:42`), and detection scoring's matched/missed/unexpected partition (`detection-scorer.ts:64,80`). The `Set` is what makes "did the model stay inside its allowed tools" an O(1) check instead of an O(n) scan. → `02-arrays-strings-and-hash-maps.md`.
-
-**3. The real cost model is tokens-and-turns, not Big-O.** `run-agent-loop.ts:98` bounds the loop with `turn < maxTurns`, `:101` adds a `maxToolCalls` budget, and `usage-ledger.ts:25` reduces the event stream into a token total that `estimateCost` (`:50`) prices in USD. The asymptotic complexity of any structure here is dwarfed by the cost of one model round-trip. This is the cost axis that actually bites. → `01-complexity-and-cost-models.md`.
-
-**4. Round-robin modulo scheduling is the only non-trivial *algorithm* in the repo.** `content-generation-workflow.ts:148-156` (`planContentVariant`) uses `variantIndex % sections.length` and `variantIndex % angles.length` to fan content variants evenly across sections and angles. It is a clean, classic technique and the closest thing to an "algorithm with a name" outside of sort. → `03-stacks-queues-deques-and-heaps.md`.
-
-**5. Ranking is comparator-sort-then-slice, repeated.** `monitoring-agent.ts:86-88` sorts anomalies by a `severityRank` lookup table descending, then `slice(0, 10)` caps the output — a top-k by full sort. The same shape (sort by a derived key, take a prefix) recurs wherever the repo ranks — and now also in `InMemoryVectorStore.search` (`packages/retrieval/src/in-memory-vector-store.ts:31-32`), which sorts all chunks by cosine score descending and slices the top-k. No heap-based selection, because k is tiny. → `06-sorting-searching-and-selection.md`.
-
-**6. Cosine similarity is the repo's first and only numeric vector algorithm.** `in-memory-vector-store.ts:46-57` computes a dot product plus two squared-magnitudes in one O(d) pass, then divides by the product of norms (with a zero-denominator guard returning 0 to avoid `NaN`). Every retrieval hit's score comes from this one function. It's the foundation under the entire RAG ranking, and the `search` method's overall cost — score every stored chunk, then sort — is **O(n·d + n log n)**: a linear scan over n chunks at d dimensions. This is the textbook brute-force nearest-neighbor, and it's exactly the cost the contracts are designed to swap out for an ANN index later. → `06-sorting-searching-and-selection.md`, with the scale tradeoff in `05-graphs-and-traversals.md`.
-
-**7. Fixed-window chunking and precision@k/recall@k are new string-and-set work.** `chunker.ts:16-31` slides a `512`-char window with a `64`-char overlap across a document (`step = size - overlap`), a classic windowing algorithm with an off-by-one-able termination (`start + size >= text.length` breaks the loop). And `evals/src/precision-at-k.ts:27-78` scores ranked retrieval with `Set` membership — `countDistinctHits` builds a `seen` set over the top-k so a relevant id counted once, with denominators that differ between precision (`min(k, retrieved)`) and recall (`|relevant|`). → chunking and the `Set` scoring both land in `02-arrays-strings-and-hash-maps.md`.
-
-**8. Memory's `recall` is over-fetch-then-filter-then-slice — a post-filtered top-k.** `conversation-memory.ts:94-98` can't filter-then-rank because the `VectorStore.search` contract (`contracts.ts:33-37`) takes only `(vector, k)` — no metadata predicate. So it over-ranks: `fetchK = Math.max(k * 4, 20)` pulls a wider window of candidates, `.filter(h => h.meta?.kind === kind)` drops rows that aren't memory (a shared store can interleave documents above them), then `.slice(0, k)` truncates to the asked-for count. The `k*4`-or-`20` is a *margin* so the post-filter still yields k even when most of the window is the wrong kind. This is the canonical "select more than you need, post-filter, truncate" selection pattern. → `06-sorting-searching-and-selection.md`.
-
-**9. A per-conversation counter `Map` generates collision-free memory ids.** `conversation-memory.ts:71` holds `counters = new Map<string, number>()`; each `remember` does `counters.get(conversationId) ?? 0`, builds the id `${kind}:${conversationId}:${n}`, then writes back `n + 1`. It's the same hash-map-keyed-by-id machine as the tool registry, used here as a monotonic per-key sequence so repeated turns in one conversation never collide. → `02-arrays-strings-and-hash-maps.md`.
-
-## The `not yet exercised` list — and when each would matter here
-
-This is the honest half. Each of these is a foundation you've already built in `reincodes`; none appears in AptKit, and here's the trigger that would change that.
+## The repo-grounded map — what DSA aptkit actually runs
 
 ```
-  foundation            status in aptkit       what would pull it in
+  aptkit through the DSA lens — which structures light up
 
-  cosine similarity     NOW EXERCISED          in-memory-vector-store.ts:46
-  fixed-window chunk    NOW EXERCISED          chunker.ts:16
-  precision@k/recall@k  NOW EXERCISED          evals/precision-at-k.ts:47,68
-  linear-scan k-NN      NOW EXERCISED          in-memory-vector-store.ts:25
-                        (brute force, O(n·d))
-  ──────────────────────────────────────────────────────────────────────────
-  ANN / HNSW graph      not yet exercised      corpus grows past a few-thousand
-   index                (BUT the code now       chunks so the O(n·d) scan hurts;
-                         points right at it)    the PgVectorStore drop-in or an
-                                                HNSW index replaces the scan
-  heap / priority queue not yet exercised      top-k where k << n and n is
-                                                large; today retrieval sorts
-                                                ALL chunks then slices — a heap
-                                                wins once n is large and k small
-  binary search         not yet exercised      sorted artifact index large
-                                                enough that linear scan hurts
-  balanced tree / index not yet exercised      a persistent ordered store of
-                                                replays queried by range
-  trie                  not yet exercised      prefix routing over hundreds of
-                                                tool names or intents
-  graph + BFS/DFS       not yet exercised      capability dependencies that
-                                                actually chain (A enables B
-                                                enables C), needing topo order
-  dynamic programming   not yet exercised      optimal sub-structure problem —
-                                                none exists in this kit today
-  backtracking          not yet exercised      constraint search over a state
-                                                space (your river-crossing PG.ts)
+  ┌─ Service layer (agents) ───────────────────────────────────┐
+  │  runAgentLoop  →  bounded for-loop + state machine          │
+  │  (packages/runtime/src/run-agent-loop.ts)                   │
+  │     control: a counted loop with a forced-final escape      │
+  └───────────────────────────┬─────────────────────────────────┘
+                              │ calls tools
+  ┌─ Tool layer ──────────────▼─────────────────────────────────┐
+  │  filterToolsForPolicy  →  Set membership (allowlist)        │
+  │  (packages/tools/src/tool-policy.ts)                        │
+  │  parseAgentJson        →  bounded substring scan / tolerant │
+  │  (packages/runtime/src/json-output.ts)     parse            │
+  └───────────────────────────┬─────────────────────────────────┘
+                              │ search_knowledge_base
+  ┌─ Retrieval layer ─────────▼─────────────────────────────────┐
+  │  chunkText      →  sliding window over a string             │
+  │  InMemoryVectorStore.search → linear scan + cosine + sort   │
+  │                              + top-k slice  ★ the core DSA ★ │
+  │  recall()       →  Map<id,counter> + over-fetch + filter    │
+  │  (packages/retrieval/*, packages/memory/*)                  │
+  └───────────────────────────┬─────────────────────────────────┘
+                              │ scored by
+  ┌─ Eval layer ──────────────▼─────────────────────────────────┐
+  │  scorePrecisionAtK / scoreRecallAtK → Set ∩ over top-k      │
+  │  (packages/evals/src/precision-at-k.ts)                     │
+  └──────────────────────────────────────────────────────────────┘
+                              │ production drop-in (companion repo)
+  ┌─ buffr / Provider layer ──▼─────────────────────────────────┐
+  │  PgVectorStore → HNSW graph index (ANN)                     │
+  │  (buffr/sql/001_agents_schema.sql, vector_cosine_ops)       │
+  │  THE one real graph algorithm in the whole system —         │
+  │  and it lives in the companion repo, not aptkit.            │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-The honest read: AptKit's data is still small and flat almost everywhere — heaps, balanced trees, and graph *traversal* have nothing to bite on yet. The one thing that changed is retrieval. `InMemoryVectorStore.search` is the kit's first algorithm whose cost scales with corpus size (O(n·d) to score, O(n log n) to sort), and the package's own comments call out that an `HNSW`/`PgVectorStore` drop-in is the next step. That's the most concrete "scale would pull in a foundation" story in the repo now: an HNSW index is literally a navigable-small-world *graph* you traverse greedily, so the day the corpus outgrows the in-memory scan, finding #6 turns into a graph-traversal problem — and the heap that a partial top-k would use (find #5) becomes worth its complexity. Separately, the coverage system (`coverage-gate.ts`) still *looks* like a dependency graph — `requires`/`enriches` are edges in spirit — but is still evaluated as flat `Set.has` checks with no traversal. → `05-graphs-and-traversals.md` walks both the coverage case and the new ANN/HNSW trigger.
+The whole system is, structurally, **one ranking problem wrapped in one bounded loop**. Everything load-bearing reduces to: turn text into a vector, scan an array, sort by score, take the top-k. That's the spine. The graph appears exactly once — as the HNSW index in buffr — and it's the production substitute for aptkit's linear scan.
 
-## How to use this guide
+---
 
-Work top to bottom. Each concept file opens with where it sits in the layer diagram, walks the mechanism with pseudocode and a diagram before any real code, then shows the actual AptKit lines with a line-by-line read. The `not yet exercised` files are short on repo-anchored code (because there isn't any) and longer on "here's the foundation, here's the trigger, here's where you'd reach for it" — those lean on your `reincodes` background so the teaching has somewhere to land.
+## Ranked findings — what to look at first
 
-The final file, `08-dsa-foundations-practice-map.md`, ranks what to practice: the exercised concepts to sharpen for interviews first, the missing foundations to keep warm second.
+**1. The single most consequential algorithm is a linear scan, and that's a deliberate `O(n)`-per-query tradeoff, not an oversight.** `InMemoryVectorStore.search` (`packages/retrieval/src/in-memory-vector-store.ts:25-33`) walks *every* chunk, computes cosine similarity against each, sorts the full hit list, and slices the top-k. For a from-scratch teaching pipeline with a few docs, that's the right call — it's deterministic, dependency-free, and trivially correct. The cost it accepts: linear in corpus size on every single query. The production answer is buffr's HNSW index (an approximate-nearest-neighbor *graph*), which trades exactness for sub-linear lookup. This swap — array linear-scan → ANN graph — is *the* DSA story of this repo. Read **02** and **05**.
+
+**2. The agent loop is a bounded state machine whose load-bearing part is the part people forget — the forced-final turn.** `runAgentLoop` (`packages/runtime/src/run-agent-loop.ts:98-190`) is a `for (turn = 0; turn < maxTurns; …)` loop. The kernel isn't the iteration — it's `forceFinal = turn === maxTurns - 1 || budgetSpent` (line 102), which strips the tools on the last turn and forces synthesis. Drop that and the loop can spin to the cap producing no answer. Read **01** (cost models / amortized) and the loop walk in **07**.
+
+**3. aptkit is array-and-map shaped; your graph/tree/heap portfolio is `not yet exercised` here.** No tree, no heap, no graph traversal, no DP runs anywhere in aptkit's source. The top-k selection in `search` *could* use a heap (your `BinaryHeap.ts`) instead of a full sort — and at corpus scale it would — but the in-memory store sorts the whole array because `n` is tiny. This is the honest gap: the repo doesn't punish you for not knowing graphs; it simply doesn't use them. The curriculum files (**03**, **04**, **05**, **07**) teach those foundations and say plainly where they *would* enter if aptkit grew.
+
+---
+
+## Reading order
+
+```
+  01  complexity-and-cost-models          ← the lens for every file below
+  02  arrays-strings-and-hash-maps        ← REPO-GROUNDED: the spine
+  03  stacks-queues-deques-and-heaps      ← curriculum + top-k heap seam
+  04  trees-tries-and-balanced-indexes    ← curriculum + the HNSW seam
+  05  graphs-and-traversals               ← curriculum + the ONE real graph (HNSW)
+  06  sorting-searching-and-selection     ← REPO-GROUNDED: the ranking sort + top-k
+  07  recursion-backtracking-and-dp       ← partial: bounded loop, no DP/backtracking
+  08  dsa-foundations-practice-map        ← ranked plan: exercised first, gaps second
+```
+
+Read **01** first — it's the cost lens you hold over every other file. Then **02** and **06** are the dense repo-grounded core. **03–05** and **07** are mostly curriculum, each with one honest seam back into aptkit.
+
+---
+
+## Repo-grounded vs curriculum-only
+
+```
+  topic                              status in aptkit
+  ─────────────────────────────────  ───────────────────────────────────
+  arrays / strings / hash-maps       REPO-GROUNDED — the whole spine
+  sorting / searching / selection    REPO-GROUNDED — ranking sort + top-k slice
+  complexity / cost models           REPO-GROUNDED — analyzes the above
+  bounded iteration / state machine  REPO-GROUNDED — runAgentLoop
+  set / map membership               REPO-GROUNDED — tool policy, id counters, p@k
+  heaps / priority queues            NOT YET EXERCISED — would replace the top-k sort
+  trees / tries / balanced indexes   NOT YET EXERCISED — HNSW (a graph) is in buffr
+  graphs / BFS / DFS / shortest path NOT YET EXERCISED in aptkit; ONE graph in buffr (HNSW)
+  recursion / backtracking           NOT YET EXERCISED — the loop is flat, not recursive
+  dynamic programming                NOT YET EXERCISED — no overlapping-subproblem code
+```
+
+---
+
+## See also — cross-guide seams
+
+- **`study-ai-engineering`** owns the *retrieval pipeline as an AI system* — embeddings, RAG, agentic retrieval. This guide owns the *data structures and algorithms* underneath it (the array scan, the cosine math, the top-k). When you want "why RAG," go there; when you want "what's the cost of `search`," stay here.
+- **`study-database-systems`** owns buffr's pgvector storage engine, the HNSW index build, and query execution. This guide names HNSW as the ANN *graph structure* (file **05**); the storage-engine mechanics live there.
+- **`study-performance-engineering`** owns the measurement and budgets (the latency of the linear scan, the token budget of the loop). This guide names the *asymptotic* cost; that guide measures the *wall-clock* cost.

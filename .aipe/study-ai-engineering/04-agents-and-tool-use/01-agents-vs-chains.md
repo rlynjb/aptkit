@@ -1,315 +1,264 @@
-# Agents vs chains (who decides the steps?)
+# Agents vs chains
 
-**Industry names:** chain / pipeline / DAG vs agent / agentic loop · *Industry standard*
+**Subtitle:** Agentic vs deterministic orchestration · who decides the steps · *Industry standard (aptkit runs both)*
 
 ## Zoom out, then zoom in
 
-The whole pipeline in AptKit — monitor for anomalies, diagnose the worst one,
-recommend actions — looks like a chain from the outside: three boxes, output of
-one feeds the next, fixed order. But zoom into any one box and it is *not* a
-chain. It is an agent loop. The distinction lives at two altitudes, and you have
-to see both.
+The first decision in any LLM feature is who controls the control flow: you, or
+the model. A *chain* is a fixed pipeline — you wrote the steps, the model just
+fills the blanks. An *agent* is a loop where the model decides which tool to call
+and when to stop. aptkit ships both, and the line between them is a single
+question: does a `for` loop over turns exist, and does the model steer it?
 
 ```
-  Zoom out — chains across, agents inside
+  Zoom out — two shapes of orchestration in aptkit
 
-  ┌─ Orchestration layer (fixed pipeline — a CHAIN) ──────────────┐
-  │  monitor ──► diagnose ──► recommend   (you wrote this order)   │
-  └──────┬───────────┬───────────┬────────────────────────────────┘
-         │           │           │   each box is…
-  ┌─ Agent layer ────▼───────────▼────────────────────────────────┐
-  │  ★ runAgentLoop ★  — inside each box, the MODEL picks steps    │ ← we are here
-  └──────┬─────────────────────────────────────────────────────────┘
-         │  ModelProvider.complete()
-  ┌─ Provider layer ─▼─────────────────────────────────────────────┐
-  │  anthropic / openai / fixture                                  │
-  └────────────────────────────────────────────────────────────────┘
+  ┌─ Chain (you define the steps) ─────────────────────────────┐
+  │  generateStructured: prompt ─► model ─► parse ─► validate   │
+  │  fixed, one-shot (+ bounded JSON retry). NO loop, NO tools. │
+  └─────────────────────────────────────────────────────────────┘
+  ┌─ Agent (the model decides the steps) ──────────────────────┐
+  │  ★ runAgentLoop: for turn in 0..maxTurns ★                  │ ← we are here
+  │    model picks a tool → run it → feed result back → repeat  │
+  │    model decides WHICH tools and HOW MANY turns             │
+  └─────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: a **chain** is steps *you* hard-code — call A, then B, then C, every
-time, no matter what. An **agent** is a loop where the *model* decides which step
-comes next and how many steps there are. The question this file answers is the
-one you ask before building anything: *do I know the steps in advance, or does
-the model?* If you know them, write a chain — it's cheaper, deterministic, and
-debuggable. If you don't, you need an agent.
+Now zoom in. Both shapes live in `packages/runtime`. The chain is
+`generateStructured` (`structured-generation.ts:54`) — one call, parse, validate,
+retry once. The agent is `runAgentLoop` (`run-agent-loop.ts:76`) — a real loop
+where the model emits `tool_use` blocks and you run them. Same model provider, same
+codebase; the difference is entirely *who owns the iteration*.
 
 ## Structure pass
 
-**Layers.** Two, and they're easy to confuse. The *outer* orchestration layer
-(the monitor→diagnose→recommend pipeline) and the *inner* agent layer (each
-single-purpose loop).
+**Layers.** Capability (the feature) → orchestration primitive (`generateStructured`
+*or* `runAgentLoop`) → model provider → model.
 
-**Axis — who decides control flow?** Trace that one question down the stack and
-watch the answer flip. Outer pipeline: *code* decides (the order is written in
-TypeScript). Inner loop: *the model* decides (it picks which tool, how many
-times, in what order). One tool call deep: nobody decides — the *tool* just runs.
+**Axis — control of the steps.** Who decides what runs next? Trace it: in
+`generateStructured` the sequence is hard-coded — generate, then parse, then
+validate, then maybe one strict-JSON retry (`structured-generation.ts:62`). The
+model never chooses a next step; *you* did, in code. In `runAgentLoop` the model
+emits `tool_use` blocks and the loop runs whatever it named (`run-agent-loop.ts:139`),
+so the step sequence is decided at runtime by the model. The axis "is the next
+step in the code or in the model's output?" is the whole distinction.
 
-```
-  One question down the layers — "who picks the next step?"
-
-  ┌──────────────────────────────────┐
-  │ outer: monitor→diagnose→recommend │  → CODE decides (chain)
-  └──────────────────────────────────┘
-      ┌──────────────────────────────┐
-      │ inner: runAgentLoop per box   │  → MODEL decides (agent)
-      └──────────────────────────────┘
-          ┌──────────────────────────┐
-          │ innermost: one tool call  │  → TOOL just runs
-          └──────────────────────────┘
-```
-
-**Seams.** The load-bearing seam is the boundary between the pipeline and the
-loop — it's where control flips from "code decides the sequence" to "model
-decides the sequence." That flip is the entire definition of an agent. If
-nothing flips at a boundary, you don't have an agent there, you have another
-chain step.
+**Seam.** The choice of primitive itself. A capability that calls
+`generateStructured` is a chain; one that calls `runAgentLoop` is an agent. The
+seam flips at *which function the capability imports* — there is no third thing.
 
 ## How it works
 
-You already know a chain: it's a `.then().then().then()` or a function that
-calls three other functions in order. The control flow is in *your* source.
-An agent is the opposite — the control flow lives in the model's head, and your
-code is a loop that keeps asking "what next?" until the model says "done."
-
 ### Move 1 — the mental model
 
-```
-  Chain vs agent — same goal, opposite control
-
-  CHAIN (you wrote the arrows)
-  step A ──► step B ──► step C ──► done
-  control: in your code. count: fixed. order: fixed.
-
-  AGENT (the model draws the arrows at runtime)
-        ┌─────────────────────────────┐
-        ▼                             │
-  ask model "what next?" ──► tool? ──┘ (yes: run it, loop)
-        │                       │
-        │                       └─ no: done
-  control: in the model. count: variable. order: variable.
-```
-
-A chain is a recipe; an agent is a cook. The recipe lists steps in order and you
-follow them. The cook tastes, decides, and acts — you only set the kitchen rules
-(budget, allowed ingredients) and wait for the dish.
-
-### Move 2 — the trade you're actually making
-
-**The chain's promise: determinism.** Bridge from a unit test — a chain is
-testable the way a pure function is, because the same input runs the same steps
-every time. You get predictable cost (you know it's exactly 3 model calls),
-predictable latency, and a stack trace you can read. The boundary where it breaks:
-the moment a step's *next* step depends on what the previous step *found*. A
-chain can't branch on content it hasn't seen at author-time without you encoding
-every branch by hand — and that's a combinatorial explosion.
+You already know this split from frontend work. A chain is a `Promise` chain you
+wrote: `fetch().then(parse).then(validate)` — the steps are in your code, the data
+just flows through. An agent is an event loop you *don't* fully control: it runs
+until a condition you set, but each iteration's work is decided by something else
+(the user, or here, the model). Chain = imperative script. Agent = bounded loop
+with a model in the driver's seat.
 
 ```
-  When a chain stops being enough
+  Chain vs agent — where the steps live
 
-  fixed:   "fetch metric → format → return"        ✓ chain
-  dynamic: "investigate WHY revenue dropped"        ✗ chain
-           (the 2nd query depends on the 1st result —
-            you can't author the branch in advance)
+  CHAIN (steps in your code)        AGENT (steps in model output)
+  ┌──────────────┐                  ┌──────────────────────────┐
+  │ step1 (you)  │                  │ for turn in 0..maxTurns:  │
+  │   ▼          │                  │   model picks step ◄──┐   │
+  │ step2 (you)  │                  │     ▼                 │   │
+  │   ▼          │                  │   run tool            │   │
+  │ step3 (you)  │                  │     ▼                 │   │
+  │   ▼          │                  │   feed result back ───┘   │
+  │ done         │                  │   model decides: stop?    │
+  └──────────────┘                  └──────────────────────────┘
 ```
 
-**The agent's promise: adaptivity.** The model reads each tool result and picks
-the next move based on what it found — exactly the branch a chain can't author.
-The boundary where *this* breaks: the model can loop forever, fan out 20 tool
-calls, or never produce a parseable answer. Freedom without a fence is a liability.
-That's why every AptKit agent is the *bounded* loop from `03-react-pattern.md`:
-the model gets the freedom, your code keeps the budget.
+### Move 2 — the two primitives, side by side
+
+**The chain — `generateStructured`.** A chain is a one-shot pass with a bounded
+parse/validate retry. No loop over turns, no tools array — the model produces text
+once (or twice, on a strict-JSON nudge) and you turn it into a typed value
+(`structured-generation.ts:62`):
+
+```ts
+for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {   // maxAttempts default 2
+  const messages = attempt === 1 ? baseMessages : appendStrictSuffix(baseMessages, strictSuffix);
+  response = await options.model.complete({ system, messages, ... });   // no tools
+  const parsed = parseValidatedJson(rawText, options.validate);
+  if (parsed.ok) return { ok: true, value: parsed.value, ... };          // done — fixed shape
+}
+```
+
+The loop here is *not* the model deciding steps — it's a retry on a parse failure.
+The step sequence (generate → parse → validate → retry) is fully yours. This is the
+chain: the anomaly-monitoring scan and the rubric judge both run this way.
 
 ```
-  Agent = model's freedom INSIDE code's fence
+  Chain — fixed steps, you own every one
 
-  ┌─ code owns the fence ───────────────────────────┐
-  │   maxTurns · maxToolCalls · forced synthesis     │
-  │   ┌─ model owns the moves ──────────────────┐    │
-  │   │  which tool, how many, in what order     │    │
-  │   └──────────────────────────────────────────┘    │
-  └──────────────────────────────────────────────────┘
+  prompt ─► model.complete (no tools) ─► parse JSON ─► validate
+                  │                                       │ fail
+                  └──────── retry once (+strict suffix) ◄─┘
+  the model never names a "next step" — the code does
 ```
+
+**The agent — `runAgentLoop`.** An agent is a `for` loop over turns where the model
+emits `tool_use` blocks and the loop runs them, feeds results back, and lets the
+model decide whether to go again (`run-agent-loop.ts:98`):
+
+```ts
+for (let turn = 0; turn < maxTurns; turn += 1) {                 // default maxTurns 8
+  const response = await model.complete({ system, messages, tools: toolSchemas, ... });
+  const toolUses = toolUsesFromContent(response.content);        // what did the MODEL choose?
+  if (toolUses.length === 0) { finalText = text; break; }        // model decided to stop
+  for (const toolUse of toolUses) {
+    const { result } = await tools.callTool(toolUse.name, toolUse.input);  // run model's choice
+    toolResults.push({ type: 'tool_result', toolUseId: toolUse.id, content: ... });
+  }
+  messages.push({ role: 'user', content: toolResults });          // observation → next turn
+}
+```
+
+The loop bounds the iteration (`maxTurns`), but *which* tool runs and *whether to
+continue* are read out of the model's output. That is the agent: the model steers.
+
+```
+  Agent — model steers a bounded loop
+
+  turn ► model.complete(tools) ► tool_use blocks?
+           ▲                          │ yes        │ none
+           │                          ▼            ▼
+           └─ result fed back ◄─ callTool      finalText, break
+                                 (model's pick)  (model chose to stop)
+```
+
+**The fleet.** aptkit has six capabilities split across the two shapes. Four are
+agents (the model decides the trajectory); two are chains (you fixed the steps):
+
+```
+  The six capabilities, by shape
+
+  AGENTS (runAgentLoop — model decides)        CHAINS (generateStructured — you decide)
+  ┌──────────────────────────────────┐         ┌──────────────────────────────────┐
+  │ rag-query        maxTurns 6 / 4   │         │ anomaly-monitoring scan           │
+  │ query            maxTurns 8 / 6   │         │ rubric judge (in rubric-          │
+  │ recommendation   maxTurns 6 / 4   │         │   improvement's eval step)        │
+  │ diagnostic-inv.  maxTurns 8 / 6   │         └──────────────────────────────────┘
+  │ anomaly-monitor. maxTurns 8 / 6   │
+  │ rubric-improve.  maxTurns 6 / 3   │
+  └──────────────────────────────────┘
+```
+
+(Some capabilities mix both: `anomaly-monitoring` and `rubric-improvement` run an
+agent loop *and* a one-shot structured pass for different sub-steps.)
 
 ### Move 3 — the principle
 
-Reach for a chain when you know the steps; reach for an agent when only the model
-can know them at runtime. The cost of an agent is determinism — you trade a
-predictable 3-call pipeline for a variable loop you must fence. So the senior
-move is *single-purpose agents inside a fixed chain*: the orchestration is a
-chain you can reason about, and the loop only appears where genuine runtime
-investigation is required. AptKit is the agent shape, not chains — but each agent
-is single-purpose, and the pipeline that strings them together is a chain.
+Reach for a chain when you know the steps; reach for an agent only when you don't.
+Agents cost more — every turn is a model call, and a model that steers can loop,
+dead-end, or pick the wrong tool. A chain is cheaper, more predictable, and trivial
+to test because the control flow is yours. aptkit's default is the chain
+(`generateStructured` for anything with a fixed shape) and it pays for an agent only
+where the *number and choice of retrievals genuinely depends on the question* —
+rag-query, query, diagnostic, recommendation. The interview signal is refusing to
+make everything an agent: most "agent" features are chains that didn't need a loop.
 
 ## Primary diagram
 
-The full picture: a fixed outer chain, an agent loop inside each box, one engine
-shared by all three.
-
 ```
-  AptKit — chains outside, agents inside, one engine
+  Agents vs chains — one codebase, two control flows
 
-  ORCHESTRATION (chain — code-ordered)
-  ┌──────────┐   ┌───────────┐   ┌──────────────┐
-  │ monitor  │──►│ diagnose  │──►│ recommend    │
-  └────┬─────┘   └─────┬─────┘   └──────┬───────┘
-       │ each box delegates to…         │
-       ▼                ▼               ▼
-  ┌──────────────── runAgentLoop ───────────────────┐
-  │  model.complete → run tool → feed result → loop │
-  │  fence: maxTurns / maxToolCalls / forceFinal     │
-  │  RecommendationAgent: maxTurns 6, maxToolCalls 4 │
-  └──────────────────────┬───────────────────────────┘
-                         │ ModelProvider.complete()
-  ┌─ Provider ───────────▼───────────────────────────┐
-  │  anthropic / openai / fixture                    │
-  └───────────────────────────────────────────────────┘
+  ┌─ Capability ────────────────────────────────────────────────────────┐
+  │  imports ONE primitive — that import IS the agent/chain decision      │
+  └───────────────┬───────────────────────────────────┬──────────────────┘
+                  │                                   │
+  ┌─ generateStructured (CHAIN) ──┐   ┌─ runAgentLoop (AGENT) ────────────┐
+  │  steps fixed in code:         │   │  for turn in 0..maxTurns:          │
+  │   generate → parse → validate │   │    model emits tool_use            │
+  │   → retry once (strict JSON)  │   │    run it → feed result back       │
+  │  NO loop, NO tools            │   │    model decides stop / continue   │
+  │  cheap, predictable, testable │   │  bounded by maxTurns/maxToolCalls  │
+  └───────────────────────────────┘   └────────────────────────────────────┘
+        anomaly scan, rubric judge        rag-query, query, diagnostic, recommend
 ```
-
-## Implementation in codebase
-
-**Use cases.** Three single-purpose agents, each a loop, each wrapped by a
-single-job class. The recommendation agent turns one diagnosis into ≤3 grounded
-actions. The query agent answers a free-form NL question. The anomaly monitor
-scans ecommerce categories for what changed. None of them hard-codes a sequence
-of tool calls — each hands the model an allowlist and a budget and lets it
-investigate.
-
-The single clearest proof that each box is an *agent* (not a chain) is that the
-step count is a *budget*, not a constant:
-
-```
-  packages/agents/recommendation/src/recommendation-agent.ts  (lines 86-90)
-
-  maxTurns: 6,                     ← UP TO 6 model round-trips, not exactly 6
-  maxToolCalls: 4,                 ← UP TO 4 tool calls total — the model
-                                      decides whether it needs 0, 1, or 4
-  synthesisInstruction: buildSynthesisInstruction(
-    'Stop querying now and output your final answer. …',
-  ),
-       │
-       └─ a chain would say "call get_scenario, then list_segmentations,
-          then answer." This says "you may make at most 4 calls — pick
-          which ones." That's the model deciding the steps. The number
-          is a ceiling the code owns, not a script the code wrote.
-```
-
-Contrast the *orchestration* seam — the recommendation agent's input is a
-`Diagnosis` produced by a *different* agent upstream
-(`recommendation-agent.ts:64`, `propose(anomaly, diagnosis)`). The pipeline that
-feeds one agent's output into the next is the chain; the propose() loop inside is
-the agent. Same file, two altitudes, two answers to "who decides control flow?"
-
-The shared engine itself — the loop that makes every one of these an agent — is
-`runAgentLoop` at `packages/runtime/src/run-agent-loop.ts:76-202`. See
-`03-react-pattern.md` for its full anatomy.
 
 ## Elaborate
 
-The chain-vs-agent split predates LLMs by decades — it's the difference between a
-static DAG (Airflow, a build system, a `Promise` chain) and a planner that emits
-actions at runtime (classical AI planning, now ReAct). What LLMs changed is that
-the "planner" is now a frozen model you prompt, not a search algorithm you wrote.
-The trade is identical to the old one: determinism and debuggability (chain) vs
-adaptivity to inputs you couldn't enumerate at author-time (agent).
-
-The practical lesson the industry keeps relearning: **prefer chains; reach for
-agents only at the steps that genuinely need runtime decisions.** An agent where
-a chain would do is a more expensive, less predictable system with no upside.
-AptKit's shape — fixed pipeline, single-purpose agents at the boxes that need
-investigation — is the mature version of this.
-
-Adjacent concepts: the loop itself (`03-react-pattern.md`), how the model's
-"step" is physically a tool call (`02-tool-calling.md`), and the orchestration
-*across* agents, which is its own discipline — see
-`.aipe/study-agent-architecture/`.
+The industry framing is "workflows vs agents" (Anthropic's *Building effective
+agents* uses exactly this split): workflows are LLM calls orchestrated through
+predefined code paths; agents are systems where the LLM directs its own process.
+aptkit is a clean instance — the same `ModelProvider` underneath, two orchestration
+primitives on top. The subtle bit is that an agent's `for` loop *looks* like a chain
+if you only read the runtime: it's bounded, deterministic-ish code. The difference
+isn't the loop — it's that the loop body reads its next action out of model output
+(`toolUsesFromContent`, `run-agent-loop.ts:131`) instead of from the next line of
+your function. Read `03-react-pattern.md` for what those turns actually are
+(thought/action/observation), and `06-error-recovery.md` for why an agent needs
+bounds a chain doesn't.
 
 ## Project exercises
 
-*Provenance: Phase 4 — Agents and tool use (C4.x). No `aieng-curriculum.md`
-present; IDs are by-phase convention. Case A — the agent shape is implemented;
-these sharpen the chain/agent boundary.*
-
-### Exercise — collapse a single-purpose agent into a chain where it's cheaper
-
-- **Exercise ID:** `[A4.1]` Phase 4, agents-vs-chains concept
-- **What to build:** Profile the recommendation agent on diagnoses where it makes
-  *zero* tool calls (it reasons purely from the diagnosis). For that path, add a
-  fast chain: one `generateStructured` call with no loop, no tool schemas. Route
-  to it when the diagnosis is self-contained.
-- **Why it earns its place:** Recognizing when an agent is overkill — and proving
-  it with a cheaper deterministic chain — is the senior judgment this whole file
-  teaches. It's a real cost win on the no-tool path.
-- **Files to touch:** `packages/agents/recommendation/src/recommendation-agent.ts`,
-  `packages/runtime/src/structured-generation.ts`,
-  `packages/agents/recommendation/test/recommendation-agent.test.ts`.
-- **Done when:** A diagnosis that needs no lookups produces recommendations via
-  the single-call chain path; a test asserts zero tool-call records.
+### Convert one over-engineered agent capability to a chain
+- **Exercise ID:** —  (no curriculum file in repo)
+- **What to build:** take a capability that runs `runAgentLoop` but almost always
+  makes exactly one tool call (inspect traces), and rewrite it as a two-step chain
+  (one retrieval, then `generateStructured`) — then compare token cost and latency.
+- **Why it earns its place:** the most common agent mistake is using a loop where a
+  line would do; proving a capability didn't need the loop, with numbers, is the
+  staff-level judgment call.
+- **Files to touch:** the chosen agent under `packages/agents/*/src/`,
+  `packages/runtime/src/structured-generation.ts` (reference), the agent's `test/`.
+- **Done when:** the rewritten capability passes the same eval set with fewer model
+  calls per question and a tighter p95 latency.
 - **Estimated effort:** `1–4hr`
 
-### Exercise — make the orchestration chain explicit and traceable
-
-- **Exercise ID:** `[A4.2]` Phase 4, orchestration as chain
-- **What to build:** Write a thin `runPipeline(workspace)` that calls monitor →
-  picks worst anomaly → diagnose → recommend, emitting a trace event at each
-  chain hop so the fixed sequence is visible in Studio as distinct from the
-  agent-internal turns.
-- **Why it earns its place:** It forces the chain/agent boundary into code — the
-  pipeline hops are chain steps, the per-box turns are agent steps, and the trace
-  shows both altitudes. Demonstrates you can see the two layers.
-- **Files to touch:** a new `packages/agents/*/src/pipeline.ts` (or `apps/studio`
-  orchestration), `packages/runtime/src/events.ts` (reuse existing event types).
-- **Done when:** A pipeline run produces a trace with labelled chain hops wrapping
-  each agent's turn events.
+### Add a `shape` field to the trace so agent vs chain is visible
+- **Exercise ID:** —  (no curriculum file in repo)
+- **What to build:** emit a trace event at capability start tagging it `agent` or
+  `chain` (and for agents, the observed turn count), so Studio can show the split.
+- **Why it earns its place:** making the control-flow shape observable turns "is
+  this an agent?" from a code-reading question into a dashboard fact — useful for
+  cost attribution.
+- **Files to touch:** `packages/runtime/src/events.ts`,
+  `packages/runtime/src/run-agent-loop.ts`,
+  `packages/runtime/src/structured-generation.ts`.
+- **Done when:** a Studio trace shows `shape: agent, turns: 3` for rag-query and
+  `shape: chain` for the anomaly scan.
 - **Estimated effort:** `1–4hr`
 
 ## Interview defense
 
-**Q: When would you NOT use an agent?**
-"Whenever I know the steps in advance. I'd sketch the two shapes:"
+**Q: "When do you use an agent vs a fixed chain?"**
+A chain when I know the steps, an agent only when the number and choice of steps
+depends on the input. In aptkit, anything with a fixed output shape — the anomaly
+scan, the rubric judge — runs `generateStructured`: generate, parse, validate, one
+strict retry, done. The four retrieval/analytics capabilities run `runAgentLoop`
+because how many searches a question needs isn't knowable upfront, so the model
+decides. The default is the chain; the agent is the exception you pay for.
 
 ```
-  fixed steps → CHAIN          unknown steps → AGENT
-  A ─► B ─► C                  loop: ask model → tool? → loop
-  deterministic, cheap         adaptive, must be fenced
+  steps known?  ─yes─► chain (generateStructured) — cheap, predictable
+                ─no──► agent (runAgentLoop)        — model steers, bounded
 ```
+Anchor: *don't make it an agent unless the model needs to choose the steps.*
 
-"If the second step doesn't depend on what the first step *found*, a chain is
-strictly better: deterministic, cheaper, debuggable. I reach for an agent only
-when the model has to decide the next move from a result I couldn't predict at
-author-time. In AptKit the monitor→diagnose→recommend pipeline is a chain; only
-the boxes that genuinely investigate are agents."
-*Anchor: agents trade determinism for adaptivity — only pay that when you must.*
+**Q: "Both your chain and your agent have a loop. What makes one an agent?"**
+The chain's loop is a parse-retry — the step sequence (generate → parse → validate)
+is in my code; the loop only re-runs the same step on a JSON failure. The agent's
+loop reads its next action *out of the model's output*: `toolUsesFromContent` pulls
+the `tool_use` blocks the model emitted, and the loop runs whatever the model named.
+The model owning the next step is what makes it an agent, not the presence of a loop.
 
-**Q: Your recommendation agent has `maxTurns: 6`. Doesn't that make it a chain of
-6 steps?**
-"No — `maxTurns` is a *ceiling*, not a count. The model might answer in 1 turn
-with 0 tool calls, or use all 4 tool calls across 3 turns. A chain would say
-'call these exact tools in this order.' The agent says 'you have a budget; you
-pick.' The number is the fence the code owns; the moves inside it belong to the
-model. That's `recommendation-agent.ts:86`."
-*Anchor: a budget is not a script — the ceiling is code's, the moves are the model's.*
-
-## Validate
-
-- **Reconstruct:** From memory, draw the two control-flow shapes (chain arrows vs
-  agent loop) and label who owns control in each. Check against the Move 1
-  diagram.
-- **Explain:** Why is `maxToolCalls: 4` (`recommendation-agent.ts:87`) evidence
-  of an agent and not a chain? (Because it's an upper bound the model spends as it
-  sees fit — a chain would name the exact calls in order.)
-- **Apply:** You're asked to build "fetch a customer's lifetime value, format it,
-  and return it." Chain or agent, and why? (Chain — the steps are known and
-  fixed; an agent adds cost and nondeterminism for no benefit.)
-- **Defend:** Why does AptKit keep the orchestration (monitor→diagnose→recommend)
-  as a chain instead of one big agent that does all three? (Determinism and
-  debuggability at the top level; the loop only appears where runtime
-  investigation is genuinely required — `recommendation-agent.ts:64` takes a
-  finished `Diagnosis` as input rather than rediscovering it.)
+```
+  chain loop: retry the SAME step you coded
+  agent loop: run the NEXT step the MODEL chose
+```
+Anchor: *agent = the loop body's next action comes from model output, not your code.*
 
 ## See also
 
-- [03-react-pattern.md](03-react-pattern.md) — the bounded loop that makes each box an agent
-- [02-tool-calling.md](02-tool-calling.md) — what the model's "step" physically is
-- [04-tool-routing.md](04-tool-routing.md) — which tools each single-purpose agent may see
-- [../02-context-and-prompts/03-prompt-chaining.md](../02-context-and-prompts/03-prompt-chaining.md) — the pipeline as prompt chaining
-- [.aipe/study-agent-architecture/](../../study-agent-architecture/) — multi-agent orchestration on top of the loop
+- `02-tool-calling.md` — how the agent's tool_use blocks are produced
+- `03-react-pattern.md` — what a single agent turn actually is
+- `04-tool-routing.md` — which tools an agent is even allowed to choose
+- `06-error-recovery.md` — the bounds an agent needs that a chain doesn't
+- `05-evals-and-observability/01-eval-set-types.md` — testing each shape

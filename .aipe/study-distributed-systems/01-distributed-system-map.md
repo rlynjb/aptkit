@@ -1,338 +1,254 @@
-# 01 — The distributed system map
+# 01 — The Distributed System Map
 
-**Industry name(s):** system topology / failure-domain map / coordination map.
-**Type:** Industry standard (concept) · Project-specific (the map).
+**Industry names:** system topology · failure domains · service boundary map · trust/ownership map — *Industry standard.*
 
 ## Zoom out, then zoom in
 
-Before any mechanism, here's the whole thing in one frame. The question a
-distributed-systems map answers is: *what are the nodes, where are the
-boundaries, who owns what, and where can a failure be contained?* For most
-systems that's a busy diagram. For AptKit it's almost embarrassingly small —
-and that smallness is the single most important fact about this repo.
+Before any mechanism, look at where coordination actually happens. aptkit *looks*
+like one process, and most of it is. The distributed-systems content lives only at
+the boundaries where one process talks to another over a network it doesn't own.
 
 ```
-  Zoom out — where "the system" actually lives
+  Zoom out — the four bands, and where boundaries cross them
 
-  ┌─ UI layer (local dev only) ─────────────────────────────────┐
-  │  apps/studio — React + Vite, replay API over NDJSON          │
-  └───────────────────────────┬──────────────────────────────────┘
-                              │ in-process function calls
-  ┌─ Service layer (ONE Node process) ──▼───────────────────────┐
-  │  runAgentLoop → tools → parseAgentJson → usage-ledger        │
-  │  RagQueryAgent → retrieval pipeline (embed → search)         │
-  │  ★ THIS FILE: the map of these boxes and their exits ★       │ ← we are here
-  └──────────────┬────────────────────────────────┬──────────────┘
-                 │ ModelProvider.complete()        │ EmbeddingProvider.embed()
-  ┌─ Provider boundary ─▼──────────────────────────▼──────────────┐
-  │  Anthropic / OpenAI / Fallback / ContextGuard / Gemma adapters │
-  └──────────────┬────────────────────────────────┬──────────────┘
-                 │ HTTPS                            │ HTTP (localhost)
-                 ▼                                  ▼
-  ┌─ External: cloud (not yours) ─────┐  ┌─ External: local Ollama process ──┐
-  │  api.anthropic.com  api.openai.com │  │  :11434  /api/chat  /api/embed     │
-  └────────────────────────────────────┘  └────────────────────────────────────┘
+  ┌─ App layer (single Node process) ──────────────────────────────────┐
+  │   runAgentLoop · RagQueryAgent · ToolRegistry                       │
+  │   ★ everything here is in-process: no coordination ★                │
+  └───────────────────────────┬─────────────────────────────────────────┘
+                              │  ModelProvider.complete() / EmbeddingProvider.embed()
+  ┌─ Provider / adapter layer ▼─────────────────────────────────────────┐
+  │   FallbackModelProvider · ContextWindowGuardedProvider              │
+  │   GemmaModelProvider · OllamaEmbeddingProvider                      │
+  │   ★ THE SEAM: in-process call on the near side,                     │
+  │     network call on the far side ★                                  │ ← we are here
+  └───────────────────────────┬─────────────────────────────────────────┘
+                              │  HTTP :11434          │  TCP (pg)
+  ┌─ External services ───────▼───────────────────────▼─────────────────┐
+  │   Ollama daemon (separate process)   Supabase Postgres (network DB) │
+  │   ★ partial failure originates here ★                               │
+  └─────────────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: a "node" is an independent failure unit — something that can crash,
-slow, or lie *without* taking its neighbors down with it. By that definition
-AptKit now has **three**: your process, the cloud provider API, and the local
-Ollama process. The third one is the subtle addition — Ollama runs on the *same
-machine* over plain HTTP, so it feels like a local call, but it's a **separate
-OS process** you talk to over a socket. It can be not-running, mid-model-load,
-or slow, independently of your process. That makes it a node, not a function
-call. The Studio UI, by contrast, is *not* a separate node — it calls into the
-same process via Vite middleware. So the map is three boxes and (up to) two
-arrows out of your process, and the whole discipline is about what happens to
-those arrows.
+Zoom in: a **system map** answers one question — *which boxes can fail
+independently of which other boxes?* A box that can crash, hang, or fall off the
+network without taking its caller down with it is a **failure domain.** Drawing
+those domains, and the boundaries between them, is the first move before you reason
+about anything else. You can't reason about partial failure until you know which
+parts can fail *partially*.
 
-## Structure pass — layers, axis, seam
+## Structure pass
 
-Three layers (UI / Service / Provider), and we trace **one axis: failure — where
-does it originate, propagate, and get contained?** Hold that question constant
-and walk down.
+**Layers.** Three nested levels: (1) the in-process app, (2) the provider adapters
+that sit on the seam, (3) the external services across the network.
+
+**Axis — trace `failure origin` down the layers.** Hold one question constant:
+*where does a failure start, and what contains it?*
 
 ```
-  One question down the layers: "where does failure get contained?"
+  One axis — "where does failure originate / get contained?" — top to bottom
 
-  ┌────────────────────────────────────────────┐
-  │ UI layer (Studio)                           │  → failure = render error,
-  │                                             │    local, no blast radius
-  └────────────────────────────────────────────┘
-      ┌──────────────────────────────────────────┐
-      │ Service layer (agent loop, tools, parse)  │  → failure = throws in-process,
-      │                                           │    caught by try/catch, bounded
-      └──────────────────────────────────────────┘
-          ┌──────────────────────────────────────┐
-          │ Provider boundary (the HTTPS hop)     │  → failure = ORIGINATES HERE:
-          │                                       │    timeout, 429, 5xx, partial
-          └──────────────────────────────────────┘
+  ┌─ App layer ───────────────────────────────┐
+  │  failure = a thrown error from complete()  │  → caught by runAgentLoop's
+  │                                            │    try/catch around the tool call
+  └─────────────────────┬──────────────────────┘
+       ┌────────────────▼───────────────────────┐
+       │ Provider layer: FallbackModelProvider   │  → CONTAINS failure: catches,
+       │                                         │    records attempt, tries next
+       └────────────────┬───────────────────────┘
+            ┌───────────▼────────────────────────┐
+            │ External: Ollama / Postgres         │  → ORIGINATES failure: HTTP
+            │                                     │    non-200, ECONNREFUSED, hang
+            └─────────────────────────────────────┘
 
-  the answer flips at the boundary — that flip IS the seam
+  the answer flips at each altitude — that flip is where the contracts live
 ```
 
-The **seam** is the `ModelProvider.complete()` contract. It's load-bearing
-because the failure axis *flips* across it: above the seam, failures are
-ordinary in-process exceptions you can reason about with a stack trace. Below
-it, failures are partial and ambiguous — a timeout could mean the request never
-arrived, arrived but the response was lost, or fully succeeded on the
-provider's side while your socket died. That ambiguity is the entire reason
-distributed systems are hard, and it lives at exactly one place in this repo.
-
-The other seam worth naming is **trust**: everything above the boundary is code
-you wrote and can change; everything below is a system run by someone else,
-with their own rate limits, deploys, and outages (fallacy #6 — "there is one
-administrator" — is false, and the administrator isn't you).
+**Seams (boundaries where the axis-answer flips).** The flip from "originates" to
+"contains" happens at the provider adapter. That's the load-bearing seam: the
+near side is a normal in-process method call (`provider.complete(request)`); the
+far side is a network round-trip that can fail in ways an in-process call never
+does (it can *hang*, it can return *stale* data, it can *partially* apply a write).
+Every distributed-systems lesson in this repo hangs off one of these four seams.
 
 ## How it works
 
-### Move 1 — the mental model: nodes and the edges between them
+### Move 1 — the mental model: a process can only see messages, never state
 
-A distributed system map is a graph: nodes are failure units, edges are the
-messages between them. You already build this shape constantly — a React app
-calling a `fetch()` to a backend is a two-node graph. AptKit is the same shape,
-with a fork: your process is node A, and it talks to *either* a cloud provider
-API *or* the local Ollama process — each its own node — over `complete()` /
-`embed()`.
-
-```
-  The map as a graph — node = failure unit, edge = message
-
-                              complete()  ┌──────────────────┐
-         ┌─────────────────┐ ───────────► │  Cloud API (B)   │  someone else owns
-         │  AptKit process │ ◄─────────── └──────────────────┘  (HTTPS, rate-limited)
-         │  (node A)       │
-         │  you own this   │  complete() / embed()  ┌──────────────────┐
-         └─────────────────┘ ─────────────────────► │  Ollama proc (C) │  you run it, but
-                             ◄───────────────────── └──────────────────┘  it's a separate
-                                                                          process (localhost)
-  two edges out of A. that's the system.
-```
-
-The thing that makes it a *distributed* map rather than plain function calls:
-B and C can each fail independently of node A. Node A keeps running while a
-provider is down. There's no shared memory, no shared clock, no transaction
-spanning the boundary — and crucially, that's true for the *localhost* hop too.
-Ollama sharing your machine doesn't make it share your address space; a crashed
-or not-yet-started Ollama is a partial failure exactly like a cloud 503.
-
-### Move 2 — walking the map
-
-**The failure domains.** A failure domain is the set of things that go down
-together. In AptKit there are now three, cleanly separated:
+The single hardest thing about a boundary: your process never sees the other side's
+*state*. It only sees the *messages* that come back — or the silence when none do.
+A successful `fetch()` is a message. An `ECONNREFUSED` is a message. But a `fetch()`
+that hasn't returned yet is **ambiguous** — the daemon might be working, might be
+wedged, might be dead. You cannot tell from inside your process. That ambiguity is
+the entire problem.
 
 ```
-  Failure domains — what dies together
+  The boundary — you see messages, never the far side's state
 
-  ┌─ Domain 1: your process ──────────┐   ┌─ Domain 2: cloud provider ─────┐
-  │  agent loop, tools, parsing,      │   │  api.anthropic.com / openai     │
-  │  ledger, retrieval, Studio        │   │  dies → complete() throws (503),│
-  │  dies → nothing remote affected   │   │  loop falls over to fallback    │
-  └───────────────────────────────────┘   └─────────────────────────────────┘
-                                          ┌─ Domain 3: local Ollama proc ──┐
-                                          │  :11434, gemma + nomic models   │
-                                          │  not running / loading / slow → │
-                                          │  fetch rejects → same throw path │
-                                          └─────────────────────────────────┘
+  near side (your process)        boundary         far side (you can't see in)
+  ┌────────────────────┐                           ┌──────────────────────┐
+  │ provider.complete()│ ──── request message ───► │  Ollama: working?    │
+  │                     │                           │          wedged?      │
+  │   awaiting...       │ ◄─── response message ─── │          crashed?     │
+  │   (ambiguous!)      │      ...or silence        │  YOU CANNOT TELL      │
+  └────────────────────┘                           └──────────────────────┘
+              ▲
+              └─ the gap between "sent" and "received" is where
+                 every distributed-systems bug lives
 ```
 
-When domain 2 *or* 3 fails, domain 1 stays up and *handles* it — that's the
-whole point of the fallback chain (a down Ollama can fail over to cloud, and
-vice versa). When domain 1 fails (your process crashes), there's nothing to
-coordinate; you just restart and re-run. No partial state is stranded in a
-remote system because there's no remote state in this design — the in-memory
-`InMemoryVectorStore` dies with domain 1 and is rebuilt on the next run by
-re-indexing the corpus.
+### Move 2 — walking the four seams
 
-**Ownership.** Every piece of state in AptKit is owned by domain 1 and lives in
-memory or on the local filesystem: the `messages` array in the loop, the
-`toolCalls` records, the trace events, the replay artifacts in
-`artifacts/replays/`, the embedded chunks in `InMemoryVectorStore`, and — new
-with `@aptkit/memory` — both the episodic-memory vectors (when wired to the
-in-memory store) and the per-conversation **id counter `Map`**
-(`packages/memory/src/conversation-memory.ts:71`) that mints `memory:<convId>:<n>`
-ids. That counter is the one piece of state that's *interestingly* in-process:
-it's ephemeral (resets on restart) and it silently assumes a *single* process
-mints ids for a given conversation — fine while the store is also ephemeral,
-load-bearing the moment the store becomes durable (see `04`/`09`). The providers
-own *nothing* of yours between calls — each `complete()`/`embed()` is stateless
-from your side; you re-send the full message history every turn and re-send the
-text to embed every call. Ollama holds the loaded model weights, but no
-per-request state of yours. That stateless-per-call design is why there's no
-consistency problem to solve at the *provider* boundary (covered in `04`).
+**Seam 1 — the app↔Ollama HTTP boundary.** This is the one you cross most. The
+default transport is a bare `fetch`:
 
-**The messages.** A small, fixed set crosses the boundaries: a `ModelRequest`
-out → `ModelResponse` back on the chat edge, and `string[]` (texts) out →
-`number[][]` (vectors) back on the embed edge. Either can fail or never return.
-There's no gossip protocol, no heartbeat, no replication stream. The richness
-lives *inside* domain 1 as `CapabilityEvent`s on a trace, never on the wire.
+```ts
+// packages/providers/gemma/src/gemma-provider.ts:201-215
+function defaultHttpTransport(host: string): GemmaChatTransport {
+  const base = host.replace(/\/$/, '');
+  return async ({ signal, ...payload }) => {
+    const res = await fetch(`${base}/api/chat`, {       // ← network round-trip
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+      ...(signal ? { signal } : {}),                    // ← only cancellation, no deadline
+    });
+    if (!res.ok) {
+      throw new Error(`ollama HTTP ${res.status}: ...`); // ← failure becomes a thrown error
+    }
+    return (await res.json()) as OllamaChatResponse;
+  };
+}
+```
+
+The annotation that matters: the `signal` is *caller-driven cancellation*, not a
+*timeout*. Nothing in this function gives up on its own. The embedding provider is
+the same shape (`ollama-embedding-provider.ts:60-75`). This is failure domain #1 —
+Ollama is a separate OS process that can die or hang without your process knowing.
+
+**Seam 2 — the fallback chain (a failure-containment boundary).** This is the one
+adapter whose entire job is to *contain* a far-side failure:
+
+```ts
+// packages/providers/fallback/src/fallback-provider.ts:50-64
+for (let index = 0; index < this.providers.length; index += 1) {
+  const provider = this.providers[index];
+  request.signal?.throwIfAborted();
+  try {
+    const response = await provider.complete(request);  // ← may be the network call
+    this.lastSelectedProvider = { providerId: provider.id, ... };
+    return { ...response, model: response.model ?? provider.defaultModel };
+  } catch (error) {
+    // ← failure CONTAINED here: recorded, then we fall through to the next provider
+  }
+}
+```
+
+This is the seam where the axis flips from "originates" to "contains." Notice what
+it *can't* contain: a provider that hangs forever never reaches the `catch`, so the
+loop never advances. Containment depends on the far side actually *failing* rather
+than stalling — which is exactly why finding #1 (no timeout) undermines this seam.
+
+**Seam 3 — buffr↔Postgres (a network database).** buffr opens a `pg.Pool`
+(`buffr/db.ts:4-6`) and every `PgVectorStore` query crosses it. A pool is itself a
+small distributed-systems object: a bounded set of TCP connections shared across
+concurrent callers. Run out of connections and callers *queue*; the DB goes away
+and every checked-out connection errors. → walked in
+`05-replication-partitioning-and-quorums.md` and `09`.
+
+**Seam 4 — the trace as an event log.** The `CapabilityEvent` union
+(`runtime/events.ts:1-24`) is an append-only log emitted as the agent runs. In
+aptkit it's streamed as NDJSON; in buffr it's drained into `agents.messages`. An
+event log that has to survive racing writers and reconstruct order is a
+distributed-systems artifact even inside one process — walked in `06` and `07`.
 
 ### Move 3 — the principle
 
-The most senior thing you can say about a system is **"here's the smallest
-true map of it."** For AptKit that map is your process plus its external-service
-dependencies — three nodes, two edge *types*, all behind one provider contract.
-Drawing it honestly — counting the localhost Ollama process as a real node
-rather than waving it away as "local" — is the skill. A system whose distributed
-surface is external-service calls needs the discipline of *those edges* and
-nothing more; bolting on consensus or queues would be complexity with no failure
-to justify it.
+A "distributed system" is not defined by how many machines you have. It's defined
+by how many **independent failure domains** a single operation depends on. The
+instant your operation's success depends on a box that can fail without telling
+you, you're doing distributed systems — even if both boxes are on your laptop. Map
+the failure domains first; the mechanisms are all answers to "what happens when
+domain X is slow, dead, or racing?"
 
 ## Primary diagram
 
-The full recap — every layer, the three nodes, the two edge types, and where
-failure is contained.
+The full map, with every boundary and failure domain labelled.
 
 ```
-  AptKit — the complete distributed map
+  aptkit + buffr — failure domains and the boundaries between them
 
-  ┌─ UI (local) ──────────────────────────────────────────────────┐
-  │  apps/studio  ── in-process calls, NOT a remote node            │
-  └────────────────────────────┬───────────────────────────────────┘
-                              │ function call (same process)
-  ┌─ Service (NODE A — your process, failure domain 1) ─▼──────────┐
-  │  runAgentLoop ─ tools ─ parseAgentJson ─ usage-ledger ─ trace   │
-  │  RagQueryAgent ─ retrieval pipeline ─ InMemoryVectorStore       │
-  │  state lives HERE: messages[], toolCalls[], events[], vectors[] │
-  └──────────────┬────────────────────────────────┬────────────────┘
-        complete()│  ← THE SEAM (failure axis flips) │ embed()
-  ┌─ Provider adapters (still NODE A) ─▼────────────▼──────────────┐
-  │  Anthropic · OpenAI · Fallback · ContextGuard · Gemma · Ollama  │
-  └──────────────┬────────────────────────────────┬────────────────┘
-        HTTPS     │  ◄── node-to-node edges ──►    │ HTTP (localhost)
-  ┌─ Cloud (NODE B, domain 2) ─▼──────┐  ┌─ Ollama (NODE C, domain 3) ─▼──────┐
-  │  api.anthropic.com  api.openai.com │  │  :11434  /api/chat  /api/embed      │
-  │  partial failure originates here   │  │  partial failure originates here too │
-  └────────────────────────────────────┘  └──────────────────────────────────────┘
+  ┌─ FAILURE DOMAIN A: aptkit process ────────────────────────────────────┐
+  │  runAgentLoop ──► provider.complete() ──► [adapters: fallback, guard]  │
+  │  emit(CapabilityEvent) ─────────────► trace (NDJSON stream)            │
+  └───────────────┬─────────────────────────────────┬──────────────────────┘
+                  │ HTTP :11434 (no timeout)         │  (aptkit core also consumed
+                  ▼                                  │   by buffr as a library)
+  ┌─ FAILURE DOMAIN B: Ollama daemon ──┐             │
+  │  /api/chat   (Gemma)               │             │
+  │  /api/embed  (nomic-embed-text)    │             │
+  └────────────────────────────────────┘             │
+                                                      ▼
+  ┌─ FAILURE DOMAIN C: buffr process ─────────────────────────────────────┐
+  │  ChatSession.ask() ──► PgVectorStore ──► pg.Pool ──┐                    │
+  │                   └──► SupabaseTraceSink.flush() ──┤                    │
+  └────────────────────────────────────────────────────┼───────────────────┘
+                                                        │ TCP (pg)
+  ┌─ FAILURE DOMAIN D: Supabase Postgres ────────────────▼─────────────────┐
+  │  agents.documents · agents.chunks (pgvector) · conversations · messages│
+  └─────────────────────────────────────────────────────────────────────────┘
+
+  A operation can depend on A→B (every model call) and C→B + C→D (every buffr turn).
+  Each arrow is a place the operation can hang, fail, or partially apply.
 ```
-
-## Implementation in codebase
-
-**Use cases.** Every agent run instantiates this map. A recommendation run
-builds a `WorkspaceDescriptor`, assembles a prompt, enters `runAgentLoop`, and
-the only thing that leaves your process is the `complete()` call to a provider.
-The map is the same for monitoring, diagnostic, query, and rubric agents — they
-differ in prompt and tool policy, not topology. The **RAG query agent**
-(`packages/agents/rag-query/scripts/ask.ts`) is the richest instance: it crosses
-the boundary *twice* per question against Ollama — once via
-`OllamaEmbeddingProvider.embed()` to vectorize the query, once via
-`GemmaModelProvider.complete()` to reason over the retrieved chunks — plus the
-embed calls at index time. Both depend on the same external process being up.
-
-**The seam — the contract that defines the boundary.**
-
-```
-  packages/runtime/src/model-provider.ts  (the ModelProvider contract)
-  packages/runtime/src/run-agent-loop.ts  (lines 103-109)
-
-  const response = await model.complete({   ← the ONE call that crosses node A→B
-    system: ...,                            ← everything assembled in-process
-    messages,                               ← full history re-sent each turn
-    tools: forceFinal ? undefined : ...,    ← (stateless from your side)
-    maxTokens,
-    signal,                                 ← cancellation rides along the edge
-  });
-       │
-       └─ this await is the entire distributed surface. Above it: in-process.
-          Below it: a network you don't control. Everything else in the repo
-          is one side or the other of this single line.
-```
-
-**The three real nodes, in code:**
-
-- Node A (your process): `packages/runtime/src/run-agent-loop.ts:76-202` — the
-  loop and all the state it owns (`messages`, `toolCalls`, `finalText`).
-- Node B (cloud provider): reached only through an adapter, e.g.
-  `packages/providers/anthropic/src/anthropic-provider.ts:28-61`, the thinnest
-  possible translation over `client.messages.create(...)`.
-- Node C (local Ollama process): reached through two adapters that both default
-  to `fetch` against `http://localhost:11434` —
-  `packages/providers/gemma/src/gemma-provider.ts:201-215` (`/api/chat`) and
-  `packages/retrieval/src/ollama-embedding-provider.ts:60-75` (`/api/embed`).
-  Both throw `ollama HTTP <status>` on a non-OK response, or reject when the
-  process isn't running.
-
-**What's NOT on the map (and the trigger that would add it):**
-
-- No second process *of yours*, no IPC, no RPC between your own components →
-  *trigger: extracting the agent loop into its own service that Studio calls
-  over HTTP.* (Ollama is a node, but it's not *your* component — it's a
-  dependency.)
-- No *durable* datastore node → *trigger: injecting `PgVectorStore` (which
-  already exists in `buffr` at `/Users/rein/Public/buffr/src/pg-vector-store.ts`)
-  into `createConversationMemory` or the retrieval pipeline in place of
-  `InMemoryVectorStore` — that adds a fourth node with real persistence and its
-  own partial-failure surface, and turns the in-process memory id counter
-  (`packages/memory/src/conversation-memory.ts:71`) into a correctness hazard
-  across restarts (`04`/`09`). aptkit ships the contract; the durable store and
-  this wiring live in `buffr` (`docs/personal-agent-packages.md:81-86`).*
-- No queue/broker node → *trigger: making agent runs async with a producer and
-  a separate consumer.*
 
 ## Elaborate
 
-The discipline of drawing the smallest true map comes from the fact that every
-node and edge you add is a new failure mode you now own. Lamport's framing — "a
-distributed system is one where the failure of a computer you didn't even know
-existed can render your own computer unusable" — is the warning. AptKit dodges
-it by having exactly one computer it depends on, and that one is explicit,
-named, and handled at the seam.
+The "failure domain" framing comes from large-scale systems work where the
+question is never "is the system up?" but "*which parts* are up, and what's still
+correct given the parts that aren't?" The classic reference is the *fallacies of
+distributed computing* (the network is reliable, latency is zero, bandwidth is
+infinite...). aptkit violates the first fallacy at exactly two arrows: the Ollama
+HTTP call and the pg TCP connection. Everything else is in-process and immune.
 
-The neighboring guides open the boxes this map keeps closed:
-`study-networking` opens the HTTPS edge (what actually happens on the wire when
-`complete()` runs); `study-system-design` treats the adapter layer as an
-architectural decision (provider-neutral core, swappable adapters); this guide
-only cares that the edge can fail and what node A does about it.
+What makes this repo a *good* place to learn the subject rather than a frustrating
+one: the failure domains are few and concrete. You can hold all four in your head.
+At Google scale the map has thousands of boxes and you reason statistically; here
+you reason exactly, which is the right place to build the intuition first.
 
 ## Interview defense
 
-**Q: "Walk me through your system's architecture and where it's distributed."**
-
-Draw the three-node graph. Say: "It's single-process by design — a library plus
-a local dev tool. Its distributed surface is external-service dependencies: cloud
-model APIs over HTTPS, and a local Ollama process over HTTP for the Gemma/RAG
-path. Everything else is in-process function calls — and it is *not* a
-distributed system itself; the multi-node sync plane is deferred to a separate
-repo."
+**Q: "Is this a distributed system?"**
+Answer with the verdict, not a dodge: "It's a single-process app with two real
+network boundaries — Ollama over HTTP and Supabase Postgres over TCP. So the
+*distributed-systems surface* is exactly those two arrows plus the fallback chain
+that sits on them. Everything else is in-process and has no partial-failure
+semantics. I'd rather name the two real seams precisely than claim a cluster I
+didn't build."
 
 ```
-  [your process] ──complete()──► [cloud API]      owns nothing of yours
-   owns all state  ──embed()────► [Ollama proc]    separate process, localhost
-   failure domain 1               domains 2 and 3
+  the one-line map you sketch while answering
+
+  [aptkit] ──HTTP──► [Ollama]        ← seam 1: can hang (no timeout)
+  [buffr]  ──TCP───► [Postgres]      ← seam 3: pool, transactions, racing writes
+       └─ fallback chain wraps seam 1 ← seam 2: contains failure
 ```
 
-Anchor: "The seam is the `ModelProvider`/`EmbeddingProvider` contract — that's
-where the failure axis flips from in-process exceptions to partial network
-failure. The non-obvious part: the Ollama hop is on localhost but it's still a
-separate failure domain, because it's a separate process."
+**Q: "What's a failure domain and why map it first?"**
+"A failure domain is a box that can fail independently of its caller. I map them
+first because partial failure — the whole subject — is only meaningful between
+domains. Inside one process a function either runs or the process dies; across a
+domain boundary the callee can hang, return stale data, or partially apply a write
+while the caller keeps running. The map tells me which arrows need timeouts,
+retries, and idempotency, and which don't need anything because they never leave
+the process."
 
-**Q: "Why not add a queue / cache / second service?"**
-
-Model answer: "Nothing in the workload justifies a second node. Adding one adds
-a failure domain with no failure to contain. The honest move is to draw the
-two-box map and add infrastructure only when a real trigger appears — async
-hand-off would justify a queue, a too-big dataset would justify sharding. None
-of those exist yet."
-
-## Validate
-
-1. **Reconstruct:** Draw AptKit's full map from memory — how many nodes, how
-   many edge types, where's the seam?
-2. **Explain:** Why is the local Ollama process *a* node (a separate failure
-   domain) while `apps/studio` is *not*, even though Studio has its own API
-   routes and Ollama is on the same machine? (Hint: separate OS process vs
-   same address space.)
-3. **Apply:** A teammate proposes moving artifact storage to a hosted Postgres.
-   Redraw the map. What new failure domain appears, and what new partial-failure
-   case must the code now handle?
-4. **Defend:** Argue that a single-edge map is the *correct* design for this
-   repo, not a limitation. (Hint: `run-agent-loop.ts:76-202` owns all state in
-   memory — what does that buy you on crash recovery?)
+*Anchor:* four failure domains, two network arrows, `fallback-provider.ts:50-64`
+is the one that contains failure.
 
 ## See also
 
-- `00-overview.md` — the ranked findings and the `not yet exercised` table.
-- `02-partial-failure-timeouts-and-retries.md` — what node A does when the edge
-  fails.
-- `study-networking` — the transport inside the HTTPS edge.
-- `study-system-design` — the adapter layer as an architectural decision.
+- `02-partial-failure-timeouts-and-retries.md` — what to do at each boundary arrow
+- `09-distributed-systems-red-flags-audit.md` — ranked risks per seam
+- **study-networking** — the wire-level mechanics of the two network arrows
+- **study-system-design** — why these boundaries exist (local-first, single DB)
+```

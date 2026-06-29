@@ -1,211 +1,161 @@
-# 03 — TCP/UDP, connections, and sockets
+# TCP, UDP, Connections, and Sockets
 
-**Industry name(s):** transport connections / sockets / connection lifecycle. **Type:** Industry standard.
+**Industry name:** transport layer / connection lifecycle / sockets · *Industry standard*
 
-## Zoom out — where this concept lives
+## Zoom out, then zoom in
 
-Sockets are the layer directly under HTTP — the actual byte pipe. Here's where the two connections in AptKit sit.
+One layer below HTTP is the connection itself: the socket that gets opened, used, and torn down. Here's where aptkit's code opens one.
 
 ```
-  Zoom out — two TCP connections, both below HTTP
+  Zoom out — where a socket gets opened
 
-  ┌─ UI (browser) ────────────────────────────────────────────┐
-  │  fetch() ── opens/reuses TCP to dev server                 │
+  ┌─ Service layer ────────────────────────────────────────────┐
+  │  defaultHttpTransport → fetch(`${base}/api/chat`, ...)     │
+  │                          ★ this opens a TCP connection ★    │
   └───────────────────────────┬────────────────────────────────┘
-                              │  ★ CONNECTION 1: TCP, browser↔Node ★
-                              │  long-lived (held open for the whole stream)
-  ┌─ Service (Node/Vite) ─────▼────────────────────────────────┐
-  │  SDK ── opens/reuses TCP to provider                        │
-  └───────────────────────────┬────────────────────────────────┘
-                              │  ★ CONNECTION 2: TCP, Node↔provider ★
-                              │  one per turn (SDK pools/reuses)
-  ┌─ Provider (external) ─────▼────────────────────────────────┐
-  └──────────────────────────────────────────────────────────────┘
+                              │ TCP handshake → request → response → close
+  ┌─ Provider layer ─────────▼─────────────────────────────────┐
+  │  Ollama daemon listening on TCP :11434 (loopback)          │
+  └────────────────────────────────────────────────────────────┘
+
+  ┌─ Storage layer (buffr) ────────────────────────────────────┐
+  │  pg.Pool — keeps a SET of TCP connections OPEN, reuses them │
+  └────────────────────────────────────────────────────────────┘
 ```
 
-## Zoom in — narrow to the concept
+**Zoom in.** A socket is the OS handle for one connection between two `(IP, port)` pairs. TCP gives you an ordered, reliable byte stream after a 3-way handshake; UDP gives you fire-and-forget datagrams with no ordering. Everything aptkit and buffr touch is TCP — HTTP rides on it, the pg wire protocol rides on it. The pattern to learn: **a connection has a lifecycle (open → use → close), and the big design choice is whether you pay that lifecycle cost per request or amortize it with a pool.**
 
-A socket is the OS object both sides hold for one connection. The question this file answers: *who opens each socket, how long is it held open, and who closes it?* AptKit has up to three TCP connections and the interesting one is still connection 1 — it's held open far longer than a normal request because the server streams into it. There's no UDP anywhere; everything is TCP because everything is HTTP. The repo never touches a *raw* socket — but the socket-ownership story now splits: connection 1 is opened by the browser/Node HTTP server, connection 2 by the SDK's HTTP agent, and connection 3 (Node↔local Ollama, new) by Node's global `fetch`/undici pool because the repo's transport calls `fetch` directly. Connection 3 is an ordinary short request/response — the contrast with conn 1 (long-held) still holds; the new wrinkle is just that the repo, not an SDK, is the code making the `fetch`.
+## Structure pass
 
-## The structure pass
+**Layers:** the agent loop (caller) → the transport (`fetch` / `pg.Pool`) → the OS socket → the listening daemon.
 
-**Layers.** Connection 1 (browser↔Node, managed by the browser fetch stack on one side and Node's HTTP server on the other). Connection 2 (Node↔provider, managed entirely by the SDK's HTTP agent).
-
-**Axis — lifecycle (when is the socket open vs idle vs closed?).**
+**Axis — lifecycle: "when does the connection open and close?"** Trace it across the two socket-owners in this system:
 
 ```
-  One axis (socket lifetime) across the two connections
+  Axis — connection lifecycle — across the two owners
 
-  connection 1 (browser↔Node):
-    open ──── held open for ENTIRE agent run ──── close on res.end()
-              (streaming records the whole time)
-
-  connection 2 (Node↔provider):
-    open ── one request/response ── kept alive in SDK pool ── reused
-              (short-lived per turn, socket recycled)
+  owner            opens when            closes when         reused?
+  ──────────────────────────────────────────────────────────────────
+  fetch (Gemma)    each complete() call  response done       NO (per request)
+  fetch (embed)    each embed() call     response done       NO (per request)
+  pg.Pool (buffr)  lazily, up to a cap   pool idle/shutdown  YES (checked out/in)
 ```
 
-The lifetime answer flips hard across the two: connection 1 is one long-held socket per run; connection 2 is a series of short request/response exchanges over pooled sockets. That contrast is the lesson — same transport (TCP), opposite lifecycle.
-
-**Seams.** The load-bearing seam is `res.end()` in the streaming middleware (`vite.config.ts:916`): it's the single line that decides connection 1's death. Hold it open forever (forget to call it) and the browser's `await reader.read()` never returns `done` — the panel hangs. Connection 2's seam is entirely inside the SDK's agent; the repo can't observe or tune it.
+**Seam:** the boundary between aptkit's per-request `fetch` and buffr's pooled `pg` is where the lifecycle axis flips from "open-use-close every time" to "open once, lend out repeatedly." That flip is the entire reason connection pools exist.
 
 ## How it works
 
-### Move 1 — the mental model
+#### Move 1 — the mental model
 
-You know how a normal `fetch` opens a connection, gets the whole response, and the connection goes back to the pool in milliseconds? Connection 1 here breaks that assumption: the socket stays open for *seconds* because the server keeps writing. Think of it as a fetch where the response body is a faucet that drips for the whole agent run, and the socket can't close until the faucet does.
-
-```
-  The long-held-socket shape
-
-  normal fetch:   [open] ─req─ ─resp─ [close]      (milliseconds)
-
-  AptKit conn 1:  [open] ─req─ ─chunk─chunk─chunk…─resp_end─ [close]
-                          │                                    │
-                     stays open the whole agent run    res.end() closes it
-```
-
-### Move 2 — walking each connection
-
-**Connection 1 opens when the browser fetches.** The browser fetch stack opens a TCP connection to the dev server (or reuses a keep-alive one). The Node HTTP server accepts it and hands the middleware a `req`/`res` pair. The socket is now bound to this one logical request. Boundary condition: as long as the middleware hasn't called `res.end()`, the OS keeps this socket in the established state, consuming a file descriptor.
+You know a `fetch()` from the browser: you call it, a request goes out, a response comes back, you don't think about the connection underneath. Under that `fetch` is a TCP socket — a handshake (SYN / SYN-ACK / ACK), then a reliable ordered byte stream, then a teardown. The kernel of TCP is *reliability through acknowledgement*: every byte is accounted for, retransmitted if lost, delivered in order.
 
 ```
-  Connection 1 open — TCP established, bound to one req/res
+  The pattern — TCP connection lifecycle
 
-  ┌─ browser ─┐  SYN/SYN-ACK/ACK   ┌─ Node ────┐
-  │ fetch     │ ══════════════════►│ accept    │
-  │           │  (or reuse pooled) │ → req,res  │
-  └───────────┘                    └───────────┘
-        socket now ESTABLISHED, held by both sides
+  client                              server
+    │ ── SYN ──────────────────────►   │   handshake
+    │ ◄──── SYN-ACK ──────────────────│   (1 round trip
+    │ ── ACK ──────────────────────►   │    before any data)
+    │                                  │
+    │ ── request bytes ─────────────►  │   ordered, ack'd
+    │ ◄──── response bytes ───────────│   stream
+    │                                  │
+    │ ── FIN / close ───────────────►  │   teardown
 ```
 
-**Connection 1 stays open while the server streams.** Every `res.write(ndjson)` pushes bytes down this established socket without closing it. The browser's reader pulls them as they arrive. This is the whole point of the design — file `06` covers the protocol, but the *socket* fact is: one connection, many writes, no close between them.
+The part people forget: the handshake is a full round trip *before the first byte of your request*. Pay it once and reuse the connection (a pool), or pay it every single time (per-request `fetch`). That's the load-bearing tradeoff.
 
-**Connection 1 closes on `res.end()`.** When the agent loop finishes and the final result record is written, the middleware calls `res.end()`. That sends the terminating chunk, the server closes its half, the browser's reader gets `done: true`, and the socket tears down. If the middleware threw before `res.end()` in the `finally`, the connection would leak — which is exactly why `streamReplayResponse` puts `res.end()` in a `finally` block.
+#### Move 2 — walking the sockets in this repo
 
-```
-  Connection 1 close — res.end() tears it down
+**aptkit opens a fresh TCP connection per Ollama call.** The `fetch` in `defaultHttpTransport` (`packages/providers/gemma/src/gemma-provider.ts:204`) has no agent, no keep-alive hint, no pool — Node's default `fetch` (undici) may keep-alive under the hood, but aptkit's code makes no attempt to manage or reuse the connection. Each `complete()` is a standalone request:
 
-  ┌─ Node ────┐  res.end() → FIN     ┌─ browser ─┐
-  │ finally{} │ ═══════════════════► │ reader    │
-  │           │                       │ done:true │
-  └───────────┘                       └───────────┘
-        socket → TIME_WAIT → closed
-```
-
-**Connection 2 is opened, pooled, and reused by the SDK.** Each `client.chat.completions.create` either opens a new TLS-over-TCP socket to the provider or reuses an idle one from the SDK's HTTP agent pool. After the response, the socket goes back to the pool (keep-alive) rather than closing, so the next model turn reuses it. The repo has zero visibility into this — no `maxSockets`, no `keepAlive` setting anywhere. This is `not yet exercised` at the repo level (delegated).
-
-```
-  Connection 2 — SDK pools the socket across turns
-
-  turn 1: create() ─► [open socket] ─resp─ ► back to pool (idle)
-  turn 2: create() ─► [reuse same socket] ─resp─ ► back to pool
-  turn 3: create() ─► [reuse] …
-              (all inside the SDK's HTTP agent; repo can't see it)
+```ts
+const res = await fetch(`${base}/api/chat`, {
+  method: 'POST',
+  headers: { 'content-type': 'application/json' },
+  body: JSON.stringify(payload),     // one request, one connection's worth of work
+  ...(signal ? { signal } : {}),     // the ONLY lifecycle control: abort
+});
 ```
 
-### Move 3 — the principle
+Because the target is loopback, the handshake cost is negligible (no network latency on `127.0.0.1`), so per-request connections are cheap here. The same code pointed at a remote host would pay a real handshake RTT per call — the cost the missing pool would then matter for (`07`).
 
-The principle is *socket lifetime follows the data shape, not the request count*. Connection 1 is one socket because there's one logical stream, even though dozens of records flow over it. Connection 2 is many short exchanges because each model turn is an independent request/response, even though they reuse one pooled socket. When you reason about sockets, ask "how long does the *data* need the pipe?" — not "how many messages are there?"
+**UDP appears nowhere.** No datagram sockets, no QUIC in aptkit's code (HTTP/3 would be QUIC-over-UDP, but the SDKs decide their own protocol). Mark it `not yet exercised` — UDP would become relevant only if the repo grew something latency-sensitive and loss-tolerant (telemetry, a metrics firehose), which it hasn't.
+
+**buffr is where connection pooling actually lives.** `createPool` builds a `pg.Pool` (`buffr/src/db.ts:4-6`), and `PgVectorStore` uses it two ways:
+
+```ts
+// pg-vector-store.ts — a multi-statement transaction CHECKS OUT one connection
+const client = await this.pool.connect();   // borrow a socket from the pool
+try {
+  await client.query('begin');
+  for (const c of chunks) { /* upsert each */ }
+  await client.query('commit');
+} finally {
+  client.release();                          // return the socket to the pool
+}
+
+// search() uses the pool DIRECTLY — pool picks an idle connection for one query
+const { rows } = await this.pool.query(`select ... order by embedding <=> $1::vector limit $3`, ...);
+```
+
+```
+  Layers-and-hops — pool checkout vs direct query
+
+  ┌─ buffr: PgVectorStore ─────────────────────────────────────┐
+  │  upsert():  pool.connect() → client → begin/commit → release│  (needs ONE
+  │             ◄── borrows a single socket for the txn ──────► │   socket the
+  │  search():  pool.query()  → pool lends any idle socket      │   whole txn)
+  └──────────────────────────┬─────────────────────────────────┘
+                  hop E: pg wire over reused TCP sockets
+                             ▼
+                    ┌─ Supabase Postgres ─┐
+                    │ accepts pooled conns │
+                    └──────────────────────┘
+```
+
+The distinction matters: `upsert` runs a multi-statement transaction, so it must hold *one* connection across `begin`/`commit` — hence `connect()`/`release()`. `search` is a single statement, so `pool.query()` lets the pool pick any idle connection. Getting this wrong (running `begin`/`commit` on the pool directly) would scatter the transaction across different sockets and break atomicity — that's the load-bearing reason for the checkout pattern.
+
+#### Move 3 — the principle
+
+The principle: **connection lifecycle is a cost you either pay per request or amortize with a pool, and the right choice is set by latency and concurrency, not taste.** aptkit's per-request `fetch` to loopback is correct *because* the handshake is free on `127.0.0.1`. buffr's pool is correct *because* the database is remote and queried often — paying a handshake per query would dominate latency. Same transport (TCP), opposite lifecycle decision, each justified by its distance.
 
 ## Primary diagram
 
-Both connections, their full lifecycle, who owns each.
-
 ```
-  AptKit sockets — two TCP connections, opposite lifecycles
+  Connection lifecycle recap — two owners, opposite choices
 
-  ┌─ UI (browser) ─────────────────────────────────────────────┐
-  │  fetch stack opens conn 1                                   │
-  │     │  TCP established ───────────────────────── held open  │
-  └─────┼───────────────────────────────────────────────────────┘
-        │ CONNECTION 1 (browser↔Node): ONE long-held socket
-        │ open: fetch  │  data: many res.write  │ close: res.end()
-  ┌─────▼───────────────────────────────────────────────────────┐
-  │  Node HTTP server (req/res) + SDK HTTP agent                │
-  │     │  SDK opens/reuses conn 2                               │
-  └─────┼───────────────────────────────────────────────────────┘
-        │ CONNECTION 2 (Node↔provider): MANY short pooled sockets
-        │ open/reuse per turn │ keep-alive in SDK pool
-  ┌─────▼───────────────────────────────────────────────────────┐
-  │  Provider                                                   │
-  └──────────────────────────────────────────────────────────────┘
+  aptkit (loopback, cheap handshake)        buffr (remote, expensive handshake)
+  ──────────────────────────────────        ───────────────────────────────────
+  complete() → fetch → [SYN/ACK]            search() → pool.query()
+             → POST /api/chat                        → reuse an OPEN socket
+             → response → CLOSE              upsert() → pool.connect()
+             (new socket each call)                   → begin..commit on ONE socket
+                                                      → release (back to pool)
+  no pool, fine because loopback            pool, required because remote+frequent
 ```
-
-## Implementation in codebase
-
-**Use cases.** Connection 1's lifetime is controlled on every streaming replay. Connection 2's lifetime is controlled by no repo code at all — it's the SDK's pool.
-
-**`res.end()` in a `finally` is what guarantees connection 1 closes.** `apps/studio/vite.config.ts:904-917`:
-
-```
-  apps/studio/vite.config.ts  (streamReplayResponse, lines 904–917)
-
-  try {
-    const body = await readJsonBody(req);
-    const result = await run(body, (event) => {
-      res.write(encodeNdjsonRecord({ type: 'event', event }));  ← writes, never closes
-    });
-    res.write(encodeNdjsonRecord({ type: 'result', result }));  ← final write
-  } catch (error) {
-    res.write(encodeNdjsonRecord({ type: 'error', error: ... })); ← error still over the open socket
-  } finally {
-    res.end();                                                   ← THE close — always runs
-  }
-       │
-       └─ res.end() in finally is load-bearing: if it only lived in the try and
-          run() threw after a partial write, the socket would leak and the
-          browser's reader would hang forever waiting for done
-```
-
-**The browser side reads until the socket signals done.** `apps/studio/src/api.ts:169-180`:
-
-```
-  apps/studio/src/api.ts  (responseBodyChunks, lines 169–180)
-
-  const reader = body.getReader();
-  while (true) {
-    const { done, value } = await reader.read();  ← pulls bytes off conn 1
-    if (done) return;                             ← done = server called res.end()
-    if (value) yield value;
-  }
-       │
-       └─ done becomes true only when the server closes its half of the socket;
-          this loop is the browser end of connection 1's lifecycle
-```
-
-**Connection 2 has no repo-side socket config — by design.** The SDK clients (`openai-provider.ts:30`, `anthropic-provider.ts:25`) are constructed with `apiKey` only. No `httpAgent`, no `maxSockets`, no `keepAlive`. The pool exists; the repo doesn't tune it.
-
-**Connection 3 rides Node's global `fetch` pool — also untuned, but now repo-initiated.** The Gemma/embedding transports call the global `fetch` (`gemma-provider.ts:204`, `ollama-embedding-provider.ts:63`), which uses Node's built-in undici connection pool against `localhost:11434`. Like connection 2 it's a short request/response with keep-alive reuse handled below the repo — but unlike connection 2, the *call* is repo code, so this is the one delegated pool the repo could most easily reach into (pass a custom `dispatcher` to `fetch`). It doesn't, so socket tuning here is `not yet exercised` too. The socket-lifetime lesson is unchanged: conn 3 is "many short exchanges over a reused socket," the same shape as conn 2, just hand-initiated.
 
 ## Elaborate
 
-The long-held socket of connection 1 is the same shape you've hit in your streaming work — AdvntrCue streams GPT-4 responses back to the browser over a connection held open the whole generation, and contrl's hot path deliberately holds *no* network socket at all (on-device ML, no cloud in the frame loop). AptKit's connection 1 is the AdvntrCue pattern; its connection 2 is the ordinary request/response your `fetch`-based code does daily. The thing to carry forward: a streaming endpoint changes your socket math — one open socket per concurrent run, not per request. At a single-user dev tool that's one or two sockets; at scale it's the number that decides how many concurrent runs your server can hold.
+TCP's handshake-before-data cost is the reason every serious database client pools connections and every HTTP/1.1 client tries keep-alive. The reason aptkit can skip pooling is purely that it talks to loopback; the reason buffr can't is that it talks across the internet to Supabase. This is also where `pg`'s pool gives you backpressure for free — when all connections are checked out, `connect()` queues, which is the closest thing to flow control in the whole system (`07`). For the reliability guarantees TCP provides under partial failure, see `study-distributed-systems`.
 
 ## Interview defense
 
-**Q: How long is each connection held open, and what closes it?**
+**Q: "Do you pool connections? Why or why not?"**
+Two-part answer: "For my Ollama calls, no — they're plain per-request `fetch` to loopback, where the TCP handshake is free, so pooling buys nothing. For the database in the companion repo, yes — a `pg.Pool`, because the DB is remote and queried per request, so reusing open sockets avoids a handshake RTT every time." Then name the subtlety: "Transactions check out a single connection with `connect()`/`release()`; single queries go through `pool.query()` so the pool picks any idle socket."
 
 ```
-  conn1: open whole run → res.end()      conn2: short, pooled by SDK
+  sketch: the lifecycle flip
+
+  loopback:  open→use→close  (per call, fine)
+  remote:    open ONCE → lend → return  (pool, required)
+              ▲ handshake paid once, not per query
 ```
 
-Connection 1 (browser↔Node) is held open for the entire agent run because the server streams into it; it closes only when the middleware calls `res.end()` in its `finally` (`vite.config.ts:916`). Connection 2 (Node↔provider) is a short request/response per model turn, with the socket kept alive and reused from the SDK's pool. **Anchor:** `res.end()` in `finally` is the one line that prevents a socket leak.
-
-**Q: Why is there no UDP?**
-
-Everything is HTTP, and HTTP rides on TCP. There's no use case here for an unreliable datagram transport — no media streaming, no DNS-over-UDP in repo code (the OS resolver handles that below). **Anchor:** TCP-only because HTTP-only.
-
-## Validate
-
-1. **Reconstruct:** Draw connection 1's lifecycle: open, data, close — name the trigger for each.
-2. **Explain:** Why is `res.end()` in a `finally` and not just after the result write? (Socket-leak / hang prevention on the error path — `vite.config.ts:910,916`.)
-3. **Apply:** The panel hangs forever with no error. Which socket, which missing call? (Connection 1; a missing/never-reached `res.end()`.)
-4. **Defend:** Why does the repo not tune connection 2's pool? (Single-user tool, no concurrency pressure; SDK defaults are correct — `not yet exercised`.)
+Anchor: *the handshake is a round trip before your first byte — pool it when that round trip costs something.*
 
 ## See also
 
-- `04-tls-and-trust-establishment.md` — connection 2 is TLS-over-TCP; what the handshake adds
-- `06-websockets-sse-streaming-and-realtime.md` — what flows over connection 1's long-held socket
-- `07-timeouts-retries-pooling-and-backpressure.md` — the SDK pool and what AptKit doesn't tune
-- study-runtime-systems — the event loop that keeps connection 1's socket serviced without blocking
+- `02-dns-routing-and-addressing.md` — resolution happens before the handshake
+- `04-tls-and-trust-establishment.md` — TLS adds more round trips on top of the TCP handshake
+- `07-timeouts-retries-pooling-and-backpressure.md` — the pool as backpressure; the missing timeout on the socket

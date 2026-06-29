@@ -1,325 +1,160 @@
-# 08 — Replication and read consistency
+# 08 · Replication and Read Consistency
 
-**Subtitle:** Replication / read replicas / replication lag / stale reads —
-*Industry standard* (taught), *status: not yet exercised; analog:
-deterministic replay as reproducible reads* (in-repo)
-
----
+**Industry name(s):** streaming replication, read replicas, replication lag, stale reads, failover. **Type:** Industry standard.
 
 ## Zoom out, then zoom in
 
-Replication is keeping copies of your data on more than one node so reads can
-scale out and the system survives a node dying — at the cost of *lag*, the
-window where a replica hasn't caught up and serves a stale read. AptKit has no
-replicas, no nodes, no lag, because it's a single machine writing local files.
-But it has a cousin of the problem replication's *consistency* guarantees
-solve: "will two reads of the same thing return the same answer?" AptKit
-answers yes, and not through replication — through *determinism*. The
-`FixtureModelProvider` replays recorded responses byte-for-byte, so a read is
-reproducible by construction. This file teaches replication and stale reads,
-then shows how deterministic replay delivers reproducible reads without any
-distribution.
+Replication is "keep a second copy of the database so reads can scale and a failover has somewhere to go." You know the read-your-own-write problem from frontend: you POST an update, immediately GET, and the GET hits a stale cache that hasn't seen your write. Replication lag is that exact problem at the database tier. The headline here is short and honest: **buffr uses one Postgres endpoint, one connection pool, no replicas.** So this file teaches the mechanism and names precisely where it would attach — almost all of it is `not yet exercised`.
 
 ```
-  Zoom out — where replication would sit (but there's one node)
+  Zoom out — where replication would sit (but doesn't, yet)
 
-  ┌─ Service layer (single process) ──────────────────────────┐
-  │  FixtureModelProvider → same responses, same order, always │ ← we are here:
-  │  (reproducible reads via determinism, not replicas)        │   consistency w/o
-  └───────────────────────────┬───────────────────────────────┘   replication
-  ┌─ Storage layer (single local disk) ───────────────────────┐
-  │  artifacts/ + fixtures/  — no replicas, no failover        │
-  └───────────────────────────────────────────────────────────┘
+  ┌─ Application (buffr) ──────────────────────────────────┐
+  │  one pg.Pool → one DATABASE_URL → one Postgres endpoint │
+  └────────────────────────────┬────────────────────────────┘
+                               │  every read AND write
+  ┌─ Postgres (Supabase) ──────▼────────────────────────────┐
+  │  PRIMARY (single)                                        │ ← we are here
+  │  ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄ │
+  │  read replica(s): NONE wired (Supabase could provide)    │
+  └──────────────────────────────────────────────────────────┘
 ```
 
-**Zoom in.** The question replication's consistency model answers: *if I read
-the same record twice (or from two places), do I get the same bytes?* In a
-replicated database that depends on lag and your consistency level. In AptKit
-the answer is unconditionally yes — promoted fixtures replay deterministically,
-the same input producing the same output every run. That reproducibility is
-the in-repo analog; true replication is `not yet exercised`.
+Zoom in: the concept is **read consistency under replication** — when you have copies, which copy does a read hit, and how stale can it be? buffr's answer today is trivially strong: there's one copy, so every read is up-to-date, no lag, no stale reads. That simplicity is a *choice* (single-tenant laptop runtime), and the file's job is to show what changes the moment a replica appears.
 
----
+## The structure pass
 
-## Structure pass
+**Layers.** Replication concerns three altitudes: the connection layer (how many endpoints the app talks to — buffr: one), the routing layer (which reads go to a replica — buffr: none), and the engine (WAL streaming from primary to replica — buffr: not configured).
 
-The layers: the **authoritative source** (promoted fixtures = the baselines)
-and the **served read** (a replay run). Axis to hold constant: **freshness /
-agreement — do two reads of the same record agree?**
+**Axis — trace "how fresh is a read, and where does it go?":**
 
 ```
-  One axis — "do two reads agree?" — across the consistency layers
+  One question down the layers: "read freshness and destination?"
 
-  ┌───────────────────────────────────────────┐
-  │ promoted fixture (the baseline record)    │  → fixed bytes on disk; the
-  └───────────────────────────────────────────┘    authoritative version
-      ┌───────────────────────────────────────┐
-      │ replay run over that fixture          │  → SAME output every time:
-      └───────────────────────────────────────┘    FixtureModelProvider serves
-                                                    the same responses in order
-      ┌───────────────────────────────────────┐
-      │ HYPOTHETICAL second node / replica    │  → would introduce LAG → stale
-      └───────────────────────────────────────┘    reads. Not present.
+  ┌─ connection (buffr) ────────────────────┐
+  │  one pg.Pool, one DATABASE_URL           │ → all reads hit the PRIMARY
+  └──────────────────────────────────────────┘
+  ┌─ routing ────────────────────────────────┐
+  │  no read/write split                      │ → no routing decision exists
+  └──────────────────────────────────────────┘
+  ┌─ engine ─────────────────────────────────┐
+  │  no replica → no WAL stream → no lag      │ → reads ALWAYS fresh (trivially)
+  └──────────────────────────────────────────┘
 
-  the seam: AptKit's reads agree because the source is immutable AND the read
-  is deterministic — there's no second copy to lag. Add a replica and you add
-  the staleness window this file teaches.
+  freshness is perfect BECAUSE there is one copy — not because lag is handled
 ```
 
-The load-bearing seam: "one deterministic source" vs "multiple lagging
-copies." AptKit lives entirely on the first side — reproducibility comes from
-determinism over a single immutable source. Replication would move it to the
-second side and introduce lag, the central cost this file exists to name.
-
----
+**Seam.** The boundary that *would* matter is the read/write split — the routing decision "send this read to a replica or the primary." It doesn't exist in buffr (one pool, `buffr/src/db.ts:4-6`). Naming the absent seam is the lesson: the moment you add a replica, that seam appears, and with it the stale-read problem.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know how a CDN serves a cached copy of your page from an edge node, and
-sometimes you see a stale version until the cache updates? Read replicas are
-that for a database: writes go to the primary, then propagate to replicas that
-serve reads, and there's a window where a replica is behind. The mental model:
-**replication = one writer (primary) fanning its changes out to read-only
-copies, trading read scalability for a staleness window called lag.**
+Replication is the WAL (07) put to a second use: instead of only replaying the log locally for crash recovery, *stream* it to another Postgres that replays it to stay a copy. The replica is always slightly behind — it's replaying a log that's still being written — and that gap is replication lag.
 
 ```
-  the real mechanism: primary → replicas, with lag
+  Streaming replication — the WAL as a feed to a copy
 
-   writes
-     │
-     ▼
-  ┌─ PRIMARY ─┐  ship WAL   ┌─ replica A ─┐  reads ◄── client 1 (fresh)
-  │ (writable)│ ──────────► │ (read-only) │
-  └───────────┘     │       └─────────────┘
-                    │       ┌─ replica B ─┐  reads ◄── client 2 (STALE:
-                    └─────► │ (read-only) │              hasn't applied
-                            └─────────────┘               latest WAL yet)
-   lag = time between primary commit and replica apply → stale-read window
+  PRIMARY                                    REPLICA
+  ┌──────────────┐  WAL stream (async)       ┌──────────────┐
+  │ writes commit│ ────────────────────────► │ replays WAL  │
+  │ WAL appended │                           │ stays behind │
+  └──────────────┘                           └──────────────┘
+       ▲                                          ▲
+   writes go here                          reads CAN go here
+                                           but see state from
+                                           "lag" milliseconds ago  ◄ stale-read window
 ```
 
-### Move 2 — the parts that matter
+The kernel: **the replica replays the primary's WAL and is always `lag` behind.** A read routed to the replica sees the database as of `now - lag`. Read your own write through a replica inside that window, and you don't see your write — the canonical stale read.
 
-**The primary / replica split (absent).** Replication needs a designated
-writer and one-or-more read-only copies, with a transport (usually shipping the
-WAL) between them. AptKit has one process and one local disk — no split, no
-transport. What this buys by its absence: there's no lag and no stale-read
-window, because there's only one copy. What you give up: read scale-out and
-node-failure survival. `not yet exercised`; trigger = reads must scale beyond
-one machine, or survive a host failing.
+### Move 2 — the walkthrough
 
-**Replication lag and stale reads (absent).** Lag is the gap between a write
-committing on the primary and being visible on a replica; a read hitting a
-behind replica is *stale*. The consistency levels (read-your-writes,
-monotonic reads, eventual) exist to manage which staleness you'll tolerate.
-AptKit has none of this to manage — a read always sees the one current file.
-Trigger to care: the moment a second copy can answer reads.
+**The single endpoint — one pool, everything.** buffr's entire connection story is one function:
 
-**The in-repo analog: deterministic replay = reproducible reads.** Here's the
-real connection. The *value* a consistency model protects is "the same read
-gives the same answer." AptKit guarantees that not by syncing copies but by
-making the read deterministic: the `FixtureModelProvider` holds a fixed
-`ModelResponse[]` and serves them in order by an integer cursor, so replaying
-the same fixture produces the same output on every run, on any machine, with
-no model call. Promotion bakes a live run's *answer* into a fixture
-(`promote-replay-to-fixture.mjs:44-74`) precisely so that answer becomes a
-reproducible baseline — the equivalent of a fully-replicated, never-stale
-read. What breaks the reproducibility: running in `openai`/`anthropic` mode
-instead of `fixture` mode, which calls a live model — now the "read" is
-non-deterministic, the way a stale replica read is non-deterministic relative
-to the primary.
+```ts
+// buffr/src/db.ts:4-6
+export function createPool(databaseUrl: string): pg.Pool {
+  return new pg.Pool({ connectionString: databaseUrl });   // ONE url, ONE pool
+}
+```
+
+One `DATABASE_URL` (`config.ts:11`), one `pg.Pool`, shared by every read and every write. The chat session creates exactly one pool and holds it for the session lifetime (`buffr/src/session.ts:39, 72-74`). Searches, upserts, message inserts, profile reads — all go through this single pool to the single primary. There is no second connection string, no replica URL, no read-only pool. So there is no routing decision to get wrong, and no lag to reason about: **every read is strongly consistent because there's only one copy.**
+
+**Read-your-own-write — currently free, the moment a replica appears it's not.** The session's flow is read-after-write heavy: index a document, then immediately search it; remember a turn, then recall it next turn (`session.ts:60-70`). Today that's safe — the search hits the same primary the upsert committed to, so it sees the write. Trace what breaks if you add a replica and route searches to it:
 
 ```
-  deterministic replay gives reproducible reads (the consistency value),
-  without any replication
+  Layers-and-hops — read-your-own-write, today vs with a replica
 
-  promoted fixture (fixed responses)
-        │
-        ▼
-  FixtureModelProvider.complete() → responses[index++]   ← same bytes, same order,
-        │                                                   every run, every machine
-        ▼
-  agent output  ==  agent output  ==  agent output
-   (run 1)          (run 2)           (run N)
-        ▲
-        └─ "read-your-writes" and "monotonic reads" hold trivially: there's one
-           immutable source and a deterministic reader. No lag because no copy.
-
-  switch mode fixture → openai:  live model call → output may DIFFER per run
-                                  (the non-determinism replication-lag would add)
+  TODAY (one primary)                      WITH A REPLICA (hypothetical)
+  ┌─ session ─┐ upsert → PRIMARY           ┌─ session ─┐ upsert → PRIMARY
+  │           │ search → PRIMARY ✓ fresh   │           │ search → REPLICA
+  └───────────┘                            └───────────┘          │
+                                                      lag window ▼
+                                            REPLICA hasn't replayed the upsert yet
+                                            → search returns ZERO hits for the doc
+                                              just indexed  ◄ stale read = silent RAG miss
 ```
+
+This is the concrete consequence to hold onto: in a RAG system, a stale read isn't a wrong number on a dashboard — it's the model retrieving *nothing* for a document it was just told about, then confidently answering "I don't have information on that." The fix when replicas arrive is read-your-own-write routing: send reads that follow a write to the primary, or wait for the replica's LSN to catch up. None of that exists yet — **`not yet exercised`**.
+
+**Failover — Supabase's job, untested here.** If the primary dies, a managed Supabase plan can promote a standby and the `DATABASE_URL` endpoint repoints. buffr's code does nothing for this:
+
+- **No connection retry/reconnect logic** beyond what `pg.Pool` does by default — a failover mid-query surfaces as a connection error to the caller.
+- **No health check or endpoint failover** in the app.
+- **No tested failover drill.**
+
+So failover resilience is inherited from Supabase and **`not yet exercised`** at the application layer — a mid-query failover today would propagate as an error, not a transparent retry.
+
+**Why this is the right call now.** buffr is a *laptop runtime* (`context.md`: "Supabase-backed laptop runtime") — single user, single writer, a small corpus. A read replica would add lag and a routing seam to solve a scaling problem buffr doesn't have. One primary is the honest, correct choice for the deployment; the file's value is showing the reader the exact seam that appears the day the deployment isn't single-user anymore.
 
 ### Move 3 — the principle
 
-Replication trades a staleness window for read scale and fault tolerance; the
-consistency model is just how you choose to spend that window. The deeper value
-underneath — *reproducible reads* — can be bought a different way entirely:
-make the read deterministic over an immutable source, and two reads agree
-without any copy to keep in sync. AptKit buys exactly that with fixture replay.
-The generalizable rule: **distribution is one way to get consistency
-guarantees, determinism is another — and when your data fits on one node,
-determinism gives you reproducibility with none of replication's lag.** The
-day reads must outscale one machine or survive its death, you take on
-replication and inherit lag as the price.
-
----
+Replication is the WAL stream reused to keep a copy, and the copy is always `lag` behind — which turns "read your own write" into a real hazard the instant you route reads to a replica. In a RAG system that hazard is uniquely nasty: a stale read is a retrieval *miss*, which the model launders into a confident wrong answer. The general lesson: every replica you add buys read capacity and a failover target at the cost of a new consistency seam — and you don't get to ignore that seam, you get to *route* it.
 
 ## Primary diagram
 
 ```
-  AptKit "read consistency" — determinism instead of replication
+  Full replication picture — what exists, what would attach
 
-  ┌─ authoritative source (one local disk) ───────────────────┐
-  │  promoted fixture: fixed ModelResponse[]                  │
-  │  (baked by promotion — promote-replay-to-fixture.mjs)     │
-  └───────────────────────────┬───────────────────────────────┘
-                              │ replay (fixture mode)
-  ┌─ deterministic reader ────▼───────────────────────────────┐
-  │  FixtureModelProvider.index++  → responses[index]         │
-  │  same input → same output, every run, no model call       │
-  └───────────────────────────┬───────────────────────────────┘
-                              │ contrast
-  ┌─ non-deterministic read (live mode) ──────────────────────┐
-  │  openai/anthropic provider → live call → output may vary  │  ← the only
-  │  (the variability a stale replica read would also have)   │     "stale" analog
-  └───────────────────────────────────────────────────────────┘
-
-  no primary/replica, no lag, no failover — one node, deterministic reads.
+  ┌─ EXISTS in buffr ──────────────────────────────────────────────┐
+  │  one pg.Pool ── one DATABASE_URL ── one PRIMARY                 │
+  │  all reads + writes → primary → strongly consistent, zero lag   │
+  │  (correct for a single-user laptop runtime)                     │
+  └─────────────────────────────────────────────────────────────────┘
+  ┌─ NOT EXERCISED (the seam that appears with a replica) ─────────┐
+  │  read replica · WAL streaming · replication lag                 │
+  │  read/write split routing · read-your-own-write handling        │
+  │  failover promotion · reconnect/retry · failover drill          │
+  │     │                                                           │
+  │     └─► RAG-specific risk: stale read = retrieval MISS =        │
+  │         model answers "no information" on a just-indexed doc    │
+  └─────────────────────────────────────────────────────────────────┘
 ```
-
----
-
-## Implementation in codebase
-
-**Use cases.** Reproducible reads are exercised every time a promoted fixture
-is replayed — in CI, in the per-package `replay:promoted` scripts, and in the
-Studio promoted-fixture panels. The non-deterministic contrast appears the
-moment a replay runs in `openai`/`anthropic` mode against a live provider.
-
-**The deterministic reader** — `fixture-provider.ts:11-17`:
-
-```
-  async complete(request) {
-    this.requests.push(request);
-    const response = this.responses[this.index]; ← read at the current cursor
-    this.index += 1;                              ← advance — deterministic order
-    if (!response) throw new Error(`fixture model exhausted after ${this.index - 1} responses`);
-    return response;
-  }
-       │
-       └─ the entire "read consistency" mechanism. Same responses array + same
-          call order ⇒ identical output every run. This is reproducibility by
-          determinism, the value replication's consistency levels protect —
-          achieved with zero distribution.
-```
-
-**Promotion bakes the reproducible baseline** —
-`scripts/promote-replay-to-fixture.mjs:52-67`:
-
-```
-  modelResponses: [
-    {
-      content: [{ type: 'text', text: `\`\`\`json\n${JSON.stringify(toAscii(
-        stripRecommendationIds(artifact.recommendations)), null, 2)}\n\`\`\`` }],
-                                          ← the live run's ANSWER, frozen as the
-                                            single response the fixture will replay
-      usage: { inputTokens: ..., outputTokens: ..., estimated: true },
-      model: `promoted-${providerId}-replay`,
-    },
-  ],
-       │
-       └─ note the promotion's own note (line 72): "captures the final replay
-          answer deterministically; it does not reconstruct the live provider
-          tool loop." That sentence IS the consistency model: the promoted read
-          is the frozen answer, reproducible forever, never stale.
-```
-
-**The mode switch that breaks determinism** — `apps/studio/vite.config.ts:756-760`:
-
-```
-  if (mode === 'fixture') return new FixtureModelProvider(fixture.modelResponses);
-                                  ← deterministic, reproducible read
-  if (mode === 'anthropic') {
-    return providerWithConfiguredFallback(requireAnthropicProvider(), ...);
-  }                                ← LIVE model: output may differ run-to-run
-  return providerWithConfiguredFallback(requireOpenAIProvider(), ...);
-       │
-       └─ choosing 'fixture' vs 'openai'/'anthropic' is choosing reproducible
-          vs non-deterministic reads — AptKit's nearest thing to "fresh vs stale."
-```
-
----
 
 ## Elaborate
 
-Replication is where distributed databases get genuinely hard: synchronous
-replication trades write latency for zero data loss; asynchronous trades a
-small loss window for speed; quorum systems (Dynamo-style) let you tune
-consistency per request. All of it is machinery for keeping copies agreeing
-under network delay and partial failure. AptKit needs none of it because it's
-single-node — but it cares about the same *outcome* (reproducible reads) and
-gets it through determinism, which is the technique behind record-and-replay
-testing, deterministic simulation, and event sourcing. Rein has shipped the
-real distributed version of the consistency problem in buffr
-(SQLite-canonical-local with a Supabase mirror has to reconcile two copies
-that can diverge) — that's where replication lag and stale reads actually
-bite. AptKit deliberately stays single-node and leans on determinism instead.
-
-The trigger for real replication: reads must scale past one machine, or the
-artifact/fixture store must survive a host dying without a manual git restore.
-At that point you take on a primary/replica split and inherit lag — and the
-fixture-replay determinism stays useful as your *test* consistency even after
-production goes distributed.
-
-The streaming transport that carries replay results to the client (NDJSON over
-HTTP) is `study-system-design`'s concern; this file owns only the read-
-consistency semantics.
-
----
+Streaming replication is asynchronous by default (the primary doesn't wait for the replica to confirm), which is why lag exists; synchronous replication eliminates the stale-read window but adds commit latency — a tradeoff buffr never has to make at one node. The reason this file is mostly `not yet exercised` is the same reason it's honest: buffr's system-design choice (local-first, single-user) deliberately sidesteps the whole category. When that changes — multi-user, or read-heavy enough to need replicas — the first thing to design is read-your-own-write for the index→search and remember→recall paths, because those are where a stale read becomes a silent correctness bug rather than a visible one. Read next: 07 for the WAL that replication streams, study-system-design for the scaling decision, study-distributed-systems for consistency under partial failure.
 
 ## Interview defense
 
-**Q: "No replicas — how do you guarantee two reads of the same thing agree?"**
-
-> I don't replicate; I make the read deterministic. A promoted fixture holds a
-> fixed set of model responses, and `FixtureModelProvider` serves them in order
-> by an integer cursor, so replaying the same fixture produces identical output
-> every run on any machine — no model call, no copy to keep in sync. That's the
-> value a consistency model protects (reproducible reads) bought through
-> determinism instead of distribution. There's no lag because there's no second
-> copy. The non-deterministic case is live mode — calling OpenAI/Anthropic
-> directly — which is my only analog to a stale read.
+**Q: How do you handle replication lag and stale reads?**
 
 ```
-  promoted fixture → FixtureModelProvider.index++ → same bytes every run
-                       (reproducible read, zero lag, one node)
+  today: one primary → no replica → no lag → no stale reads (trivially)
+  with a replica: upsert→primary, search→replica, lag window → search MISSES the doc
 ```
 
-**Anchor:** "Determinism replaces replication for read consistency —
-`fixture-provider.ts:13` is the whole mechanism."
+Answer: "Today I don't have to — buffr is one primary, one connection pool, so every read is strongly consistent. That's a deliberate single-user-laptop choice, not lag handling. The moment a read replica is added, the index→search and remember→recall paths become read-your-own-write hazards: a search routed to a lagging replica returns zero hits for a doc just indexed, and the model answers 'no information.' The fix is routing those reads to the primary or waiting on the replica's LSN. It's `not yet exercised` because the deployment doesn't need replicas." Anchor: *in RAG, a stale read is a retrieval miss, not a stale number.*
 
----
+**Q: What happens on a database failover?**
 
-## Validate
-
-1. **Reconstruct:** Draw primary→replica with lag, then draw AptKit's
-   deterministic-replay read path, and mark where staleness could enter each.
-2. **Explain:** Why does replaying a promoted fixture twice give identical
-   output? Cite `fixture-provider.ts:13` and the promotion note at
-   `promote-replay-to-fixture.mjs:72`.
-3. **Apply:** You move the artifact store behind two read replicas. What new
-   anomaly appears, and which consistency level prevents a user from not seeing
-   their own just-saved run?
-4. **Defend:** Argue why single-node determinism is the right consistency story
-   for AptKit, and name the trigger to take on real replication.
-
----
+Answer: "At the app layer, honestly nothing graceful. There's one `pg.Pool` to one endpoint; a mid-query failover surfaces as a connection error, not a transparent retry. Supabase can promote a standby and repoint the endpoint, but buffr has no reconnect logic, health check, or failover drill — so it's inherited and untested. For a laptop runtime that's acceptable; for multi-user I'd add pool-level reconnect and a tested failover." Anchor: *failover is Supabase's mechanism, untested at the app layer.*
 
 ## See also
 
-- `07-wal-durability-and-recovery.md` — shipping the WAL is how replicas sync
-- `06-locks-mvcc-and-concurrency-control.md` — immutability behind reproducibility
-- `05-transactions-isolation-and-anomalies.md` — read-your-writes as an isolation cousin
-- `study-system-design` → NDJSON streaming and the single-node deployment choice
-- `study-data-modeling` → the promoted-fixture schema that freezes the baseline
+- `07-wal-durability-and-recovery.md` — the WAL stream replication consumes.
+- `01-database-systems-map.md` — the single pg.Pool endpoint.
+- `09-database-systems-red-flags-audit.md` — replication gaps ranked.
+- study-system-design — the local-first/single-user choice that defers replication.
+- study-distributed-systems — read-your-own-write and consistency under partial failure.

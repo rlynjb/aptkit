@@ -1,156 +1,122 @@
 # Scope, Cuts, and Non-Goals
 
-The fastest way to lose a review room is a wishlist — a problem framed so big that nothing could falsify it. This file does the opposite: it draws the *smallest slice that can fail*, then lists everything deliberately left out. The constraints come first, because they're what make the slice the right size.
+*Brief-answers 7 and 8: the narrowest slice that validates the premise, and
+everything deliberately left unbuilt.*
 
-## The constraints that shape the slice
+The premise to validate: **a provider-neutral, local-first contract lets one
+substrate serve more than one app without a rewrite.** The smallest scope
+that actually tests that — not a feature wishlist.
 
-You don't get to pick scope in a vacuum. Here are the constraints visible in the repo, drawn as the box the slice has to fit inside.
+---
 
-```
-  THE CONSTRAINT BOX
+## 7. Smallest useful scope
 
-  ┌─ TIME ─────────────────────────────────────────────────────┐
-  │  Solo. One person's evenings-and-weekends budget.          │
-  └─────────────────────────────────────────────────────────────┘
-  ┌─ DEPLOYMENT ───────────────────────────────────────────────┐
-  │  Local-first. Laptop. No per-token cloud bill on the        │
-  │  default path. Gemma2:9b over Ollama @ localhost:11434.    │
-  └─────────────────────────────────────────────────────────────┘
-  ┌─ BOUNDARY ─────────────────────────────────────────────────┐
-  │  Library, not app. aptkit stays deployment-agnostic; the   │
-  │  runtime never imports a vendor SDK (model-provider.ts).   │
-  └─────────────────────────────────────────────────────────────┘
-  ┌─ CONSUMERS ────────────────────────────────────────────────┐
-  │  Exactly ONE real consumer: buffr. Everything has to be    │
-  │  validated against n=1, not a hypothetical fleet of apps.  │
-  └─────────────────────────────────────────────────────────────┘
-  ┌─ DATA ─────────────────────────────────────────────────────┐
-  │  Shared reindb Postgres, `agents` schema, app_id-keyed.    │
-  │  RLS deferred — single-operator trust model for now.       │
-  └─────────────────────────────────────────────────────────────┘
-```
-
-Every one of these constraints is a *reason a non-goal is a non-goal.* Multi-tenant SaaS isn't cut because it's hard — it's cut because there's one operator and RLS is deferred. The constraints make the cuts honest instead of arbitrary.
-
-## The smallest useful scope
-
-The premise to validate is three words: **reusable, swappable, local.** The narrowest slice that can prove or break all three is this — not a feature set, a falsification path.
+The narrowest slice runs as a three-step pipeline. Each step de-risks the
+next; you don't proceed until the prior one holds.
 
 ```
-  THE SLICE — narrowest thing that validates the premise
+  Smallest useful scope — three steps, each de-risks the next
 
-  ┌─ 0. DE-RISK SPIKE ─────────────────────────────────────────┐
-  │  Can a local 9B model run a bounded agent loop at all?     │
-  │  Prove the riskiest assumption FIRST, before building out. │
-  └───────────────────────────────┬────────────────────────────┘
-                                  │ if yes, build the spine:
-  ┌─ A. RUNTIME + PROVIDER SEAM ──▼────────────────────────────┐
-  │  ModelProvider.complete() · runAgentLoop (bounded by       │
-  │  maxTurns/maxToolCalls) · gemma provider EMULATES tools    │
-  └───────────────────────────────┬────────────────────────────┘
-  ┌─ B. RETRIEVAL ────────────────▼────────────────────────────┐
-  │  EmbeddingProvider + VectorStore contracts ·               │
-  │  InMemoryVectorStore (cosine, zero-infra) ·                │
-  │  search_knowledge_base tool                                 │
-  └───────────────────────────────┬────────────────────────────┘
-  ┌─ C. AGENT ────────────────────▼────────────────────────────┐
-  │  rag-query agent: one-tool allowlist, maxTurns:6,          │
-  │  maxToolCalls:4 — the smallest real agent that uses A + B  │
-  └───────────────────────────────┬────────────────────────────┘
-  ┌─ D. EVALS ────────────────────▼────────────────────────────┐
-  │  precision@k / recall@k · rubric-judge · replay fixtures   │
-  └───────────────────────────────┬────────────────────────────┘
-  ┌─ E. ONE CONSUMER ─────────────▼────────────────────────────┐
-  │  buffr: PgVectorStore implements the SAME VectorStore      │
-  │  contract against LIVE Supabase pgvector. ← the real test. │
-  └─────────────────────────────────────────────────────────────┘
+  ┌─ STEP 1: DE-RISK SPIKE ──────────────────────────────────┐
+  │ prove the hard parts work at all:                        │
+  │  • local Gemma via Ollama, tool-calling EMULATED         │
+  │    (Gemma has none) — packages/providers/gemma           │
+  │  • RAG from scratch: embed → chunk → store → search      │
+  │    → rank — packages/retrieval                           │
+  │ done when: a grounded answer comes back locally          │
+  └────────────────────────────┬───────────────────────────────┘
+                               │  spike holds →
+  ┌─ STEP 2: PACKAGES ─────────▼───────────────────────────────┐
+  │ extract the proven parts behind contracts:                │
+  │  • ModelProvider.complete()                               │
+  │  • EmbeddingProvider + VectorStore                        │
+  │  • bundle as @rlynjb/aptkit-core (16 pkgs)                │
+  │ done when: clean InMemoryVectorStore RAG runs + evals     │
+  └────────────────────────────┬───────────────────────────────┘
+                               │  contracts hold →
+  ┌─ STEP 3: ONE CONSUMER LIVE ▼───────────────────────────────┐
+  │ prove the contract crosses a repo boundary:               │
+  │  • buffr installs the published bundle                    │
+  │  • buffr supplies PgVectorStore implements VectorStore    │
+  │    (buffr/src/pg-vector-store.ts:19, session.ts:41)       │
+  │ done when: InMemory→Pg swap is ONE line, buffr runs RAG   │
+  └────────────────────────────────────────────────────────────┘
 ```
 
-Step E is the whole point. Everything A–D could be self-deception — a substrate that's only ever "reused" by itself. The premise is only validated when a *separate repo* drops the `VectorStore` contract in unchanged and runs against live Postgres. That one drop-in is the falsifiable claim.
+The slice is deliberately one consumer deep. Step 3 is the validation:
+if a *different* repo can swap the in-memory store for Postgres/pgvector
+by implementing one contract, the premise holds. A second app would add
+confidence but not change the answer — so it's a non-goal, not part of the
+minimum slice.
+
+┃ Why this is the *smallest* useful scope: drop step 3 and you've built a
+┃ library nobody consumes — the "reusable" claim is untested. Drop step 1
+┃ and you've designed contracts against an unproven mechanism. The three
+┃ steps are the irreducible kernel; remove any one and the premise goes
+┃ unvalidated.
+
+---
+
+## 8. Non-goals and cuts
+
+Each is a real capability deliberately NOT built. For each: what it would
+cost, and why cutting it is correct *for this problem*.
 
 ```
-┃ "The slice isn't 'build the toolkit.' It's: prove a
-┃  SECOND repo can consume one contract unchanged against
-┃  a live database. If buffr can't, the premise is wrong —
-┃  and I'd rather find that out at one consumer than five."
+  The non-goals — what NOT to build, and why the cut is right
+
+  NON-GOAL                  WHY CUT (for personal-tooling + portfolio)
+  ────────                  ──────────────────────────────────────────
+  multi-tenant SaaS         no tenants exist. Multi-tenancy is the most
+                            expensive thing to retrofit AND the most
+                            expensive to build speculatively. Cut.
+
+  RLS / auth                no untrusted users. buffr is single-operator,
+                            local-first. Auth solves a problem this
+                            substrate does not have.
+
+  hosted provider default   the whole point is local-first + neutral. A
+                            hosted default would re-weld to a vendor —
+                            the exact pain being solved. local Gemma is
+                            the default; cloud is opt-in via env key.
+
+  distributed scale         solo, no sustained traffic, no SLA. Queue
+                            infra / replication / load balancing solve
+                            scale problems that don't exist here.
+
+  native-tool models        scoped to Gemma-via-Ollama, which has NO
+                            native tool-calling — so tool-calling is
+                            EMULATED. Supporting native-tool models is a
+                            later drop-in, not part of validating the core.
+
+  >1 consumer               buffr is the one consumer. A second proves
+                            generality but isn't needed to validate the
+                            contract crosses ONE boundary. Deferred — it
+                            is the open discovery question from 01.
 ```
 
-## What's deliberately NOT in scope
-
-The cuts are not deferrals you forgot to do. They're decisions, each tied to a constraint above.
+## The cut line in one picture
 
 ```
-  NON-GOALS — and the constraint that justifies each cut
+  What's inside the line vs deliberately outside
 
-  CUT                              │  WHY IT'S CUT (the constraint)
-  ─────────────────────────────────┼──────────────────────────────────
-  Multi-tenant SaaS                 │  one operator; not a product for
-                                    │  external devs
-  ─────────────────────────────────┼──────────────────────────────────
-  RLS / auth / row-level security   │  single-operator trust model;
-                                    │  app_id-keyed is enough for n=1
-  ─────────────────────────────────┼──────────────────────────────────
-  A hosted / cloud-DEFAULT provider │  local-first is the bet; cloud
-                                    │  providers exist in the monorepo
-                                    │  but are NOT in the bundle
-  ─────────────────────────────────┼──────────────────────────────────
-  Distributed-scale ANN / HNSW      │  one consumer, small corpus;
-  tuning                            │  pgvector's defaults suffice
-  ─────────────────────────────────┼──────────────────────────────────
-  Swapping in a native-tool-calling │  emulation over Gemma IS the
-  model to dodge emulation          │  learning artifact — cutting it
-                                    │  cuts the depth-signal
-  ─────────────────────────────────┼──────────────────────────────────
-  A second / third consumer         │  validate at n=1 first; a wishlist
-                                    │  of consumers proves nothing
+  ┌─ BUILT (validates the premise) ──────────────────────────┐
+  │  provider-neutral ModelProvider contract                  │
+  │  EmbeddingProvider + VectorStore contracts                │
+  │  RAG from scratch (InMemoryVectorStore + Ollama embed)    │
+  │  local Gemma provider (emulated tool-calling)             │
+  │  eval harness (precision@k / recall@k / rubric-judge)     │
+  │  ONE published bundle + ONE live consumer (buffr/Pg)      │
+  └────────────────────────────────────────────────────────────┘
+                          ╪  the cut line  ╪
+  ┌─ NOT BUILT (deliberate, see table above) ────────────────┐
+  │  multi-tenant · RLS/auth · hosted default · scale ·       │
+  │  native-tool models · second consumer                     │
+  └────────────────────────────────────────────────────────────┘
 ```
 
-A reviewer who sees this list reads it as discipline, not as gaps. The signal is that you know what you didn't build *and why* — each cut points back at a constraint, not at "ran out of time."
-
-## The honest gap inside the slice — name it first
-
-There's one thing inside the scope that's built but not wired, and you volunteer it before anyone finds it.
-
-```
-  BUILT-BUT-NOT-ACTIVE — the episodic memory gap
-
-  ┌─ EXISTS ───────────────────────────────────────────────────┐
-  │  createConversationMemory (packages/memory) REUSES the     │
-  │  same EmbeddingProvider + VectorStore contracts as RAG.    │
-  └───────────────────────────────┬────────────────────────────┘
-                                  │ but...
-  ┌─ NOT WIRED ───────────────────▼────────────────────────────┐
-  │  NO aptkit agent consumes it yet. Only buffr's chat        │
-  │  runtime does. The contract-reuse is proven; the in-aptkit │
-  │  integration is a real, named gap — not a hidden one.      │
-  └─────────────────────────────────────────────────────────────┘
-```
-
-Naming this unprompted is the move. It proves the contract-reuse claim is honest (memory *does* reuse the retrieval contracts — that's real) while admitting the integration is incomplete. A reviewer who finds a gap you already disclosed trusts the rest of the brief more, not less.
-
-```
-▸ A cut you can name and tie to a constraint reads as
-  judgment. A cut a reviewer discovers reads as a hole.
-  The episodic-memory gap is named here on purpose — so
-  it's the first one, not the worst one.
-```
-
-## One-screen recap
-
-```
-  SCOPE IN ONE FRAME
-
-  PREMISE   reusable + swappable + local
-  SLICE     spike → runtime/provider → retrieval → agent →
-            evals → ONE consumer (buffr) on live pgvector
-  FALSIFY   if buffr can't drop in the VectorStore contract
-            unchanged, the premise is wrong
-  CUTS      multi-tenant · RLS · cloud-default · ANN tuning ·
-            native-tool models · a 2nd consumer
-  GAP       episodic memory reuses the contracts but no aptkit
-            agent wires it (buffr does) — named, not hidden
-  CONSTRAINTS solo time · local-first · library boundary ·
-            n=1 consumer · shared reindb, RLS deferred
-```
-
-**The one thing to remember:** the slice is the narrowest thing that can *fail*, not the most you could build. One consumer dropping in one contract unchanged is the whole falsifiable bet — and every cut points back at a constraint, so the non-goals read as decisions, not as a to-do list you abandoned.
+▸ The cut line is drawn at "what proves a neutral contract serves more than
+  one app." Everything left of it is load-bearing for that proof.
+  Everything right of it solves problems a personal-tooling + portfolio
+  artifact does not have — and would trade build time for capability that
+  no user is waiting on.

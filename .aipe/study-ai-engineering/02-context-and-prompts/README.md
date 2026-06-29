@@ -1,31 +1,30 @@
 # 02 — Context and prompts
 
-The model's only input is the context window — a finite container of tokens. What
-you put in it, in what order, and how you keep it from overflowing is the entire
-craft of this section. AptKit's context handling is deliberately minimal and
-honest: one explicit window guard, no summarization, prompts versioned as code.
+> Anchor: LLM application engineering. · Curriculum: Phase 2 (no curriculum file
+> in this repo; exercises cite real aptkit/buffr paths instead).
 
-## Files
+The model is a function with a fixed-size input slot. Everything in this
+sub-section is about that slot: how big it is, how the model reads what's inside
+it, and how you assemble what goes in. Three concepts, three different failure
+modes.
 
-- **[01-context-window.md](01-context-window.md)** — The finite container. The
-  local context guard is AptKit's only explicit window management — it estimates
-  system + messages + tool schemas and refuses the call if it exceeds the budget.
-  Tool results are truncated to 16k. No history summarization. `compactSystem`
-  exists as a shorter prompt variant.
-- **[02-lost-in-the-middle.md](02-lost-in-the-middle.md)** — Position bias: models
-  attend best to the start and end of long context, worst to the middle. AptKit
-  doesn't directly mitigate it (no reranking, no retrieval ordering) — taught as a
-  foundation. The `schemaSummary` is small enough that middle-loss isn't yet a live
-  problem; mitigation is marked not-yet-exercised.
-- **[03-prompt-chaining.md](03-prompt-chaining.md)** — Multi-step, each step one
-  job. AptKit's monitor → diagnose → recommend pipeline *is* prompt chaining across
-  agents — one agent's output feeds the next (recommendation takes a `Diagnosis` as
-  input). `PromptPackage` versioning is prompts-as-code.
+You've shipped UIs — you already think about fixed-size containers (a viewport,
+a scroll buffer, a render pipeline). That intuition transfers directly. The
+window is a buffer; lost-in-the-middle is "users only read the top and bottom of
+a list"; prompt chaining is composing pure functions. The new part is that the
+consumer is a probabilistic model, not a deterministic renderer.
 
-## Reading order
+## Files (self-contained per concept)
 
-```
-  Start → 01 (the container and its limits)
-        → 02 (where attention drops inside the container)
-        → 03 (chaining prompts so each stays small and focused)
-```
+1. `01-context-window.md` — the window as a fixed token budget; aptkit's
+   GUARD-don't-truncate approach (`ContextWindowExceededError`) plus tool-result
+   truncation in the agent loop. Bridge: a fixed-size buffer / a `div` with
+   `overflow`.
+2. `02-lost-in-the-middle.md` — models attend to the start and end, miss the
+   middle; aptkit's lever is retrieve-few-rank-well (top-k cosine). Reranking by
+   position is `not yet exercised`. Bridge: a long list where you only read the
+   top and the bottom.
+3. `03-prompt-chaining.md` — the analytics pipeline:
+   monitoring → diagnostic → recommendation; one job per step; prompt packages
+   plus `renderPromptTemplate`. Bridge: composing pure functions / a render
+   pipeline.

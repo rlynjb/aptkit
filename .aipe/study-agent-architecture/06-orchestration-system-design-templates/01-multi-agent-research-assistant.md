@@ -1,126 +1,39 @@
-# 01 — Multi-Agent Research Assistant
+# Multi-Agent Research Assistant
 
-> The fan-out + synthesis template. When the interviewer wants "deep research,"
-> they want one supervisor splitting a question into independent sub-questions,
-> many workers chasing them in parallel, and one merge step that produces a
-> cited answer. AptKit has the worker half (agentic retrieval) and none of the
-> coordination half.
+A system-design interview template. Nine bullets; the generic architecture is the model answer's shape, the last two bullets are about aptkit.
 
----
+- **The prompt:** "Design a system that answers a complex research question by gathering from multiple sources and synthesizing."
 
-- **The prompt:**
-  "Design a system that answers a complex research question by gathering from
-  multiple sources and synthesizing."
+- **Standard architecture:** supervisor decomposes the question → parallel worker agents each retrieve from a source (agentic RAG per worker) → supervisor synthesizes with citations.
 
-- **Standard architecture:**
-  A supervisor decomposes the question into independent sub-questions, fans them
-  out to parallel worker agents — each doing agentic RAG (tool-calling
-  retrieval, not a single embedding lookup) over one source — and then
-  synthesizes the workers' findings into a single answer with citations. The
-  workers are independent because the sub-questions are independent; that
-  independence is what makes parallelism safe and what justifies multi-agent at
-  all.
+```
+  Fan-out + synthesis
 
-  ```
-    Fan-out + synthesis: research assistant
+  question → supervisor (decompose)
+                 ┌────────┼────────┐
+                 ▼        ▼        ▼
+            worker(src1) worker(src2) worker(src3)   each = agentic RAG
+                 └────────┼────────┘
+                          ▼
+              supervisor synthesizes → cited answer
+```
 
-                       ┌──────────────────────┐
-        question ─────▶│      Supervisor      │
-                       │  decompose into N    │
-                       │  independent subqs   │
-                       └──────────┬───────────┘
-                  fan-out (parallel, no shared state)
-            ┌─────────────────────┼─────────────────────┐
-            ▼                     ▼                     ▼
-     ┌────────────┐        ┌────────────┐        ┌────────────┐
-     │  Worker A  │        │  Worker B  │        │  Worker C  │
-     │ agentic RAG│        │ agentic RAG│        │ agentic RAG│
-     │  source 1  │        │  source 2  │        │  source 3  │
-     └─────┬──────┘        └─────┬──────┘        └─────┬──────┘
-           │ findings + cites    │                     │
-           └─────────────────────┼─────────────────────┘
-                                 ▼
-                       ┌──────────────────────┐
-                       │      Supervisor      │
-                       │  synthesize answer   │
-                       │  with citations      │──────▶ answer + provenance
-                       └──────────────────────┘
-  ```
+- **Data model:** source registry, per-worker retrieval indices, a shared findings store keyed by sub-question, citation provenance.
 
-- **Data model:**
-  A `Question`, a list of `SubQuestion`s (each tagged with the source/tool scope
-  it should hit), per-worker `Finding`s carrying the claim plus its provenance
-  (which source, which tool call, which row), and a final `Answer` that holds the
-  synthesized text plus the citation list assembled from the findings.
-  Provenance must survive the whole way through — a synthesis step that drops the
-  source links is the most common way these systems lose trust.
+- **Key components:** decomposition (supervisor), parallel retrieval (workers, fan-out), synthesis (merge agent), citation tracking. Decision per component: tools-style vs handoff-style delegation; shared state vs message passing.
 
-- **Key components:**
-  - **Decomposer** — splits the question into independent sub-questions.
-    *Decision: how independent are the sub-questions?* If they actually depend on
-    each other, you don't have fan-out, you have a pipeline, and parallelism is a
-    lie. Decompose only along genuine independence.
-  - **Worker agent** — a bounded ReAct loop doing agentic retrieval over one
-    source. *Decision: what's each worker's tool scope?* Scoping each worker to a
-    source family is what keeps its context small and its retrieval focused.
-  - **Synthesizer** — merges findings, resolves conflicts, attaches citations.
-    *Decision: what happens when two workers disagree?* You need an explicit
-    conflict policy (prefer-recent, prefer-authoritative, surface-both), not
-    whatever the model happens to do.
-  - **Provenance tracker** — carries source links from tool result to citation.
+- **Scale concerns:** at many sources, fan-out cost; at deep questions, iteration blowup (cap it); at high volume, the supervisor becomes the bottleneck (cheap workers, expensive supervisor only).
 
-- **Scale concerns:**
-  Fan-out multiplies token cost linearly with worker count; the synthesis context
-  grows with the *sum* of all worker findings and can blow the context window
-  faster than any single worker. Parallel workers also multiply provider
-  rate-limit pressure and tail latency (you wait for the slowest worker). Past a
-  point, more workers add noise the synthesizer must filter, not signal.
+- **Eval framing:** trajectory eval (did each worker hit the right source?), answer groundedness (every claim cites a retrieved chunk), cost/latency per question.
 
-- **Eval framing:**
-  Score the final answer for faithfulness (every claim traceable to a cited
-  source) and completeness (did it cover the sub-questions). Eval the decomposer
-  separately — bad decomposition poisons everything downstream — and eval each
-  worker's retrieval in isolation against a fixed source. A replay harness that
-  pins each worker's tool results makes the whole fan-out deterministic and
-  testable.
+- **Common failure modes:** synthesis of contradictory sources, citation hallucination, cost blowup from deep loops, lost-in-the-middle across many worker results.
 
-- **Common failure modes:**
-  Over-decomposition (splitting a simple question into N redundant workers that
-  all retrieve the same thing); lost provenance (synthesis produces fluent text
-  with no traceable citations); synthesis context overflow; one worker's
-  hallucination contaminating the merged answer with no way to attribute it;
-  workers with overlapping scope doing duplicate work.
+- **Applies to this codebase: partially.** aptkit has the *worker* fully built — the rag-query agent is exactly "an agentic-RAG worker that retrieves and cites" (`packages/agents/rag-query/`, with `search_knowledge_base` and precision@k eval). It has the *routing primitive* (`classifyIntent`) that a supervisor's decomposition step would use. And it has citation provenance baked into the tool output (`search-knowledge-base-tool.ts:108`). What's missing is the multi-agent layer: no supervisor decomposes one question into sub-questions, no fan-out runs workers concurrently, no merge agent synthesizes. aptkit is a *single* research worker, not a multi-agent assembly of them.
 
-- **Applies to this codebase:** **Partially.**
-  AptKit's query agent (`packages/agents/query/src/query-agent.ts:75`,
-  `.answer(question, { intent })`) is a single-agent agentic-retrieval loop over
-  ~35 read-only analytics tools — that is exactly *one worker*, over *one source
-  family*. It does the agentic-RAG half well: it tool-calls against analytics
-  APIs inside the bounded `runAgentLoop`. (The sixth capability, `rag-query`,
-  does the *vector-retrieval* half — embed → ANN → ground → cite over a real
-  store, with citations attached — and is the closest thing in the repo to a
-  research-assistant worker: see
-  `../02-agentic-retrieval/04-agentic-rag-over-vector-search.md`.) What's missing
-  is the entire coordination layer: there is no supervisor decomposing the
-  question, no fan-out to parallel workers, and no merge across sources. So two
-  worker primitives exist (analytics tool-calling and vector RAG); the
-  research-assistant *topology* that fans out and synthesizes across them does
-  not.
+- **How to make it apply:** Three additions in aptkit's files. (1) A supervisor agent that decomposes the question — reuse `classifyIntent`'s one-call-classify shape (`packages/agents/query/src/intent.ts:13`) to split into sub-questions. (2) Fan out the existing `RagQueryAgent.answer()` over sub-questions with `Promise.all` plus a concurrency cap (the limiter from `05-production-serving/02-fan-out-backpressure.md`). (3) A merge agent that synthesizes the workers' cited answers — validating each against a schema before merging (reuse the validator pattern from `tryParseRecommendations`). The shared findings store is the existing `VectorStore` partitioned by sub-question (the same `kind`-tag trick the memory engine uses, `conversation-memory.ts:84`). Every piece reuses an existing aptkit primitive; the only genuinely new code is the supervisor's decompose-and-synthesize loop.
 
-- **How to make it apply:**
-  Add a supervisor capability that decomposes a question into sub-questions, then
-  fans out multiple `QueryAgent` instances each scoped to a different tool subset,
-  and merges their answers with provenance. The seam that makes this cheap is
-  already in place: `filterToolsForPolicy` in
-  `packages/tools/src/tool-policy.ts:11` scopes the tool catalog per capability
-  via an allowlist, so each fan-out worker is just a `QueryAgent` constructed with
-  a narrower `ToolPolicy` (e.g. revenue tools vs. retention tools vs. acquisition
-  tools). The query agent already returns text; the real work is (1) the
-  decomposer prompt, (2) threading source provenance through tool results into
-  citations — the `CapabilityEvent` trace
-  (`packages/runtime/src/events.ts`, `tool_call_start`/`tool_call_end`) already
-  records which tool produced which result, so the provenance data exists and
-  just needs to be carried into the answer. See
-  [03 — Sequential Pipeline](../03-multi-agent-orchestration/03-sequential-pipeline.md)
-  and [01 — When NOT to Go Multi-Agent](../03-multi-agent-orchestration/01-when-not-to-go-multi-agent.md)
-  for why this repo deliberately stayed single-agent.
+## See also
+
+- `03-multi-agent-orchestration/02-supervisor-worker.md` · `04-parallel-fan-out.md`
+- `02-agentic-retrieval/01-agentic-rag.md` — the worker that's already built
+- `04-agent-infrastructure/04-agent-evaluation.md` — precision@k for the worker

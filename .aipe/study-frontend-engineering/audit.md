@@ -1,104 +1,312 @@
-# audit.md — the 8-lens frontend audit
+# Frontend audit — `apps/studio/`
 
-One pass over `apps/studio` (the repo's only frontend) against the frontend-engineering lens inventory. Every lens gets a verdict grounded in `file:line`, or an honest `not yet exercised`. Significant patterns cross-link to their Pass-2 file.
+Pass 1 of the audit-style output: the 8 frontend-engineering lenses, each walked
+against real `file:line` evidence. Where the repo doesn't exercise a lens, it
+says `not yet exercised` — no invented patterns. Significant findings cross-link
+to their Pass-2 pattern file.
+
+The subject is **Studio** (`apps/studio/`): React `^18.3.1`, Vite `^8.0.16`,
+`@vitejs/plugin-react` `^6`, TypeScript, ESM. UI deps are deliberately tiny:
+`lucide-react` (icons), `react-markdown` + `remark-gfm` + `rehype-slug` +
+`github-slugger` (docs). No router, state, or data-fetching libraries.
 
 ---
 
 ## 1. rendering-and-reactivity
 
-**SPA, client-rendered, no SSR/SSG/RSC, no hydration.** One root mount: `createRoot(document.getElementById('root')!).render(<App/>)` at `apps/studio/src/main.tsx:76-77`. `index.html` ships an empty `<div id="root">` and a single module script (`index.html:9-10`) — everything is painted by React in the browser after the bundle loads.
+**Mode: client-only SPA. Virtual-DOM, synchronous default reactivity. No SSR /
+SSG / RSC / hydration / concurrent features.**
 
-Reconciliation is **stock React 18 virtual-DOM diffing**, synchronous default scheduling. No `startTransition`, no `useDeferredValue`, no Suspense boundaries anywhere in `src/`. Work happens at mount (each workspace fires `startReplay` in a mount `useEffect`, `AgentReplayShell.tsx:134-136`) and on update (every streamed trace event triggers a `setLiveTrace`, re-rendering the trace list).
+- Single mount: `createRoot(document.getElementById('root')!).render(<App />)`
+  at `main.tsx:119`. The root is memoized onto `window.__aptkitStudioRoot`
+  (`main.tsx:118`) so Vite HMR re-renders into the same root instead of
+  creating a second one — a small, deliberate HMR-correctness touch.
+- `index.html` is a bare shell — `<div id="root">` + `<script type="module"
+  src="/src/main.tsx">`. Everything renders client-side after JS executes.
+- Reconciliation is stock React 18 virtual-DOM diffing. No `startTransition`,
+  no `useDeferredValue`, no `Suspense` anywhere (grep: zero hits). No
+  `useMemo`/`useCallback` micro-tuning beyond two spots:
+  `DocPage.tsx:46` memoizes the TOC parse, and `AgentReplayShell.tsx:104`
+  wraps `startReplay` in `useCallback` because it's an effect dependency.
+- Work happens on **mount and on state-set**: each workspace kicks a replay
+  either on a button click or, for the shell agents, on mount via
+  `useEffect(() => { void startReplay(); }, [startReplay])`
+  (`AgentReplayShell.tsx:134`).
+- Runtime event-loop / scheduling mechanics → `study-runtime-systems`.
 
-The one reactivity subtlety worth naming: the live trace re-renders on **every** streamed event via `setLiveTrace((current) => [...current, event])` (`AgentReplayShell.tsx:116`). Each event allocates a new array and re-renders `TracePanel` and its filter. For traces of ~10-50 events this is invisible; it would matter at thousands. Cross-link the event-loop interleaving to `study-runtime-systems`; the per-event re-render *cost* to `study-performance-engineering`. The browser-consumption mechanism is `01-live-stream-consumption.md`.
+`not yet exercised`: SSR, streaming SSR, islands, server components, resumability,
+concurrent rendering, transitions.
 
-One render path is now **not** streamed-from-a-server at all: `RagQueryWorkspace` runs a full retrieval pipeline (index + embed + cosine search + agent loop) **synchronously in the browser** and sets the whole result in one `setResult` (`RagQueryWorkspace.tsx:21-22`). No incremental paint — one click, one render of answer + chunks + metrics. It's the same deterministic-replay idea as `CapabilitiesWorkspace`, but the compute it replays is a *real* RAG pipeline rather than a server round-trip. See `09-deterministic-in-browser-rag.md`. The doc pages (`DocPage`) are pure render-from-prop — a markdown string compiled to a React tree by `react-markdown`, zero data fetch (`DocPage.tsx:81-83`); see `08-build-time-markdown-docs.md`.
+---
 
 ## 2. state-architecture
 
-**All local `useState`, lifted to the workspace, plus one generic hook. No global store.** The state graph:
+**Local `useState` per screen + one global state (the URL hash) + one custom
+workflow hook. No store, no Context for app data, no server-state cache.**
 
-- **Router state** — `view: StudioView` in `App()` (`main.tsx:20`). URL state is *not* used (see lens 5). The union now carries ten members — six agent workspaces, `capabilities`, `home`, plus two doc views `api-docs` / `user-guide` (`types.ts:143-153`).
-- **RAG-workspace run state** — `RagQueryWorkspace` is a *custom* page (not the shell): `selectedId`, `result`, `running`, `error`, `runId` are local `useState` (`RagQueryWorkspace.tsx:9-13`), and the whole `RagQueryReplayResult` lands in one `setResult` (`:22`). Same source-of-truth discipline as the shell, hand-rolled because the page doesn't replay an agent against a provider *mode* — see `09-deterministic-in-browser-rag.md`.
-- **Doc-page state** — `DocPage` has exactly one piece: `toc`, a `useMemo` over the markdown string (`DocPage.tsx:41`). The markdown itself is a build-time constant (imported via `?raw`), not state. See `08-build-time-markdown-docs.md`.
-- **Shell run state** — `selectedFixtureId`, `mode`, `providerStatus`, `replay`, `liveTrace`, `running`, `runId`, `error` all in `AgentReplayShell` (`AgentReplayShell.tsx:85-96`). This is the source of truth for a replay; it's lifted exactly as high as it needs to be (the shell) and no higher.
-- **Run- identity** — `runCounter` is a `useRef`, deliberately *not* state (`AgentReplayShell.tsx:97`). It's mutated synchronously and read in callbacks; making it state would cause spurious renders and stale closures. This is the load-bearing detail — see `02-stale-run-guard.md`.
-- **Server state as client state** — `useReplayArtifacts` (`useReplayArtifacts.ts:13`) owns `savedReplays`, `promotedFixtures`, and their loading/error flags. Fetched in `useEffect`, manually invalidated by calling `refreshReplayHistory()` after a save (`useReplayArtifacts.ts:111`). See `06-replay-artifact-hook.md`.
-- **Build-mode capability gate** — `STATIC_DEMO` (`env.ts:1`) is a compile-time boolean read from `import.meta.env.VITE_STATIC_DEMO`. It's not React state, it's a build-time constant, but it short-circuits state-mutating effects and handlers: the provider-status fetch (`AgentReplayShell.tsx:139`), the history/promoted fetches (`useReplayArtifacts.ts:77,94`), and the save/promote mutations (`useReplayArtifacts.ts:100,120`) all early-return when it's set. The fixture-only Pages build thus never reaches for the absent backend. See `07-static-demo-gated-ui.md`.
-- **Derived state** — computed inline, not stored: `visibleTrace = replay?.trace ?? liveTrace` (`AgentReplayShell.tsx:163`), `usage = summarizeUsage(visibleTrace)` (`:164`), `costEstimate` (`:166`). Correct — these are pure functions of state, so they're recomputed each render rather than duplicated into state.
-- **Form/URL state** — none. The fixture `<select>` (`AgentReplayShell.tsx:211`) is a controlled input bound to `selectedFixtureId`, the only form element of note.
+The full state graph is drawn in `00-overview.md`. By category:
 
-Source-of-truth discipline is clean: the shell owns the run, the hook owns the artifact history, panels are mostly presentational. Cross-link system-level state ownership to `study-system-design`.
+- **URL state (the only global):** `parseHash()` (`main.tsx:34-42`) is the
+  source of truth for *which screen*; `App` mirrors it into
+  `useState(parseHash)` (`main.tsx:45`) and resubscribes via a `hashchange`
+  listener (`main.tsx:47-51`). → `01-hash-router-with-section-anchors.md`.
+- **Local component state:** every workspace owns its own ephemeral run state.
+  `RagQueryWorkspace.tsx:9-13`: `selectedId / result / running / error /
+  runId`. Thrown away on unmount; no lifting, no persistence.
+- **Shared shell state:** `AgentReplayShell.tsx:85-96` holds `selectedFixtureId
+  / mode / providerStatus / replay / liveTrace / running / runId / error` for
+  the four analytics agents. Refs (`runCounter`, `selectedFixtureRef`,
+  `modeRef`, `lines 97-99`) guard against stale closures when async replays
+  land out of order — the one genuinely subtle bit of state handling here
+  (`AgentReplayShell.tsx:116` drops trace events whose `runId` is stale).
+- **Server-history state:** `useReplayArtifacts.ts` (`:14`) is the only hook
+  that owns server-derived state (saved replays, promoted fixtures). Every
+  effect in it is gated `if (STATIC_DEMO) return;` (`:77, :94, :100, :120`) so
+  the static Pages demo never touches the network.
+- **Derived state:** computed inline, not stored — `precisionLabel`
+  (`RagQueryWorkspace.tsx:32`), `usage`/`modelName`/`costEstimate`
+  (`AgentReplayShell.tsx:164-166`). Recomputed each render; cheap.
+- **Source-of-truth enforcement:** `runId`/`runCounter` is the discipline —
+  bump a counter, force a fresh derive, ignore late async writes.
+
+System-level state ownership (the fixture/promote loop, where data persists) →
+`study-system-design`.
+
+`not yet exercised`: global store (Redux/Zustand/Jotai), Context for app data,
+server-state cache library (react-query/SWR), form-state library, optimistic
+updates with rollback, URL *query-param* state (only the hash is used).
+
+---
 
 ## 3. component-architecture
 
-**Render-prop composition over one deep generic shell.** The defining pattern: `AgentReplayShell<F, M, R extends ReplayResultBase>` (`AgentReplayShell.tsx:48`) is parameterized over fixture, mode, and result types, and takes two render-prop slots — `metricItems(context)` and `renderPanels(context)` (`:70, :76`) — plus two runner callbacks `runFixture` / `runServer` (`:77-83`). Each workspace is a thin adapter: `RecommendationWorkspace` is ~25 lines of config (`RecommendationWorkspace.tsx:23-47`) that hands the shell its fixtures, modes, metric renderer, and panel renderer. Five workspaces share this. See `03-shared-replay-shell.md`.
+**Container-vs-presentational split, plus one render-prop "headless" host. Modest
+but real composition discipline.**
 
-**The custom-page-vs-shell split is now a deliberate, repeated decision, not a one-off.** Three pages bypass `AgentReplayShell`: `CapabilitiesWorkspace` (runs four utility previews in `Promise.all`), `RagQueryWorkspace` (`RagQueryWorkspace.tsx:8`), and `DocPage` (`DocPage.tsx:30`). The rule that decides shell-vs-custom: a page uses the shell *only if it replays one agent against a fixture/provider mode*. RAG runs a fixture but has no provider-mode axis (it's deterministic in-browser, no anthropic/openai switch), so it reuses the shell's *leaf* presentational components — `Panel`, `Metric`, `TracePanel`, `EvalPanel` (`RagQueryWorkspace.tsx:2`) — without the shell's run-lifecycle generics. `DocPage` shares nothing but the `.shell`/`.topbar` CSS. That's the correct boundary: share the leaves, don't force `F/M/R` generics onto pages that don't have those axes. See `09-deterministic-in-browser-rag.md` and `08-build-time-markdown-docs.md`.
+- **Presentational primitives** live in `components.tsx`: `Metric` (`:8`),
+  `Panel` (`:68`), `ModeButton` (`:18`), `ReplayModeSwitch` (`:39`),
+  `TracePanel` (`:131`), `EvalPanel` (`:184`), `AgentStatusPanel` (`:80`),
+  `PromptPackagePanel` (`:211`). Pure props-in, JSX-out. `Panel` is the
+  layout atom every workspace composes from.
+- **Container components** are the workspaces (`RecommendationWorkspace`,
+  `MonitoringWorkspace`, `DiagnosticWorkspace`, `QueryWorkspace`,
+  `RubricImprovementWorkspace`, `RagQueryWorkspace`) — each owns state and
+  data flow, delegates rendering to the primitives.
+- **The headless/render-prop host:** `AgentReplayShell` (`AgentReplayShell.tsx:48`)
+  is generic over `<F, M extends string, R extends ReplayResultBase>` and takes
+  `metricItems` and `renderPanels` as render-prop functions receiving a typed
+  `context`. It owns *all* the shared behavior (run loop, mode switch, fixture
+  select, provider status, stale-run guarding) and lets each agent inject only
+  its own panels. This is the closest thing to a compound/headless pattern in
+  the repo. → `04-generic-replay-shell.md`. Module-depth argument →
+  `study-software-design`.
+- **Boundary placement:** panel files are split by agent
+  (`recommendation-panels.tsx`, `monitoring-panels.tsx`) when they got large
+  (470 / 436 lines) — a pragmatic split, not a design-system layer.
+- `CapabilityCard` (`StudioHome.tsx:196`) is a presentational card with
+  keyboard handling (`role="button"`, `tabIndex={0}`, Enter/Space →
+  `onOpen`, `:211-216`) — accessibility done by hand since it's a `<article>`,
+  not a `<button>`.
 
-Below the shell, components are **presentational and small**: `Panel`, `Metric`, `ModeButton`, `ReplayModeSwitch`, `AgentStatusPanel`, `TracePanel`, `EvalPanel`, `ProviderStatusPanel` all live in `components.tsx`. `Panel` (`components.tsx:67`) is the universal container (title + icon + children, optional `wide`). `ReplayModeSwitch` (`components.tsx:38`) is a small generic-over-`M` headless-ish selector. Workspace-specific panels split into `recommendation-panels.tsx` and `monitoring-panels.tsx`. `EvalPanel`/`TracePanel`/`Panel`/`Metric` are reused verbatim by `RagQueryWorkspace`, confirming they're genuinely presentational — they don't assume the shell's context.
+`not yet exercised`: slot/children-composition beyond `Panel`'s `children`,
+true compound-component APIs (`<Tabs.Item>`), context-based component
+coordination, a published/shared design-system package.
 
-Container-vs-presentational discipline holds: workspaces and the shell are containers (own state, fire effects); `components.tsx` is presentational (props in, JSX out). The one leak: panels reach into `navigator.clipboard.writeText` directly (`MonitoringWorkspace.tsx:241`, `recommendation-panels.tsx:289`) — a platform side-effect inside a render component rather than a passed handler. Minor. Cross-link module/interface depth to `study-software-design`.
+---
 
 ## 4. data-fetching-and-cache
 
-**Hand-rolled `fetch` wrappers, no query library, manual invalidation.** All network access is in `api.ts`. Two shapes:
+**Raw `fetch` + one NDJSON decode helper. No query library. The only fetches are
+dev-only and severed in the static build.**
 
-1. **JSON request/response** — `loadProviderStatus`, `loadSavedReplays`, `promoteReplay`, `saveReplayArtifact`, etc. (`api.ts:10-17, 193-328`). Plain `fetch` → `response.json()` → throw on `!response.ok`. No retry, no dedup, no cache.
-2. **Streaming NDJSON** — `runReplayStream` (`api.ts:119-166`), the interesting one. POST, read `response.body` as a `ReadableStream`, decode incrementally. See lens 1 and `01-live-stream-consumption.md`.
+- All network code is in `api.ts`. Reads: `loadProviderStatus` (`:10`),
+  `loadSavedReplays` (`:206`), `loadPromotedFixtures` (`:294`), and siblings.
+  Writes: `saveReplayArtifact` (`:193`), `promoteReplay` (`:242`).
+- **Streaming reads** go through `runReplayStream` (`api.ts:119`): POST
+  `{fixtureId, mode}`, then iterate `decodeNdjsonStream(...)` over the response
+  body, dispatching `{type:'event'}` records to an `onEvent` callback so the
+  trace renders **line-by-line as the agent runs** (`api.ts:138-161`). The
+  browser `ReadableStream` is adapted to the runtime's async-iterable decoder
+  by `responseBodyChunks` (`api.ts:169`). Wire semantics → `study-networking`.
+- **Error handling:** every fetch checks `response.ok` and throws
+  `payload?.error ?? '<fallback>'`; callers catch into local `error` state.
+  No retry, no backoff, no timeout, no abort/`AbortController`.
+- **Cache:** none. There is no client cache to invalidate; each run recomputes.
+  History is re-fetched explicitly via `refreshReplayHistory`
+  (`useReplayArtifacts.ts:64`) after a save.
+- **The static-demo cut:** in the Pages build `STATIC_DEMO` is `true`
+  (`env.ts:1`), so `useReplayArtifacts` skips all fetch effects and the
+  RagQuery / shell screens replay from inlined fixtures instead. The deployed
+  app makes **zero network calls**.
 
-**Cache strategy: none, by design.** Server state is fetched into `useState` and re-fetched after mutations. After a save, `saveCurrentReplay` calls `await refreshReplayHistory()` (`useReplayArtifacts.ts:111`); after a promote, it refreshes the same way. This is manual cache invalidation — correct for a single-user local tool where there's no second client to go stale against, and a query library (React Query / SWR) would be ceremony. **`react-query` / `SWR` / route loaders / RSC streaming: not yet exercised.** The entire fetch path is also gated by the `STATIC_DEMO` build flag — in the Pages build, `saveCurrentReplay`/`promoteSavedReplay` short-circuit to a "local dev only" note (`useReplayArtifacts.ts:100,120`) instead of POSTing to an `/api/*` route that doesn't exist there (lens 7; `07-static-demo-gated-ui.md`).
+`not yet exercised`: react-query/SWR, route loaders, optimistic mutations,
+cache invalidation strategy, request dedup, retry/backoff, `AbortController`
+cancellation, pagination/infinite-scroll.
 
-No optimistic updates and no rollback — mutations show a `saving`/`promoting` flag, await the server, then refetch (`06-replay-artifact-hook.md`). Error behavior is per-call try/catch into an error-string state slot (`useReplayArtifacts.ts:105-108`). Cross-link wire semantics to `study-networking`, cache-as-architecture to `study-system-design`.
+---
 
 ## 5. routing-and-navigation
 
-**Hand-rolled router: a single `useState<StudioView>` switch. No react-router, no URL, no history.** `App()` holds `const [view, setView] = useState<StudioView>('home')` and returns one of ten components based on `view` (`main.tsx:19-73`). The union grew from seven to ten views: six agent workspaces (`recommendation`/`monitoring`/`diagnostic`/`query`/`rubric-improvement`/`rag-query`), `capabilities`, `home`, and two doc views `api-docs` / `user-guide` (`types.ts:143-153`). The two doc branches both render the same `DocPage` component with a different markdown prop (`main.tsx:50-70`). Navigation is `onOpen(view)` / `onHome(() => setView('home'))` passed as props. See `04-hand-rolled-router.md`.
+**Hand-rolled hash router, ~40 lines, no library. Deep-links into doc sections
+via a `view/section` hash grammar.**
 
-The one navigation primitive that *is* URL-aware now: in-page anchor links inside a doc page. `DocPage` builds a TOC of `#slug` links (`DocPage.tsx:71`) whose ids match the `rehype-slug` anchors on the rendered headings — so clicking a TOC entry scrolls within the page via the browser's native fragment behavior. That's intra-page navigation (a fragment, not a route); it doesn't change `view` and doesn't need the router. See `08-build-time-markdown-docs.md`.
+- `parseHash()` (`main.tsx:34`) strips `#`/`#/`, splits on the first `/` into
+  `{view, anchor}`. `navigate()` (`main.tsx:53`) writes `window.location.hash`,
+  which fires `hashchange` → `setRoute`. The `view` is validated against a
+  `VIEW_TOKENS` allowlist (`main.tsx:23-32`); anything unknown falls to
+  `'home'`. → `01-hash-router-with-section-anchors.md`.
+- **Why hash and not history API:** the GitHub Pages deploy is static with no
+  SPA 404 fallback and is served under `/aptkit/` — a real path router would
+  404 on refresh. The comment at `main.tsx:18-22` states this explicitly. This
+  is the *right* call, not a shortcut.
+- **Deep-linking:** the `section` after the slash
+  (`#api-docs/conversation-memory`) is a markdown heading slug.
+  `DocPage` scrolls to it after layout via `requestAnimationFrame`
+  (`DocPage.tsx:50-56`), and `StudioHome` deep-links into doc sections by
+  slugging headings the same way `rehype-slug` does (`StudioHome.tsx:10`,
+  `:181`). → `02-build-time-markdown-docs.md`.
+- **Navigation lifecycle:** instant — no prefetch, no transitions, no route
+  suspense. Swapping `view` swaps the rendered component synchronously
+  (`main.tsx:65-115`).
+- **Scroll restoration:** only the deep-link scroll-into-view; no general
+  scroll restoration across navigations.
 
-Consequences, named honestly: **no deep-linking** (you always land on `home`, can't bookmark a workspace), **no back-button** integration (browser back leaves the app), **no scroll restoration**, **no route guards**. For a 10-view single-user dev tool launched fresh each session, this is still the right call — react-router would add a dependency and a URL contract for zero benefit. **react-router / nested routes / route-level code-splitting / prefetch / route loaders: not yet exercised.** There is no `React.lazy` anywhere, so every workspace's code — *and both doc markdown strings, inlined via `?raw`* (lens 7) — is in the initial bundle.
+`not yet exercised`: route-level code-splitting (single chunk — see lens 7),
+nested/layout routes, route guards/redirects, prefetch-on-hover, view
+transitions, query-param routing.
+
+---
 
 ## 6. styling-and-design-system
 
-**Single hand-written CSS file, BEM-ish flat class names, no framework.** `apps/studio/src/styles.css` (1840 lines) is imported once at `main.tsx:11` and applies globally. Class names are semantic and flat: `.shell`, `.topbar`, `.modeSwitch`, `.metric`, `.panel`, `.traceItem`, `.reviewBanner` — referenced as string literals in `className` throughout. No CSS Modules (no `styles.x`), no CSS-in-JS, no Tailwind utility classes, no `clsx`.
+**One hand-written `styles.css` (~1180 lines), reincodes-style monochrome dark
+theme. Colors are hardcoded hex, transformed by author-time scripts. No design
+tokens, no CSS variables.**
 
-There are a few **hardcoded design tokens by repetition, not by variable**: the palette (`#1d2420`, `#f5f7f4`, `#cfd8d1`, etc.) is set in `:root` (`styles.css:1-9`) for the base colors, but most component colors are inlined per-rule rather than pulled from CSS custom properties. So the "design system" is convention, not enforced tokens — changing the accent color is a find-and-replace, not a one-line variable edit.
+- **Architecture:** a single global stylesheet (`src/styles.css`) imported once
+  (`main.tsx:14`). Class names are conventional BEM-ish camelCase (`.shell`,
+  `.topbar`, `.capabilityCard`, `.ragChunk`). No CSS Modules, no CSS-in-JS, no
+  utility framework.
+- **Theme:** monochrome dark — `#0a0a0a` bg, `#ededed` text
+  (`styles.css:6-12`), **purple titles `#a78bfa`** (`:191, :461, :511, :606`),
+  **red accent `#ef4444`** for hover/error (`:14, :104`). `color-scheme: dark`
+  set on `html` (`:1`).
+- **The interesting bit — theming is a *script*, not tokens:** there are **zero
+  CSS custom properties** (grep `var(--`: 0). The palette was produced by
+  running `scripts/darkify-theme.mjs` (invert lightness, keep hue) then
+  `scripts/reincodes-theme.mjs` (desaturate everything except red) which
+  *rewrite the hex literals in `styles.css` in place*. → `06-scripted-theme-transform.md`.
+  Consequence: runtime theme switching is impossible without re-running a
+  script and rebuilding; this is a build/author-time theme, not a runtime one.
+- **Full-bleed sticky header:** `.topbar` is `position: sticky` with negative
+  margins to bleed to the shell edge (`styles.css:51-64`), plus a
+  `::before` pseudo-element at `width: 100vw; left: 50%; translateX(-50%)`
+  (`:68-78`) to paint the black bar edge-to-edge behind container-aligned
+  content. `html { overflow-x: hidden }` (`:3`) prevents the 100vw bleed from
+  causing horizontal scroll. → `06-…` (covered as a sibling technique).
+- **Layout widths:** `.shellNarrow` 720px (home), `.shellDoc` 1120px (docs),
+  full-width otherwise (`styles.css:39-49`) — the reincodes column layout.
+- **Responsive:** only **3 `@media` queries** in the whole stylesheet. Largely
+  a desktop-first fixed-column layout; mobile is not a first-class target.
+- **Animation:** **zero** `transition`/`@keyframes`/`animation` rules. Static UI.
 
-The CSS file grew two new surface families, same flat-class convention: the **doc-page family** — `.docLayout` (the TOC-plus-article two-column grid, `styles.css:71`), `.docToc` (sticky sidebar, `:79`), `.docTocLink` with an `.h2`/`.h3` indent variant (`:103,118`), and `.docPage` plus typographic rules for every markdown element react-markdown can emit — `.docPage h1..h4`, `pre`, `code`, `table`, `th/td`, `blockquote`, `hr` (`:142-217`). This last block is load-bearing: react-markdown emits bare semantic tags (`<h2>`, `<pre>`, `<table>`) with no class names, so the *only* styling hook is descendant selectors under `.docPage`. And the **rag family** — `.ragQuestion`, `.ragAnswer`, `.ragChunkList`/`.ragChunk` with a `.relevant` highlight variant, `.ragQualityGrid`, `.ragFixtureSelect` (`:220-312`). The `.ragChunk.relevant` rule is what visually marks which retrieved chunks were in the relevant set (`RagQueryWorkspace.tsx:114`).
+`not yet exercised`: design tokens, CSS variables, runtime theme switching,
+container queries, fluid type, an animation system, a component style library,
+dark/light toggle (it's dark-only).
 
-Responsive strategy is minimal: `min-width: 320px` on `body` (`styles.css:17`), grid layouts with `minmax()` (`.modeSwitch` at `:46`), and the three-column `.layout` is the dominant structure. The new `.docLayout` collapses its sidebar at a media-query breakpoint (`styles.css:134-137`) — one of the few explicit breakpoints in the file. Conditional layout via `modeClassName` — e.g. two-provider workspaces pass `monitoringModeSwitch` to collapse the mode grid from 3 to 2 columns (`MonitoringWorkspace.tsx:34`, `styles.css:55-57`). **Dark mode / brand theming / design tokens / container queries / animation system: not yet exercised.** Theming scales by convention only — fine at this size, would not scale to dozens of contributors. Cross-link bundle-size *measurement* to `study-performance-engineering`.
+---
 
 ## 7. browser-platform-and-build
 
-**Web APIs actually touched:**
-- **`fetch` + `ReadableStream` + `reader.getReader()`** — the streaming consumer (`api.ts:170-179`). The most load-bearing platform API in the app.
-- **`TextDecoder`** — decodes `Uint8Array` chunks to text across chunk boundaries inside the runtime decoder (`packages/runtime/src/ndjson-stream.ts:107,113`).
-- **`navigator.clipboard.writeText`** — copy-command buttons (`recommendation-panels.tsx:289`, `MonitoringWorkspace.tsx:241`). No fallback if the API is absent or the page is non-secure-context — a minor gap (lens 8).
-- **`window.setTimeout`** — the "copied" toast reset (`recommendation-panels.tsx:291`).
-- **`performance.now()`** — client-side fixture-replay timing (`agent-runners.ts:12`), now also wrapping the in-browser RAG pipeline (`agent-runners.ts:168,224`).
-- **`window.__aptkitStudioRoot`** — an HMR guard stashing the root on `window` so Vite hot-reload doesn't double-mount (`main.tsx:75-76`). Nice touch.
+**Web APIs touched: `location.hash` + `hashchange`, `requestAnimationFrame`,
+`navigator.clipboard`, `fetch` + `ReadableStream`. Bundler: Vite. Single chunk,
+no code-splitting.**
 
-**A new class of client-side compute: a real retrieval pipeline running entirely in the browser.** `runRagQueryFixtureReplay` (`agent-runners.ts:167-228`) instantiates `InMemoryVectorStore`, a `createRetrievalPipeline`, and a `search_knowledge_base` tool from `@aptkit/retrieval` — the *same* contracts buffr backs with pgvector — and runs them in the browser. A keyword-hash fake `EmbeddingProvider` (`agent-runners.ts:149-165`) replaces Ollama so the pipeline is deterministic with no network. So the page does real index→embed→cosine-search→rank work client-side, plus `scorePrecisionAtK`/`scoreRecallAtK` from `@aptkit/evals` (`agent-runners.ts:205-206`). This is the first place Studio runs core package logic in the browser beyond replaying recorded responses. See `09-deterministic-in-browser-rag.md`.
+- **Platform APIs actually used:**
+  - `window.location.hash` + `hashchange` — routing (`main.tsx`).
+  - `requestAnimationFrame` / `cancelAnimationFrame` — scroll-after-layout in
+    `DocPage.tsx:52-55`.
+  - `navigator.clipboard.writeText` — copy-command buttons
+    (`recommendation-panels.tsx:292`, `MonitoringWorkspace.tsx:242`). Used
+    *without* a fallback or permission check — minor red flag (lens 8).
+  - `fetch` + `ReadableStream` reader — streaming replay (`api.ts:126, :169`),
+    dev-only.
+  - `performance.now()` — duration timing (`agent-runners.ts:14, :168`).
+- **Build:** `vite build` (`tsc -b && vite build`, `package.json`). Two modes:
+  default (`base: '/'`, dev middleware) and `--mode pages` which loads
+  `.env.pages` (`VITE_STATIC_DEMO=1`) → `base: '/aptkit/'`
+  (`vite.config.ts:196`) and severs all server calls.
+- **Fixtures are build input:** agent fixtures (`fixtures.ts:2-8`) and docs
+  (`main.tsx:12-13` via `?raw`) are *imported*, so Vite inlines them into the
+  bundle at build time — that's what makes the zero-backend Pages demo
+  possible. → `05-fixture-as-build-input.md`, `02-build-time-markdown-docs.md`.
+- **Dev-only API:** a Vite plugin (`vite.config.ts:197+`) registers
+  `/api/model-status`, `/api/stream/*/replay`, `/api/replays`,
+  `/api/*/promote` middleware that run the real agents in Node and stream
+  NDJSON. None of this ships to Pages.
+- **Output shape:** a single JS chunk + single CSS file (`dist/assets/` →
+  `index-*.js`, `index-*.css`). **No code-splitting, no lazy chunks** (grep:
+  no `React.lazy`, no `import(`). Fine at this size; named as a limitation.
+- Bundle-size *measurement* (FCP/LCP/TTI as numbers) → `study-performance-engineering`.
 
-**No `localStorage` / `sessionStorage` / `IndexedDB` / `Worker` / `ServiceWorker` / `WebSocket` / `EventSource`.** Notable: the live stream uses chunked `fetch` + NDJSON, *not* `EventSource`/SSE — a deliberate choice because the transport is a POST with a JSON body, which `EventSource` (GET-only) can't do. Cross-link to `study-networking`.
+`not yet exercised`: Web Workers, Service Workers / offline, IndexedDB,
+`localStorage`/`sessionStorage`, WebSocket, `EventSource`, MediaRecorder,
+`IntersectionObserver`, code-splitting, prefetch, route-level lazy loading.
 
-**Build: Vite 8 + `@vitejs/plugin-react` 6.** `package.json:35-36`. `build` is `tsc -b && vite build` (`package.json:8`). The single most interesting build detail is the **custom Vite plugin `aptkit-studio-api`** (`vite.config.ts:199-527`): a `configureServer` middleware that mounts ~20 dev-only API routes — the streaming replay endpoints, save/promote, fixture listing — running the actual agent packages in the Vite Node process. So in dev, the "backend" is the Vite server. React 18.3, lucide-react 0.468 for icons. **Code-splitting / tree-shaking config / polyfills / sourcemap config: not explicitly configured** — defaults only; no `build.rollupOptions`, no `React.lazy`, so the bundle is monolithic.
-
-**Build-time markdown inlining via Vite `?raw`.** The two doc pages import their markdown as raw strings: `import coreApiMarkdown from '../../../docs/core-api.md?raw'` (`main.tsx:13-14`). Vite's `?raw` suffix reads the file at build time and inlines its contents as a string export — so `docs/core-api.md` and `docs/studio-guide.md` become part of the JS bundle, no runtime `fetch`. This is what makes in-app docs work in the static GitHub Pages build (lens 7's `STATIC_DEMO` path): the markdown is *already in the bundle*, so there's no `/docs/*.md` request to a server that isn't there. See `08-build-time-markdown-docs.md`. **New runtime dependencies** this enables: `react-markdown ^9.1`, `remark-gfm ^4.0` (GFM tables/strikethrough), `rehype-slug ^6.0` (heading anchor ids), `github-slugger ^2.0` (matching TOC slugs) — `package.json:28-34`. These are the first frontend libraries in Studio beyond React + lucide-react.
-
-**Two deploy targets, one bundle.** There *is* a non-dev build target now: a fixture-only static demo for GitHub Pages. `build:pages` runs `vite build --mode pages` (`package.json:9`), which loads `VITE_STATIC_DEMO=1` from `.env.pages` and sets `base: '/aptkit/'` so asset URLs resolve under the project-pages path (`vite.config.ts:196`). There's still no production *server* — the Pages artifact is pure static files with no `/api/*` routes behind it. The UI handles the missing backend through a build-time flag (`STATIC_DEMO`, `src/env.ts`) that gates every network-touching button and effect; see `07-static-demo-gated-ui.md`. The `configureServer` middleware is dev-only and does not ship in either build.
+---
 
 ## 8. frontend-red-flags-audit
 
-Ranked by user-visible consequence. Studio is a single-user dev tool, so several "red flags" are deliberate non-issues — flagged as such.
+Ranked by user-visible / correctness consequence. Each grounded; each with the
+move.
 
-1. **`navigator.clipboard` with no fallback** (`recommendation-panels.tsx:289`, `MonitoringWorkspace.tsx:241`). If the API is unavailable (non-secure context, older browser) the copy button throws an unhandled rejection — the `void copyCommand(...)` swallows it silently and the toast never fires, leaving no feedback. Low impact (localhost is a secure context) but a real silent failure. **Fix:** guard `navigator.clipboard?.writeText` and fall back to a `document.execCommand` or a visible "copy manually" state.
-2. **Per-event trace re-render is unbounded** (`AgentReplayShell.tsx:116`). `setLiveTrace(c => [...c, event])` re-renders the full trace list on every streamed event. Fine at tens of events; if an agent ever streamed thousands, the UI would jank. Currently a non-issue given fixture sizes. **Fix if it bites:** batch events per animation frame, or virtualize the trace list.
-3. **No URL state / deep-linking** (lens 5). You can't share or bookmark a workspace, and browser-back exits the app. Deliberate for a dev tool, but the cheapest future upgrade if Studio ever gets multiple users — hang `view` off `location.hash`.
-4. **Design tokens by repetition, not variables** (lens 6). Color values are inlined across 1840 lines of CSS rather than centralized in custom properties. A theme change is a risky find-and-replace. Non-issue at one contributor; debt if the team grows.
-5. **No accessibility pass.** Cards use `role="button"` + `tabIndex={0}` + Enter/Space handlers (`StudioHome.tsx:158-171`) — that part is done right. But the live trace region has no `aria-live` (`aria-label` only, `components.tsx:139`), so streamed events are invisible to screen readers. The fixture `<select>` and metric regions are labeled. Partial, not absent. **a11y audit: not yet exercised** as a deliberate pass. (For the dedicated audit, see `aipe:audit-frontend-a11y`.)
+1. **No `AbortController` on streaming replays — late runs can clobber the UI.**
+   `runReplayStream` (`api.ts:119`) has no cancellation. The *shell* defends
+   against this with a `runCounter` ref that drops stale trace events
+   (`AgentReplayShell.tsx:116`), but the standalone `RagQueryWorkspace`
+   (`:17-30`) has no such guard — fire two runs fast and the slower one's
+   result can land last. Low real-world impact (deterministic, fast), but it's
+   a correctness gap. **Move:** thread an `AbortController` through `fetch` and
+   abort on new run / unmount; or apply the same `runId` guard the shell uses.
 
-6. **Markdown render trusts the source — but the source is build-time-owned.** `DocPage` renders `react-markdown` without `rehype-raw`, so embedded HTML is *not* dangerously rendered (react-markdown escapes raw HTML by default), and the markdown is a repo-owned `?raw` import (`main.tsx:13-14`), never user input. So there's no live XSS surface here. If a future doc view ever rendered *fetched* or *user-supplied* markdown, that calculus flips — sanitization would become load-bearing. Trust-boundary mechanics belong to `study-security`; flagged here only because rendering arbitrary markup is new this session.
+2. **`navigator.clipboard` used without a fallback.** `recommendation-panels.tsx:292`
+   and `MonitoringWorkspace.tsx:242` call `navigator.clipboard.writeText`
+   directly. On insecure contexts or older browsers `navigator.clipboard` is
+   `undefined` and the click throws unhandled. **Move:** guard
+   `navigator.clipboard?.writeText` and fall back to a `document.execCommand`
+   or a "copy this" textarea, or at least catch.
 
-None of these are correctness bugs in the run/replay path. The run lifecycle, the stream consumption, the stale-run guard, and the in-browser RAG replay are solid.
+3. **Theme can't change at runtime — colors are baked hex.** Zero CSS variables
+   (lens 6); the palette is rewritten into `styles.css` by a script. A
+   light-mode toggle or per-user theme is impossible without a rebuild. **Move:**
+   promote the palette to CSS custom properties on `:root` so the scripts set
+   variables once and runtime theming becomes a class swap. Acceptable today —
+   it's a single-theme demo — but it's the ceiling on the styling layer.
+
+4. **`buildToc` is a hand-rolled markdown-heading regex parser.**
+   `DocPage.tsx:11-27` re-parses the markdown with a regex (tracking fenced
+   code blocks by hand at `:16-19`) to build the TOC, *separately* from
+   `react-markdown`'s own parse. Two parsers over the same string can drift;
+   an edge-case heading (setext `===`, headings inside HTML) is parsed by one
+   and not the other. **Move:** derive the TOC from a `rehype` plugin that
+   walks the same AST `react-markdown` already builds, so there's one parse.
+
+5. **Single bundle blocks first paint with everything.** No code-splitting
+   (lens 7) means the docs markdown, all six workspaces, and every panel ship
+   in one chunk even when the user only opens home. Small today; grows linearly
+   with each new agent. **Move:** `React.lazy` the workspace + DocPage modules
+   behind the router so home paints with a minimal chunk. Measure first —
+   → `study-performance-engineering`.
+
+6. **`CapabilityCard` is a clickable `<article>`, not a `<button>`.**
+   `StudioHome.tsx:218-225` adds `role="button"`, `tabIndex={0}`, and manual
+   Enter/Space handling — correct, but reimplements what a native button gives
+   free, and the inner `<h2>` inside a `role="button"` is a minor a11y smell.
+   **Move:** a real `<button>` wrapping the card content. (Full a11y pass →
+   `audit-frontend-a11y`.)
+
+`not yet exercised` as risks (because the feature isn't there): XSS via
+`dangerouslySetInnerHTML` (none — `react-markdown` sanitizes by default, grep
+confirms no `dangerouslySetInnerHTML`); token storage in `localStorage` (no
+auth in the client); re-render storms from un-memoized context (no context).
+Security trust boundaries → `study-security`.

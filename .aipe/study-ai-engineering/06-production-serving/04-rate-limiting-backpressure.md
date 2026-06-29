@@ -1,301 +1,221 @@
-# Rate limiting and backpressure (don't outrun the provider)
+# Rate limiting & backpressure
 
-**Industry names:** rate limiting, request throttling, backpressure, concurrency limiting · *Industry standard*
+**Subtitle:** Bound the rate of requests, not just the count of work · the 429 you never get · *Industry standard*
 
 ## Zoom out, then zoom in
 
-Every LLM provider enforces rate limits — requests per minute, tokens per minute,
-concurrent requests. Exceed them and you get 429s, dropped work, or a throttled
-account. Rate limiting and backpressure are how a *client* stays under those ceilings:
-cap your own concurrency, queue the overflow, and slow down when the provider pushes
-back. AptKit does not do this today — it bounds work *per run*, not *across runs* — so
-this file teaches the foundation and marks the gap.
+Before mechanism: rate limiting caps *how fast* requests hit a downstream;
+backpressure is the signal that pushes back when the downstream is full. Here's
+where that lives in aptkit — and the honest answer is the slot is empty because
+the downstream is `localhost`.
 
 ```
-  Zoom out — where a limiter would sit (none today)
+  Zoom out — where a rate limiter would sit (and doesn't)
 
-  ┌─ Caller layer (many concurrent runs) ─────────────────────────┐
-  │  run A   run B   run C   …   (no cross-run coordination)        │
-  └───────────────────────────────┬────────────────────────────────┘
-                                   │ ★ a concurrency limiter would go HERE ★
-  ┌─ Limiter / queue layer (NOT BUILT) ──▼──────────────────────────┐
-  │  cap in-flight calls · queue overflow · backpressure on full     │ ← we are here
-  └───────────────────────────────┬────────────────────────────────┘
-                                   │ model.complete()
-  ┌─ Provider layer ───────────────▼────────────────────────────────┐
-  │  enforces RPM / TPM / concurrency limits → 429 on excess         │
-  └──────────────────────────────────────────────────────────────────┘
+  ┌─ Callers ───────────────────────────────────────────────────┐
+  │  agents firing model.complete() as fast as the loop turns    │
+  └───────────────────────────┬─────────────────────────────────┘
+                              │ complete(request)
+  ┌─ Rate limiter (the slot) ─▼─────────────────────────────────┐
+  │  ★ tokens-per-minute budget? queue? reject when full?       │ ← EMPTY in aptkit
+  └───────────────────────────┬─────────────────────────────────┘
+                              │
+  ┌─ Provider / model ────────▼─────────────────────────────────┐
+  │  Gemma on local Ollama — no provider quota, no 429           │ ← no limit to respect
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: a rate limiter caps the *rate or concurrency* of outbound requests;
-backpressure is what the system does when it's already at the cap — *refuse or
-queue* new work rather than pile on. The question this file answers: what bounds
-AptKit's request rate today? Answer: only `maxToolCalls`, which caps fan-out *within
-a single run*. Nothing coordinates *across* concurrent runs — ten simultaneous scans
-fire ten independent loops at the provider with no shared ceiling. A
-concurrency-limited provider wrapper is the missing piece.
+Now zoom in. Cloud providers return `429 Too Many Requests` when you exceed a
+quota, and a serious app meters its own request rate to stay under it. aptkit
+talks to local Ollama — there's no quota, no 429, no bill that punishes a burst.
+So request-rate limiting is `not yet exercised`. The nearest idea aptkit *does*
+have bounds the *amount of work per run* (`maxToolCalls`, `maxTurns`) — that's
+work-bounding, a cousin of backpressure, not rate-limiting. Keep them separate.
 
 ## Structure pass
 
-**Layers.** The relevant seam is again the *provider boundary* — a limiter wraps
-`model.complete` and gates how many calls are in flight. Above it, callers; below it,
-the rate-limited provider.
+**Layers.** Caller → (rate limiter, absent) → provider. The limiter would be a
+gate between caller and provider; aptkit has no gate there.
 
-**Axis — guarantees / how many requests can be in flight at once?** Trace it. Within
-one run, `maxToolCalls` caps total tool calls (and thus loosely bounds model turns) —
-a *per-run* guarantee. Across runs: *no* guarantee — each run is independent, so N
-concurrent runs produce up to N× the load with nothing summing it. The provider's
-limit is global; AptKit's only bound is local.
+**Axis — failure.** Trace how the system fails under load. With a cloud quota and
+no limiter, a burst fails *externally*: the provider returns 429 and your calls
+error. aptkit can't hit that failure — local Gemma just queues internally and
+gets slower. So aptkit's load failure mode is *latency*, not *rejection*.
 
-```
-  One question — "how many requests can hit the provider at once?"
-
-  ┌─ within one run ──┐  → bounded by maxToolCalls (per-run fan-out)
-  ┌─ across runs ─────┐  → UNBOUNDED — no shared concurrency limit (the gap)
-  ┌─ provider ────────┐  → hard global RPM/TPM/concurrency → 429 on excess
-```
-
-**Seams.** The seam a limiter needs is the `ModelProvider.complete` decorator point —
-the same one the fallback chain and context guard use. A limiter there could gate
-*all* runs through one shared semaphore. The seam exists; the limiter doesn't.
+**Seam.** The boundary that *would* hold a limiter is
+`ModelProvider.complete()` (`packages/runtime/src/model-provider.ts:54`) — same
+decorator slot a cache uses. The seam that aptkit *actually* guards is the loop
+counter inside `runAgentLoop`, and it bounds iterations, not request rate. The
+axis "what stops runaway work?" flips at the loop counter — but "what stops
+runaway *rate*?" has nothing to flip.
 
 ## How it works
 
-You already know a connection pool or a semaphore: a fixed number of permits, acquire
-before work, release after, and callers block (or get rejected) when permits run out.
-A concurrency limiter for LLM calls is exactly that, wrapped around
-`model.complete`. Backpressure is the policy for "permits exhausted": queue, reject,
-or block.
-
 ### Move 1 — the mental model
 
-```
-  Rate limiting + backpressure — a semaphore at the provider seam
-
-  incoming complete() calls
-        │
-  acquire permit ──┐  permits available?
-                   │  yes → proceed → call provider → release
-                   │  no  → BACKPRESSURE:
-                   │         queue (wait) │ reject (429-fast) │ shed
-                   ▼
-  in-flight count never exceeds the cap → provider never overrun
-```
-
-The idea in one line: bound your own concurrency *below* the provider's limit, and
-decide deliberately what happens to the overflow.
-
-### Move 2 — the moving parts
-
-**The concurrency cap.** Bridge from a worker pool of size N — only N model calls run
-at once; the N+1th waits for one to finish. Boundary condition: set the cap at or
-below the provider's concurrency limit and you never get throttled by over-parallelism;
-set it too low and you waste throughput.
+You know a token-bucket limiter on an API gateway: requests draw from a bucket
+that refills at a fixed rate; when it's empty you wait or get rejected. That's
+rate-limiting — it governs *time*. aptkit's `maxToolCalls` is a different
+governor: it's a *budget counter* that caps total work in one run, regardless of
+time. A bucket says "no more than N per second"; a budget says "no more than N
+total, ever, this run." Don't conflate them.
 
 ```
-  Pattern — bounded in-flight calls
+  Rate limit (time-based) vs. work budget (count-based)
 
-  inFlight = 0; LIMIT = N
-  on complete():
-    while inFlight >= LIMIT: wait        ← the cap
-    inFlight++; try provider.complete() finally inFlight--
+  TOKEN BUCKET (rate)              WORK BUDGET (count)   ← what aptkit has
+  ┌──────────────────┐            ┌──────────────────┐
+  │ refills N/sec     │            │ maxToolCalls = 4 │
+  │ draw on request   │            │ decrement per    │
+  │ empty → wait/429  │            │   tool call      │
+  │ governs SPEED     │            │ 0 left → force    │
+  └──────────────────┘            │   final answer   │
+                                   │ governs TOTAL    │
+                                   └──────────────────┘
 ```
 
-**Backpressure policy.** Bridge from a bounded queue with an overflow strategy — when
-the cap is hit, you choose: *queue* (callers wait, throughput smooths, latency
-grows), *reject* (fail fast with a "busy" error, protect latency), or *shed* (drop
-low-priority work). Boundary condition: an *unbounded* queue is the trap — it hides
-overload until memory blows; a real backpressure design bounds the queue too.
+### Move 2 — the work-budget aptkit actually has
 
-```
-  Comparison — backpressure policies when the cap is hit
+**The budget check.** `runAgentLoop` carries an optional `maxToolCalls` and a
+`maxTurns` (default 8), and each turn checks whether the budget is spent —
+`packages/runtime/src/run-agent-loop.ts:101`:
 
-  QUEUE (wait)            REJECT (fail fast)         SHED (drop)
-  ───────────────────     ───────────────────────    ────────────────
-  smooths bursts          protects p99 latency        protects critical work
-  latency grows           caller must retry           low-priority dropped
-  bound the queue!        clear signal to backoff     needs a priority signal
-```
-
-**Rate vs concurrency.** Bridge from "requests per second" vs "requests in flight" —
-providers cap both RPM/TPM (a rate over time) and concurrent requests (a count at an
-instant). A concurrency limiter handles the latter; a token-bucket handles the former.
-Boundary condition: you often need both — a token bucket for RPM/TPM and a semaphore
-for concurrency.
-
-### Move 2.5 — what AptKit has vs needs
-
-```
-  Comparison — present vs absent
-
-  PRESENT                              ABSENT
-  ──────────────────────────────       ──────────────────────────────────
-  maxToolCalls: per-RUN fan-out cap    cross-run concurrency limit
-  (recommendation 4, query 6)          request queue / token bucket
-  signal-based cancellation            backpressure policy (queue/reject/shed)
-  (abort a single run)                 provider-aware throttle (read 429 headers)
+```ts
+for (let turn = 0; turn < maxTurns; turn += 1) {              // turn cap (default 8, :87)
+  signal?.throwIfAborted();
+  const budgetSpent = maxToolCalls !== undefined && toolCalls.length >= maxToolCalls;  // tool-call cap
+  const forceFinal = turn === maxTurns - 1 || budgetSpent;    // out of budget → wrap up
+  const response = await model.complete({
+    system: forceFinal && synthesisInstruction ? `${system}\n\n${synthesisInstruction}` : system,
+    messages,
+    tools: forceFinal ? undefined : toolSchemas,              // ← no tools offered when forcing final
+    maxTokens,
+    signal,
+  });
+  // ...
+}
 ```
 
-`maxToolCalls` is a real bound, but it's the *wrong axis* for rate limiting: it caps
-how many tools *one run* uses, not how many runs hit the provider together. Launch
-fifty scans and you get fifty loops racing at the provider with no shared ceiling —
-the provider's 429s become your only (reactive, painful) rate limiter.
+Read what `forceFinal` does: when the budget is spent it stops offering tools, so
+the model *must* produce a final answer. That bounds how much work one run can
+do. The rag-query agent sets `maxTurns: 6, maxToolCalls: 4`
+(`packages/agents/rag-query/src/rag-query-agent.ts:75`) — a hard ceiling on the
+investigation, not a cap on requests per second.
+
+```
+  maxToolCalls bounds WORK PER RUN — it never looks at the clock
+
+  turn 0: tool call (1/4)   ┐
+  turn 1: tool call (2/4)   │ budget draws down per call
+  turn 2: tool call (3/4)   │
+  turn 3: tool call (4/4)   ┘ budgetSpent → forceFinal: no tools, answer now
+   nothing here meters requests-per-second — that's the gap
+```
+
+**Why there's no limiter.** The thing a rate limiter protects you from — a
+provider quota — doesn't exist for local Gemma. `gemma-provider.ts` POSTs
+straight to `http://localhost:11434/api/chat` with no quota in sight. A burst
+makes Ollama slower; it never returns a 429. There's nothing to back off *from*,
+so backpressure has no source signal to react to. `not yet exercised`.
 
 ### Move 3 — the principle
 
-Bound your outbound concurrency *below* the provider's limit, and make overflow an
-explicit decision — queue (bounded), reject, or shed — never an accident. The failure
-mode that bites in production is uncoordinated parallelism: many independent runs each
-behaving politely but summing to a thundering herd. The fix lives at the shared
-provider seam, where one limiter can see all calls. AptKit bounds per-run work well
-and hasn't yet needed cross-run coordination; that coordination is the foundation to
-add before scaling concurrency.
+Rate-limiting governs *time* (requests per interval) to respect a downstream
+quota; work-budgeting governs *count* (total work per run) to stop a runaway
+agent. aptkit built the second because a local model has no quota to respect but a
+chatty agent loop genuinely can spin. The discipline is knowing which problem you
+have: aptkit's problem is "stop the loop," not "stay under the limit." When a
+cloud provider with a real quota enters, the limiter slots in at `complete()`,
+exactly where a cache would.
 
 ## Primary diagram
 
-The full (proposed) picture: a shared limiter at the provider seam, with the per-run
-cap that exists today shown for contrast.
-
 ```
-  Rate limiting + backpressure — where it attaches (not yet built)
+  What aptkit bounds vs. what it doesn't
 
-  CALLERS: run A · run B · run C …  (each bounded internally by maxToolCalls)
-        │  but NOTHING coordinates them across runs  ◄── THE GAP
-        ▼
-  ┌─ CONCURRENCY LIMITER (ModelProvider wrapper) — Case B ──────────┐
-  │  semaphore(LIMIT) — acquire before complete(), release after     │
-  │  overflow → backpressure: bounded queue | reject | shed          │
-  └────────────────────────────┬─────────────────────────────────────┘
-                               ▼ in-flight ≤ LIMIT
-  ┌─ PROVIDER ──────────────────────────────────────────────────────┐
-  │  RPM / TPM / concurrency limits → 429 only if you exceed them    │
-  └──────────────────────────────────────────────────────────────────┘
+  ┌─ BOUNDED: work per run (built) ─────────────────────────────┐
+  │  maxTurns (8)  + maxToolCalls (4)  → forceFinal → stop       │
+  │  protects against: a loop that never concludes              │
+  └──────────────────────────────────────────────────────────────┘
 
-  same wrapper seam as FallbackModelProvider + ContextWindowGuardedProvider
+  ┌─ UNBOUNDED: request rate (not yet exercised) ───────────────┐
+  │  no tokens/minute budget · no queue · no 429 handling       │
+  │  reason: local Gemma has no quota → load shows up as LATENCY │
+  │  slot for it: ModelProvider.complete() decorator            │
+  └──────────────────────────────────────────────────────────────┘
 ```
-
-## Implementation in codebase
-
-**Use cases (per-run only).** Today the only request-bounding in AptKit is per run.
-The recommendation agent caps total tool calls at 4, the query agent at 6 — so a
-*single* run can't fan out unboundedly. But there is no limiter coordinating multiple
-concurrent runs, and no queue or backpressure anywhere.
-
-**The per-run cap (the wrong-axis bound)**, `packages/runtime/src/run-agent-loop.ts:101-102`:
-
-```
-  run-agent-loop.ts  (lines 101-102)
-
-  const budgetSpent = maxToolCalls !== undefined && toolCalls.length >= maxToolCalls;
-  const forceFinal  = turn === maxTurns - 1 || budgetSpent;
-       │
-       └─ this bounds fan-out WITHIN one run (e.g. recommendation-agent.ts:87
-          sets maxToolCalls: 4). It says nothing about how many RUNS call the
-          provider at once — so it is NOT a rate limiter. Fifty concurrent
-          scans = fifty independent loops with no shared ceiling.
-```
-
-**Cancellation exists; throttling doesn't** — the loop honors an `AbortSignal`
-(`run-agent-loop.ts:99`, `signal?.throwIfAborted()`), so a single run can be cancelled.
-That's flow *control*, not flow *limiting* — it stops one run, it doesn't cap how many
-run together.
-
-**The seam a limiter would use** — `ModelProvider.complete`
-(`packages/runtime/src/model-provider.ts:54-58`): a `ConcurrencyLimitedProvider` would
-implement `ModelProvider`, hold a shared semaphore, acquire a permit before delegating
-`complete`, and apply a backpressure policy when permits are exhausted — wrapping the
-real provider exactly like the fallback chain and context guard already do.
 
 ## Elaborate
 
-Backpressure is a foundational distributed-systems idea: a fast producer must not
-overwhelm a slower consumer, so the consumer signals "slow down" and the producer
-obeys. For LLM clients the "consumer" is the provider with its rate limits, and the
-"signal" is either your own concurrency cap (proactive) or the provider's 429s
-(reactive — the bad kind, because by then you're already over). The mature design is
-proactive: cap concurrency below the limit, bound the queue, and additionally read the
-provider's rate-limit headers to throttle dynamically.
-
-AptKit hasn't needed this because its runs are interactive and low-concurrency. The
-honest gap: `maxToolCalls` is often *mistaken* for rate limiting in a code read, but
-it bounds the wrong axis (per-run fan-out, not cross-run concurrency). The first real
-move is a shared concurrency limiter at the provider seam — the seam already exists,
-proven by two other wrappers.
-
-Adjacent concepts: the retry/backoff that pairs with a limiter on 429s
-(`05-retry-circuit-breaker.md`), the provider-decorator seam (`01-llm-caching.md`),
-and the cost angle of doing less work (`02-llm-cost-optimization.md`).
+The reason backpressure is unbuilt is the same local-first thread running through
+this whole section: when the downstream is a process on your own machine, the
+failure under load is "it gets slow," not "it rejects you." Rate limiting earns
+its place the moment a shared, quota'd downstream appears — a cloud provider, or a
+multi-tenant deployment where one user's burst starves another. At that point the
+limiter is a `complete()` decorator and `maxToolCalls` keeps doing its unrelated
+job. Read `05-retry-circuit-breaker.md` next — retries and rate limits are the two
+halves of treating a flaky, quota'd downstream with respect, and aptkit has bits
+of the first and none of the second.
 
 ## Project exercises
 
-*Provenance: Phase 6 — Production serving (C6.x). No `aieng-curriculum.md` present;
-IDs are by-phase convention. Case B — no limiter exists; this introduces one.*
-
-### Exercise — concurrency-limited provider wrapper (Case B)
-
-- **Exercise ID:** `[B6.6]` Phase 6, rate-limiting/backpressure concept
-- **What to build:** A `ConcurrencyLimitedProvider` implementing `ModelProvider` that
-  holds a semaphore of size N: acquire before delegating `complete`, release after,
-  and apply a configurable backpressure policy when full (bounded-queue-with-wait
-  default; reject-fast option). Emit a trace event when a call queues.
-- **Why it earns its place:** This is the missing cross-run bound — the difference
-  between "polite per run" and "polite as a system." It wraps the same provider seam
-  the fallback chain uses, so it composes cleanly, and it directly addresses the
-  thundering-herd failure that 429s otherwise punish.
-- **Files to touch:** a new `packages/providers/limiter/src/*`,
-  `packages/runtime/src/model-provider.ts` (consume the interface), matching tests.
-- **Done when:** With N=2, three concurrent `complete` calls never exceed two in
-  flight (the third waits or is rejected per policy); a test proves the in-flight cap
-  holds and the queued call eventually runs.
+### Add a token-bucket rate limiter as a provider decorator
+- **Exercise ID:** —  (no curriculum file in repo)
+- **What to build:** a `RateLimitedModelProvider implements ModelProvider` that
+  wraps another provider, refills a token bucket at a configured requests/second,
+  and `await`s (or rejects) when the bucket is empty before delegating to the
+  inner `complete()`.
+- **Why it earns its place:** builds the limiter at the right seam and forces the
+  wait-vs-reject decision — the core backpressure tradeoff.
+- **Files to touch:** new
+  `packages/providers/ratelimit/src/rate-limited-provider.ts`, reusing
+  `ModelProvider` from `packages/runtime/src/model-provider.ts`.
+- **Done when:** a test fires N+1 requests against a bucket of size N and asserts
+  the N+1th waits (or rejects) rather than calling the inner provider immediately.
 - **Estimated effort:** `1–4hr`
+
+### Write the test that pins maxToolCalls as work-bounding (not rate)
+- **Exercise ID:** —  (no curriculum file in repo)
+- **What to build:** a test driving `runAgentLoop` with `maxToolCalls: 2` and a
+  fixture that keeps requesting tools, asserting exactly 2 tool calls fire and
+  the loop then forces a final answer.
+- **Why it earns its place:** proves you can distinguish a work budget from a rate
+  limit — the exact confusion this concept exists to clear up.
+- **Files to touch:** new test in `packages/runtime/test/`, using
+  `packages/runtime/src/run-agent-loop.ts:101` and
+  `packages/agents/query/src/fixture-provider.ts`.
+- **Done when:** the test asserts tool-call count caps at `maxToolCalls` and the
+  final turn was forced (no tools offered).
+- **Estimated effort:** `<1hr`
 
 ## Interview defense
 
-**Q: A hundred agent runs fire at once. What stops you from getting rate-limited?**
-"Today, nothing cross-run — and I'd be honest about it. I'd draw the gap:"
+**Q: "How does aptkit handle rate limiting?"**
+It doesn't — and that's correct for its design. The default model is local Gemma
+on Ollama, which has no quota and never returns a 429, so there's nothing to rate
+limit against. Load shows up as latency, not rejection. A limiter would slot in as
+a `complete()` decorator the day a quota'd cloud provider joins.
 
 ```
-  run1 … run100  → each capped by maxToolCalls (per-run only)
-        │ no shared ceiling
-        ▼ 100 independent loops hit the provider → 429s
-  fix: a semaphore at the provider seam → in-flight ≤ N
+  local Gemma:  burst → slower (queues internally)   → no limiter needed
+  cloud quota:  burst → 429 rejection                → limiter at complete()
 ```
+Anchor: *no quota downstream → no rate limit to enforce.*
 
-"`maxToolCalls` (`run-agent-loop.ts:101`) bounds fan-out *within* a run, not
-concurrency *across* runs — it's the wrong axis for rate limiting. With no shared
-limiter, a hundred runs race the provider and the 429s become my reactive rate
-limiter. The fix is a `ConcurrencyLimitedProvider` at the `model.complete` seam —
-a semaphore capping in-flight calls below the provider limit, with a bounded queue for
-overflow."
-*Anchor: per-run caps aren't rate limiting; coordinate at the shared provider seam.*
+**Q: "Isn't `maxToolCalls` a rate limiter?"**
+No — it's a work budget. It caps the *total* tool calls in one run regardless of
+time; a rate limiter caps requests *per interval*. `maxToolCalls` stops a runaway
+loop; a rate limiter respects a downstream quota. Different trigger, different
+purpose.
 
-**Q: Queue, reject, or shed when you hit the cap?**
-"Depends on the SLA. Queue (bounded!) smooths bursts at the cost of latency; reject
-fast protects p99 and tells the caller to back off; shed drops low-priority work to
-protect the critical path. The trap is an *unbounded* queue — it hides overload until
-memory blows. I'd bound the queue and pick the policy per workload."
-*Anchor: backpressure is an explicit overflow decision, and the queue must be bounded.*
-
-## Validate
-
-- **Reconstruct:** From memory, write the semaphore-wrapped `complete`: acquire,
-  delegate, release, with an overflow policy. Check the seam against
-  `model-provider.ts:54-58`.
-- **Explain:** Why is `maxToolCalls` (`run-agent-loop.ts:101`) not a rate limiter?
-  (It bounds tool fan-out within a single run; it doesn't coordinate or cap how many
-  runs call the provider concurrently — the wrong axis.)
-- **Apply:** You set a concurrency limiter to N=5 but the provider allows 10
-  concurrent. What's the effect, and is it wrong? (You never exceed 5 in flight, so
-  you're never throttled — but you under-use available throughput; raise the cap
-  toward the limit if throughput matters.)
-- **Defend:** Why add the limiter at the `ModelProvider` seam rather than inside each
-  agent? (One shared limiter at the seam sees *all* runs and can enforce a global
-  cap; per-agent limits can't coordinate across concurrent runs — same reason the
-  fallback chain and context guard live at that seam.)
+```
+  maxToolCalls:  count-based · "≤4 total this run"  · stops runaway loop
+  rate limiter:  time-based  · "≤N per second"      · respects a quota
+```
+Anchor: *`run-agent-loop.ts:101` — `toolCalls.length >= maxToolCalls`, no clock.*
 
 ## See also
 
-- [05-retry-circuit-breaker.md](05-retry-circuit-breaker.md) — backoff/retry that pairs with a limiter on 429s
-- [01-llm-caching.md](01-llm-caching.md) — the same provider-decorator seam
-- [02-llm-cost-optimization.md](02-llm-cost-optimization.md) — doing less work as the other load-reducer
-- [../04-agents-and-tool-use/03-react-pattern.md](../04-agents-and-tool-use/03-react-pattern.md) — the per-run maxToolCalls bound
+- `05-retry-circuit-breaker.md` — the other half of respecting a flaky downstream
+- `01-llm-caching.md` — the sibling `complete()` decorator
+- `04-agents-and-tool-use` — where `maxToolCalls` bounds the investigation

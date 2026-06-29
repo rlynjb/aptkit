@@ -1,265 +1,223 @@
-# 05 — Graphs and Traversals
+# Graphs & Traversals
 
-**Industry name(s):** Graph (directed/undirected), adjacency list, BFS, DFS, topological sort, shortest path (Dijkstra). Type label: Language-agnostic foundation.
+**Industry name(s):** graphs · BFS / DFS · shortest paths · dependency graphs · HNSW (hierarchical navigable small world) — *Industry standard*
+
+> **Status: `not yet exercised` in aptkit; ONE real graph in the companion repo (buffr).** No BFS, DFS, shortest-path, or topological sort runs in aptkit's source. You've built graph traversal from scratch (`Graph.ts` BFS/DFS, `Graph2.ts` weighted + Dijkstra, `PG.ts` BFS over a river-crossing state graph). This file is curriculum — with the single most important DSA fact about the whole system: **the production vector index is a graph.** buffr's `PgVectorStore` uses HNSW, an approximate-nearest-neighbor *graph*, and a query is a *greedy graph traversal*. That's the one place a real graph algorithm runs.
+
+---
 
 ## Zoom out, then zoom in
 
-Graphs model *relationships you traverse* — dependencies, networks, paths. AptKit has data that *looks* relational — capability coverage with `requires` and `enriches` lists, the package dependency tree, the provider fallback chain — but none of it is traversed as a graph. Every relationship here is evaluated as a flat, one-hop `Set.has` check or a fixed linear order. So graphs are `not yet exercised`, and this file's job is to be precise about *why*, and exactly where a real graph would appear. You've built the real thing (`Graph.ts`, `Graph2.ts`, BFS/DFS, Dijkstra, connected components in `reincodes`), so the teaching has somewhere solid to land.
+aptkit has no graph. But the structure that replaces aptkit's linear scan in production *is* a graph, and the search over it is a traversal — so graphs are the climax of this guide, not a footnote.
 
 ```
-  Zoom out — relational-looking data in AptKit (none traversed)
+  Zoom out — the one graph in the system (and it's not in aptkit)
 
-  ┌─ Tools/context layer ────────────────────────────────┐
-  │  coverage: requirement.requires = [tokenA, tokenB]   │ ← LOOKS like edges
-  │            requirement.enriches = [tokenC]            │   evaluated as flat
-  │            → capabilities.has(token)  ONE HOP only    │   Set.has, no traversal
-  └───────────────────────────┬───────────────────────────┘
-                              │
-  ┌─ Providers layer ─────────▼───────────────────────────┐
-  │  fallback chain: try A, then B, then C  (fixed list)  │ ← a path, but LINEAR,
-  │                                                        │   not a graph search
-  └───────────────────────────┬───────────────────────────┘
-                              │
-  ┌─ (absent as graph) ───────▼───────────────────────────┐
-  │  adjacency list, BFS, DFS, topo sort, Dijkstra         │ ← your reincodes work
-  │  not yet exercised                                     │
-  └────────────────────────────────────────────────────────┘
+  ┌─ aptkit Retrieval layer ────────────────────────────────────┐
+  │  InMemoryVectorStore.search → LINEAR SCAN of an array        │
+  │  no graph; touch all n chunks                                │
+  └───────────────────────────┬─────────────────────────────────┘
+                              │ same VectorStore contract, swap in prod
+  ┌─ buffr Storage layer ─────▼─────────────────────────────────┐
+  │  PgVectorStore → Postgres HNSW index                        │
+  │  ★ embeddings linked into a navigable GRAPH ★               │
+  │  a query is a GREEDY TRAVERSAL: start at an entry node,     │
+  │  hop to the nearest neighbor, repeat until no closer        │
+  │  buffr/sql/001_agents_schema.sql:28-29 (vector_cosine_ops)  │
+  │  [graph build/tuning mechanics → study-database-systems]    │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: a graph is nodes plus edges; traversal is visiting nodes by following edges, tracking what you've seen so you don't loop. The defining feature is *transitivity* — A connects to B connects to C, and you care about reaching C *through* B. AptKit never has that. Its "edges" are all single-hop membership checks against a flat set, and its one "path" (the provider fallback) is a fixed linear list you walk start-to-end. No transitivity means no traversal means no graph.
+Zoom in: a graph is nodes connected by edges; a traversal explores it (BFS by layers, DFS by depth, greedy by best-next-hop). HNSW connects each embedding to its nearest neighbors as graph edges, then *searches* by walking edges toward the query — a best-first traversal. It's the production answer to "find nearest without scanning all `n`."
+
+---
 
 ## Structure pass
 
-**Layers.** Tools/context (coverage `requires`/`enriches`), providers (the fallback chain). Both *look* like graph layers; neither traverses.
+**Layers:** the flat array (aptkit, no graph) → the HNSW proximity graph (buffr) → the traversal that queries it.
 
-**Axis — trace "reachability": *to use X, what must transitively be true?*** This is the graph question, and watching it stay one-hop everywhere is the lesson.
+**Axis — how is the nearest neighbor found?** trace it across the seam.
 
 ```
-  One axis — "reachability" — and why it never goes transitive
+  One axis — "how do you find the nearest chunk?"
 
-  coverage:   requirement requires [t1, t2]
-              → capabilities.has(t1) AND capabilities.has(t2)
-              ONE HOP. t1 is a raw token, not another requirement.
-              no "t1 requires t3" chain to follow.
-
-  fallback:   try provider A → fail → try B → fail → try C
-              LINEAR walk of a fixed list. no branching, no cycles.
-
-  a graph question would be: "X requires Y, Y requires Z,
-  is Z available?" — transitive closure. that question is
-  NEVER ASKED here. so reachability stays one hop deep.
+  ┌─ aptkit (InMemoryVectorStore) ─┐  scan ALL n, compare each, sort
+  │  exhaustive: exact, O(n)        │  → guaranteed exact top-k
+  └─────────────────────────────────┘
+              seam: contract swap (same VectorStore interface)
+  ┌─ buffr (PgVectorStore / HNSW) ─┐  TRAVERSE a proximity graph
+  │  greedy best-first hops         │  → approximate, ≈ O(log n)
+  └─────────────────────────────────┘  → trades exactness for speed
 ```
 
-**Seam.** The load-bearing boundary is between *one-hop membership* (what AptKit does — `capabilities.has(token)`) and *multi-hop traversal* (what a graph needs — follow edges, track visited, until frontier empty). The axis-answer flips from "check direct presence" to "search transitive reachability" exactly when a requirement's dependency points at *another requirement* instead of a raw capability token. Today it always points at a raw token. That single fact is why there's no graph: the edges don't chain.
+**Seam — exact scan vs approximate traversal.** The axis-answer flips hard across the `VectorStore` contract: aptkit is *exhaustive and exact*; buffr's HNSW is *greedy, graph-walked, and approximate*. That trade — give up exactness, gain sub-linear lookup — is the defining graph decision in the system.
+
+---
 
 ## How it works
 
-This is the kernel you already know from `reincodes`, walked here so the *absence* is precise — and so the trigger that would summon it is unmistakable.
+### Move 1 — the mental model (BFS/DFS you know, then HNSW)
 
-### Move 1 — the mental model
-
-You built grid BFS — the river-crossing puzzle (`PG.ts`) lighting up reachable states. That's the shape: a frontier of "to-visit" nodes, a visited set so you never re-expand, and a loop that pulls from the frontier, expands neighbors, and enqueues the unseen ones until the frontier drains.
+You've animated BFS lighting up grid cells and Dijkstra finding a path through obstacles, so the traversal mechanics are yours. The kernel of any traversal: a *frontier* (what to explore next), a *visited set* (so you don't loop), and an *expansion* step (dequeue a node, look at its neighbors). BFS uses a FIFO frontier (explore by distance layers); DFS uses a stack (go deep first); greedy/best-first uses a priority order (explore the most promising neighbor first). HNSW's search is best-first: the frontier is ordered by closeness to the query.
 
 ```
-  The kernel — BFS frontier + visited (the thing AptKit lacks)
+  Pattern — HNSW search is a greedy best-first traversal
 
-  frontier: [start]      visited: {start}
-    ┌──────────────────────────────────────┐
-    │ while frontier not empty:             │
-    │   node = dequeue(frontier)            │
-    │   for neighbor of node.edges:         │  ← edges = the relationships
-    │     if neighbor not in visited:       │  ← visited = no re-expand
-    │       visited.add(neighbor)           │
-    │       enqueue(frontier, neighbor)     │
-    └──────────────────────────────────────┘
-  terminates when frontier empties ← the load-bearing part people forget
+  query q ●
+            entry node
+              ○──────○ visited
+             /│      │
+            ○ │      ○  ← hop to the neighbor CLOSEST to q
+            │ ○──────○
+            ○         \
+                       ○ ● ← stop: no neighbor closer to q than current
+                            return current (+ its neighbors) as top-k
+
+  frontier = candidate neighbors ordered by distance to q
+  visited  = nodes already expanded (don't re-walk)
+  expand   = move to the closest unvisited neighbor
+  stop     = no neighbor improves on the current best
 ```
 
-The whole point of this machine is *following edges across multiple hops*. AptKit's coverage check is the degenerate one-hop case: `frontier = [requirement]`, expand once into its `requires` tokens, check each is present, done. There's no second hop, so the frontier, the visited set, and the loop all collapse into a single `.every(has)`. That collapse *is* why it's not a graph.
+The HNSW twist on plain best-first: it's *hierarchical* — a coarse top layer with long-range links for fast approach, finer layers below for precision. You descend layers, each a navigable small-world graph, zooming in on the query's neighborhood. But the per-layer mechanic is the greedy traversal you already know.
 
-### Move 2 — where the graph isn't, one relationship at a time
+### Move 2 — the walkthrough
 
-**Coverage `requires`/`enriches` — edges that don't chain.** Bridge from your adjacency list: an adjacency list maps a node to its neighbors. `requirement.requires` maps a capability to the tokens it needs — that's *shaped* like adjacency. But the neighbors are raw capability tokens (event names, catalog names), not other requirements. So there's no node to traverse *to*. It's a one-hop `.every(capabilities.has(dep))`.
+#### What aptkit does instead: the exhaustive non-graph
 
-```
-  Coverage as a (non-)graph — one hop, no traversal
+To see the graph's value, look at what it replaces — aptkit's scan visits *every* node with no edges at all:
 
-  requirement R
-     requires → ["purchase", "purchase.amount", "catalog:products"]
-                      │            │                    │
-                      ▼            ▼                    ▼
-                 capabilities.has(each)  ── all present? → 'full'
-                                            some enrich missing? → 'limited'
-                                            some require missing? → 'unavailable'
-
-  the arrows are NOT edges to other requirements — they're
-  membership checks against a flat Set. depth = 1. no closure.
+```ts
+// packages/retrieval/src/in-memory-vector-store.ts:27-32
+const hits: VectorHit[] = [];
+for (const chunk of this.chunks.values()) {     // visit ALL n — no graph
+  hits.push({ id: chunk.id, score: cosineSimilarity(vector, chunk.vector), meta: chunk.meta });
+}
+hits.sort((a, b) => b.score - a.score);
+return hits.slice(0, Math.max(0, k));
 ```
 
-What would make it a graph: if `requires: ["capability:diagnosis"]` meant "this capability needs *another capability* to have run first," you'd have edges between requirements, possible chains (A→B→C), possible cycles, and you'd need topological sort to order them and cycle detection to reject bad configs. None of that exists. The check is flat by design.
+There are no edges, no frontier, no traversal — it's the degenerate case: "the graph where you check every node." Exact, simple, `O(n)`. This is the baseline HNSW improves on.
 
-**The provider fallback chain — a path, but linear.** Bridge from a linked list: the fallback provider tries adapters in a fixed sequence — A, then B if A fails, then C. That's a *path*, but a predetermined linear one, not a search through a branching graph. There's no choice of which neighbor to visit, no visited set, no termination-on-empty-frontier — just "next in the list until one succeeds or the list ends."
+#### The real graph: buffr's HNSW index and its traversal query
 
-```
-  Fallback chain — linear walk, not graph search
+In buffr the same contract method runs a graph traversal, expressed as SQL over an HNSW-indexed column:
 
-  [provider A] → fail → [provider B] → fail → [provider C] → result | error
-       │                     │                     │
-   no branching          no visited set       fixed order
-   it's a for-loop over a list, not a traversal
-```
-
-**The package dependency DAG — real, but resolved by the build tool, not the repo.** AptKit's 11 internal packages *do* form a dependency graph (runtime → tools → agents → core), and `build:core:deps` even has an explicit ordered chain. That ordering is a topological sort — but `tsc -b` and npm compute it, the repo just declares the edges in `package.json`. The repo never traverses this graph in its own code. (This is a system-design/build concern — see `study-system-design`.)
-
-### Move 2.5 — current state vs future state: the real graph trigger
-
-```
-  Phase A (now)                    Phase B (a graph appears)
-
-  coverage: requires → raw token   capabilities depend on OTHER
-            one-hop Set.has        capabilities → edges chain →
-                                   need topo sort (run order) +
-                                   cycle detection (reject bad config)
-                                   + transitive reachability (can X
-                                   run given what's available?)
-
-  agents: independent, flat        a planner that composes capabilities
-                                   into a DAG and executes in dependency
-                                   order → BFS/DFS/topo over that DAG
-
-  cost of switching: this is your reincodes Graph.ts +
-  topological-sort territory, dropped in when composition arrives.
+```sql
+-- buffr/sql/001_agents_schema.sql:28-29  (the graph itself)
+create index if not exists chunks_embedding_hnsw
+  on agents.chunks using hnsw (embedding vector_cosine_ops);
 ```
 
-The honest read: the day AptKit grows a *planner* that chains capabilities — "to answer this, first run diagnosis, which first needs monitoring" — the coverage system becomes a real dependency graph and you'll want BFS/DFS for reachability, topological sort for execution order, and cycle detection to reject impossible configs. That's exactly your `reincodes` `Graph.ts` (BFS/DFS, valid-tree check, connected components) and the topo-sort layer on top. It hasn't arrived because today every agent is independent and every dependency is one hop to a raw token.
-
-**The second, more concrete graph trigger — the ANN index inside retrieval.** This one isn't speculative: the code already points at it. `InMemoryVectorStore.search` (`packages/retrieval/src/in-memory-vector-store.ts:25-33`) finds the top-k nearest vectors by *scanning every chunk* — an exact, brute-force k-NN at O(n·d). The class docstring even names the successor: a `PgVectorStore` "drop-in behind the same contract." The moment the corpus is large enough that scanning every vector hurts, the replacement isn't another linear structure — it's an **approximate-nearest-neighbor (ANN) index**, and the dominant one (HNSW — Hierarchical Navigable Small World) is a *graph you traverse*.
-
-```
-  Phase A (now)                    Phase B (a real graph traversal)
-
-  search(): linear scan over       HNSW index: a multi-layer proximity
-  ALL n chunks, cosine each,       GRAPH. each node links to its near
-  sort, slice → exact top-k        neighbors. query = greedy traversal:
-  O(n·d + n log n)                 start at an entry node, hop to the
-  → no graph, just a loop          neighbor closest to the query, repeat
-                                   until no neighbor is closer → O(log n)
-                                   approximate top-k. THIS is BFS/greedy
-                                   best-first search over a navigable graph.
-
-  cost of switching: the contract (VectorStore.search) doesn't change;
-  the in-memory loop is swapped for an index that traverses edges.
+```ts
+// buffr/src/pg-vector-store.ts:69-75  (the traversal, as a query)
+// <=> is cosine DISTANCE; cosine similarity score = 1 - distance.
+//   select ... 1 - (embedding <=> $1::vector) as score
+//   ... order by embedding <=> $1::vector   ← planner uses the HNSW graph
 ```
 
-The point that makes this the repo's *most concrete* graph trigger: it doesn't need a new feature to invent it. The contract and the "drop-in" comment are already there — it's purely a scale threshold. Exact brute-force k-NN (a `for` loop) is correct while the corpus is a handful of documents; cross into thousands and the right structure is a proximity graph traversed greedily, which is the same visited-set, frontier, best-first machinery as your `reincodes` graph work, just optimizing for *nearness* instead of reachability. So unlike the planner trigger (which needs a planner to exist first), this one is one corpus-size away.
+```
+  Layers-and-hops — a vector query traverses the HNSW graph
+
+  ┌─ aptkit (consumer) ──┐ hop 1: store.search(queryVec, k)
+  │  pipeline.query()    │ ─────────────────────────────────►┐
+  └──────────────────────┘                                    │
+                          hop 4: VectorHit[] (ranked) ◄────┐  │
+  ┌─ buffr PgVectorStore ┐                                 │  ▼
+  │  SQL: order by <=>   │ hop 2: planner picks HNSW index │ ┌─ Postgres ─┐
+  └──────────────────────┘ ───────────────────────────────┼►│  HNSW graph │
+                          hop 3: greedy traversal returns  │ │  best-first │
+                          ~k nearest WITHOUT scanning all n └─│  walk       │
+                                                              └─────────────┘
+```
+
+The load-bearing point: `order by embedding <=> $1` is *not* a sort-the-whole-table — the planner uses the HNSW index to traverse to the query's neighborhood and return candidates without scanning every row. That's the `O(n)` → `~O(log n)` win, achieved by a graph traversal. Both stores satisfy `VectorStore`, so aptkit's pipeline code is byte-for-byte identical; only the wiring picks which store, hence which lookup strategy.
+
+#### The load-bearing skeleton of any traversal — and what breaks without each part
+
+HNSW's search, like your BFS, has a kernel where each part is load-bearing:
+
+```
+  traversal kernel        what breaks if you drop it
+  ──────────────────────  ──────────────────────────────────────────
+  frontier (ordered)      no "explore next" → can't progress
+  visited set             revisit nodes → infinite loop on cycles
+  expansion (neighbors)   no edges followed → not a traversal, a scan
+  termination (no closer) never stops → walks the whole graph (O(n))
+```
+
+The part people forget is **termination** — for HNSW, "stop when no neighbor is closer to the query." Drop it and the approximate search degrades to the exhaustive scan it was meant to avoid. (This mirrors BFS's empty-frontier termination, the part you'd name in an interview.) The *approximate* in ANN comes precisely from this greedy local-stopping: it can stop at a local optimum and miss the true nearest — the exactness aptkit's scan keeps and HNSW trades away.
+
+#### Where graphs would enter aptkit itself (they haven't)
+
+Two honest "not yet" cases. (1) **Tool/capability dependency graphs** — if tools had prerequisites ("run anomaly-detection before diagnosis"), you'd topologically sort a DAG. aptkit's tool policy is a flat `Set` allowlist (file **02**), no dependencies, no graph. (2) **Multi-agent orchestration as a graph** — if agents formed a call graph with cycles to detect, a traversal would apply. aptkit's agents are independent single-capability loops; there's no inter-agent graph. Both are plausible future shapes; neither exists today.
 
 ### Move 3 — the principle
 
-A relationship is only a *graph* when you traverse it transitively — follow edges across multiple hops, tracking visited to handle cycles. Data that's shaped like edges but only ever checked one hop deep (membership) is a set problem, not a graph problem, and a flat `Set.has` is the right tool — reaching for BFS there is over-engineering. The skill is spotting the difference: ask "do I follow this relationship through to a node I didn't start from?" If no, it's membership; if yes, it's a graph. AptKit always answers no.
+**A linear scan is the graph with no edges; an index is the graph with edges worth traversing.** The leap from aptkit to buffr is exactly the leap from "visit every node" to "follow edges toward the answer." HNSW buys sub-linear lookup by giving up exactness — a greedy best-first traversal that stops at a good-enough local optimum. The traversal kernel (frontier, visited, expand, terminate) is the same one you animated for BFS; only the frontier ordering and the stopping rule change. Graphs enter a system the moment "nearness" or "dependency" becomes the query.
+
+---
 
 ## Primary diagram
 
-The relational-looking data, framed against the absent traversal machinery.
+The whole graph story for this system in one frame.
 
 ```
-  Graphs in AptKit — relational-looking, never traversed
+  Graphs in the system — the one that runs, and the ones that don't
 
-  ┌─ LOOKS RELATIONAL, EVALUATED FLAT ───────────────────┐
-  │  coverage requires/enriches → capabilities.has() ×1   │
-  │  fallback chain → linear for-loop over fixed list      │
-  │  package deps → real DAG, but topo-sorted by tsc/npm   │
-  └────────────────────────────────────────────────────────┘
-  ┌─ NOT YET EXERCISED (in repo code) ──────────────────┐
-  │  adjacency list · BFS frontier+visited · DFS          │
-  │  topological sort · cycle detection · Dijkstra        │
-  │  → your reincodes Graph.ts / Graph2.ts / PG.ts        │
-  │  trigger: capability composition into a dependency DAG │
-  └────────────────────────────────────────────────────────┘
+  RUNS IN PRODUCTION (buffr, not aptkit):
+    HNSW proximity graph over embeddings
+      query = greedy best-first traversal
+      frontier ordered by distance to query
+      ≈ O(log n), APPROXIMATE (may miss true nearest)
+      buffr/sql/001_agents_schema.sql:28-29 · pg-vector-store.ts:69-75
+
+  THE BASELINE IT REPLACES (aptkit):
+    InMemoryVectorStore — no edges, visit all n, exact, O(n)
+    "the graph where you check every node"
+
+  NOT YET EXERCISED ANYWHERE:
+    tool dependency DAG (topo sort)   — tools are a flat Set allowlist
+    multi-agent call graph            — agents are independent loops
+    BFS/DFS/Dijkstra                  — your portfolio, no aptkit use
+
+  traversal kernel (shared): frontier · visited · expand · TERMINATE
+                             (termination is the part people forget)
 ```
 
-## Implementation in codebase
-
-**Use cases.** The coverage check runs pre-model to decide which tasks are even runnable given a workspace's available data (so the agent doesn't spend tokens on impossible tasks). The fallback chain runs when a primary provider errors. Neither traverses; both are the closest the repo gets to relational data.
-
-The one-hop coverage check — `packages/tools/src/coverage-gate.ts` (lines 38–45, `requirementCoverage`):
-
-```
-  export function requirementCoverage(requirement, capabilities): CoverageLevel {
-    if (!requirement.requires.every((dep) => capabilities.has(dep)))   ← one hop, all-present
-      return 'unavailable';
-    if (requirement.enriches?.length &&
-        !requirement.enriches.every((dep) => capabilities.has(dep)))   ← one hop, enrichers
-      return 'limited';
-    return 'full';
-       │
-       └─ `requires` is shaped like an adjacency list (node → dependency tokens), but
-          `dep` is a raw capability token (e.g. "purchase.amount"), never another
-          requirement. So there's nothing to traverse TO — depth is always 1. This is
-          a Set-membership problem, correctly solved with .has, NOT a graph.
-  }
-```
-
-And how tokens are built — `coverage-gate.ts:23` `schemaCapabilities` flattens events, event-properties, and catalogs into one `Set<string>`. The "graph" is pre-flattened into a token set, which is exactly what removes the need to traverse: every dependency is resolved against the flat set in one hop.
-
-There is no graph traversal code to cite — no adjacency list construction, no BFS/DFS, no visited set, no topological sort anywhere in `packages/`. That absence is the finding.
+---
 
 ## Elaborate
 
-Graphs are the most general relational structure — trees and linked lists are special cases (a tree is an acyclic connected graph; a list is a path). BFS and DFS are the two fundamental traversals: BFS explores level by level with a queue (shortest path in unweighted graphs), DFS goes deep with a stack/recursion (cycle detection, topological sort). Dijkstra adds edge weights and a priority queue to find shortest weighted paths — which is the one place your `BinaryHeap`/`PriorityQueue` and `Graph2.ts` compose into a single algorithm.
+HNSW (2016) sits on a long line: navigable small-world graphs, and before them skip lists — the "express lanes" idea of a hierarchy of increasingly coarse links so you approach a target fast then refine. The greedy traversal is best-first search, the same family as A\* and Dijkstra (your `Graph2.ts`), minus the global-optimality guarantee — ANN deliberately trades the guarantee for speed. The reason vector search needs a graph and not a tree (file **04**): in high dimensions, tree-based spatial indexes (k-d trees, ball trees) degrade toward `O(n)` — the "curse of dimensionality." Proximity graphs sidestep it, which is why every production vector store (pgvector, FAISS, Qdrant, Weaviate) ships HNSW or a cousin.
 
-The reason AptKit has none of this is genuinely structural, not an oversight: agent capabilities are independent, dependencies are one-hop to raw tokens, and the only real DAG (package build order) is owned by the build tool. The most likely future graph is capability composition — a planner that sequences capabilities by dependency. When that lands, the coverage `requires` field grows edges to other capabilities, and you'll want topological sort (build order respected at runtime) and cycle detection (reject "A needs B needs A"). That's a clean, bounded place to drop in the `reincodes` graph work. Until then, the `Set.has` is correct and a graph would be premature.
+The honest framing for your portfolio: you've built the exact traversal kernel HNSW uses (BFS frontier + visited + termination) and a weighted best-first search (Dijkstra). HNSW is those primitives applied to a proximity graph with a hierarchy on top. The gap isn't the algorithm — it's that aptkit's scale doesn't yet justify building the graph, so the production version lives in buffr's Postgres rather than hand-rolled. Read `study-database-systems` for how that index is built, tuned (`ef_search`, `m`), and queried; this file only names it as the system's one real graph.
 
-The build-order DAG and provider-fallback shape are system-design concerns — `study-system-design` owns the architectural view of those; this file only notes they aren't *traversed in repo code*.
+---
 
 ## Interview defense
 
-**Q: "The coverage system has `requires` and `enriches` lists. Is that a graph?"**
+**Q: There's no graph algorithm in aptkit — so where do graphs actually show up in this system?**
 
-No — it's shaped like one but evaluated as flat membership. `requires` lists *raw capability tokens*, not other requirements, so there's no node to traverse to. The check is `requires.every(token => capabilities.has(token))` — one hop, O(requires). A graph needs transitivity: follow edges across multiple hops with a visited set. That never happens here, so a `Set.has` is the correct tool and BFS would be over-engineering.
-
-```
-  requirement → [raw tokens] → has()?   depth 1, no closure
-  NOT requirement → requirement → requirement   (that'd be a graph)
-```
-
-Anchor: *it's adjacency-shaped but one-hop — a set problem, not a graph problem, until dependencies point at other capabilities.*
-
-**Q: "When would this become a real graph, and what would you add?"**
-
-When a capability's dependency points at *another capability* — composition. Then edges chain (A→B→C), and I'd need topological sort to run them in dependency order, cycle detection to reject impossible configs, and BFS/DFS for "is X reachable given what's available." That's exactly the `Graph.ts` + topo-sort work I've built before; it drops in when a capability planner arrives.
+> Exactly one place, and it's the most important DSA fact about the system: the production vector index is a graph. aptkit's `InMemoryVectorStore` scans a flat array — exact, `O(n)`, no edges. Swap in buffr's `PgVectorStore` behind the same `VectorStore` contract and a query becomes a traversal of an HNSW proximity graph: start at an entry node, greedily hop to the neighbor closest to the query, stop when none is closer — `≈ O(log n)`, approximate. Same kernel as BFS — frontier, visited, expand, terminate — with the frontier ordered by distance and a greedy stopping rule.
 
 ```
-  trigger: requires → other capability
-  add: adjacency list + topo sort (order) + cycle detect (reject)
+  aptkit: scan all n (exact, O(n))  ──contract swap──►
+  buffr:  HNSW greedy traversal (approx, ~O(log n))
 ```
 
-Anchor: *the trigger is capability-to-capability dependencies — that's when one-hop membership becomes transitive reachability and you need traversal.*
+**Q: What's the part of that traversal people forget, and what does HNSW give up?**
 
-**Q: "Is the provider fallback chain a graph traversal?"**
+> Termination — "stop when no neighbor is closer to the query." Forget it and the greedy walk degrades to the exhaustive scan it was meant to beat. And what HNSW gives up is *exactness*: greedy local stopping can settle at a local optimum and miss the true nearest neighbor. aptkit's scan keeps exactness and pays `O(n)`; HNSW trades a little recall for sub-linear speed. That trade is the whole reason vector DBs use a graph and not a k-d tree — in 768 dimensions, tree indexes collapse toward `O(n)` (curse of dimensionality), proximity graphs don't.
 
-No — it's a linear walk of a fixed list: try A, then B, then C. There's no branching, no choice of neighbor, no visited set, no cycle concern. It's a `for`-loop with early exit on success, not a search. Calling it traversal would overstate it.
+Anchor: *the production vector index is a graph; the query is a greedy best-first traversal that trades exactness for sub-linear lookup.*
 
-```
-  A → fail → B → fail → C   fixed order, for-loop, not search
-```
-
-Anchor: *a fixed linear fallback is a loop, not a traversal — no frontier, no visited, no branching.*
-
-## Validate
-
-**Reconstruct.** Write the BFS kernel from memory: frontier queue, visited set, dequeue→expand→enqueue-unseen, terminate on empty frontier. Then write AptKit's coverage check and identify which BFS parts collapse away (frontier of one, no second hop, no visited needed).
-
-**Explain.** In `coverage-gate.ts:42`, why is `requires.every(capabilities.has)` *not* a graph traversal even though `requires` looks like an adjacency list? (Answer: the elements of `requires` are raw tokens in the capability set, not nodes with their own edges — there's no node to traverse to, so depth is fixed at 1.)
-
-**Apply to a scenario.** AptKit adds a planner where `recommendation` requires `diagnosis` to have run, and `diagnosis` requires `monitoring`. A config accidentally sets `monitoring` to require `recommendation`. What breaks, and which algorithm catches it? (Answer: a cycle — recommendation→diagnosis→monitoring→recommendation. A topological sort can't order a cyclic graph; running DFS and detecting a back-edge catches it. Today nothing catches it because there's no graph; this is precisely the trigger to add one.)
-
-**Defend the decision.** Someone wants to model coverage as a graph "to be future-proof." Defend the flat `Set.has`. (Answer: dependencies are one-hop to raw tokens — there is no transitivity to traverse, so a graph adds an adjacency structure, a traversal, and a visited set that all collapse to a single `.every(has)`. It's complexity for a relationship that isn't there yet. Add the graph when composition makes edges chain, not before.)
+---
 
 ## See also
 
-- `02-arrays-strings-and-hash-maps.md` — the `Set.has` coverage check, the membership solution that stands in for traversal.
-- `03-stacks-queues-deques-and-heaps.md` — the queue (BFS frontier) and heap (Dijkstra) that a real graph would need.
-- `04-trees-tries-and-balanced-indexes.md` — trees as the acyclic special case; also absent for the same flat-data reason.
-- `06-sorting-searching-and-selection.md` — the linear-scan k-NN (`InMemoryVectorStore.search`) that an HNSW *graph* index would replace, and its cosine-score top-k.
-- `study-ai-engineering` (neighboring guide) — the RAG pipeline as an AI concern; this file owns only the graph-index angle (ANN/HNSW).
-- `study-system-design` (neighboring guide) — the package build DAG and provider fallback as architectural shape.
+- **04-trees-tries-and-balanced-indexes.md** — why a tree can't index vectors, so the index is this graph.
+- **02-arrays-strings-and-hash-maps.md** — the flat-array scan HNSW replaces.
+- **06-sorting-searching-and-selection.md** — exact full-sort selection vs approximate graph search.
+- `study-database-systems` — how buffr builds, tunes, and queries the HNSW index in Postgres.
+- `study-ai-engineering` — ANN as the retrieval-at-scale move in the RAG pipeline.

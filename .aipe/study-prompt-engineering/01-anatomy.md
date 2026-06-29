@@ -1,497 +1,219 @@
 # 01 — Anatomy of a production prompt
 
-**Industry name(s):** system prompt / context injection / few-shot / user
-message. **Type:** Language-agnostic.
+**Industry name:** prompt structure / message-role decomposition — *Language-agnostic*
 
 ## Zoom out, then zoom in
 
-Before you reason about a single instruction, look at where a prompt sits in the
-machine. In AptKit a prompt is not a string you pass to `complete()` — it's a
-structured envelope that gets assembled, rendered, and forced through a loop.
+Every prompt you send is four things wearing one coat: a *system* instruction
+(constant), some *context* spliced in (per-call data), maybe a few *examples*,
+and the *user message* (the actual ask). Junior prompts blend all four into one
+blob. Production prompts keep them separate, because the seams between them are
+where every drift bug lives.
+
+Here's where the four sections sit in this repo's assembly path.
 
 ```
-  Zoom out — where a prompt's anatomy lives
+  Zoom out — the four sections, and who owns each
 
-  ┌─ Prompt layer (packages/prompts/src) ───────────────────────┐
-  │  ★ THE FOUR SECTIONS ★                                       │ ← we are here
-  │  system literal  +  {var} holes  +  examples[]  +  user msg  │
-  └───────────────────────────┬──────────────────────────────────┘
-                             │  renderPromptTemplate fills the holes
-  ┌─ Runtime layer ──────────▼──────────────────────────────────┐
-  │  runAgentLoop: system + messages → Provider.complete         │
-  └───────────────────────────┬──────────────────────────────────┘
-                             │  provider request
-  ┌─ Provider layer ─────────▼──────────────────────────────────┐
-  │  anthropic / openai / fallback / local guard                 │
-  └───────────────────────────────────────────────────────────────┘
+  ┌─ Authoring (constant across calls) ───────────────────────────┐
+  │  ★ SYSTEM ★  packages/prompts/src/query.ts QUERY_PROMPT        │ ← we are here
+  │  ★ FEW-SHOT ★ examples[] in the PromptPackage (mostly inline)  │
+  └───────────────────────────┬───────────────────────────────────┘
+                              │  renderPromptTemplate({schema, intent...})
+  ┌─ Assembly (per call) ─────▼───────────────────────────────────┐
+  │  ★ CONTEXT ★  {schema}, {intent}, {anomaly} spliced in         │
+  │  ★ USER ★     messages:[{role:'user', content: question}]      │
+  └───────────────────────────┬───────────────────────────────────┘
+                              │  ModelRequest → provider.complete()
+  ┌─ Model ───────────────────▼───────────────────────────────────┐
+  │  system string + messages[] arrive as distinct fields          │
+  └────────────────────────────────────────────────────────────────┘
 ```
 
-Now zoom in. The pattern: a production prompt has four sections, each with one
-job. The system prompt holds what's constant across every call. Context
-injection holds what changes per workspace but not per question. Few-shot
-examples pin the output shape. The user message holds the one variable thing —
-the actual question or task. Mix those jobs into one blob and the prompt drifts:
-nobody can tell which line is policy and which line is data.
+Now zoom in. The thing worth learning isn't "prompts have sections" — it's the
+*decomposition rule*: **one job per section, named explicitly, and the constant
+stuff never mixes with the per-call stuff.** Break that rule and you get the
+classic Friday bug where someone edits the system prompt to fix one query and
+silently changes behavior for every query.
 
-## Structure pass
+## The structure pass
 
-**Layers.** Two: the *template* (the literal string with `{var}` holes) and the
-*rendered instance* (holes filled, ready for the provider). The four anatomy
-sections live in the template; the runtime produces the instance.
+**Layers:** authoring (the template, written once) → assembly (the per-call
+render) → model (the wire format: a `system` field plus a `messages[]` array).
 
-**Axis — held constant: "is this constant or per-call?"** Trace it down:
+**Axis — what changes per call?** Trace it down the stack:
 
 ```
-  One question across the four sections: constant or per-call?
+  One axis: "does this change per call?" — traced down the layers
 
-  ┌─ system prose ────────────┐   → CONSTANT  (ships with the package)
-  │ "You are a recommendation │
-  │  agent... read-only..."   │
-  └───────────────────────────┘
-  ┌─ {schema} injection ──────┐   → PER-WORKSPACE (changes per tenant, not per Q)
-  │ schemaSummary(workspace)  │
-  └───────────────────────────┘
-  ┌─ examples[] ──────────────┐   → CONSTANT  (pinned shape, ships with package)
-  └───────────────────────────┘
-  ┌─ user message ────────────┐   → PER-CALL  (the actual question/task)
-  └───────────────────────────┘
+  ┌──────────────────────────────────────────┐
+  │ SYSTEM string (role, hard rules)          │  → NO  (constant)
+  └──────────────────────────────────────────┘
+      ┌──────────────────────────────────────┐
+      │ {schema} {intent} {anomaly} context   │  → YES (per workspace/call)
+      └──────────────────────────────────────┘
+          ┌──────────────────────────────────┐
+          │ user message (the question)       │  → YES (every call)
+          └──────────────────────────────────┘
+
+  the answer flips at the {placeholder} boundary — that's the seam
 ```
 
-**Seam — the `{var}` boundary.** The load-bearing seam is the substitution point
-in `renderPromptTemplate`. On the template side, `{schema}` is a hole; on the
-rendered side, it's deterministic text. The axis flips here: above it everything
-is constant, at it the per-workspace and per-call values get poured in. That's
-the joint to study before any instruction wording.
+**Seam:** the `{placeholder}` boundary inside the template. Above it, constant
+instructions; below it, interpolated data. `renderPromptTemplate`
+(`packages/prompts/src/types.ts:24`) is literally the machine that crosses that
+seam. If constant rules leak below the seam (hardcoding a project id into the
+system text instead of passing `{project_id}`), you've coupled the prompt to one
+caller. If per-call data leaks above it (pasting a question into the system
+string), you've made the constant part non-constant — and your prompt versioning
+(concept 03) now lies.
 
 ## How it works
 
-#### Move 1 — the mental model
+### Move 1 — the mental model
 
-You already build React components with props: the JSX is the constant
-structure, the props are what changes per render. A prompt's anatomy is the same
-split. The system prompt is the JSX; the variables are the props. You write the
-structure once and pour different values through it.
-
-```
-  The four-section prompt — shape
-
-  ┌───────────────────────────────────────────────┐
-  │ SYSTEM  (constant)                             │
-  │   role · hard rules · output contract          │
-  │   ┌─────────────────────────────────────────┐  │
-  │   │ CONTEXT INJECTION  {schema} {diagnosis}  │  │ ← per-workspace / per-task
-  │   ├─────────────────────────────────────────┤  │
-  │   │ FEW-SHOT  examples[]                     │  │ ← pinned output shape
-  │   └─────────────────────────────────────────┘  │
-  └───────────────────────────────────────────────┘
-  ┌───────────────────────────────────────────────┐
-  │ USER MESSAGE  (per-call)                       │ ← the one variable thing
-  │   "Propose recommendations for this diagnosis" │
-  └───────────────────────────────────────────────┘
-```
-
-#### Move 2 — the walkthrough
-
-**The system prompt — role, rules, output contract.** This is the part the
-reader already expects. It opens by naming the role ("You are a recommendation
-agent for an ecommerce workspace. You are read-only"), states hard rules as a
-numbered list, and ends with the output contract. It's constant: it ships inside
-the package and never changes between calls. **Breaks if missing:** the model has
-no frame, picks its own behavior per call, and your outputs are inconsistent run
-to run.
+You already know this shape from React: a component has **props** (constant
+config passed once), **state/data** (changes per render), and **children** (the
+actual content). A prompt is the same split. The system text is your props. The
+interpolated context is your data. The user message is your children. Mixing
+them is like hardcoding a fetch response inside a component's default props —
+it works in the demo and rots the moment anything varies.
 
 ```
-  System prompt — three constant blocks
+  Pattern — the four sections of one prompt
 
-  ┌─ role ────────┐  "You are X. You are read-only."
-  ┌─ hard rules ──┐  "1. Pass project_id. 2. At most 4 tool calls. ..."
-  ┌─ output ──────┐  "Return ONLY a JSON array of at most 3 objects."
+       ┌─────────────── one ModelRequest ───────────────┐
+       │                                                 │
+   system: "You are an AI analyst...     ← SECTION 1: role + hard rules
+            ## Hard rules ...                (constant, authored once)
+            ## Workspace schema {schema}" ← SECTION 2: context injected
+                                              (per-call data)
+   messages: [
+     { role:'user', content: question }  ← SECTION 4: the actual ask
+   ]
+   (examples[] on the package)           ← SECTION 3: few-shot (optional)
+       │                                                 │
+       └─────────────────────────────────────────────────┘
 ```
 
-**Context injection — the `{var}` holes.** Per-workspace facts the model needs
-but that don't change per question: the schema summary, the diagnosis to act on,
-the classified intent. These are holes in the template, filled at render time.
-**Breaks if missing:** the model hallucinates the schema, invents event names,
-or answers about the wrong tenant.
+### Move 2 — walking the real prompt
+
+**The system section carries role + hard rules.** Open
+`packages/prompts/src/query.ts:3`. The `QUERY_PROMPT` opens with "You are an AI
+analyst for an ecommerce workspace," then a `## Role`, then `## Hard rules`
+(numbered, imperative), then `## Output`. This is the constant skeleton — it's
+identical whether the question is about revenue or refunds. **What breaks if it's
+missing:** the model has no role, no output contract, no guardrails — you get
+freeform prose where you wanted a bounded answer.
 
 ```
-  Context injection — holes filled per call
+  Inline annotation — query.ts:3 QUERY_PROMPT
 
-  template:   "...## Workspace schema\n{schema}"
-                                       │ render
-  instance:   "...## Workspace schema\nProject: Olist (proj_123)\n
-               Total customers: 99,441\nTop events: purchase, view_item..."
+  "You are an AI analyst for an ecommerce workspace..."   ← role (constant)
+  "## Hard rules
+   1. ...pass project_id: {project_id} ..."               ← rule + a {var} seam
+  "## Output
+   Give a clear, concise answer in plain prose..."        ← output contract
+  "## Workspace schema
+   {schema}"                                              ← context seam (data)
 ```
 
-**Few-shot examples — pinned shape.** A short list of input → expected-contains
-pairs that show the model the output form it should produce. In AptKit these
-live in the package's `examples[]` array and inside the system prose itself (the
-query prompt's "Tool catalog reminders" are worked EQL examples). **Breaks if
-missing:** for format-sensitive tasks, the model free-styles the structure and
-your parser misses. (Full treatment in 08.)
+**The context section is everything inside `{...}`.** `{schema}`, `{intent}`,
+`{project_id}` are placeholders. They're resolved at call time by
+`renderPromptTemplate` (`types.ts:24`), a 4-line regex substitution. **What
+breaks if you mix this with the system section:** suppose someone, fixing one
+workspace, replaces `{schema}` with that workspace's literal schema. Now the
+template is hardcoded to one workspace; the next caller's `renderPromptTemplate`
+finds no `{schema}` to substitute and silently ships a stale schema. The seam
+existed precisely to stop that.
 
-**The user message — the one per-call variable.** Everything above is reusable;
-the user message is the single thing that changes per invocation. In the
-recommendation agent it's a fixed instruction string ("Propose recommendations
-for this diagnosis and return the JSON array"); in the query agent it's the
-literal user question. **Breaks if missing:** there's nothing for the model to
-act on.
+**The few-shot section is the package's `examples[]`.** On the same package
+(`query.ts:79`) there's an `examples` array — `revenue-by-state` with an
+`expectedContains`. In this repo these examples are not yet *spliced into the
+prompt string* — they read as eval anchors and documentation. That's an honest
+gap (see concept 08): the slot exists in the `PromptPackage` type
+(`types.ts:7` `PromptExample`), but the wiring that turns them into in-context
+few-shot examples is `not yet exercised`.
 
-**Persona / profile injection — a prepended constant section.** The rag-query
-agent adds a fifth slot to the front of the system prompt: a *profile* document
-(a `me.md`-style "about the person you are assisting") prepended ahead of the
-role and rules. It's done by `injectProfile`, and the ordering is deliberate —
-profile is injected *before* `renderPromptTemplate` runs, so the result is still
-a valid template whose `{var}` holes get filled afterward. The profile is
-constant per user (not per call) and answers a different question than context
-injection: not "what's in this workspace" but "who am I talking to." **Breaks if
-missing:** the assistant has no sense of the person and gives generic answers; mix
-it into the role line instead of giving it its own heading and you can't swap the
-person without re-reading the whole prompt.
+**The user section is the messages array.** In the agent loop the user message
+is `[{ role: 'user', content: userPrompt }]` (`run-agent-loop.ts:94`). It is
+*never* concatenated into the system string. That separation is what lets the
+provider apply its own role handling (Anthropic and OpenAI treat system and user
+turns differently at the model level).
 
-```
-  Profile injection — a constant persona block, prepended
+### Move 3 — the principle
 
-  injectProfile(template, profileText, { position: 'start', heading })
-
-  ┌─ # About the person you are assisting ─┐  ← heading
-  │ <me.md text>                           │  ← per-user constant
-  └────────────────────────────────────────┘
-                  ▼  then the existing template
-  ┌─ "You are a personal knowledge assistant. Always call search... " ─┐
-  └─────────────────────────────────────────────────────────────────────┘
-        │  THEN renderPromptTemplate fills any {var} holes (order matters)
-```
-
-**Recalled memory — a turn-format template that becomes injected context.**
-There's a section the prompt author doesn't write by hand but still controls the
-wording of: a *remembered exchange*. When the agent recalls a past turn, that
-turn arrives back in context as a tool result — and what it reads like is set by
-a template, `defaultFormat(turn)`, that renders one Q/A pair into a single string:
-`Past exchange — user asked: "<q>"` then `assistant answered: "<a>"`. That same
-string is what got *embedded* when the turn was first remembered, so the template
-is load-bearing twice: it shapes what the vector index matches against, and it
-shapes what the model reads when the memory comes back. **Breaks if missing:**
-embed the raw answer with no `user asked:` framing and a recall surfaces a bare
-sentence with no signal that it's a prior exchange — the model can't tell history
-from a fresh instruction, and your retrieval matches on answer-text alone (a
-follow-up phrased like the *question* won't match an answer-only embedding).
-
-```
-  Turn-format template — same string, two jobs
-
-  remember(turn):                         recall(query):
-  ┌─ format(turn) ────────────────┐       ┌─ search returns the meta.text ─┐
-  │ Past exchange — user asked:   │       │ same formatted string, now an  │
-  │ "<q>"                         │       │ injected tool result the model │
-  │ assistant answered: "<a>"     │ ──┐   │ reads as recalled context      │
-  └───────────────┬───────────────┘   │   └────────────────────────────────┘
-                  │ embed             │                ▲
-                  ▼                   └─ stored as meta.text ─┘
-            vector indexed            (embedded form == recalled form)
-```
-
-**The `search_memory` description — a when-to-recall steering prompt.** Tool
-*descriptions* are prompt too: they're the text the model reads to decide whether
-to call a tool. `search_memory`'s description is one steering sentence past the
-factual part — `"Search past conversation exchanges with this user for ones
-relevant to a query. Use when the answer may depend on something discussed
-earlier."` That second sentence isn't documentation; it's an instruction aimed at
-tool *selection*. Contrast it with the sibling retrieval tool: `search_knowledge_
-base` says only `"Search the indexed knowledge base ... and return ranked chunks
-with citations."` — it describes WHAT it does, with no when-to-use clause. The
-two descriptions partition the model's choice: knowledge-base for "what's in the
-docs," memory for "what did we say before." **Breaks if missing:** drop the "use
-when..." sentence and the model either never recalls (treats memory as inert) or
-recalls on every turn (wastes a tool call and pollutes context). The wording is
-the steering. (The retrieval *mechanics* — over-fetch-then-filter, the kind tag —
-are the AI-engineering guide's; the agent's *decision* to call the tool is
-agent-architecture's; the wording of the description that steers that decision is
-this file's.)
-
-```
-  Two tool descriptions partition one decision
-
-  ┌─ search_knowledge_base ──────────────┐   ┌─ search_memory ───────────────────┐
-  │ "...indexed knowledge base ...        │   │ "...past conversation exchanges... │
-  │  ranked chunks with citations."       │   │  Use when the answer may depend   │
-  │  (WHAT it does — no when-clause)       │   │  on something discussed earlier." │
-  └───────────────────────────────────────┘   │  (WHAT + an explicit WHEN-clause) │
-            ▲ model reaches here for           └───────────────────────────────────┘
-              "what's in the docs"                        ▲ model reaches here for
-                                                            "what did we say before"
-```
-
-#### Move 3 — the principle
-
-One job per section, named explicitly. The reason this matters isn't tidiness —
-it's drift. When constant policy and per-call data live in the same paragraph,
-the next person who "just adds one instruction" can't tell whether they're
-editing the contract or the data, and the prompt slowly rots. Separation is what
-lets you change the schema injection without touching the rules, and change the
-rules without re-testing every workspace.
+**A prompt is a function signature, not a paragraph.** The constant parts are
+the body; the `{placeholders}` are the parameters; the user message is the
+argument. The discipline that separates a prompt that survives six months from
+one that drifts is the same discipline that separates a clean function from a
+2000-line one: one job per section, parameters named explicitly, no global state
+leaking in. Every prompt-drift incident I've debugged traced back to someone
+collapsing two of these sections into one.
 
 ## Primary diagram
 
-The full anatomy, assembled, as `runAgentLoop` sees it.
+The full anatomy, authoring through wire.
 
 ```
-  Assembled prompt — what reaches Provider.complete()
+  Anatomy of a production prompt — aptkit assembly path
 
-  system  = renderPromptTemplate(PACKAGE.system, {
-              schema:     schemaSummary(workspace),   ← context injection
-              project_id: workspace.projectId,        ← context injection
-              diagnosis:  JSON.stringify(diagnosis),  ← context injection
-            })
-            └─ contains: role + hard rules + output contract + examples (constant)
-
-  messages = [{ role: 'user', content: userPrompt }] ← the one per-call variable
-
-  on the LAST turn:
-  system = `${system}\n\n${synthesisInstruction}`     ← forced final answer (02, 09)
-```
-
-## Implementation in codebase
-
-**Use cases.** Every one of the agents assembles a prompt this way. The cleanest
-example is the recommendation agent, which injects three context variables and a
-constant output contract. The rag-query agent adds a fifth section — a prepended
-user profile — via `injectProfile`. The memory package adds two more
-prompt-template surfaces: `defaultFormat` (the wording of a remembered exchange,
-embedded once and re-injected on recall) and the `search_memory` tool description
-(the when-to-recall steering sentence the model reads to decide whether to look).
-
-The `PromptPackage` type defines the envelope — the system string plus its
-declared variables and examples:
-
-```
-  packages/prompts/src/types.ts  (lines 13–22)
-
-  export type PromptPackage = {
-    id: string;            ← provenance (see 03)
-    version: string;       ← provenance (see 03)
-    capabilityId: string;  ← which agent owns this prompt
-    description: string;
-    system: string;        ← the constant system section
-    compactSystem?: string;← shorter variant (declared, not yet used — see 04)
-    variables: PromptVariable[]; ← declares the {var} holes
-    examples: PromptExample[];   ← few-shot (see 08)
-  };
-```
-
-The recommendation system prompt shows the four sections in one literal — role,
-hard rules, the `{diagnosis}` and `{schema}` injection holes, and the output
-contract:
-
-```
-  packages/prompts/src/recommendation.ts  (lines 3–76, excerpt)
-
-  `You are a recommendation agent for an ecommerce workspace.       ← ROLE
-   You are read-only: you do NOT execute anything.
-   ...
-   ## Hard rules                                                     ← RULES
-   1. Pass project_id: {project_id} to every tool call...
-   ...
-   ## The diagnosis to act on
-   {diagnosis}                                                       ← CONTEXT INJECTION
-   ...
-   ## Output
-   Return ONLY a JSON array ... of at most 3 objects.                ← OUTPUT CONTRACT
-   ...
-   ## Workspace schema
-   {schema}`                                                         ← CONTEXT INJECTION
-       │
-       └─ the {diagnosis} and {schema} holes are the per-task seam; everything
-          else is constant and ships with the package. Mixing a per-call fact
-          into the rules section is how this prompt would start to drift.
-```
-
-And the render call that fills the holes — the user message is the one per-call
-variable, separate from the system:
-
-```
-  packages/agents/recommendation/src/recommendation-agent.ts  (lines 71–82)
-
-  const system = renderPromptTemplate(this.prompt, {
-    schema: schemaSummary(this.options.workspace),       ← per-workspace
-    project_id: this.options.workspace.projectId,        ← per-workspace
-    diagnosis: JSON.stringify(diagnosis),                ← per-task
-  });
-  ...
-  userPrompt: 'Propose recommendations for this diagnosis and return the JSON array.',
-       │
-       └─ system carries the four constant/injected sections; userPrompt is the
-          single per-call message. Clean separation = the seam stays clean.
-```
-
-The rag-query agent shows the fifth section — a profile prepended ahead of the
-template, *then* rendered, so the order (inject → render) is preserved:
-
-```
-  packages/agents/rag-query/src/rag-query-agent.ts  (lines 52–59)
-
-  const template = options.prompt ?? DEFAULT_SYSTEM_TEMPLATE;
-  // C then render: inject the profile, then resolve any template placeholders.
-  const withProfile = options.profile
-    ? injectProfile(template, options.profile,
-        { position: 'start', heading: PROFILE_HEADING })   ← prepend the persona block
-    : template;
-  this.system = renderPromptTemplate(withProfile, {});       ← {var} holes filled after
-       │
-       └─ injectProfile runs BEFORE renderPromptTemplate by design — the profile
-          block becomes part of the template, so any {var} in either still renders.
-          Swap the order and a {placeholder} inside the profile would leak unrendered.
-```
-
-`injectProfile` itself is a pure string-in/string-out helper — it never touches
-`fs`; the caller reads the profile file and hands it in:
-
-```
-  packages/context/src/profile-injector.ts  (lines 25–38)
-
-  export function injectProfile(systemTemplate, profileText, opts?) {
-    const position = opts?.position ?? 'start';
-    const block = opts?.heading ? `${opts.heading}\n${profileText}` : profileText;
-    return position === 'end'
-      ? `${systemTemplate}\n\n${block}`
-      : `${block}\n\n${systemTemplate}`;                      ← default: prepend persona
-        │
-        └─ pure: the package never reads files. That keeps prompt assembly testable
-           and the persona swappable without an fs dependency in the prompt layer.
-```
-
-The `defaultFormat` template renders one remembered exchange — and this exact
-string is what gets embedded *and* what comes back on recall:
-
-```
-  packages/memory/src/conversation-memory.ts  (lines 44–46)
-
-  function defaultFormat(turn: MemoryTurn): string {
-    return `Past exchange — user asked: "${turn.question}"\n` +
-           `assistant answered: "${turn.answer}"`;   ← the turn-as-prompt template
-  }
-       │
-       └─ remember() embeds format(turn) and stores it as meta.text (line 75, 84);
-          recall() returns that same meta.text (line 102). The wording is load-
-          bearing twice: it's the embedded form AND the recalled-context form.
-          Override it via opts.format (line 28/68) and you change both at once.
-```
-
-The `search_memory` tool *description* is the when-to-recall steering prompt —
-note the second sentence is an instruction about tool selection, not docs:
-
-```
-  packages/memory/src/memory-tool.ts  (lines 36–38)
-
-  description:
-    'Search past conversation exchanges with this user for ones relevant to a ' +
-    'query. Use when the answer may depend on something discussed earlier.',
-       │
-       └─ "Use when..." steers the model to recall only when history is relevant.
-          Contrast search-knowledge-base-tool.ts:55 — "...indexed knowledge base
-          ... ranked chunks with citations." — WHAT only, no when-clause. The two
-          descriptions split the model's choice between docs and memory.
+  AUTHORING LAYER                         packages/prompts/src/query.ts
+  ┌────────────────────────────────────────────────────────────────┐
+  │ QUERY_PROMPT (system, constant)                                 │
+  │   role + ## Hard rules + ## Output + ## Workspace schema {schema}│
+  │ examples[] (few-shot slot — not yet spliced into the string)    │
+  └───────────────────────────────┬──────────────────────────────────┘
+            renderPromptTemplate({schema, intent, project_id})  types.ts:24
+  ASSEMBLY LAYER                  ▼
+  ┌────────────────────────────────────────────────────────────────┐
+  │ system: rendered string   │   messages: [{role:'user', content}] │
+  └───────────────────────────┴──────────────────────────────────────┘
+            ModelRequest        ▼                  run-agent-loop.ts:94
+  MODEL LAYER
+  ┌────────────────────────────────────────────────────────────────┐
+  │ provider.complete({ system, messages, tools, maxTokens })       │
+  └────────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The four-section split is the oldest stable convention in production prompting —
-it predates tool calling and survives every model upgrade because it's about
-*ownership of lines*, not provider syntax. Anthropic's prompt guide and the
-OpenAI cookbook both land on the same decomposition under different names.
+The system/user split comes straight from the chat-completions message format
+every major provider settled on. The reason it's a *role* distinction and not
+just "first paragraph vs rest" is that providers weight system instructions
+differently — and concept 12 (injection defense) leans on exactly that: a system
+instruction outranks a user instruction in the model's instruction hierarchy.
+Anthropic's prompt guide and the OpenAI cookbook both treat the system message
+as the durable contract and the user message as the variable input — the same
+props-vs-data split you already use in components.
 
-The profile/persona section is a newer addition to the same convention — modern
-RAG assistants prepend a "who you're assisting" block so answers are personalized
-without re-stating it per call. The discipline that matters is the same: give it
-its own heading, keep it constant-per-user, inject it *before* template rendering
-so the envelope stays renderable. AptKit's `injectProfile` does exactly that.
-
-Where it connects: the system/user split is also a trust boundary (12 — user
-content belongs in the user message, never spliced into the system rules), and
-the output-contract section is where structured-output discipline starts (02).
-The rag-query agent's grounding-and-citation instructions ("ground every answer
-in the retrieved chunks, say so plainly if not found") are an anti-hallucination
-guardrail covered alongside the injection defenses in 12. Read 03 next for why the
-whole envelope carries a version.
+This repo's PromptPackage adds a fifth thing the raw message format doesn't:
+provenance (`id`, `version`, `capabilityId`). That's the bridge to concept 03.
 
 ## Interview defense
 
-**Q: Why split system from user instead of one big prompt?**
-Constant vs per-call. The system prompt is the contract — role, rules, output
-shape — and ships with the package, versioned. The user message is the one thing
-that changes per call. Separation is what stops drift: you can change the schema
-injection without re-testing the rules.
+**Q: What are the sections of a production prompt and why keep them separate?**
+System (constant role + rules), context (per-call data via placeholders), few-shot
+examples, user message. Keep them separate because the constant/per-call boundary
+is the seam where drift bugs live — if per-call data leaks into the constant
+system text, your prompt versioning lies and the next caller gets stale data.
 
 ```
-  ┌─ system (constant, versioned) ─┐  seam  ┌─ user (per-call) ─┐
-  │ role + rules + output contract │ ═════► │ the question/task │
-  └────────────────────────────────┘ (flip) └───────────────────┘
-   constant ──────────────────────── axis ──────────── per-call
+  constant ────────┊──────── per-call
+  system + rules   ┊   {schema} {intent} + user question
+                   ┊
+              the {placeholder} seam — keep it sharp
 ```
-Anchor: "constant lives in `system`, per-call lives in `messages` —
-`recommendation-agent.ts:71`."
+*Anchor: `renderPromptTemplate` (`types.ts:24`) is the machine that crosses the seam.*
 
-**Q: Where does context injection go and why not the user message?**
-In the system prompt, at a named `{var}` hole. Schema is per-workspace, not
-per-question — it's stable across many user messages for the same tenant, so it
-belongs with the constant contract, filled once per render by
-`renderPromptTemplate`. Putting it in the user message re-sends it every turn and
-muddies the trust boundary.
-Anchor: "`{schema}` is per-workspace context, filled at `types.ts:24`."
-
-**Q: Where does a user-profile / persona block go, and why inject it before render?**
-Its own prepended section with a heading, ahead of the role line — it's
-constant-per-user, not per-call, so it belongs with the constant contract. Inject
-it *before* `renderPromptTemplate`, not after: `injectProfile` makes the profile
-part of the template, so any `{var}` in either still resolves. Render first and a
-placeholder inside the profile would leak unrendered.
-Anchor: "`injectProfile(template, profile, {position:'start'})` then
-`renderPromptTemplate` at `rag-query-agent.ts:55`."
-
-**Q: A tool description is "just documentation" — why treat it as a prompt?**
-Because it's the text the model reads to *choose* the tool. `search_memory`'s
-description ends with "Use when the answer may depend on something discussed
-earlier" — a when-to-use instruction, not docs. Its sibling `search_knowledge_
-base` has no such clause. The two descriptions partition the model's choice
-between docs and memory; change the wording and you change recall behavior.
-
-```
-  ┌─ search_knowledge_base ─┐  contrast  ┌─ search_memory ──────────┐
-  │ WHAT only, no when-clause│ ═════════► │ WHAT + "Use when..." WHEN │
-  └──────────────────────────┘  (flips)   └───────────────────────────┘
-   describes ──────────────── steering axis ──────────── steers selection
-```
-Anchor: "the 'Use when...' sentence at `memory-tool.ts:38` is steering, not
-docs — `search-knowledge-base-tool.ts:55` has no when-clause."
-
-**Q: Where does a recalled memory's wording come from, and why does it matter twice?**
-From `defaultFormat(turn)` (`conversation-memory.ts:44`). The same formatted
-string is embedded when the turn is remembered and re-injected when it's recalled
-— so the template shapes both what the vector index matches and what the model
-reads back. Drop the `user asked:` framing and recall matches answer-text only,
-and the model can't tell history from a fresh instruction.
-Anchor: "format(turn) is embedded (line 75) and returned (line 102) — one
-template, two jobs."
-
-## Validate
-
-- **Reconstruct:** Draw the four sections and label each constant / per-workspace
-  / per-call, without opening the file.
-- **Explain:** Why does `renderPromptTemplate` (`packages/prompts/src/types.ts:24`)
-  leave an unknown `{var}` untouched instead of erroring? (Hint: the regex
-  returns `match` when the value is undefined.) What does that buy and what does
-  it risk?
-- **Apply:** A new agent needs a per-call `{customer_id}`. Which section does it
-  go in, and where in `recommendation-agent.ts:71` do you wire it?
-- **Defend:** Someone wants to move the `## Hard rules` into the user message "so
-  it's easier to tweak per request." Argue against it using the constant/per-call
-  axis.
+**Q: The load-bearing part people forget?** The *output contract* in the system
+section (`query.ts:48` `## Output`). Drop it and the model's format becomes
+nondeterministic, which breaks every downstream parser. Naming the output mode
+in the system text is what makes concept 07 (output-mode mismatch) a non-issue.
 
 ## See also
 
-- [02-structured-outputs.md](02-structured-outputs.md) — the output-contract section, enforced.
-- [03-prompts-as-code.md](03-prompts-as-code.md) — why the envelope carries id + version.
-- [08-few-shot.md](08-few-shot.md) — the examples section in depth.
-- [12-prompt-injection-defense.md](12-prompt-injection-defense.md) — the system/user split as a trust boundary; grounding/citation as anti-hallucination.
-- `../study-ai-engineering/` — the recall *mechanics* behind `defaultFormat` (embedding, over-fetch-then-filter, the kind tag).
-- `../study-agent-architecture/` — the agent's *decision* to call `search_memory` (tool selection, agentic recall control).
+- `03-prompts-as-code.md` — the provenance the PromptPackage adds on top.
+- `07-output-mode-mismatch.md` — the output contract section, at depth.
+- `08-few-shot.md` — the examples slot that isn't yet wired into the string.
+- `12-prompt-injection-defense.md` — why the system/user role split is a defense.

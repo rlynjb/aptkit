@@ -1,289 +1,125 @@
-# 07 — Routing
+# Routing
 
-*Routing / intent classification / LLM router — Industry standard (router chains;
-the "classify then dispatch" pattern).*
+**Industry standard.** "Intent routing," "LLM router," "classify-then-dispatch." Type label: reasoning pattern (the bridge to multi-agent). **In this codebase: yes — the query agent's `classifyIntent` is an LLM router.**
 
 ## Zoom out, then zoom in
 
-Routing is the one place AptKit lets a model *pick a path* — but read carefully
-*what* it picks, because the honest answer is smaller than the name suggests.
+Routing picks the right handler *before* committing to a loop. aptkit's query agent does exactly this: it classifies a natural-language question into one of three intents, then dispatches. It's also the bridge from single-agent to multi-agent — in a single-agent system routing picks a *tool*; in a multi-agent system the same pattern picks which *agent* runs (the supervisor's core job).
 
 ```
-  Where routing sits, and what it actually controls
+  Zoom out — routing in aptkit's query agent
 
-  ┌─ Studio / caller ────────────────────────────────────────┐
-  │  free-form question                                       │
-  └───────────────────────────┬───────────────────────────────┘
-                              ▼
-  ┌─ ★ ROUTING (query/src/intent.ts) ★ ─────────────────  ← here
-  │  parseIntent (heuristic)  +  classifyIntent (LLM)         │
-  │  output: an intent STRING ('monitoring'|'diagnostic'|     │
-  │          'recommendation')                                │
-  └───────────────────────────┬───────────────────────────────┘
-                              ▼  feeds the string into ONE agent's prompt
-  ┌─ QueryAgent.answer(question, {intent}) ──────────────────┐
-  │  same agent runs regardless; the string only BIASES the  │
-  │  system prompt                                            │
-  └──────────────────────────────────────────────────────────┘
+  ┌─ Caller layer ──────────────────────────────────────────┐
+  │  ★ classifyIntent ★  query/src/intent.ts:13              │ ← we are here
+  │  one model call → "monitoring" | "diagnostic" |          │
+  │                   "recommendation"                       │
+  └───────────────────────────┬──────────────────────────────┘
+                              │ parseIntent maps word → route
+  ┌─ Dispatch layer ──────────▼──────────────────────────────┐
+  │  picks which capability/answer path handles the query     │
+  └────────────────────────────────────────────────────────────┘
 ```
-
-Here's the load-bearing honesty for this file: AptKit's router **picks an intent
-string, not an agent.** The string is fed into the *query agent's* system prompt
-to bias *how* it answers (`query-agent.ts:78-83`). The same `QueryAgent` runs no
-matter what the router decides. So this is *classification that tunes a prompt*,
-not *dispatch that selects a handler.* The textbook router — "classify, then
-route to one of N different agents" — is the bridge case in SECTION C
-(`../03-multi-agent-orchestration/`), and AptKit doesn't do that yet.
-
-Frontend anchor: textbook routing is `react-router` — the URL picks *which
-component mounts*. AptKit's router is more like passing a `variant="diagnostic"`
-prop into one component that's always mounted — same component renders, the prop
-just changes its behavior. Know the difference; interviewers probe exactly here.
 
 ## Structure pass
 
-Trace the **control axis** — "what does the routing decision actually switch" —
-to locate the gap between the name and the reality.
-
-```
-  Control axis: what the routed decision switches
-
-  Layer                  Decision switches…              Switches the agent?
-  ─────────────────────  ──────────────────────────────  ───────────────────
-  textbook router        which of N agents/handlers runs  YES
-  ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─  ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─   ─ ─ ─ ─ ─ ◄ SEAM
-  AptKit intent router   a STRING in one agent's prompt    NO
-```
-
-The seam is whether the decision crosses into *handler selection*. Textbook
-routing crosses it; AptKit's stops short — the decision stays inside one agent
-as a prompt variable. This is a deliberate, modest design: AptKit only has a
-query agent exposed to free-form questions, so there's nothing to dispatch
-*to* yet. The router is built to *grow into* dispatch later (the intents already
-name the three other agents), but today it tunes a prompt.
+**Layers:** classify → dispatch. **Axis: who decides, and how cheaply?** aptkit's router is a single 16-token model call (`intent.ts:25`) — deterministic dispatch, model-decided classification. The seam: classification is *model* judgment (handles paraphrase), dispatch is *code* (deterministic). That split is the production routing pattern — let the model handle ambiguity, let code handle the branch.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-A router is a cheap classifier in front of expensive work: a small, fast
-decision that picks a label, and the label steers what happens next. AptKit
-layers two classifiers — a free heuristic first, an LLM fallback — and both emit
-the *same* label space.
+Routing is a switch statement where the model fills in the case. You know how a form might `switch (field.type)` to pick a renderer? Same shape — except the model reads the user's natural language and returns which case to take.
 
 ```
-  Routing = cheap classify, then steer on the label
+  Routing — heuristic-first, LLM-fallback (the production pattern)
 
-  raw text
-     │
-     ▼
-  ┌─────────────────┐   label    ┌───────────────────────────┐
-  │ CLASSIFY        │ ─────────▶ │ STEER on label             │
-  │ heuristic, then │            │ (here: inject into prompt; │
-  │ LLM fallback    │            │  textbook: pick an agent)  │
-  └─────────────────┘            └───────────────────────────┘
+  Input
+    │
+    ▼
+  ┌─────────────────────┐
+  │ Heuristic router    │  fast, deterministic (parseIntent: substring match)
+  └─────────┬───────────┘
+            │ ambiguous / no clear match
+            ▼
+  ┌─────────────────────┐
+  │ LLM router          │  classify intent, pick the handler
+  └─────────────────────┘
 ```
 
-### Move 2 — the moving parts
+### Move 2 — aptkit's two-piece router
 
-**Heuristic-first: `parseIntent`**
+**Piece 1 — the LLM classifier.** One tiny model call, constrained to one word, with a tight token budget so it can't ramble.
 
-```
-  raw text ─▶ lowercase ─▶ substring match
-     "monitoring" in text? ──▶ 'monitoring'
-     "recommendation"?     ──▶ 'recommendation'
-     "diagnostic"?         ──▶ 'diagnostic'
-     else                  ──▶ 'diagnostic'   (default)
-```
-
-Pseudocode: a few `if (text.includes(...))` checks with a default. Zero model
-calls, instant, free. This is the cheap fast path — if the word is literally in
-the input, you never pay for a model. The default-to-`diagnostic` encodes a
-product bet: "why did X happen" is the most common ask.
-
-**LLM fallback: `classifyIntent`**
-
-```
-  raw text ─▶ ONE model.complete (maxTokens: 16)
-            system: "reply with ONLY one word: monitoring/diagnostic/recommendation"
-            ─▶ raw word ─▶ parseIntent(word)   ← reuses the SAME parser
+```typescript
+// packages/agents/query/src/intent.ts:13
+const response = await model.complete({
+  system: 'Classify the user query as exactly one word: monitoring (what changed / what is new), '
+        + 'diagnostic (why did something happen), or recommendation (what should I do). '
+        + 'Reply with ONLY the one word.',
+  messages: [{ role: 'user', content: query }],
+  maxTokens: 16,   // ← can't produce more than the one word
+});
 ```
 
-Pseudocode: `word = await model.complete({system: classifyPrompt, maxTokens:16});
-return parseIntent(word)`. Note `maxTokens: 16` — this is a *deliberately tiny*
-call, cents not dollars, because a router must be cheap relative to the work it
-gates. And it pipes its output back through `parseIntent`, so the LLM's free-form
-word gets normalized by the same substring matcher — one canonical label space,
-two ways to reach it.
+**Piece 2 — the deterministic parser (the heuristic).** `parseIntent` maps the model's word to a route by substring match, with a safe default — so even a noisy model answer routes somewhere sane.
 
-**Steer: feed the label into the prompt**
-
-```
-  intent string ─▶ renderPromptTemplate(prompt, { intent }) ─▶ system prompt
-                ─▶ same QueryAgent runs, biased by the string
-```
-
-Pseudocode: `system = render(prompt, {intent}); runAgentLoop({system, ...})`.
-This is the step that *isn't* dispatch. The string becomes a template variable.
-The agent's behavior shifts; the agent itself does not.
-
-### Move 3 — the principle
-
-A good router is cheaper than what it gates and emits one canonical label —
-heuristic-first then LLM-fallback gives you free hits with a smart backstop; just
-be honest about whether the label switches a *handler* or merely a *prompt*.
-
-## Primary diagram
-
-The two-tier classifier, the shared label space, and the honest stopping point —
-the label tunes a prompt, it does not pick an agent.
-
-```
-  AptKit routing — two-tier classify, then prompt-bias (NOT dispatch)
-
-  raw question
-       │
-       ▼
-  ┌──────────────┐  match?  yes ─────────────────────┐
-  │ parseIntent  │ (free, substring)                  │
-  └──────┬───────┘                                    │
-         │ no clear match                              │
-         ▼                                             ▼
-  ┌──────────────┐  word   ┌──────────────┐    intent string
-  │ classifyIntent│ ──────▶│ parseIntent  │ ──▶ 'diagnostic' | ...
-  │ LLM, 16 tok  │         │ (normalize)  │           │
-  └──────────────┘         └──────────────┘           ▼
-                                          renderPromptTemplate({intent})
-                                                       │
-                                                       ▼
-                              QueryAgent.answer — SAME agent, biased prompt
-                              ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
-                              (textbook router would branch to 3 agents HERE)
-```
-
-Everything above the dashed line exists; the branch-to-three-agents below it is
-SECTION C's job.
-
-## Implementation in codebase
-
-**Use case: a free-form question needs the right *framing* before the query
-agent answers it.** "What changed last week" wants a monitoring framing; "why
-did revenue drop" wants a diagnostic one. The router picks the framing label.
-
-`packages/agents/query/src/intent.ts:4` — the free heuristic path:
-
-```ts
-// intent.ts:4-10 — substring match, zero model calls, defaults to diagnostic
+```typescript
+// packages/agents/query/src/intent.ts:4
 export function parseIntent(raw: string): Intent {
   const text = raw.trim().toLowerCase();
   if (text.includes('monitoring')) return 'monitoring';
   if (text.includes('recommendation')) return 'recommendation';
   if (text.includes('diagnostic')) return 'diagnostic';
-  return 'diagnostic';                                  // ← product-bet default
+  return 'diagnostic';   // ← default: don't crash on an off-format answer
 }
 ```
 
-`intent.ts:12` — the LLM fallback, deliberately tiny, normalized through the
-same parser:
+The interesting choice is the **default to `diagnostic`** (line 10). The model might return "I think this is a diagnostic question" instead of just "diagnostic" — the substring match catches it. And if it returns garbage, it routes to diagnostic rather than throwing. That's the heuristic guarding the LLM, the production pattern in miniature: model for the ambiguous classification, code for the robust dispatch.
 
-```ts
-// intent.ts:12-29 — one cheap classify call, output piped back through parseIntent
-export async function classifyIntent(model, query, options = {}): Promise<Intent> {
-  const response = await model.complete({
-    system: 'Classify the user query as exactly one word: monitoring ... diagnostic ... recommendation ... Reply with ONLY the one word.',
-    messages: [{ role: 'user', content: query }],
-    maxTokens: 16,                                      // ← router must be cheap
-    signal: options.signal,
-  });
-  const text = /* extract text blocks */;
-  return parseIntent(text);                             // ← one canonical label space
-}
+**The boundary condition.** A pure-LLM router with no parsing fallback breaks the first time the model returns "monitoring." or "Monitoring:" or a full sentence. `parseIntent`'s substring-match-plus-default is what makes the router survive a weak local model — the same defensive instinct as the `minTopK` floor and the Gemma retry nudge.
+
+### Move 3 — the principle
+
+Routing is the bridge from SECTION A to SECTION C. Here it picks an answer path; in a supervisor-worker topology the identical pattern picks which *agent* handles the request. The production shape is heuristic-at-the-front for the predictable high-volume routes, LLM-at-the-back for the ambiguous ones — and aptkit's classify-then-parse is the two-call version of that.
+
+## Primary diagram
+
 ```
+  aptkit's query router — classify then dispatch
 
-Where the label is *used* — and where it stops short of dispatch —
-`packages/agents/query/src/query-agent.ts:78-83`:
-
-```ts
-// query-agent.ts:78-83 — the intent becomes a PROMPT VARIABLE, not a handler choice
-const intent = runOptions.intent ?? 'diagnostic';
-const system = renderPromptTemplate(this.prompt, {
-  schema: schemaSummary(this.options.workspace),
-  project_id: this.options.workspace.projectId,
-  intent,                                               // ← biases the prompt; same agent runs
-});
+  ┌─ NL question ────────────────────────────────────────────┐
+  └───────────────────────────┬──────────────────────────────┘
+                              ▼
+  classifyIntent ─model call (16 tok)─► raw word    [Caller→Provider hop]
+                              │
+                              ▼
+  parseIntent ─substring match + default─► 'monitoring' |
+                                           'diagnostic' (default) |
+                                           'recommendation'
+                              │
+                              ▼
+  dispatch to the matching answer path
 ```
-
-There is no `if (intent === 'monitoring') return monitoringAgent.scan()` anywhere
-— the string only flows into the template. That absence is the whole honest
-point of this file.
 
 ## Elaborate
 
-**Origin.** Router chains (LangChain's `RouterChain`, `MultiPromptChain`)
-formalized "classify the input, then dispatch to the matching sub-chain." The
-heuristic-first-then-LLM layering is a standard cost optimization: pay for the
-model only when cheap rules can't decide — the same instinct as a cache before a
-network call.
-
-**Adjacent concepts.** The textbook *agent* router (classify → run one of N
-*agents*) is the bridge to multi-agent orchestration: a supervisor is a router
-whose labels are workers (`../03-multi-agent-orchestration/`). AptKit's router is
-the *degenerate* case — N=1 agent, the label only tunes its prompt. Semantic
-routing (embed the query, nearest-neighbor against labeled exemplars) is the
-vector-based cousin; AptKit uses substring + a tiny LLM call instead, which is
-cheaper and good enough for three coarse intents.
+Routing is the cheapest way to specialize a system without going multi-agent: instead of one giant agent that handles everything, classify first and run a focused path. aptkit's three intents (what changed / why / what to do) map onto the three analytics concerns its agents cover — so the router is also a map of the capability surface. If aptkit ever composed those agents into one multi-agent system, `classifyIntent` is exactly the supervisor's routing step, lifted unchanged.
 
 ## Interview defense
 
-**Q: "You said you have routing — does it pick which agent runs?"**
+**Q: How does your query agent decide what to do?**
+A two-piece router. An LLM classifier — one 16-token call constrained to a single word (monitoring/diagnostic/recommendation) — then `parseIntent`, a deterministic substring match with a safe default. The model handles the ambiguity of natural language; the code handles robust dispatch. The default-to-diagnostic is deliberate: a weak local model that returns a full sentence still routes somewhere sane instead of crashing.
 
 ```
-  what the label switches, honestly
-
-  AptKit:   label ─▶ prompt variable ─▶ SAME QueryAgent (no handler switch)
-  textbook: label ─▶ pick 1 of N agents  (handler switch)
+  classify (model, ambiguity) → parseIntent (code, robust dispatch + default)
 ```
+*Anchor: heuristic guards the LLM — same defensive pattern as the top_k floor.*
 
-Anchor: "It's intent *classification* that biases one agent's prompt — it picks a
-string, not an agent; turning it into real dispatch is a SECTION C change, not a
-done thing." Saying this unprompted is the credibility move.
-
-**Q: "Why two classifiers instead of just the LLM?"**
-
-```
-  parseIntent (free) ─▶ hit?  yes ─▶ done, $0
-                          no  ─▶ classifyIntent (LLM, 16 tokens)
-```
-
-Anchor: "Heuristic-first means I pay for the model only on ambiguous inputs — a
-router has to be cheaper than the work it gates, or it's not worth running."
-Surfaces the skeleton part: `classifyIntent` is a *single* `model.complete`
-(`intent.ts:17`), not a `runAgentLoop` — routing is a chain step, not an agent
-(tie back to `01-chains-vs-agents.md`).
-
-## Validate
-
-- **Reconstruct:** Draw the two-tier classifier and mark where the LLM output is
-  re-normalized (`intent.ts:28`, `return parseIntent(text)`).
-- **Explain:** Why is `classifyIntent` a chain step, not an agent? (one
-  `model.complete`, `maxTokens:16`, no loop, no tools — `intent.ts:12-23`.)
-- **Apply:** You want routing to actually run different agents. What's the
-  minimal change and where? (replace the prompt-variable injection at
-  `query-agent.ts:80-83` with a switch dispatching to `scan`/`investigate`/
-  `propose` — i.e., promote the label from prompt-var to handler-selector;
-  that's the SECTION C supervisor.)
-- **Defend:** A reviewer says "you don't really have routing." Concede the
-  precise sense and defend what *is* there. (concede: no agent dispatch; defend:
-  a real two-tier cost-tiered intent classifier with one canonical label space,
-  built to grow into dispatch — `intent.ts:4,12`.)
+**Q: How does this become a supervisor in a multi-agent system?**
+Unchanged. In single-agent it picks an answer path; in supervisor-worker the same classify step picks which worker agent runs. The router IS the supervisor's routing half — the other half is synthesis, which aptkit doesn't have yet because the agents don't compose.
 
 ## See also
 
-- [01-chains-vs-agents.md](01-chains-vs-agents.md) — why `classifyIntent` is a
-  chain step, not an agent
-- [02-agent-loop-skeleton.md](02-agent-loop-skeleton.md) — the agent the routed
-  string feeds into
-- `../03-multi-agent-orchestration/` — where routing grows up into a supervisor
-  that picks an *agent* (the dispatch this file stops short of)
-- `.aipe/study-prompt-engineering/` — how the injected `intent` string shapes the
-  query agent's system prompt
+- `01-chains-vs-agents.md` — the router is the chain-side step
+- `03-multi-agent-orchestration/02-supervisor-worker.md` — routing as the supervisor's core job
+- `02-agentic-retrieval/03-retrieval-routing.md` — the same pattern applied to picking a knowledge source

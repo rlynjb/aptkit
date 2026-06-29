@@ -1,211 +1,194 @@
-# 02 — Processes, Threads, and Tasks
+# Processes, Threads, and Tasks — where work actually runs
 
-**Industry name:** concurrency model / unit-of-work · *Language-agnostic*
+**Industry name(s):** process/thread model · task scheduling (async tasks) · **Type:** Industry standard (Node single-threaded event loop)
 
 ## Zoom out, then zoom in
 
-Where does a "unit of work" live in AptKit? Not in a thread. Here's the band it occupies.
+aptkit's answer to "where does work run" is short: one process, one thread, many *tasks*. The interesting part is what a "task" is when there are no threads to put it on.
 
 ```
-  Zoom out — the unit of concurrency, by layer
+  Zoom out — the three scheduling levels, only one is real here
 
-  ┌─ OS layer ──────────────────────────────────────────────┐
-  │  processes: node (server), node (script), browser tab    │
-  └──────────────────────────┬───────────────────────────────┘
-  ┌─ Runtime layer ──────────▼───────────────────────────────┐
-  │  ★ ONE thread per process — no worker_threads ★          │ ← we are here
-  └──────────────────────────┬───────────────────────────────┘
-  ┌─ Application layer ──────▼────────────────────────────────┐
-  │  tasks = awaited Promises (model call, tool call, chunk)  │
-  └───────────────────────────────────────────────────────────┘
+  ┌─ OS level: PROCESSES ─────────────────────────────────────────────┐
+  │   one Node process per run (test / script / dev server)           │
+  │   parallel? only if you launch several — aptkit never forks workers │
+  └────────────────────────────────────┬───────────────────────────────┘
+  ┌─ Runtime level: THREADS ────────────▼───────────────────────────────┐
+  │   exactly ONE JS thread. no worker_threads, no cluster.            │ ← the whole story
+  │   ★ all aptkit logic is scheduled here ★                          │
+  └────────────────────────────────────┬───────────────────────────────┘
+  ┌─ Language level: TASKS ─────────────▼───────────────────────────────┐
+  │   Promises / async functions — interleaved on the one thread        │
+  │   a "task" = an async function suspended at an await                │
+  └──────────────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: in a threaded runtime (Java, Go, a Rust tokio worker pool) the unit of concurrency is a thread or goroutine and you reason about which one holds what. In AptKit the unit is an **awaited Promise on a single thread**. The question "how many things run at once?" has a blunt answer: *one*. What varies is how many are *suspended at an await*, waiting to resume. That distinction — running vs suspended — replaces the entire threading mental model here.
+**Zoom in.** When people say "tasks" in a multi-threaded runtime they mean units of work a scheduler hands to threads. In aptkit there's no thread pool to hand work to — a "task" is just an `async` function call that suspends at an `await` and resumes when its Promise settles. The scheduler is the JS event loop. That's the model; the mechanics are how aptkit's loops sit on top of it.
 
 ## Structure pass
 
-**Layers.** Process → thread → task, as in the zoom-out. The interesting layer is the middle one, because it's *empty* of the thing you'd expect (no second thread).
-
-**Axis — "how many of these run simultaneously?"** Trace it down:
+Trace the **failure** axis across the three levels — where can a unit of work die, and what does it take down with it?
 
 ```
-  One question down the layers: "how many run at the same instant?"
+  Axis: "if this unit fails, what dies?" — across scheduling levels
 
-  ┌─ processes ─────────────┐   MANY (OS runs them truly in parallel)
-  └────────────┬────────────┘
-       ┌───────▼────────────┐   exactly ONE thread per process
-       │  threads           │   (the answer collapses here)
-       └───────┬────────────┘
-           ┌───▼──────────────┐ exactly ONE task executing,
-           │  tasks           │ N suspended at awaits
-           └──────────────────┘
+  ┌──────────────────────────────────────────────┐
+  │ PROCESS: an unhandled throw at top level      │  → the whole run exits
+  └───────────────────┬────────────────────────────┘
+      ┌───────────────▼──────────────────────────┐
+      │ THREAD: n/a — one thread = process         │  → no thread to lose independently
+      └───────────────┬──────────────────────────┘
+          ┌───────────▼──────────────────────────┐
+          │ TASK: an await rejects                 │  → the awaiting function's
+          │ (caught in try/catch in the loop)      │    Promise rejects; loop decides
+          └─────────────────────────────────────────┘
 ```
 
-The answer flips hard at the thread layer: many processes truly parallel, but inside each, exactly one thread, so exactly one task's code running at any instant. Everything else is *suspended*, parked at an `await`, waiting for the loop to resume it.
-
-**Seams.** The one seam that matters: the `await` point inside `runAgentLoop`'s tool loop. It looks like it could be a fan-out seam (multiple tools → parallel execution) but it isn't — it's a sequential `for...of`. That gap between "looks parallel" and "is serial" is the load-bearing observation of this file.
+The seam that matters: **thread = process.** Because there's one thread, there's no isolation between "tasks" — a synchronous CPU loop in one task (the cosine scan) blocks *every* other pending task until it finishes. The flip side: there's also no shared-memory race between tasks, because only one runs at a time (`04` builds on this). The single-thread choice buys safety and costs isolation.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know how `Promise.all([a, b, c])` *starts* three fetches before any resolves, vs `for (const x of [a,b,c]) await x()` which finishes each before starting the next? AptKit is entirely the second shape. The strategy: **sequential awaited tasks, never concurrent ones.**
+You know this from the browser: `setTimeout`, `fetch().then()`, `await` — none of them spawn a thread. They register work that the event loop picks up later, on the same thread. A "task" is a continuation, not a worker.
 
 ```
-  The two shapes — AptKit uses only the right one
+  Tasks on one thread — interleaving, not parallelism
 
-  Promise.all (NOT used):     for-await (used everywhere):
-    a ──┐                       a ──► (done) ──► b ──► (done) ──► c
-    b ──┤ all in flight           one finishes before the next starts
-    c ──┘ at once                 total time = sum, not max
+  thread:  ████ task A runs ████─await─░░░░░░░░░░─████ A resumes ████
+                                 │              ▲
+                                 │ task B can   │ when A's Promise
+                                 ▼ run here      settles, A is re-queued
+                              ████ task B ████
+
+  two tasks "in flight" — but never two running at the same instant
 ```
 
-### Move 2 — walking the model
+The strategy aptkit uses: **express every slow operation as an awaited Promise so the one thread can interleave tasks, and never schedule work onto threads because there are none.** Concurrency exists (multiple agent runs could be in flight); parallelism does not (no two run simultaneously).
 
-**A process owns a heap and a loop.** Each `node` invocation is isolated: separate V8 heap, separate event loop, separate `process.env`. Two scripts can't see each other's variables. The dev server is one long-lived process; each `scripts/*.mjs` is a fresh one that exits.
+### Move 2 — the agent loop as the task scheduler
 
-**A process has exactly one JS thread.** This is verified, not assumed: there is no `worker_threads`, no `new Worker`, no `child_process` fan-out, no `cluster` anywhere in the source. All "concurrency" is cooperative interleaving on one thread.
-
-```
-  Inside one process — one thread, tasks interleave at awaits
-
-  time ──────────────────────────────────────────────►
-  thread:  [taskA runs][  await — loop idle/other  ][taskA resumes]
-                            ▲
-                            └─ here, and ONLY here, another suspended
-                               task could run; never mid-synchronous-block
-```
-
-**A task is one awaited Promise continuation.** When `runAgentLoop` hits `await model.complete()`, the function suspends, the loop is free, and it resumes when the network reply lands. The tool loop then suspends again at each `await tools.callTool(...)`.
-
-**The tool loop is sequential — this is the load-bearing detail.** When a model turn returns three `tool_use` blocks, you might expect them to run at once. They don't. The loop walks them in a `for...of` and awaits each before starting the next. Three independent 200ms tools take 600ms, not 200ms.
+The clearest place to see aptkit's task model is `runAgentLoop`. It *is* a hand-written sequential scheduler: a `for` loop where each iteration is "do one model call, then do its tool calls," strictly in order.
 
 ```
-  Tool execution within one turn — serial, not fanned out
+  runAgentLoop as a sequential task driver — run-agent-loop.ts:98
 
-  toolUses = [getMetric, getSegments, listVouchers]
-       │
-       for (const toolUse of toolUses):
-         await callTool(getMetric)     ── 200ms ──► result
-         await callTool(getSegments)   ── 200ms ──► result   (starts AFTER above)
-         await callTool(listVouchers)  ── 200ms ──► result   (starts AFTER above)
-       │
-       └─ total ≈ 600ms. Promise.all would be ≈ 200ms — but these results
-          all feed the SAME next message, so order doesn't matter and the
-          code chose simplicity over the parallel win
+  for turn in 0..maxTurns:
+      signal?.throwIfAborted()              // ← cancellation check, every turn
+      response = await model.complete(...)  // ← TASK 1: suspend on HTTP
+      for each toolUse in response:
+          result = await tools.callTool(...) // ← TASK 2..n: one tool at a time
+      append results, loop
 ```
 
-**Why-it-breaks-if-removed framing:** the sequential `for...of` is what guarantees `toolCalls` is appended in a deterministic order and that trace events emit in causal sequence. Swap in `Promise.all` and you'd gain latency but lose ordered traces and would need to handle partial failure across the batch. For dependent agent reasoning the sequential choice is defensible; for a turn with provably independent tools it's latency left on the table.
+**The model call is one suspended task.** Real code, `run-agent-loop.ts:103`:
 
-### Move 2.5 — current state vs future state
-
-```
-  Phase A (now): sequential tools          Phase B (if needed): bounded fan-out
-  ────────────────────────────────         ──────────────────────────────────
-  for (const t of toolUses)                 await Promise.all(
-    await callTool(t)                         toolUses.map(t => callTool(t)))
-  • deterministic order                     • latency = max, not sum
-  • simple cancellation (one await)         • need per-tool error isolation
-  • trace events in causal order            • need a concurrency cap (p-limit)
-                                            • trace ordering becomes nondeterministic
+```ts
+const response = await model.complete({
+  system: forceFinal && synthesisInstruction ? `${system}\n\n${synthesisInstruction}` : system,
+  messages,
+  tools: forceFinal ? undefined : toolSchemas,
+  maxTokens,
+  signal,
+});
 ```
 
-What *doesn't* have to change to get there: the `AbortSignal` already threads into each `callTool` (`run-agent-loop.ts:159`), so cancellation survives a fan-out. The cost is error handling and trace determinism, not plumbing.
+The `await` here is where the thread is free. While this Promise is pending, the OS is doing the HTTP work to Ollama or the cloud; the event loop could run another task if one were queued. This is the only "task switch" that matters in aptkit — at an I/O boundary.
+
+**Tool calls run strictly one at a time.** `run-agent-loop.ts:139`:
+
+```ts
+for (const toolUse of toolUses) {
+  // ...
+  const { result, durationMs } = await tools.callTool(toolUse.name, toolUse.input, { signal });
+  // ...
+}
+```
+
+This is a deliberate, and arguably suboptimal, choice. If a model returns three tool calls in one turn, aptkit `await`s them sequentially — call one, wait, call two, wait, call three. They're independent; they could be `Promise.all`'d for lower wall-clock latency. They aren't. The call was right at this scale (tool calls are mostly local synchronous work or single HTTP calls, and sequential is simpler to trace and to attribute cost to), but it's the obvious first lever if tool latency ever dominates. Name it in an interview: "tool calls within a turn are sequential, not fanned out — that's the latency I'd parallelize first."
+
+**There is no fan-out anywhere.** Grep confirms zero `Promise.all`, `Promise.allSettled`, `Promise.race`, or `p-limit` across `packages/`. Every multi-item operation is a sequential loop:
+
+```
+  Three places that COULD parallelize but don't
+
+  ┌─ tool calls in a turn ────────────┐  run-agent-loop.ts:139  → sequential await
+  ┌─ provider fallback chain ─────────┐  fallback-provider.ts:50 → sequential (correct: it's
+  │                                    │                            try-next-on-failure, not fan-out)
+  ┌─ embedding a batch of chunks ─────┐  pipeline.ts:40           → one embed() call,
+  │                                    │                            batched server-side (good)
+  └────────────────────────────────────┘
+```
+
+The fallback chain *should* be sequential — it's "try A, if A fails try B," which is inherently ordered. The embedding batch is already efficient — `embedder.embed(texts)` sends all chunk texts in one HTTP request (`pipeline.ts:40`), so the batching happens server-side in Ollama. The tool-call loop is the only one where sequential is a latency choice rather than a correctness requirement.
+
+**Processes: the one place aptkit spawns.** `scripts/pack-core-standalone.mjs:68`:
+
+```ts
+const result = spawnSync(command, args, { cwd, stdio: 'inherit' });
+```
+
+`spawnSync` — synchronous, blocking. It shells out to `npm pack` during the publish flow, waits for it to finish, reads the exit code. This is a build-time script, not runtime, and `Sync` means it doesn't even use the event loop — it blocks the thread until the child exits. Correct for a sequential build step; it would be wrong in a request path.
 
 ### Move 3 — the principle
 
-In single-threaded JS, "concurrency" is the count of suspended-at-await tasks, and "parallelism" (simultaneous execution) requires a second process or thread you don't have. The skill is knowing which of your awaits *could* overlap (independent I/O) and choosing whether the latency win is worth the loss of ordering and the added error-handling. AptKit consistently chooses sequential — correct for dependent steps, conservative for independent ones.
+A single-threaded task model is a trade: you give up CPU parallelism and task isolation, and you get freedom from data races and a dramatically simpler mental model. aptkit takes that trade everywhere — which is the right default for an I/O-bound system where the expensive thing is always a network call, not a computation. The skill is knowing the *one* place the trade bites: when CPU work grows large enough that running it inline stalls every other task. That's the cosine scan, and it's why `worker_threads` is the named escape hatch in `05` and `08`, not used today but the correct move the day the corpus gets big.
 
 ## Primary diagram
 
-```
-  Process / thread / task — the full picture
-
-  ┌─ OS: many processes, truly parallel ─────────────────────────┐
-  │                                                              │
-  │  ┌─ node (dev server) ──────┐   ┌─ node (script) ──────────┐ │
-  │  │ ONE thread, ONE loop     │   │ ONE thread, ONE loop     │ │
-  │  │                          │   │                          │ │
-  │  │ tasks (1 running, N      │   │ for-await over fixtures, │ │
-  │  │ suspended at awaits):    │   │ strictly sequential      │ │
-  │  │  • model.complete  ◄─I/O │   │  await runFixtureReplay  │ │
-  │  │  • callTool (serial)     │   │  await runFixtureReplay  │ │
-  │  │  • res.write             │   │  → process.exitCode      │ │
-  │  └──────────────────────────┘   └──────────────────────────┘ │
-  └───────────────────────────────────────────────────────────────┘
-       NO worker_threads · NO SharedArrayBuffer · NO cluster
-```
-
-## Implementation in codebase
-
-**Use cases.** This model is reached for every time the agent loop runs a turn (sequential tools), every time a script batch-replays fixtures (sequential loop), every time the RAG `ask` CLI indexes its corpus (`for (const doc of CORPUS) await pipeline.index(doc)` — one doc at a time), and every time you ask "can I speed this up by parallelizing?" (you can, with the Phase B trade).
-
-The RAG indexer is a clean illustration of the sequential-vs-batched distinction. Docs index serially, but *within* one doc the chunks embed in a single batched call — `indexDocument` builds the whole chunk array, then `await embedder.embed(texts)` once (`packages/retrieval/src/pipeline.ts:39-46`). So the batching boundary is "one HTTP round-trip per document," not "one per chunk." That's the right granularity: the embed transport already accepts an array, so chunk-level batching is free, while doc-level stays serial for the same deterministic-order reason the tool loop does.
-
-**Code side by side.**
-
-The sequential tool loop — the heart of the claim:
+The complete picture: one process, one thread, tasks interleaved at await points, no parallelism.
 
 ```
-  packages/runtime/src/run-agent-loop.ts (lines 139–189)
+  aptkit's scheduling model — complete
 
-  for (const toolUse of toolUses) {                  ← one tool at a time
-    trace?.emit({ type: 'tool_call_start', ... });   ← emits BEFORE awaiting
-    try {
-      const { result, durationMs } =
-        await tools.callTool(toolUse.name, toolUse.input, { signal }); ← suspends here
-      toolCall.result = result;
-    } catch (error) { ... }                           ← per-tool error, loop continues
-    toolCalls.push(toolCall);                         ← ordered append
-    trace?.emit({ type: 'tool_call_end', ... });
-  }
-       │
-       └─ no Promise.all: the next iteration's await does not begin until this
-          one settles. Order of toolCalls and trace events is deterministic.
-```
-
-Sequential batch in a script process:
-
-```
-  scripts/replay-promoted-fixtures.mjs (lines 28–40)
-
-  for (const fixturePath of fixturePaths) {
-    const result = await runFixtureReplay(fixturePath); ← awaited, one fixture at a time
-    results.push({ ... });
-  }
-       │
-       └─ a 50-fixture suite runs them in series; total time = sum of all replays
+  ┌─ ONE Node process ──────────────────────────────────────────────────┐
+  │  ┌─ ONE JS thread (event loop) ─────────────────────────────────────┐ │
+  │  │                                                                    │ │
+  │  │  runAgentLoop  ──(for turn)──►  await model.complete()  ──┐       │ │
+  │  │       │                          (task suspends here)      │ HTTP  │ │
+  │  │       │                                                    │       │ │
+  │  │       └──(for toolUse)──► await tools.callTool() ──────────┤ HTTP  │ │
+  │  │                            ↑ sequential, one at a time     │       │ │
+  │  │                                                            │       │ │
+  │  │  cosine scan / JSON.parse / sort ── run INLINE, block ─────┘       │ │
+  │  │                                                                    │ │
+  │  │  ✗ no worker_threads  ✗ no cluster  ✗ no Promise.all fan-out      │ │
+  │  └────────────────────────────────────────────────────────────────────┘ │
+  │  build-time only: spawnSync('npm pack') — blocking, off hot path        │
+  └────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The "no threads" choice isn't a gap — it's Node's whole proposition. Threads earn their keep for CPU-bound work (image resize, ML inference, parsing huge files). AptKit's work is I/O-bound: it spends nearly all wall-clock time *waiting* on the provider API, where the CPU is idle anyway and a thread would just sleep. The one place in Rein's portfolio where threading genuinely earns its place is `contrl` — an on-device ML pipeline with a hard frame-rate budget, using Worklets-core to keep pose inference off the JS thread. That's the right tool *there* because the work is CPU-bound and latency-critical. AptKit's agent loop is the opposite workload, so it's correctly single-threaded. `not yet exercised` here: `worker_threads`, `cluster`, process pools, `child_process` fan-out — none present, and none warranted by this workload.
+Node's single-threaded model came from the observation that web servers spend almost all their time waiting on I/O, so threads (with their memory and context-switch cost, and their locking hazards) were the wrong tool — an event loop over non-blocking I/O does the same job with one thread. aptkit fits that thesis perfectly: it's a thin orchestration layer over LLM and embedding HTTP calls. The model breaks down precisely when work becomes CPU-bound rather than I/O-bound — which is the cosine scan's future. Node's answer to *that* is `worker_threads` (true OS threads with message-passing, no shared mutable state by default), and that's the escape hatch aptkit would reach for. See `study-distributed-systems` for the multi-process coordination story (buffr's runtime), and `study-performance-engineering` for measuring when the inline-CPU bet stops paying off.
 
 ## Interview defense
 
-**Q: "Three tools in one turn — parallel or serial here? Why?"**
+**Q: How many threads does aptkit use, and what's a "task" in this codebase?**
 
 ```
-  toolUses → [A][B][C]
-  for(...) await callTool   →   A done, then B, then C   (serial, sum of latencies)
-  alternative: Promise.all  →   A‖B‖C                      (max latency, but...)
-                                 ...nondeterministic traces + batch error handling
+  threads: ONE (no worker_threads / cluster / new Worker anywhere)
+  a task  = an async function suspended at an await
+  scheduler = the JS event loop; runAgentLoop is a hand-written
+              sequential driver over those tasks
 ```
 
-Answer: "Serial — a `for...of` with an `await` inside. It's the conservative call: deterministic trace ordering and trivial cancellation, at the cost of latency when the tools are independent. The fan-out version needs a concurrency cap and per-tool error isolation, which the codebase didn't take on." Anchor: `run-agent-loop.ts:139–189`. The part people forget: the trace events `emit` in causal order *because* it's serial — parallelize and you lose that for free.
+Anchor: "It's a single-threaded async-task model — `runAgentLoop` is literally a `for` loop that awaits one model call then its tool calls in order."
 
-**Q: "Is there any true parallelism in this repo?"** Only at the OS process level (two scripts, or a script + the dev server, run on different cores). Inside any one process: one thread, never. No `worker_threads`/`Worker`/`SharedArrayBuffer`.
+**Q: Name a place the code could parallelize but chose not to, and why.**
 
-## Validate
+```
+  within-turn tool calls — run-agent-loop.ts:139
+  three tool calls → three sequential awaits, not Promise.all
 
-1. **Reconstruct:** Write the sequential tool loop in pseudocode and mark where it suspends.
-2. **Explain:** Why does serial tool execution give deterministic trace ordering? (Each `emit` runs to completion before the next `await` resumes — `run-agent-loop.ts:147,171`.)
-3. **Apply:** You profile a turn at 600ms with three independent 200ms tools. What's the change and its cost? (Phase B fan-out → ~200ms, costs trace determinism + batch error handling.)
-4. **Defend:** Argue why threads would not help the agent loop, and name the workload shape that *would* need them.
+  right call now: simpler tracing + cost attribution, tools are cheap
+  first lever later: fan them out if tool latency ever dominates
+```
+
+Anchor: "Tool calls inside a turn are sequential — independent ones could be `Promise.all`'d. That's the latency I'd parallelize first if it ever mattered."
 
 ## See also
 
-- `03-event-loop-and-async-io.md` — what the loop does while a task is suspended.
-- `04-shared-state-races-and-synchronization.md` — why one thread means no locks.
-- `07-backpressure-bounded-work-and-cancellation.md` — the bounds on this sequential work.
-- `.aipe/study-performance-engineering/` *(when generated)* — the latency case for/against fan-out.
+- `03-event-loop-and-async-io.md` — what the event loop does at those await points, and the one task that blocks it
+- `04-shared-state-races-and-synchronization.md` — why one thread sidesteps races, and the single shared-state seam
+- `05-memory-stack-heap-gc-and-lifetimes.md` — the `worker_threads` escape hatch for the CPU scan

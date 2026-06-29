@@ -1,246 +1,89 @@
-# 06 — Tree-of-Thoughts
+# Tree of Thoughts
 
-*Tree-of-Thoughts (ToT) — Industry standard as a paper (Yao et al. 2023); rare
-in production.*
+**Industry standard.** "Tree of Thoughts," "ToT," "branching search over reasoning." Type label: reasoning pattern. **In this codebase: not implemented, and correctly so.** aptkit explores no reasoning branches; it runs a single ReAct path. Cover it so you can say *why you didn't use it* — which is the more common (and stronger) interview answer.
 
 ## Zoom out, then zoom in
 
-This pattern is *not in AptKit, and that is the correct decision.* Place the
-empty-and-staying-empty slot.
+ToT explores multiple reasoning branches, scores them, and picks the best. It's the heaviest pattern in the family, and it rarely earns its cost in production. aptkit doesn't touch it.
 
 ```
-  The reasoning family, with the slot AptKit rightly skips
+  Zoom out — ToT's place in the family (aptkit skips it)
 
-  ┌─ reasoning patterns ─────────────────────────────────────┐
-  │   chain                                                   │
-  │   ReAct ───────────── 5 agents                            │
-  │   plan-and-execute ── NOT BUILT                           │
-  │   reflexion ───────── rubric agent                        │
-  │   ★ tree-of-thoughts ★ ── NOT BUILT (correctly)  ← here   │
+  ┌─ Pattern family (SECTION A) ────────────────────────────┐
+  │  ReAct → plan-execute → reflexion → ★ Tree of Thoughts ★ │
+  │  (aptkit is at ReAct)              (not exercised)        │
   └──────────────────────────────────────────────────────────┘
 ```
 
-Let me be blunt up front, because this is the file where hedging would hurt
-you: tree-of-thoughts is **rarely worth it in production.** It explores multiple
-reasoning branches in parallel, scores them, and keeps the best — which means
-its cost is the *branching factor times the depth* in model calls. For the
-analytics work AptKit does, that's a multiplier on latency and token spend to
-solve a problem ReAct already solves linearly. AptKit doesn't use it. That's not
-a gap; it's good judgment.
-
-Where ToT genuinely earns its cost: puzzle-like problems with a *verifiable*
-intermediate state and a real risk of *early wrong commitment* — Game of 24,
-crosswords, certain proof search. AptKit has none of those. Anomaly diagnosis
-doesn't branch into combinatorial possibilities you must search; it's a short
-chain of grounded lookups.
-
-Frontend anchor: ReAct is a single async function picking one next call.
-Tree-of-thoughts is `Promise.all([branchA(), branchB(), branchC()])` — but where
-each branch *itself* spawns more `Promise.all`s, and you run a scoring pass to
-throw most of them away. You'd only build that if one straight path measurably
-dead-ends. For a settings form, you'd never. For a chess engine, maybe.
-
 ## Structure pass
 
-Trace the **cost axis** — "model calls per solved problem" — to show why ToT is
-a hard sell.
-
-```
-  Cost axis: model calls to reach an answer
-
-  Pattern             Model calls (rough)             When the cost pays off
-  ──────────────────  ──────────────────────────────  ──────────────────────
-  ReAct               ~ N steps (linear)              almost always
-  ─ ─ ─ ─ ─ ─ ─ ─ ─   ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─   ─ ─ ─ ─ ─ ◄ SEAM
-  tree-of-thoughts    ~ branching^depth + scoring     verifiable search,
-                      (exponential-ish)               early-commit risk
-```
-
-The seam is where linear becomes branching. Above it ReAct pays N calls. Below
-it ToT pays a branching factor raised to a depth, *plus* a scoring call per
-frontier. You cross that seam only when a linear path provably can't find the
-answer — a condition AptKit's analytics tasks never hit.
+**Axis: cost per answer.** ToT multiplies token cost by the branch factor — explore 3 paths, pay ~3x. aptkit's cost discipline runs the other way: `maxToolCalls` caps, a `usage-ledger` tracks spend, a local Gemma default makes the cheap path free. The seam between ToT and aptkit's philosophy is cost: ToT spends *more* to chase a better answer; aptkit spends *less* and hardens the single path.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-Tree-of-thoughts generates several candidate next-thoughts at each step,
-*scores* them, *prunes* the weak ones, and continues from the survivors — a
-search over a tree of partial solutions, not a single line.
+ToT runs a reasoning step several times to get divergent paths, scores each, and continues from the best — like a beam search where each node is a chunk of reasoning.
 
 ```
-  Tree-of-thoughts = generate → score → prune → continue from survivors
+  Tree of Thoughts — branch, score, pick
 
-                   root (problem)
-                 ┌──────┼──────┐
-              thoughtA thoughtB thoughtC      ← generate K branches
-                 │8      │3      │7           ← score each (the evaluator)
-              keep ✓   prune ✗  keep ✓        ← prune low scorers
-              ┌──┼──┐         ┌──┼──┐
-             …expand survivors only…          ← recurse to some depth
-                       │
-                       ▼
-                  best leaf = answer
+           root question
+          ┌──────┼──────┐
+          ▼      ▼      ▼
+        path A  path B  path C
+          │      │      │
+        score  score  score
+          └──────┼──────┘
+                 ▼
+            best path wins  (cost ≈ branch_factor × baseline)
 ```
 
-### Move 2 — the moving parts
+### Move 2 — why aptkit is right to skip it
 
-**The branch generator**
+**The cost math.** Each branch is a full reasoning trajectory. With aptkit's `maxToolCalls: 4` per agent, a branch factor of 3 would mean up to 12 tool calls per question — and against a local Gemma model that already needs the `minTopK` floor and retry nudges to stay on track, branching multiplies the *unreliability* too, not just the cost. You'd be scoring three mediocre paths instead of hardening one.
 
-```
-  at each node: ask model for K different next thoughts
-       │
-       ▼
-  [thoughtA, thoughtB, thoughtC]   ← K parallel candidates
-```
+**Where the budget went instead.** aptkit spent its reliability budget on the single path:
+- `minTopK` floor so the one search doesn't starve (`search-knowledge-base-tool.ts:51`)
+- forced synthesis so the one trajectory always produces an answer (`run-agent-loop.ts:104`)
+- the recovery turn so a parse failure on the one path gets one salvage attempt
 
-Pseudocode: `candidates = await Promise.all(range(K).map(() => proposeNext(node)))`.
-This is the cost: every node fans out K ways, so the call count compounds with
-depth.
+That's the trade: harden one path cheaply rather than explore many paths expensively. For aptkit's tasks (grounded Q&A, evidence-gathering, scoring) a well-prompted single ReAct loop beats branching.
 
-**The state evaluator**
-
-```
-  score each candidate: "how promising is this partial solution?"
-       │
-       ▼
-  prune all but the top-M                        ← keeps the tree from exploding
-```
-
-Pseudocode: `scores = candidates.map(scoreThought); keep top M`. ToT *requires* a
-usable evaluator — if you can't score a partial solution, you can't prune, and
-the tree explodes. This requirement is exactly why ToT fits puzzles (clear
-partial-state scoring) and not open-ended diagnosis (what's the "score" of
-half a diagnosis?).
-
-**The search strategy**
-
-```
-  BFS / DFS over survivors, to a bounded depth, then pick best leaf
-```
-
-Pseudocode: a frontier loop expanding survivors. This is the part that turns a
-single chain of thought into a managed search — and the part that costs you a
-real budget on branching, not just turns.
+**When ToT would actually earn it.** Tasks with a verifiable scoring function and genuinely divergent solution paths — game-tree search, constraint puzzles, code with a test oracle. None of aptkit's capabilities look like that. Recommendation and diagnosis have no cheap "score this branch" oracle; the cost of branching wouldn't buy measurable quality.
 
 ### Move 3 — the principle
 
-Tree-of-thoughts trades a multiplicative compute bill for the ability to back
-out of early wrong commitments — worth it only with a scorable partial state and
-a real early-commit risk, which most production tasks lack.
+ToT is rarely worth it in production: the branching multiplies token cost by the branch factor and rarely beats a well-prompted ReAct loop on real tasks. Recognizing it and being able to say *why you didn't reach for it* is the senior answer — premature ToT is the same mistake as premature multi-agent.
 
 ## Primary diagram
 
-The full search shape, with the blunt cost note and the narrow conditions that
-justify it.
-
 ```
-  Tree-of-thoughts — full shape (NOT in AptKit, correctly)
+  ToT cost vs aptkit's single-path hardening
 
-  build ONLY if: scorable partial state  AND  early-commit risk  AND
-                 linear ReAct provably dead-ends
-        │
-        ▼
-                 root
-            generate K branches  ─────▶ cost = K^depth + scoring calls
-            score + prune to top M
-            recurse to depth D
-            pick best leaf
-        │
-        ▼
-   AptKit: none of the three conditions hold ──▶ stays empty
+  ToT:    root ─► 3 branches ─► score each ─► best   (≈3x cost, 3x noise)
+
+  aptkit: root ─► ONE ReAct path ─► hardened with:
+                  minTopK floor + forced synthesis + recovery turn
+          (1x cost, the reliability spent on the one path)
 ```
-
-The empty box is the right answer for this codebase; draw the shape only to show
-you know what you're declining.
-
-## Implementation in codebase
-
-**Not yet implemented — and intentionally so.** No AptKit capability branches its
-reasoning. Every agent runs one linear `runAgentLoop` (`run-agent-loop.ts:76`)
-that picks a single next step per turn; there is no candidate generation, no
-scoring of partial solutions, no pruning frontier anywhere in
-`packages/agents/*`.
-
-Why that's correct here: AptKit's tasks fail *none* of the three ToT
-preconditions. (1) No scorable partial state — there's no meaningful score for
-"half a diagnosis." (2) No early-commit catastrophe — a wrong first query just
-gets corrected by the next turn's reasoning, cheaply, because ReAct re-decides
-each turn. (3) Linear ReAct doesn't dead-end — the budget+forced-synthesis turn
-already produces a grounded answer (`run-agent-loop.ts:102-109`). Adding ToT
-would multiply token cost and latency to solve a problem that's already solved.
-
-If a future AptKit task *did* fit — say, searching over many mutually exclusive
-root-cause hypotheses where committing to the wrong branch wastes the whole
-budget — the build template would live in
-`../06-orchestration-system-design-templates/`. Until such a task exists,
-building ToT would be speculative complexity, and the honest engineering move is
-to not build it.
 
 ## Elaborate
 
-**Origin.** "Tree of Thoughts" (Yao, Yu, et al., 2023) generalized
-chain-of-thought into a deliberate tree search with generate-evaluate-prune,
-crushing GPT-4's Game-of-24 success rate (4% with CoT → 74% with ToT). The
-headline result is real — *on puzzle tasks with verifiable intermediate state.*
-
-**Adjacent concepts.** ToT is the search-y cousin of plan-and-execute
-(`04-plan-and-execute.md`): both look ahead, but plan-and-execute commits to one
-plan while ToT keeps several alive and scores them. "Graph of Thoughts" (2023)
-generalizes the tree to a DAG. In practice most teams get ToT's benefit far more
-cheaply with *best-of-N sampling* (generate N full answers, pick the best with a
-judge) — one level of branching, no recursive frontier — which is the pragmatic
-fallback when you think you want ToT.
+Tree of Thoughts came out of research on tasks where a model's first reasoning path is often wrong but a *scored* search over paths finds the right one (Game of 24, creative writing with an evaluator). The production reality: most business tasks lack a cheap, reliable branch-scorer, so ToT's branches get scored by the same model that generated them — compounding cost *and* bias. aptkit's tasks are firmly in the "harden one path" category.
 
 ## Interview defense
 
-**Q: "Would you use tree-of-thoughts here?"**
+**Q: Did you consider tree-of-thoughts?**
+Considered and rejected. ToT multiplies token cost by the branch factor, and against my local Gemma model it would multiply the unreliability too — I'd be scoring three shaky paths instead of hardening one. My tasks (grounded Q&A, evidence-gathering, scoring) have no cheap branch-scoring oracle, so branching wouldn't buy measurable quality. I spent the reliability budget on the single path instead: a top_k floor, forced synthesis, a recovery turn.
 
 ```
-  the three-gate test, all must pass
-
-  scorable partial state?  ──NO──▶  don't build ToT
-  early-commit catastrophe? ─NO──▶  don't build ToT
-  linear ReAct dead-ends?   ─NO──▶  don't build ToT
-  AptKit: three NOs ─────────────▶  correctly skipped
+  ToT: 3 branches × cost × noise   vs   aptkit: 1 path, hardened
 ```
-
-Anchor: "No — ToT needs a scorable partial state and a real early-commit risk,
-and AptKit's diagnosis has neither; I'd be paying an exponential compute bill to
-fix a problem ReAct already solves linearly."
-
-**Q: "What's the cheap alternative if you *think* you want ToT?"**
-
-```
-  best-of-N: generate N full answers ─▶ judge picks best
-  (one branch level, no recursion — most of ToT's gain, a fraction of the cost)
-```
-
-Anchor: "Best-of-N with an LLM judge — and I already have a judge pattern in the
-rubric agent, so that's the reach, not a recursive tree." Surfaces the skeleton
-part: best-of-N is just `Promise.all` of N `runAgentLoop` calls plus the
-reflexion judge from `05-reflexion-self-critique.md` — no new machinery.
-
-## Validate
-
-- **Reconstruct:** Draw generate→score→prune→recurse and label the cost as
-  `K^depth + scoring`.
-- **Explain:** Name the three preconditions ToT needs and state which AptKit
-  fails (all three — see Implementation).
-- **Apply:** Propose the *cheaper* substitute for a task you think needs ToT and
-  say which existing AptKit pattern you'd reuse (best-of-N + the rubric judge,
-  `rubric-improvement-agent.ts:57`).
-- **Defend:** A teammate read the ToT paper and wants to add it to the diagnostic
-  agent. Talk them down with the cost axis and the missing scorable partial
-  state (`diagnostic-agent.ts:55` runs linearly and the forced synthesis at
-  `run-agent-loop.ts:102-109` already handles dead-ends).
+*Anchor: "recognize it, say why you didn't use it" — premature ToT = premature multi-agent.*
 
 ## See also
 
-- [03-react.md](03-react.md) — the linear pattern ToT would replace (don't)
-- [04-plan-and-execute.md](04-plan-and-execute.md) — the look-ahead cousin
-- [05-reflexion-self-critique.md](05-reflexion-self-critique.md) — the judge you'd
-  reuse for the cheap best-of-N substitute
-- `../06-orchestration-system-design-templates/` — where you'd build it if a task
-  ever justified it
+- `03-react.md` — the single path aptkit hardens instead
+- `05-production-serving/01-cross-turn-caching.md` — aptkit's cost discipline
+- `03-multi-agent-orchestration/01-when-not-to-go-multi-agent.md` — the same "don't over-reach" judgment

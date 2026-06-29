@@ -1,353 +1,162 @@
-# 07 — WAL, durability, and recovery
+# 07 · WAL, Durability, and Recovery
 
-**Subtitle:** Write-ahead logging / fsync durability / crash recovery /
-backup — *Industry standard* (taught), *analog: CapabilityEvent append-only
-log (never replayed) + single writeFile (no fsync) + git as backup* (in-repo)
-
----
+**Industry name(s):** write-ahead log, fsync durability, crash recovery, backups/PITR. **Type:** Industry standard.
 
 ## Zoom out, then zoom in
 
-Durability is the "D" in ACID: once you say "saved," a power cut can't undo
-it. The mechanism is almost always a write-ahead log — append the *intent*
-first, fsync it, then apply the change; on restart, replay the log to recover.
-AptKit has the *shape* of a WAL sitting right there in `CapabilityEvent` — an
-append-only, timestamped, ordered event stream — but it never replays it to
-recover anything. And its actual durability boundary is a single `writeFile`
-with no fsync. This file teaches WAL and recovery properly, then shows you the
-WAL-shaped-but-not-WAL log and the thin durability the repo actually has.
+"Durable" means: the user got a success response, then the power died, and the data is still there. You know the failure it prevents — the optimistic UI update that never actually saved. This repo has the cleanest possible illustration of durability because it has *both poles*: a store with zero durability (aptkit's Map) and a store with full WAL durability (buffr's Postgres), behind the same interface.
 
 ```
-  Zoom out — where durability lives (and the WAL-shaped thing that isn't a WAL)
+  Zoom out — where durability is won or lost
 
-  ┌─ Runtime layer ───────────────────────────────────────────┐
-  │  CapabilityEvent[] ← append-only, timestamped event log    │ ← WAL SHAPE
-  │  (events.ts) emitted by the agent loop, never replayed     │   (no recovery)
-  └───────────────────────────┬───────────────────────────────┘
-  ┌─ Service layer ───────────▼───────────────────────────────┐
-  │  writeFile(artifact)  ← the durability boundary, NO fsync  │ ← we are here
-  └───────────────────────────┬───────────────────────────────┘
-  ┌─ Storage layer ───────────▼───────────────────────────────┐
-  │  filesystem + git history  ← "backup" is git commits       │
-  └───────────────────────────────────────────────────────────┘
+  ┌─ Store layer ──────────────────────────────────────────┐
+  │  InMemory: commit == Map.set in RAM → ZERO durability    │
+  │  Postgres: commit == WAL write + fsync → DURABLE         │ ← we are here
+  └────────────────────────────┬────────────────────────────┘
+                               │
+  ┌─ Postgres engine ──────────▼────────────────────────────┐
+  │  ★ WAL (write-ahead log) → fsync → checkpoint → heap ★   │
+  │  crash recovery replays WAL · Supabase backups           │
+  └──────────────────────────────────────────────────────────┘
 ```
 
-**Zoom in.** Two questions: *when does AptKit consider a write durable, and
-could a crash corrupt it?* and *what's the closest thing to a WAL, and why
-isn't it one?* The durability boundary is "`writeFile` resolved" — earlier
-than real durability, because no fsync. The WAL-shaped thing is the trace,
-which is append-only and ordered but used for display/eval, not recovery.
+Zoom in: the concept is **the durability boundary** — the exact moment a write survives a crash. In aptkit that moment never arrives (it's all RAM). In buffr it's the `commit` in the upsert transaction, which forces a WAL flush to disk. The recovery side — what happens after a crash, and whether there's a tested restore path — is where the honest gaps live.
 
----
+## The structure pass
 
-## Structure pass
+**Layers.** Durability is decided at the store layer and enforced by the engine. Above it, the pipeline gets a resolved promise from `upsert` and assumes "it's saved" — but what "saved" *means* differs completely between the two stores.
 
-The layers: the **intent log** (`CapabilityEvent` trace) and the **durable
-write** (`writeFile`). Axis to hold constant: **survival — what survives a
-crash at this point, and can it be reconstructed?**
+**Axis — trace "what does a resolved `upsert()` promise actually guarantee?":**
 
 ```
-  One axis — "what survives a crash here?" — across the durability layers
+  One question across the stores: "upsert resolved — now what survives a crash?"
 
-  ┌───────────────────────────────────────────┐
-  │ CapabilityEvent trace (in memory → in the │  → survives ONLY if the artifact
-  │ artifact)                                 │    write succeeds; never used to
-  └───────────────────────────────────────────┘    replay/rebuild → not recovery
-      ┌───────────────────────────────────────┐
-      │ writeFile(artifact) — no fsync        │  → "saved" returns before bytes
-      └───────────────────────────────────────┘    are guaranteed on disk; a power
-                                                    cut here can lose or truncate it
-      ┌───────────────────────────────────────┐
-      │ git commit of artifacts/              │  → survives a disk wipe IF you
-      └───────────────────────────────────────┘    committed; the real "backup"
+  ┌─ InMemoryVectorStore ───────────────┐
+  │  resolved = Map.set returned         │ → survives nothing; process exit = total loss
+  └──────────────────────────────────────┘
+  ┌─ PgVectorStore → Postgres ──────────┐
+  │  resolved = commit returned          │ → WAL record fsync'd to disk;
+  │                                      │   survives crash, recovered by WAL replay
+  └──────────────────────────────────────┘
 
-  the seam: the durability boundary is at writeFile-resolves, which is EARLIER
-  than bytes-on-disk. Everything above it is volatile; only a git commit is
-  durable across a machine loss.
+  same resolved promise, opposite durability — the caller can't tell which from the type
 ```
 
-The load-bearing seam is the gap between "AptKit says saved" and "the OS has
-actually flushed to disk." A real WAL closes that gap with fsync on the log.
-AptKit leaves it open and relies on git for the only durability that survives
-hardware loss.
-
----
+**Seam.** The boundary is the `commit` inside `PgVectorStore.upsert` (05). In aptkit there is no commit — `upsert` resolves the instant the loop of `Map.set` finishes. The promise's *type* is identical (`Promise<void>`); the durability behind it is night and day. That's the seam: the contract hides whether a write is durable.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know how you write to a log file before doing risky work, so if it crashes
-you can see how far you got? A write-ahead log is that, made authoritative:
-the log *is* the source of truth, fsynced before the change is applied, and on
-restart you replay the log to rebuild the data. The mental model: **WAL =
-append the intent durably first, apply lazily, replay the log to recover after
-a crash.**
+WAL is the append-only log you'd reach for to make any in-memory thing crash-safe: before you change the real data structure, append "here's what I'm about to do" to a log and `fsync` it. If you crash, replay the log on restart. Postgres does exactly this — the heap pages are the "real data," the WAL is the "about to do" log, and `commit` is the point the log is forced to disk.
 
 ```
-  the real mechanism: write-ahead log + recovery
+  WAL durability — log first, fsync, then the heap catches up
 
-  normal:   intent ─► WAL.append(record) ─► fsync(WAL) ─► apply to pages
-                                              ▲
-                                "saved" is declared HERE (log is durable)
+  commit:
+    1. append WAL record  ──────►  [ WAL on disk ]   ◄ fsync HERE = durable point
+    2. return success to caller       │
+    3. (later) checkpoint flushes      ▼
+       dirty heap pages to disk    [ heap pages ]    ← lag behind WAL; that's fine
 
-  crash + restart:
-            read WAL from last checkpoint ─► replay each record ─► state rebuilt
-            (committed records redone, uncommitted ones rolled back)
+  crash before step 3?  →  on restart, REPLAY WAL onto heap → no data lost
 ```
 
-### Move 2 — the parts that matter
+The kernel parts: the **WAL append + fsync** is what makes commit durable (lose it and a crash loses committed data); the **checkpoint** lazily reconciles heap to WAL (lose it and the WAL grows unbounded); **recovery replay** rebuilds the heap from the WAL after a crash (lose it and an unclean shutdown corrupts data).
 
-**The append-only log — `CapabilityEvent`.** A WAL is append-only, ordered,
-and timestamped — you never edit a past log record, you only append new ones,
-and order is the truth. `CapabilityEvent` is *exactly* that shape: a
-discriminated union (`step`, `tool_call_start`, `tool_call_end`,
-`model_usage`, `warning`, `error`), each carrying `capabilityId` and an ISO
-`timestamp`, pushed onto a `trace` array as the agent runs and never mutated.
-The trace sink only ever calls `trace.push(event)`. What breaks if it weren't
-append-only: you couldn't trust replay order or reconstruct the run. So the
-WAL *invariant* (append-only, ordered) holds.
+### Move 2 — the walkthrough
 
-```
-  CapabilityEvent IS a WAL by shape — append-only, ordered, timestamped
+**aptkit: the durability floor — none.** The in-memory store's "write" is a map assignment, and its `upsert` resolves immediately:
 
-  trace.push(step)          ┐
-  trace.push(tool_call_start)│  only ever appended, never edited
-  trace.push(model_usage)    │  order = truth; each has an ISO timestamp
-  trace.push(tool_call_end)  ┘
-
-  ...but nothing reads this back to REBUILD state. It's embedded in the
-  artifact for display + eval (modelTurnCount, summarizeUsage). WAL shape,
-  no recovery semantics.
+```ts
+// packages/retrieval/src/in-memory-vector-store.ts:18-23
+async upsert(chunks: VectorChunk[]): Promise<void> {
+  for (const chunk of chunks) {
+    this.assertDimension(chunk.vector, `chunk "${chunk.id}"`);
+    this.chunks.set(chunk.id, chunk);          // lives in V8 heap, that's the whole lifecycle
+  }
+}                                              // promise resolves → "saved" means "in RAM"
 ```
 
-**The missing recovery.** A WAL is only a WAL if something replays it to
-recover. AptKit never does — there's no "on startup, read the trace and
-reconstruct the agent's state." The trace is consumed for *observation*
-(counting model turns, summing token usage, rendering the timeline in Studio),
-not *recovery*. So crash recovery is `not yet exercised`. Trigger: you need to
-resume an interrupted agent run, or rebuild current state from history — then
-the trace becomes a real event-sourcing log.
+There is no log, no disk, no fsync. The instant the process exits — clean or crash — every chunk is gone. This is correct for its job (tests, demos, the Studio in-browser RAG which uses `InMemoryVectorStore` with a fake embedder per `context.md`), and it's the perfect contrast: a store where `commit` has no meaning because there's nothing below RAM.
 
-**The durability boundary — single `writeFile`, no fsync.** Here's the part
-that matters most operationally. AptKit declares an artifact "saved" the
-moment `writeFile` resolves. But `writeFile` resolving means the data is in
-the OS page cache — not necessarily on the physical disk. There's no
-`fsync`, and no write-to-temp-then-`rename` (the standard atomic-replace
-trick). What breaks: a power loss between `writeFile` resolving and the OS
-flushing can lose the artifact, or worse, leave a *truncated* file that
-`JSON.parse` later rejects. This is a torn-write exposure.
+**buffr: commit forces the WAL.** The durability point is the `commit` in the upsert transaction (the same one from 05):
 
-```
-  AptKit's durability boundary is EARLY and the write is non-atomic
-
-  JSON.stringify ─► writeFile ──resolves──► "saved!" ───► (later) OS flush ─► disk
-                       │                       ▲                                ▲
-                       │                       │                                │
-                       │            AptKit trusts the data here      actually durable here
-                       │
-                       └─ no fsync, no temp+rename. A crash in the gap can
-                          truncate the file → invalid JSON on next read.
-                          A real WAL fsyncs the log to close this gap.
+```ts
+// buffr/src/pg-vector-store.ts:43-58
+await client.query('begin');
+for (const c of chunks) { await client.query(`insert ... on conflict ...`, [...]); }
+await client.query('commit');                  // ◄ THIS forces the WAL record to fsync
 ```
 
-**The store with NO durability boundary at all (the vector store).** The
-filesystem's durability is *late* (no fsync) but it exists — bytes do reach
-disk. The new `InMemoryVectorStore` has no durability boundary whatsoever: its
-chunks live in a `Map` (`packages/retrieval/src/in-memory-vector-store.ts:11`)
-that is gone the instant the process exits. There's nothing to fsync because
-nothing is ever written anywhere. "Recovery" is not crash recovery — it's
-**re-indexing the whole corpus from source**, because the index *is* the only
-copy and it's volatile. That's an acceptable contract for a from-scratch
-in-memory pipeline (re-embedding a handful of docs is cheap), and it's the
-sharpest possible illustration of the durability spectrum: filesystem =
-durable-but-late, vector store = not durable at all, and the durable end of the
-spectrum (Postgres + WAL + fsync) lives in buffr's `PgVectorStore`, behind the
-same `VectorStore` contract. Trigger to need it: re-embedding the corpus on
-every restart becomes too slow or too expensive.
+When `commit` returns, Postgres has written the transaction's WAL records and `fsync`'d them to disk (under the default `synchronous_commit = on`). The heap pages holding the actual chunk rows may still be dirty in memory — they get flushed at the next checkpoint — but that's fine: if the box loses power one millisecond after `commit` returns, recovery replays the WAL and the chunks reappear. The promise resolving from `commit` is a *real* durability guarantee, unlike aptkit's.
 
-**Backup and restore — git.** The only durability that survives losing the
-machine is git: `artifacts/replays/` and the promoted fixtures are committed
-to the repo. "Restore" is `git checkout`. This is real but coarse — it
-protects committed artifacts, not the ones you saved-but-didn't-commit, and
-it's manual. Promoted fixtures get extra protection here because they're
-treated as correctness baselines and committed deliberately.
+**Recovery — inherited, untested.** Crash recovery (WAL replay on restart) is automatic in Postgres; buffr does nothing to configure or invoke it, and relies on it implicitly. The backup/restore side is **Supabase-managed**: Supabase takes the backups, owns PITR (point-in-time recovery) on its plan tier, and runs the WAL archiving. buffr's code contains:
+
+- **No backup invocation** — no `pg_dump`, no backup scheduling in the repo.
+- **No restore drill** — no documented or scripted "restore from backup and verify" path.
+- **No `synchronous_commit` setting** — durability is whatever the Supabase default is (`on`).
+
+So the durability guarantee is *real* but **the recovery path is `not yet exercised`** — nobody has restored this database from a backup and confirmed the corpus comes back intact. "We have backups" (Supabase does) is not "we have tested restore" (nobody has). That gap is the honest durability finding.
+
+**The migration is durable too, transactionally.** The schema apply (`migrate.ts`, 05) commits in one transaction, so the WAL makes the schema durable atomically — you can't get a half-applied, half-durable schema. Same mechanism, applied to DDL.
+
+```
+  Layers-and-hops — a chunk upsert reaching the durability point (buffr)
+
+  ┌─ PgVectorStore ─┐ hop 1: INSERT × m         ┌─ Postgres ──────────────┐
+  │ upsert (txn)    │ ─────────────────────────►│ rows in shared buffers  │
+  └─────────────────┘ hop 2: COMMIT ───────────►│ append WAL → FSYNC      │ ◄ DURABLE here
+                      hop 3: success ◄────────── │       │                 │
+                                                 │       ▼ (later)         │
+                                                 │ checkpoint → heap disk  │
+                                                 └─────────┬───────────────┘
+                                          crash? ──────────┘ restart → WAL replay
+```
 
 ### Move 3 — the principle
 
-Durability is a *boundary*, and the whole game is knowing exactly where yours
-is. A real engine pushes the boundary to "the WAL is fsynced" so a crash loses
-nothing committed. AptKit's boundary is "writeFile resolved," which is cheaper
-and earlier — fine for artifacts you can regenerate by re-running the agent,
-dangerous for anything you can't. The generalizable rule: **know whether your
-"saved" means in-memory, in-cache, or on-disk — and match that boundary to how
-much it would hurt to lose the write.** AptKit's writes are regenerable, so an
-early boundary is a defensible call; the WAL-shaped trace is one promotion away
-from becoming a real recovery log if that ever changes.
-
----
+Durability is the moment a write survives a crash, and that moment is `commit` forcing the WAL to disk — not the moment your `upsert` promise resolves, because the same promise type sits over a store (the Map) where it means nothing. And "we have backups" is a different claim from "we have a tested restore": the first is a property of your provider, the second is a property you only know by exercising it. The general lesson: durability is a guarantee you must locate precisely (the fsync) and a recovery path you must *test*, not assume.
 
 ## Primary diagram
 
 ```
-  AptKit durability & "WAL" — the full picture
+  Full durability picture — two poles behind one contract
 
-  ┌─ agent run (runtime) ─────────────────────────────────────┐
-  │  emit step/tool/usage events → trace.push(...)            │
-  │  CapabilityEvent[] : append-only, ordered, timestamped    │ WAL SHAPE
-  │  (events.ts:1-24) ── consumed for display/eval, NOT replay │ (no recovery)
-  └───────────────────────────┬───────────────────────────────┘
-                              │ embedded in artifact.trace
-  ┌─ save (service) ──────────▼───────────────────────────────┐
-  │  writeFile(artifact)  ◄── durability boundary (NO fsync)   │
-  │  non-atomic: crash → possible truncated file               │
-  └───────────────────────────┬───────────────────────────────┘
-                              │ commit (manual)
-  ┌─ backup (git) ────────────▼───────────────────────────────┐
-  │  git history of artifacts/ + fixtures/  ◄── survives wipe  │
-  │  restore = git checkout                                    │
-  └───────────────────────────────────────────────────────────┘
+  ┌─ aptkit InMemoryVectorStore ──┐      ┌─ buffr Postgres (Supabase) ────────────┐
+  │ upsert → Map.set → resolve    │      │ upsert → begin..commit                  │
+  │ NO log, NO disk, NO fsync     │      │   commit → WAL append → FSYNC (durable) │
+  │ durability: ZERO              │      │   checkpoint → heap pages → disk        │
+  │ restart = total loss          │      │   crash → restart → WAL REPLAY          │
+  │ (correct for tests/Studio)    │      │ backups/PITR: Supabase-managed          │
+  └────────────────────────────────┘     │ tested restore path: NOT EXERCISED      │
+                                          │ synchronous_commit: default (on)        │
+                                          └──────────────────────────────────────────┘
+   same Promise<void> type · opposite durability · caller can't tell from the contract
 ```
-
----
-
-## Implementation in codebase
-
-**Use cases.** The append-only log is built on every agent run (live or
-replay). The thin durability boundary is hit on every save and every
-promotion. Git backup is exercised whenever artifacts/fixtures are committed —
-the promotion flow specifically produces files meant to be committed as
-baselines.
-
-**The WAL-shaped log** — `packages/runtime/src/events.ts:1-24` +
-`apps/studio/vite.config.ts:539-543`:
-
-```
-  // events.ts — the record shape (a WAL entry)
-  export type CapabilityEvent =
-    | { type: 'step'; capabilityId: string; role: string; content: string; timestamp: string }
-    | { type: 'tool_call_start'; ...; timestamp: string }
-    | { type: 'model_usage'; ...; timestamp: string }
-    | { type: 'error'; ...; timestamp: string };
-                                          ↑ every variant carries an ISO timestamp
-
-  // vite.config.ts — the append (the only mutation of the log)
-  const traceSink = {
-    emit: (event) => {
-      trace.push(event);   ← APPEND-ONLY. Never edits a prior entry. Order = truth.
-      options.onEvent?.(event);
-    },
-  };
-       │
-       └─ this is a WAL by structure. What makes it NOT a WAL: nothing replays
-          `trace` to rebuild state — it's read by modelTurnCount/summarizeUsage
-          for metrics and streamed to the UI, never for recovery.
-```
-
-**The durability boundary — no fsync** — `apps/studio/vite.config.ts:377`:
-
-```
-  await writeFile(path, `${JSON.stringify(artifact, null, 2)}\n`, 'utf8');
-        │
-        └─ the ENTIRE durability story. No fsync → returns when data is in the
-           OS cache, not on disk. No temp-file + rename → a crash mid-write can
-           leave a partial file that fails JSON.parse on the next read
-           (replay-runner.ts:83). "Saved" here is weaker than a DB's "committed."
-```
-
-**Promotion as a durable "commit" of a baseline** —
-`scripts/promote-replay-to-fixture.mjs:76-79`:
-
-```
-  const outDir = resolve(repoRoot, args.values['out-dir'] ?? defaultOutDir);
-  await mkdir(outDir, { recursive: true });
-  const outPath = join(outDir, `${slugify(promotedId)}-${formatDateForFilename(...)}.json`);
-  await writeFile(outPath, `${JSON.stringify(promoted, null, 2)}\n`, 'utf8');
-       │
-       └─ writes the authoritative baseline into fixtures/promoted/. This file
-          is meant to be git-committed — that commit is the real durability
-          step, the one that survives a machine loss.
-```
-
----
 
 ## Elaborate
 
-The write-ahead log is arguably the single most important idea in database
-durability: by making the *log* the source of truth and fsyncing it before
-touching the data pages, you turn a random-write durability problem into a
-sequential-append one, and you get crash recovery for free by replaying. It's
-also the backbone of replication (ship the log to a replica) and
-point-in-time recovery (replay the log to a timestamp). AptKit has the log's
-*shape* in `CapabilityEvent` but uses it for observability, not durability —
-which is a perfectly common pattern (structured event traces) that just
-happens to look like a WAL. The interesting consequence: AptKit is one feature
-("resume an interrupted run from its trace") away from turning that trace into
-a genuine event-sourcing recovery log. The trigger for real WAL/fsync
-durability: artifacts become un-regenerable (a live run you can't reproduce)
-and losing one is unacceptable — then you fsync, write-temp-and-rename, and
-possibly replay the trace.
-
-The *content* of the trace (what each event type means, the discriminated
-union design) is `study-data-modeling`'s territory; the streaming transport of
-the trace as NDJSON is `study-system-design`'s. This file owns only the
-durability and recovery mechanics.
-
----
+Write-ahead logging is the foundation of every ACID database's "D"; the subtlety people miss is that durability is configurable — `synchronous_commit = off` trades a small data-loss window for throughput, and buffr leaves it at the safe default. The genuinely actionable gap is the untested restore: Supabase's managed backups are real, but a restore that's never been run is a restore you don't know works. A one-time drill — restore to a scratch database, re-run a search, confirm the corpus and recall — converts an assumption into a verified property, and it's the single highest-value durability task here. Read next: 05 for the commit that triggers the WAL, 08 for what replicas add (and what stale reads cost), 09 for the restore gap ranked.
 
 ## Interview defense
 
-**Q: "When you call something 'saved,' is it durable? What happens on a power
-loss mid-write?"**
-
-> Honestly, my durability boundary is early: "saved" means `writeFile`
-> resolved, which is OS-cache, not on-disk — there's no fsync and no
-> temp-and-rename. A power loss in that gap can lose the artifact or leave a
-> truncated file that fails to parse on the next read. That's a defensible
-> tradeoff because my artifacts are regenerable by re-running the agent, and the
-> things I actually need to keep — promoted fixtures — are git-committed, which
-> is the durability that survives losing the machine.
+**Q: When is a write durable in this system?**
 
 ```
-  writeFile resolves → "saved" (OS cache) ──gap──► disk flush
-                          ▲                          (no fsync to close the gap)
-                  boundary is HERE; git commit is the real durable line
+  upsert resolves  ≠  durable          commit returns  =  durable
+  (could be the Map — RAM only)        (WAL fsync'd to disk)
 ```
 
-**Anchor:** "The durability boundary is a single un-fsync'd `writeFile` at
-`vite.config.ts:377`; git is the only crash-proof backup."
+Answer: "At `commit`, when Postgres fsyncs the WAL record to disk — `synchronous_commit` is the default `on`, so commit doesn't return until the log is on disk. The trap is the contract: `upsert` returns `Promise<void>` in both stores, but in `InMemoryVectorStore` that resolves the moment a `Map.set` finishes — zero durability. Same promise type, opposite guarantee. Durability lives at the fsync, not at the promise." Anchor: *the fsync at commit is the durability point; the resolved promise isn't.*
 
-**Q: "You have an append-only timestamped event log. Is that a WAL?"**
+**Q: You're on Supabase — so you're covered for data loss?**
 
-> It has the shape — append-only, ordered, timestamped — but it's not a WAL,
-> because nothing replays it to recover state. `CapabilityEvent` is consumed for
-> metrics and the Studio timeline, not for rebuilding an interrupted run. It's a
-> WAL one feature away from being one.
-
-**Anchor:** "WAL shape, no recovery — `events.ts:1-24` is appended but never
-replayed."
-
----
-
-## Validate
-
-1. **Reconstruct:** Draw a WAL write+recovery, then draw AptKit's durability
-   boundary, and mark where "saved" is declared in each.
-2. **Explain:** Why can a crash leave a corrupt artifact given
-   `vite.config.ts:377`, and what two-line change (temp + rename) would prevent
-   it?
-3. **Apply:** You add live (non-fixture) runs whose results can't be
-   regenerated. What durability changes does that force, and could the
-   `CapabilityEvent` trace become a recovery log?
-4. **Defend:** Argue why no-fsync + git-as-backup is the right durability story
-   for AptKit's regenerable artifacts, and name the trigger to upgrade it.
-
----
+Answer: "For *backups*, yes — Supabase manages backups and PITR. For *recovery*, honestly no: there's no tested restore path. Nobody has restored this database from a backup and confirmed the corpus and recall come back. 'We have backups' and 'we have a tested restore' are different claims. The highest-value durability task is a one-time restore drill to a scratch DB." Anchor: *backups are not recovery until you've restored once.*
 
 ## See also
 
-- `05-transactions-isolation-and-anomalies.md` — the atomicity gap on a single write
-- `08-replication-and-read-consistency.md` — shipping a WAL is how replicas sync
-- `06-locks-mvcc-and-concurrency-control.md` — immutability of the written records
-- `study-data-modeling` → the `CapabilityEvent` union and artifact schema
-- `study-system-design` → NDJSON streaming of the trace
+- `05-transactions-isolation-and-anomalies.md` — the commit that forces the WAL.
+- `08-replication-and-read-consistency.md` — replicas that consume the WAL stream.
+- `01-database-systems-map.md` — the durability boundary at the pg.Pool hop.
+- `09-database-systems-red-flags-audit.md` — the untested-restore risk, ranked.

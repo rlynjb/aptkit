@@ -1,89 +1,73 @@
-# 08 — Machine learning (classical, supervised, on-device)
+# 08 — Machine learning
 
-**Honest banner, read this first.** AptKit ships **no trained machine-learning
-model**. There is no supervised learner, no feature-engineering pipeline, no
-train/val/test split, no on-device inference, no quantized weights, no
-collaborative-filtering recommender. AptKit is a pure LLM-application toolkit: a
-bounded agent loop, structured-output generation, a provider abstraction, a
-token/cost ledger, and a replay-driven eval layer. **Every concept in this
-section is taught as new ground** — none of it is exercised in the repo today.
+> Anchor: classical / trained ML. · Curriculum: Phase 8 (no curriculum file in
+> this repo; exercises cite real aptkit/buffr paths instead).
 
-That honesty is the point. This section exists because the classical-ML
-vocabulary (features, leakage, class imbalance, calibration, drift, retraining)
-is a known gap for the reader, who has built exactly one ML pipeline — on-device
-pose landmarking with MediaPipe in a computer-vision app. That gives you a real
-anchor for *on-device inference* and *the supervised-pipeline shape*; the rest
-(class weights, confusion matrices, PSI drift, recommender families) is new.
-Each file teaches the pattern in full depth, then says plainly where AptKit
-stands.
+Read this first, because the framing is unusual for this study set: **aptkit has
+no trained machine-learning model.** No supervised pipeline, no feature
+engineering, no fitted classifier, no recommender trained on interactions, no
+on-device inference, no computer vision. aptkit runs *pre-trained LLMs* behind a
+prompt + tool policy. So every file in this section is study ground — the
+pattern is taught, then plainly marked `Not yet exercised in aptkit`.
 
-## The LLM analogs — close in shape, not in kind
+That is honest, not apologetic. You have built one ML pipeline before (pose
+landmarking), so the *shape* of "data → features → model → metric" is not new.
+What is new is classical supervised ML as a discipline: feature engineering as
+the load-bearing 60–80%, train/val/test splits that prevent leakage, class
+imbalance, calibration, drift. This section closes that gap.
 
-Three AptKit agents have the *shape* of a classical-ML task, but they are
-LLM agents, not trained models. The guide notes these analogies where they
-genuinely help, and refuses to overclaim:
+## The one real bridge — you already hold the eval vocabulary
+
+aptkit ships genuine ML evaluation metrics. They just grade *retrieval* instead
+of a trained model:
 
 ```
-  Classical-ML task        →  AptKit's LLM analog (NOT a trained model)
+  The bridge: same metrics, different subject
 
-  multi-class classifier   →  anomaly-monitoring agent
-                              (LLM picks anomaly categories from a checklist;
-                               no learned decision boundary, no training data)
-  recommender / ranker     →  recommendation agent
-                              (LLM proposes ≤3 actions grounded in a diagnosis;
-                               no collaborative filtering, no learned ranker)
-  scoring model            →  rubric-judge in @aptkit/evals
-                              (LLM scores against a rubric; no regression head)
+  ┌─ aptkit today ──────────────────┐      ┌─ trained-model world ───────────┐
+  │ precision@k / recall@k          │ same │ precision / recall / F1 over a  │
+  │ over RETRIEVED document ids     │ math │ CLASSIFIER's predicted labels   │
+  │ packages/evals/precision-at-k.ts│ ◄──► │ confusion matrix, per-class     │
+  │ detection-scorer.ts             │      │ macro-F1, calibration curve     │
+  └─────────────────────────────────┘      └─────────────────────────────────┘
+   matched / min(k,retrieved)               TP / (TP+FP)
+   matched / |relevant|                     TP / (TP+FN)
 ```
 
-The most useful honest connection: AptKit's `detection-scorer.ts`
-(`packages/evals/src/detection-scorer.ts`) already computes
-precision/recall-shaped numbers over the anomaly agent's category detections. If
-you treated that agent as a classifier and evaluated it, the confusion matrix in
-`08-confusion-matrices.md` is exactly the artifact you'd build — and AptKit
-stops one step short of building it.
+`scorePrecisionAtK` / `scoreRecallAtK` (`packages/evals/src/precision-at-k.ts`)
+compute `matched / min(k, retrieved)` and `matched / |relevant|` with
+distinct-hit counting. `scoreDetections` (`packages/evals/src/detection-scorer.ts`)
+scores detection-like outputs as `matched / missed / unexpected` — the exact
+shape of a classification confusion. Throughout this section the recurring move
+is: *you already use this metric on retrieval; here is the trained-model version.*
 
-## Concept files
+## Where ML would actually live
 
-```
-01-supervised-pipeline.md     data → features → split → train → deploy
-02-feature-engineering.md     turning raw signals into model inputs
-03-train-val-test.md          split discipline; leakage; the unit seen new
-04-model-selection.md         logistic regression vs gradient-boosted trees
-05-class-imbalance.md         macro-F1, class weights, SMOTE, focal loss
-06-domain-gap.md              train/inference distribution mismatch
-07-transfer-learning.md       reuse a pretrained model on a new task
-08-confusion-matrices.md      ← CONNECT: evaluate the anomaly agent as a classifier
-09-calibration.md             predicted probability vs actual frequency
-10-recommender-systems.md     ← CONNECT: recommendation agent is a recommender SHAPE
-11-cold-start.md              new user / new item / new system
-12-on-device-inference.md     server vs on-device (your contrl background)
-13-quantization.md            FP32 / FP16 / INT8 / INT4
-14-training-run-logging.md    ← CONNECT: AptKit's usage-ledger is the same instinct
-15-drift-detection.md         PSI; ← CONNECT: conceptual cousin of anomaly detection
-16-retraining-pipelines.md    scheduled / drift / performance triggers
-```
+When an exercise needs a concrete target, it uses one of two natural aptkit
+extensions — never an invented app:
 
-## Reading order
+- **A learned reranker** over retrieval hits — buffr's `PgVectorStore.query()`
+  returns `{ id, score, meta }[]` (`/Users/rein/Public/buffr/src/pg-vector-store.ts`);
+  a trained model could re-score those hits. Labeled data already exists in
+  `/Users/rein/Public/buffr/eval/queries.json`.
+- **A learned intent classifier** replacing the keyword heuristic in
+  `packages/agents/query/src/intent.ts`.
 
-`01` is the spine — read it first; every other file is a station on that
-pipeline. `03` (split discipline) and `05` (class imbalance) are the two that
-interviewers probe hardest, so read those next. `08`, `10`, `14`, and `15` carry
-the honest AptKit connections and are worth reading even if you skim the
-genuinely-distant files (`07`, `12`, `13`).
+## Files (self-contained per concept)
 
-## What "Project exercises" means in this section
-
-Every file ends with a Case-B exercise: the buildable target that would make the
-concept real in AptKit. Be clear-eyed — **adding a trained ML pipeline to AptKit
-is a large stretch.** AptKit is not the natural home for a training loop. So for
-the deep-ML files the exercise is honestly a thought-experiment or a small,
-measurable deliverable you *can* land here: most often, evaluating an existing
-LLM agent's outputs with an ML metric inside `packages/evals/`. The exercise IDs
-follow a `Phase 2C [C2C.x]` convention (there is no `aieng-curriculum.md` in the
-repo; IDs are by-convention).
-
-The interview signal these exercises chase: **having actually trained and
-evaluated a model is rare among LLM-application engineers.** Closing even a
-small slice of this gap — building one confusion matrix over the anomaly agent's
-detections — is disproportionately valuable.
+1.  `01-supervised-pipeline.md` — data → features → split → train → deploy; the whole arc
+2.  `02-feature-engineering.md` — raw → fixed numeric features; the load-bearing 60–80%
+3.  `03-train-val-test.md` — split at the unit seen new at inference; leakage
+4.  `04-model-selection.md` — LR vs GBT; train both, pick the simpler that wins
+5.  `05-class-imbalance.md` — accuracy lies; macro-F1, per-class recall, weights/SMOTE/focal/threshold
+6.  `06-domain-gap.md` — train vs inference distribution mismatch; normalization/augmentation/adaptation
+7.  `07-transfer-learning.md` — pretrain → fine-tune; for tabular = retrain on personal data
+8.  `08-confusion-matrices.md` — read it; per-class precision/recall/F1 derivation
+9.  `09-calibration.md` — predicted prob vs actual frequency; Platt/isotonic; bridge to retrieval scores
+10. `10-recommender-systems.md` — content vs collaborative vs hybrid; single-user = content + rules
+11. `11-cold-start.md` — new user / new item / new system mitigations
+12. `12-on-device-inference.md` — server vs on-device; model < 50MB, latency budget
+13. `13-quantization.md` — FP32 / FP16 / INT8 / INT4 size · speed · quality
+14. `14-training-run-logging.md` — log data/feature/hyperparam/metric versions per run; bridge to replay artifacts
+15. `15-drift-detection.md` — PSI; train vs prod distribution shift
+16. `16-retraining-pipelines.md` — scheduled / drift-triggered / performance-triggered

@@ -1,341 +1,180 @@
-# 05 — Transactions, isolation, and anomalies
+# 05 · Transactions, Isolation, and Anomalies
 
-**Subtitle:** ACID / isolation levels / read-write anomalies — *Industry
-standard* (taught), *status: mostly not yet exercised; analogs: single-file
-write + read-time validation, plus the vector store's non-atomic multi-chunk
-upsert* (in-repo)
-
----
+**Industry name(s):** ACID transactions, isolation levels, read/write anomalies. **Type:** Industry standard.
 
 ## Zoom out, then zoom in
 
-A transaction is the promise that a group of reads and writes either all
-happen or none do, and that concurrent transactions don't see each other's
-half-finished work. That promise is what lets you move money between two rows
-without losing it. AptKit makes no such promise — there is no `BEGIN`, no
-`COMMIT`, no rollback, and no isolation level, because there's nothing that
-spans more than one file write. This file teaches what transactions and
-isolation actually guarantee, then shows precisely why AptKit doesn't need
-them *yet* and the single change that would create the need.
+You know "all-or-nothing" from a form submit that should either fully save or not touch the DB at all. That's atomicity. This repo has exactly one place that reaches for it — the multi-chunk upsert — and everything else runs on Postgres's default isolation without ever naming it.
 
 ```
-  Zoom out — where a "transaction" would sit (but doesn't)
+  Zoom out — where transactions live
 
-  ┌─ Service layer ───────────────────────────────────────────┐
-  │  /api/replay/save → ONE writeFile()                       │ ← we are here:
-  │  promote:replay  → read 2 files, write 1 (no BEGIN/COMMIT) │   no txn wraps these
-  └───────────────────────────┬───────────────────────────────┘
-  ┌─ Storage layer ───────────▼───────────────────────────────┐
-  │  filesystem: each write is its own all-or-nothing-ish op   │
-  └───────────────────────────────────────────────────────────┘
+  ┌─ Pipeline (aptkit) ────────────────────────────────────┐
+  │  store.upsert(chunks)   — no transaction concept here   │
+  └────────────────────────────┬────────────────────────────┘
+                               │
+  ┌─ Store layer ──────────────▼────────────────────────────┐
+  │  InMemory: no transaction — single-threaded JS tick      │
+  │  Postgres: ★ begin / commit / rollback per upsert ★      │ ← we are here
+  └────────────────────────────┬────────────────────────────┘
+                               │
+  ┌─ Postgres ─────────────────▼────────────────────────────┐
+  │  READ COMMITTED (default) · MVCC snapshots               │
+  └──────────────────────────────────────────────────────────┘
 ```
 
-**Zoom in.** The question: *what consistency does AptKit guarantee across a
-write, and what would break it?* Today: each save is a single `writeFile`,
-which the OS makes roughly atomic per-file, and each record is immutable once
-written — so there's no multi-step transaction to get half-done and no
-in-place update to race on. The integrity check (`assertReplayArtifactShape`)
-is a constraint, but it runs at read time, not as part of a commit. That's the
-gap to understand.
+Zoom in: the concept is **the transaction boundary** — the span where a set of writes is atomic and isolated. buffr draws exactly one: a document's chunks all land or none do. aptkit draws none (it doesn't need to — see below). And the isolation *level* — what one transaction can see of another's in-flight writes — is whatever Postgres defaults to: READ COMMITTED. No code sets it, so no stronger guarantee is claimed.
 
----
+## The structure pass
 
-## Structure pass
+**Layers.** The transaction matters at the store layer only. Above it, the pipeline and tools issue logical operations ("index this document") with no transactional vocabulary. Below it, buffr wraps the physical writes; aptkit relies on the JS event loop.
 
-The layers: the **logical operation** (save a run / promote a baseline) and
-the **physical writes** it decomposes into. Axis to hold constant:
-**atomicity — if the process dies mid-operation, what state is left behind?**
+**Axis — trace "what's the atomic unit, and what can a concurrent reader see mid-write?":**
 
 ```
-  One axis — "what survives a crash mid-operation?" — across operations
+  One question across the stores: "what is atomic, and what's visible mid-write?"
 
-  ┌───────────────────────────────────────────┐
-  │ save a run: ONE writeFile                 │  → crash before: nothing written
-  └───────────────────────────────────────────┘    crash during: a partial file
-                                                    (no temp+rename guard)
-      ┌───────────────────────────────────────┐
-      │ promote: read 2, write 1 new file     │  → crash during: source files
-      └───────────────────────────────────────┘    intact (only reads); output
-                                                    may be partial/absent
-      ┌───────────────────────────────────────┐
-      │ a HYPOTHETICAL update spanning 2 files│  → crash during: ONE updated,
-      └───────────────────────────────────────┘    one not — TORN STATE.
-                                                    This is what AptKit avoids
-                                                    by never doing it.
-
-  the seam: as soon as one logical operation touches two files, you cross from
-  "no transaction needed" to "you need a transaction or you get torn state."
+  ┌─ InMemory ──────────────────────────┐
+  │  atomic unit: the whole upsert call  │ → JS is single-threaded; the loop
+  │  visible mid-write: N/A              │   runs to completion in one tick,
+  │                                      │   no other code interleaves
+  └──────────────────────────────────────┘
+  ┌─ Postgres (PgVectorStore) ──────────┐
+  │  atomic unit: ONE document's chunks  │ → begin..commit; rollback on error
+  │  visible mid-write: nothing (other   │   READ COMMITTED: a reader sees only
+  │  txns see pre-commit state)          │   committed rows, never the half-loop
+  └──────────────────────────────────────┘
 ```
 
-The load-bearing seam is the multi-file boundary. AptKit stays on the safe
-side of it by construction: every logical write is a single new file. Cross
-that seam — make one save update two files, or update a file in place under
-concurrency — and you've created the exact problem transactions exist to
-solve.
-
----
+**Seam.** The boundary is `begin`/`commit` in `PgVectorStore.upsert`. Inside it: a multi-row loop that's atomic. Outside it: the document-text insert into `agents.documents` and the chunk insert are **separate operations** — the FK was dropped (01), so there's no transaction spanning "write the document row" and "write its chunks." That's the anomaly surface: document and chunks can drift apart.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know how React's `setState` batches updates so the UI never renders a
-half-applied state? A transaction is that guarantee for storage: a batch of
-writes commits as one indivisible step, and readers either see all of it or
-none. The mental model is **ACID — Atomicity (all-or-nothing), Consistency
-(constraints hold across the batch), Isolation (concurrent batches don't see
-each other's middle), Durability (committed survives a crash).**
+A transaction is a `try/finally` with teeth: everything between `begin` and `commit` either all happens or the `rollback` in the `catch` undoes it. You've written the JS shape a hundred times; the database version adds durability and isolation on top.
 
 ```
-  the real mechanism: a transaction brackets writes into one atomic unit
+  The transaction kernel — begin, body, commit-or-rollback
 
-   BEGIN ──────────────────────────────────────► COMMIT
-     │   write A      write B      write C          │
-     │   (debit)      (credit)     (log)            │
-     └─ readers see the OLD world ────────────────► readers see the NEW world
-        (nothing in between is visible)             (all three, together)
-
-   crash anywhere before COMMIT → ROLLBACK → as if BEGIN never happened
+   begin
+     │
+     ├─ INSERT chunk 0
+     ├─ INSERT chunk 1        ← if ANY throws here...
+     ├─ INSERT chunk 2
+     │
+   commit   ──────────────►  all chunks durable, visible together
+     │
+   (on throw) rollback ────►  NONE of the chunks exist; clean slate
 ```
 
-### Move 2 — the parts that matter
+The kernel parts, each named by what breaks without it: lose `begin` and each insert auto-commits individually (partial document on a mid-loop crash); lose `rollback` and a failed insert leaves the earlier chunks orphaned; lose `commit` and nothing persists. All three are present in buffr.
 
-**Atomicity.** A transaction's first promise: all writes land or none do. A
-single `writeFile` gets a *weak* version of this for free — POSIX makes a
-single write of a small file unlikely to interleave with another writer's
-file, and AptKit writes distinct filenames so two writers never target the
-same file. What breaks without true atomicity: a crash *during* the
-`writeFile` can leave a truncated, invalid JSON file on disk. AptKit doesn't
-guard against this (no temp-file-and-`rename`), so the durability story in
-`07` is where this bites. For now, atomicity across *multiple* files is `not
-yet exercised` — nothing requires it.
+### Move 2 — the walkthrough
 
-**Consistency (constraints).** A transaction must leave the database obeying
-its constraints. AptKit's "constraints" are the shape assertions
-(`assertReplayArtifactShape`), but here's the critical difference: a database
-checks constraints *as part of the commit and rejects the write if they
-fail*. AptKit checks shape *at read time* — `/api/replay/save` runs only the
-lightweight `normalizeReplayArtifact`, so a malformed-but-normalizable
-artifact can persist and only fail later when something evals it. The
-constraint exists; its enforcement is deferred.
+**The one real transaction — atomic per document.** This is the entire transactional surface of the codebase:
 
-```
-  WHERE the constraint is enforced — the key difference
-
-  database:   write → CHECK constraint → reject if bad → commit
-                                │
-                                └─ bad data never lands
-
-  AptKit:     /api/replay/save → normalize (partial check) → writeFile
-              ...later...
-              read → assertReplayArtifactShape → bad data found HERE
-                                │
-                                └─ bad data already on disk; caught on read
+```ts
+// buffr/src/pg-vector-store.ts:40-65
+const client = await this.pool.connect();           // dedicated connection for the txn
+try {
+  await client.query('begin');                      // open the transaction
+  for (const c of chunks) {
+    ...
+    await client.query(`insert into agents.chunks (...) on conflict (id) do update set ...`, [...]);
+  }
+  await client.query('commit');                     // all chunks land together
+} catch (err) {
+  await client.query('rollback');                   // any failure → none land
+  throw err;
+} finally {
+  client.release();                                 // return the connection to the pool
+}
 ```
 
-**Isolation.** A transaction's promise that concurrent transactions don't see
-each other's uncommitted writes. AptKit has *no concurrent writers to the same
-record* — each save is a new file — so there are no read-write or write-write
-anomalies to isolate against. Isolation levels (read-committed, repeatable-read,
-serializable) are `not yet exercised`. The trigger: two processes update the
-*same* file, or one logical update spans files that another reader interleaves
-with.
+Walk it. `pool.connect()` pulls a *dedicated* connection — transactions are connection-scoped, so you can't `begin` on the pool and run inserts on arbitrary pooled connections. `begin` opens it. The loop inserts every chunk. `commit` makes them all durable and visible at once. If insert #7 of 50 throws, `rollback` erases chunks 0–6 — the document's vectors are all-or-nothing. `finally` releases the connection back to the pool no matter what. This is correct, minimal, textbook atomicity for the unit "one document's chunks."
 
-**The anomalies you'd see if you crossed the seam.** Worth naming so you
-recognize them: *lost update* (two writers read a file, both modify, both
-write back, one clobbers the other), *dirty read* (a reader sees a write that
-later rolls back), *write skew* (two transactions each read a consistent
-state and write changes that together violate an invariant). AptKit's
-append-only-new-file pattern sidesteps all three — you can't lose an update to
-a file nobody updates in place. That's not isolation; it's avoiding the
-situation isolation manages.
+**The migration runner uses the same pattern.** Schema changes are also atomic:
 
-**The one multi-record write that lacks atomicity (the vector store).** The
-filesystem story above is "one file per write, so no transaction is needed."
-The new `InMemoryVectorStore.upsert` breaks that pattern: it writes *many*
-chunks in one call, looping `this.chunks.set(...)` with no transaction around
-the loop (`packages/retrieval/src/in-memory-vector-store.ts:18-23`). It also
-*mutates in place* — upsert replaces an existing id (the
-"upsert-replaces-rather-than-duplicates" test at
-`test/in-memory-vector-store.test.ts:37-44` proves it). So this is the repo's
-first write that *could* leave a half-applied state: if chunk 3 of 5 throws a
-dimension mismatch, chunks 1–2 are already in the `Map`. The blast radius is
-small — the store is in-memory and the corpus is rebuildable by re-indexing —
-so it's a real-but-bounded atomicity gap, not a corruption risk. The version
-that wraps the same multi-chunk upsert in a true `begin/commit/rollback` lives
-in the **buffr** repo (`buffr/src/pg-vector-store.ts:40-64`), not aptkit: a
-mid-loop throw there rolls the whole batch back. That contrast is the lesson —
-the moment the corpus stops being cheaply rebuildable, you want buffr's
-transactional store behind the same `VectorStore` contract.
+```ts
+// buffr/src/migrate.ts:8-20
+await client.query('begin');
+await client.query(sql);                            // the whole 001_agents_schema.sql
+await client.query('commit');
+// catch → rollback; finally → release
+```
+
+The entire schema script runs in one transaction — partial schema application is impossible. Same kernel, applied to DDL.
+
+**The isolation level is never set — so it's READ COMMITTED.** Search every `query` call in buffr: none issue `set transaction isolation level`. Postgres's default is **READ COMMITTED**, so that's what every transaction here runs at. What that buys: a statement sees only data committed *before the statement began*. What it does *not* prevent: non-repeatable reads (re-read the same row mid-transaction, get a different value if another txn committed in between) and phantom reads (a range query returns new rows on re-run). For this workload — single-writer upserts, search reads that don't re-read — READ COMMITTED is enough, and nobody claimed more. No `serializable`, no `repeatable read`, no `select ... for update`: **`not yet exercised`**.
+
+**The anomaly that IS reachable — document/chunk drift.** Here's the real exposure, and it comes straight from the dropped FK (01). Indexing a document is *two* unrelated writes:
+
+```
+  Layers-and-hops — the NON-atomic span across documents and chunks
+
+  ┌─ application (buffr) ─┐
+  │ 1. INSERT agents.documents row   ──┐   (one statement, its own implicit txn)
+  │                                    │   ★ NO transaction spans these two ★
+  │ 2. PgVectorStore.upsert(chunks) ───┘   (begin..commit — its own txn)
+  └────────────────────────────────────┘
+        │
+        ▼ if the process dies between 1 and 2:
+   a documents row exists with ZERO chunks  — or chunks exist with no documents row
+   (the dropped FK means the engine won't catch either)
+```
+
+Because there's no FK and no enclosing transaction across "insert the document" and "insert the chunks," a crash between them leaves the two tables inconsistent — orphan chunks or a chunk-less document — and Postgres won't complain. The per-document upsert transaction protects the *chunks among themselves*, not the *document-to-chunks* relationship. That's the deliberate cost of parity (01) showing up as a consistency anomaly. Today it's tolerable because indexing is a manual, low-frequency, single-writer operation; it becomes a real bug under concurrent or automated indexing.
 
 ### Move 3 — the principle
 
-Transactions and isolation are the price of *mutable, shared* state. AptKit's
-*filesystem* pays nothing because its state is *immutable and unshared per
-record* — write once, never update, unique filenames. The new vector store is
-the exception that proves the rule: it does a multi-chunk, in-place-by-id write
-with no transaction, so it inherits exactly the partial-write exposure the
-filesystem path avoided — bounded only by being in-memory and rebuildable. The
-generalizable rule: **if you make every write produce a new immutable record,
-you delete a class of concurrency bugs for free; the moment one write touches
-many records or updates in place, you've signed up for a transaction.** When
-that moment is load-bearing rather than rebuildable, buffr's PgVectorStore
-supplies the transaction behind the unchanged contract.
-
----
+A transaction is only as wide as you draw it, and READ COMMITTED is what you get when you draw none around isolation. buffr draws the boundary tightly around "one document's chunks" and accepts that the document-to-chunks link sits outside any transaction — a direct consequence of dropping the FK for contract parity. The general lesson: atomicity protects exactly the span you wrap, and every guarantee you don't explicitly request defaults to the engine's weakest acceptable one.
 
 ## Primary diagram
 
 ```
-  AptKit "transaction" model — single-file, write-once, read-time check
+  Full transaction picture — what's atomic, what isn't
 
-  ┌─ a "save" (the whole transaction) ────────────────────────┐
-  │  build artifact in memory                                 │
-  │       │                                                   │
-  │       ▼                                                   │
-  │  normalizeReplayArtifact()   ← partial write-time check   │
-  │       │                       (schemaVersion, ids, trace) │
-  │       ▼                                                   │
-  │  writeFile(unique-name.json) ← one atomic-ish op, no fsync│
-  └────────────────────────────────────────────────────────────┘
-                    │  (no rollback, no lock, no isolation level)
-                    ▼
-  ┌─ later, on READ ──────────────────────────────────────────┐
-  │  assertReplayArtifactShape() ← the FULL constraint check,  │
-  │                                deferred to read time       │
-  └────────────────────────────────────────────────────────────┘
+  ┌─ ATOMIC (one txn each) ────────────────────────────────────────┐
+  │  PgVectorStore.upsert:  begin → INSERT chunk×m → commit/rollback│
+  │  migrate.runMigration:  begin → run whole schema → commit       │
+  └─────────────────────────────────────────────────────────────────┘
+  ┌─ NOT ATOMIC (no spanning txn) ─────────────────────────────────┐
+  │  INSERT documents row    ─┐  crash here → orphans               │
+  │  upsert(chunks)          ─┘  (FK dropped → engine won't catch)  │
+  └─────────────────────────────────────────────────────────────────┘
+  ┌─ ISOLATION ────────────────────────────────────────────────────┐
+  │  READ COMMITTED (Postgres default — never set in code)          │
+  │  serializable / repeatable read / FOR UPDATE: NOT EXERCISED     │
+  └─────────────────────────────────────────────────────────────────┘
+  ┌─ aptkit InMemory: no txn — single JS tick is the atomic unit ──┐
+  └─────────────────────────────────────────────────────────────────┘
 ```
-
----
-
-## Implementation in codebase
-
-**Use cases.** The "transaction" is every save and every promotion. The
-deferred constraint check fires on every eval (`npm run eval:replays`) and
-every Studio listing. The lost-update anomaly is *avoided* everywhere because
-no code path updates a file in place.
-
-**The whole "transaction" — a single write** —
-`apps/studio/vite.config.ts:372-378`:
-
-```
-  const artifact = normalizeReplayArtifact(body.artifact); ← partial constraint
-                                                              check (throws → 400)
-  const outDir = resolve(workspaceRoot(), 'artifacts/replays');
-  await mkdir(outDir, { recursive: true });
-  const path = join(outDir, `${formatTimestamp(...)}-${slugify(...)}-studio.json`);
-  await writeFile(path, `${JSON.stringify(artifact, null, 2)}\n`, 'utf8'); ← COMMIT
-       │                                                                      (the only
-       │                                                                       durable step)
-       └─ no BEGIN, no rollback. If this throws after a partial write, the
-          partial file stays. Unique filename means it can't clobber another save.
-```
-
-**The deferred constraint** — `packages/evals/src/assertions.ts:58-72,114-117`:
-
-```
-  export function assertReplayArtifactShape(output) {
-    const result = assertRequiredPaths(output, [
-      'schemaVersion', 'createdAt', 'durationMs', 'provider.id', ...
-      'eval.name', 'eval.ok', 'modelTurns',
-    ]);                                       ← the "constraints" (required columns)
-    ...
-    const replayEval = output.eval;
-    if (!isRecord(replayEval) || replayEval.ok !== true) {
-      issues.push({ path: 'eval.ok', message: 'expected embedded replay eval to pass' });
-    }                                         ← a CHECK constraint: the embedded
-                                                eval must have passed
-    ...
-  }
-       │
-       └─ this is real integrity logic, but nothing calls it on the write path.
-          It runs when a reader (CLI eval, Studio list, promotion) pulls the
-          record back. Constraint enforcement is read-time, not commit-time.
-```
-
-**The partial write-time check** — `apps/studio/vite.config.ts:1497-1512`:
-
-```
-  function normalizeReplayArtifact(value) {
-    if (value.schemaVersion !== 1) throw new Error('artifact schemaVersion must be 1');
-    if (typeof value.createdAt !== 'string') throw new Error('...');
-    if (!Array.isArray(value.trace)) throw new Error('artifact trace must be an array');
-    ...
-    return value;
-  }
-       │
-       └─ a NOT-NULL-style guard that DOES run before writeFile. It catches
-          gross malformation but not the full shape (it won't run the
-          recommendation-shape sub-check). Partial commit-time constraint.
-```
-
----
 
 ## Elaborate
 
-ACID came from systems that had to mutate shared rows safely — banking,
-inventory, anything with concurrent updates to the same datum. The anomalies
-(lost update, dirty read, phantom, write skew) are all symptoms of *visibility
-of intermediate state under concurrency*. AptKit avoids the entire category by
-never sharing a mutable record: append-only, immutable, unique-named files.
-This is the same insight behind event sourcing and immutable infrastructure —
-don't update, append. Rein has built the mutable-shared-state version
-elsewhere (buffr's SQLite-primary-with-Supabase-mirror has to reconcile
-concurrent edits; AdvntrCue's Postgres session memory mutates rows), which is
-exactly where transactions earn their keep. AptKit is the deliberate opposite:
-no mutation, no transaction needed.
-
-The trigger to introduce real transactions: any feature where one logical
-change must touch two files atomically (e.g., "promote and update an index
-file in the same step"), or where two processes update the same file. Until
-then, transactions are correctly absent.
-
-The *shape* of what's written (the artifact schema, `schemaVersion`) belongs
-to `study-data-modeling`; this file owns only the atomicity and isolation
-mechanics around the write.
-
----
+ACID's "A" and "I" are what this file covers; "D" (durability) is 07 and "C" (consistency) leans on the constraints the FK *would* have enforced (data-modeling). The interesting historical note is that buffr *had* a `chunks_document_id_fkey` and explicitly dropped it (`001_agents_schema.sql:26-27`) — so the document/chunk anomaly is a known, accepted trade, not an oversight. If automated re-indexing ever runs concurrently, the move is either to restore a deferred FK (`deferrable initially deferred`, checked at commit) or to wrap document+chunk writes in one transaction at the application layer — both reintroduce the spanning boundary the contract gave up. Read next: 06 for the locking and MVCC under READ COMMITTED, 07 for durability.
 
 ## Interview defense
 
-**Q: "You have no transactions. How do you avoid lost updates and corruption?"**
-
-> By never updating in place. Every save writes a new, uniquely-named immutable
-> file, so two writers never touch the same record and there's no lost-update
-> race — I avoid the situation transactions manage rather than managing it.
-> Where I'm honest: there's no fsync and no temp-and-rename, so a crash mid-write
-> can leave a truncated file, and my full integrity check runs at *read* time,
-> not commit time — a malformed artifact can sit on disk until something evals it.
+**Q: What's atomic in this system, and what isn't?**
 
 ```
-  no in-place update → no lost-update race
-  but: single writeFile (no temp+rename) → crash can leave a torn file
-       constraint check is read-time (assertions.ts:58), not commit-time
+  atomic:    [ begin → chunk0..chunkM → commit ]   ← one document's vectors
+  NOT atomic: INSERT documents  ╳  upsert chunks    ← no txn spans them
+                                 (FK dropped)
 ```
 
-**Anchor:** "Append-only immutable files delete the concurrency-anomaly class;
-the gap is read-time constraint enforcement at `assertions.ts:58`."
+Answer: "One document's chunks are atomic — `begin/commit/rollback` around the insert loop (`pg-vector-store.ts:40-65`), so a mid-loop failure rolls back every chunk. What's *not* atomic is the document row plus its chunks: they're separate writes with no spanning transaction, and the FK was dropped for contract parity, so a crash between them leaves orphans and the engine won't catch it. It's an accepted trade today because indexing is single-writer and manual." Anchor: *atomic per document, not across document-and-chunks.*
 
----
+**Q: What isolation level do you run at?**
 
-## Validate
-
-1. **Reconstruct:** Name the four ACID properties and, for each, say whether
-   AptKit provides it and via what mechanism (or that it's absent).
-2. **Explain:** Why does AptKit have no lost-update anomaly despite no locks?
-   Tie it to the unique-filename write at `vite.config.ts:376`.
-3. **Apply:** A new feature must "promote a fixture AND append its id to a
-   manifest file" atomically. What breaks under a crash, and what would you
-   reach for?
-4. **Defend:** Argue why read-time constraint checking (`assertions.ts:58`) is
-   acceptable here, and name the failure it permits that a commit-time check
-   would prevent.
-
----
+Answer: "READ COMMITTED — the Postgres default, because the code never sets one. That's the honest answer: no `set transaction isolation level` anywhere. It's fine for this workload — single-writer upserts, search reads that don't re-read rows, so non-repeatable reads and phantoms don't bite. If I added a read-modify-write on the same row under concurrency, I'd reach for `repeatable read` or `select ... for update`." Anchor: *no level set means READ COMMITTED — name the default, don't pretend it's stronger.*
 
 ## See also
 
-- `06-locks-mvcc-and-concurrency-control.md` — why no locks are needed
-- `07-wal-durability-and-recovery.md` — the torn-write risk on a single writeFile
-- `04-query-planning-and-execution.md` — the promotion 1×1 "join" two-file read
-- `study-data-modeling` → the artifact schema the constraints check
+- `01-database-systems-map.md` — the dropped FK that creates the cross-table anomaly.
+- `06-locks-mvcc-and-concurrency-control.md` — what READ COMMITTED does under concurrency.
+- `07-wal-durability-and-recovery.md` — the "D" that commit triggers.
+- study-data-modeling — the FK decision and integrity constraints.
+- study-distributed-systems — the best-effort writes (memory, trace flush) outside any txn.

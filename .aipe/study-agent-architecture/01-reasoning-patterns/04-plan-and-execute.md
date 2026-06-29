@@ -1,237 +1,108 @@
-# 04 — Plan-and-Execute
+# Plan-and-Execute
 
-*Plan-and-execute (a.k.a. plan-and-solve, planner-executor) — Industry standard
-(LangChain "Plan-and-Execute" agents; BabyAGI-lineage).*
+**Industry standard.** "Plan-and-execute," "planner-executor," "decompose-then-run." Type label: reasoning pattern. **In this codebase: not yet implemented** — aptkit's agents are pure ReAct; no agent builds a plan up front before executing. Single-agent ReAct hasn't hit a planning-quality ceiling, so the escalation hasn't been made.
 
 ## Zoom out, then zoom in
 
-This pattern is *not in AptKit.* Place the empty slot honestly before describing
-what would fill it.
+Plan-and-execute separates *deciding the strategy* from *doing the work*. One expensive call builds the whole plan; cheap calls run each step without re-deciding the approach. aptkit doesn't do this — but it's the first rung on the escalation ladder above ReAct, so it's worth seeing where it would slot in.
 
 ```
-  The reasoning family, with the empty slot marked
+  Zoom out — where plan-and-execute WOULD sit in aptkit
 
-  ┌─ reasoning patterns ─────────────────────────────────────┐
-  │   chain                                                   │
-  │   ReAct ───────────── all 5 agents (base case)            │
-  │   ★ plan-and-execute ★ ── NOT BUILT  ← we are here, empty │
-  │   reflexion ───────── rubric agent                        │
-  │   tree-of-thoughts ── NOT BUILT                           │
-  └──────────────────────────────────────────────────────────┘
+  ┌─ Pattern family (SECTION A) ────────────────────────────┐
+  │  ReAct → ★ plan-and-execute ★ → reflexion → ToT          │ ← would-be here
+  │  (aptkit is here)  (not yet exercised)                   │
+  └───────────────────────────┬──────────────────────────────┘
+                              │ would still run on
+  ┌─ Loop layer ──────────────▼──────────────────────────────┐
+  │  runAgentLoop (the same kernel; a plan phase added front) │
+  └────────────────────────────────────────────────────────────┘
 ```
-
-So why spend a file on a slot that's empty? Because knowing *when you'd reach
-for it* is the staff-level skill, and because the moment AptKit grows a live
-monitor→diagnose→recommend orchestrator, the planner question becomes real.
-Right now the pipeline is *latent* — wired by data contracts, not by a runtime
-planner (see `../03-multi-agent-orchestration/03-sequential-pipeline.md`). That
-latent pipeline is, in a sense, a *hand-coded plan*: a human decided "scan, then
-diagnose, then recommend" and wrote it as a fixed order. Plan-and-execute is
-what you build when you want the *model* to write that order instead of you.
-
-Frontend anchor: ReAct is `useReducer` where you dispatch one action, see the
-result, decide the next. Plan-and-execute is "compute the entire list of actions
-up front, then run them" — like building an array of operations and then
-`for`-looping over it. The plan is a value you hold; the executor consumes it.
 
 ## Structure pass
 
-Trace the **control axis** — "when is the sequence of steps decided" — to see
-exactly how plan-and-execute differs from ReAct.
-
-```
-  Control axis: WHEN the step sequence is chosen
-
-  Pattern             Step sequence decided…           Re-decides mid-run?
-  ──────────────────  ───────────────────────────────  ───────────────────
-  ReAct               one step at a time, each turn     yes, every turn
-  ─ ─ ─ ─ ─ ─ ─ ─ ─   ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─  ─ ─ ─ ─ ─ ◄ SEAM
-  plan-and-execute    ALL up front, in a plan phase     only on replan
-```
-
-The seam is the plan phase. In ReAct there's no plan phase — the model decides
-the next step using all evidence so far, every turn, which is *adaptive* but can
-*lose the thread* over long horizons. Plan-and-execute moves the deciding to the
-front: one model call produces the whole list, then a cheaper executor runs each
-item. You trade adaptivity for a coherent long-horizon structure.
+**Axis: where does reasoning live?** ReAct interleaves it; plan-and-execute pulls it out front. **The seam** is between the plan phase (one expensive reasoning call) and the execute phase (many cheap calls). aptkit has no such seam — its recommendation agent reasons and acts in the same loop. The recommendation agent is the closest candidate to refactor, because its task (build evidence across 13 tools, then propose) *has* a predictable structure a plan could capture.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-Two phases: a **planner** (one model call that emits an ordered list of
-sub-tasks) and an **executor** (runs each sub-task, often as its own small ReAct
-loop), with an optional **replan** when reality diverges from the plan.
+You know how you'd write a `.then()` chain when you know the steps, versus a `while` loop when you don't? Plan-and-execute is: use an expensive model *once* to write the `.then()` chain at runtime, then run it with a cheap model. Strategy and grunt work, decoupled.
 
 ```
-  Plan-and-execute = plan phase, then execute phase
+  Plan-and-execute — split the strategy from the doing
 
-  user goal
-     │
-     ▼
-  ┌─────────┐   ordered list of steps   ┌────────────────────────┐
-  │ PLANNER │ ───────────────────────▶  │ EXECUTOR (per step)     │
-  │ 1 call  │   [s1, s2, s3]            │  run s1 → run s2 → s3   │
-  └─────────┘                           │  each step = mini-ReAct  │
-       ▲                                └───────────┬─────────────┘
-       │ replan if a step fails / surprises          │
-       └─────────────────────────────────────────────┘
-                                                     ▼
-                                                 final answer
+  ┌─ Plan phase (expensive model, once) ────────────┐
+  │  build full plan: [step1, step2, step3]         │
+  └──────────────────┬───────────────────────────────┘
+                     │  plan
+                     ▼
+  ┌─ Execute phase (cheap model, per step) ─────────┐
+  │  run step1 → step2 → step3 (no re-planning)     │
+  │  re-plan trigger ONLY if a step diverges         │
+  └───────────────────────────────────────────────────┘
 ```
 
-### Move 2 — the moving parts
+### Move 2 — what it would take in aptkit
 
-**The plan phase**
+aptkit's recommendation agent today is ReAct: the model queries tools in whatever order it picks, accumulating evidence, then proposes. To make it plan-and-execute, you'd split `propose()` (`recommendation-agent.ts:64`) into two loops:
 
-```
-  planner call: "decompose this goal into ordered steps"
-       │
-       ▼
-  plan = ["query revenue by segment", "check campaign calendar",
-          "correlate", "write diagnosis"]     ← a VALUE, held in memory
-```
+**Plan loop.** One `runAgentLoop` call (or one `model.complete`) with the expensive provider, output = a structured list of which tools to query for this diagnosis. The diagnosis is already passed in (`recommendation-agent.ts:74`), so the plan input exists.
 
-Pseudocode: `plan = await model.complete({ system: plannerPrompt, ...})` parsed
-into a list. This is one extra model call ReAct doesn't make. Its payoff is a
-coherent skeleton the executor follows instead of re-deciding every turn.
-
-**The execute phase**
+**Execute loop.** Run the planned queries with a cheaper provider (the Gemma local model, say), then synthesize. The synthesis step is already the forced-final turn — that part wouldn't change.
 
 ```
-  for step in plan:
-     result = runStep(step)        ← often a small ReAct loop itself
-     accumulate result
+  Recommendation agent refactor — ReAct → plan-and-execute (would-be)
+
+  TODAY (ReAct):
+    runAgentLoop ─ model picks tools ad hoc ⇄ accumulate ─ synthesize
+
+  REFACTORED:
+    plan(diagnosis) ─expensive─► [get_metric_timeseries, get_segments, ...]
+        │
+        ▼
+    execute each ─cheap─► evidence ─► synthesize (existing forced-final turn)
 ```
 
-Pseudocode: a loop over the plan, each item executed (frequently by *reusing*
-`runAgentLoop` with that single sub-task as the prompt). The executor can be
-dumber/cheaper than the planner because the hard thinking already happened.
-
-**The replan loop**
-
-```
-  step failed OR returned a surprise
-       │
-       ▼
-  feed (plan-so-far + new fact) back to planner ──▶ revised plan
-```
-
-Pseudocode: `if surprised: plan = await replan(plan, results)`. Without replan,
-plan-and-execute is brittle — the world changes and the stale plan marches on.
-With it, you've reinvented an outer ReAct loop around an inner plan, which is
-why the patterns blur at the edges.
+**The tradeoff that makes aptkit right to wait.** Plan-and-execute beats ReAct on *structured* tasks where the path is predictable — but it's brittle when plan assumptions break mid-execution (a planned tool returns nothing, and the plan has no branch). The mitigation is a re-plan trigger, which adds back much of ReAct's adaptivity *plus* the planning overhead. aptkit's recommendation task isn't structured enough to justify that yet — the model's ad-hoc tool order works, and `maxToolCalls: 4` already bounds the cost. You escalate when planning *quality* becomes the bottleneck, not before.
 
 ### Move 3 — the principle
 
-Plan-and-execute buys long-horizon coherence by deciding the whole sequence up
-front — pay for it only when ReAct *measurably* loses the thread over many steps.
+ReAct for dynamic/exploratory tasks where the path can't be predicted; plan-and-execute for structured tasks where it can. aptkit's tasks are exploratory enough that ReAct is the right call. The day a task becomes "always query these five tools in this order," that's the signal to plan.
 
 ## Primary diagram
 
-The two-phase shape with the replan back-edge, and the named-failure gate that
-should precede building it.
-
 ```
-  Plan-and-execute — full shape (NOT in AptKit)
+  Plan-and-execute — the general shape (not yet in aptkit)
 
-  named failure: "ReAct loses thread / redoes work over 10+ steps"
-        │ (only build it if you saw THIS)
-        ▼
-  ┌─────────┐                 ┌──────────────────────────────┐
-  │ PLANNER │ ──[s1..sN]────▶ │ EXECUTOR: run each step       │
-  │ 1 model │                 │  s1→s2→…  (each a mini-ReAct)  │
-  │  call   │ ◀──replan────── │  on surprise, ask to replan   │
-  └─────────┘                 └───────────────┬──────────────┘
-                                              ▼
-                                          final answer
+  input ─► ┌─ PLAN (expensive, once) ──────────┐
+           │  decompose into ordered steps     │
+           └──────────────┬─────────────────────┘
+                          ▼  plan = [s1, s2, s3]
+           ┌─ EXECUTE (cheap, per step) ───────┐
+           │  s1 → s2 → s3                     │
+           │  diverged? ─► re-plan              │
+           └──────────────┬─────────────────────┘
+                          ▼
+                       output
 ```
-
-AptKit's box for this is empty; the diagram is what you'd draw on the whiteboard.
-
-## Implementation in codebase
-
-**Not yet implemented.** AptKit has no separate plan phase anywhere — every
-capability is a single bare ReAct loop (`runAgentLoop` called once per
-capability, no planner call preceding it). The closest thing is the
-*hand-coded* pipeline order encoded in the data contracts (`Anomaly` →
-`Diagnosis` → `Recommendation`, consumed by `investigate(anomaly)` at
-`diagnostic-agent.ts:55` and `propose(anomaly, diagnosis)` at
-`recommendation-agent.ts:64`) — a human wrote that plan, not a model.
-
-When AptKit *would* reach for it: the day someone wants the system to handle an
-open-ended request like *"figure out why Q3 revenue is soft and tell me what to
-do,"* where the number and order of sub-investigations isn't known in advance
-and a single ReAct loop would lose coherence across a dozen queries. At that
-point you'd add a planner that decomposes the goal into scan/diagnose/recommend
-sub-tasks and an executor that runs each — and the executor could *reuse*
-`runAgentLoop` per sub-task. The build template for this lives in
-`../06-orchestration-system-design-templates/` (the multi-agent research
-assistant template is the closest fit).
 
 ## Elaborate
 
-**Origin.** Plan-and-execute crystallized from BabyAGI / AutoGPT (2023) — "make
-a task list, work the list" — and was formalized in LangChain's
-Plan-and-Execute agents and the "Plan-and-Solve" prompting paper (Wang et al.,
-2023), which showed planning-then-solving beat plain CoT on multi-step
-arithmetic and reasoning.
-
-**Adjacent concepts.** Plan-and-execute with a replan edge converges toward
-ReAct-with-memory; the meaningful distinction is *whether a full plan exists as
-an artifact.* It's also the natural home of a *supervisor* in multi-agent
-systems — the planner becomes the supervisor, each step a worker
-(`../03-multi-agent-orchestration/`). And the hand-coded version of "the plan" is
-just a chain (`01-chains-vs-agents.md`) — which is exactly what AptKit's latent
-pipeline is today.
+Plan-and-execute was a response to ReAct burning expensive-model calls on every step of a long, predictable task. The fix: pay for the expensive model once (the plan), run the rest cheap. aptkit's provider layer would make the cheap/expensive split trivial — `ModelProvider` is swappable, so the plan loop could use Anthropic and the execute loop could use Gemma. The infrastructure is ready; the need isn't there.
 
 ## Interview defense
 
-**Q: "Your codebase is ReAct. When would you add a planner?"**
+**Q: Do your agents plan?**
+No — they're ReAct, reasoning and acting interleaved. I considered plan-and-execute for the recommendation agent because its task has structure, but its tool order is exploratory enough that ad-hoc ReAct works and `maxToolCalls: 4` bounds the cost. I'd split it into plan/execute loops the day planning quality became the bottleneck — and my swappable provider layer would let the plan run on an expensive model and the execute steps on a cheap one.
 
 ```
-  the gate, drawn
-
-  ReAct loses coherence over many steps?  ──NO──▶  don't build it
-        │
-        YES ──▶ add plan phase: 1 planner call → executor runs the list
+  plan (expensive, once) → execute (cheap, per step) → re-plan on divergence
 ```
-
-Anchor: "I add a planner the day a single ReAct loop measurably loses the thread
-over a long horizon — not before; today AptKit's investigations are short, so
-the plan is hand-coded as a data contract."
-
-**Q: "Difference between plan-and-execute and ReAct in one line?"**
-
-```
-  ReAct:  decide next step every turn   (adaptive, can drift)
-  P&E:    decide ALL steps up front      (coherent, can go stale → replan)
-```
-
-Anchor: "Plan-and-execute front-loads the deciding into one plan artifact;
-ReAct decides one step at a time." Surfaces the skeleton part: P&E is the kernel
-*wrapped twice* — a planner call, then `runAgentLoop` per step.
-
-## Validate
-
-- **Reconstruct:** Draw the planner→executor→replan shape from memory; mark
-  which box would reuse `runAgentLoop`.
-- **Explain:** Why is AptKit's `Anomaly`→`Diagnosis`→`Recommendation` chain
-  *not* plan-and-execute? (the plan is hand-coded by a human as a data contract;
-  no model produced the step list; see `diagnostic-agent.ts:55`,
-  `recommendation-agent.ts:64`.)
-- **Apply:** A user asks an open-ended "diagnose Q3 and recommend fixes." Sketch
-  the planner output and how the executor reuses `runAgentLoop` per step.
-- **Defend:** Argue against adding a planner *today.* (No measured long-horizon
-  failure; current investigations fit inside one 8-turn budget; a planner adds a
-  model call and a stale-plan failure mode for no observed gain.)
+*Anchor: escalate to planning when path *quality* is the failure, not before.*
 
 ## See also
 
-- [03-react.md](03-react.md) — the base case you'd escalate *from*
-- [02-agent-loop-skeleton.md](02-agent-loop-skeleton.md) — the kernel an executor
-  would reuse per step
-- `../03-multi-agent-orchestration/03-sequential-pipeline.md` — the latent
-  hand-coded "plan" AptKit has today
-- `../06-orchestration-system-design-templates/` — where you'd build the live
-  planner version
+- `03-react.md` — the pattern aptkit actually runs
+- `03-tool-calling-and-mcp.md` (SECTION D) — the swappable provider layer that makes cheap/expensive splitting cheap
+- `06-orchestration-system-design-templates/03-agentic-coding-system.md` — where plan-and-execute is the standard architecture

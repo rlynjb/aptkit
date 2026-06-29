@@ -1,49 +1,65 @@
-# How This Codebase Uses ML
+# How aptkit uses ML specifically
 
-Be honest about this up front:
+This codebase does not currently train, deploy, or serve any classical ML model.
+There is no supervised pipeline, no feature engineering, no on-device classifier,
+no recommender trained on interactions. The ML engineering concepts in
+`08-machine-learning/` are covered as **study material**, not as a description of
+code that exists.
 
-> **AptKit ships no trained ML model and runs no classical-ML inference.** The AI
-> engineering concepts in section 08 are covered as study material; the Project
-> exercises identify the features that *could* be added. Where AptKit performs
-> tasks that are classically ML-shaped — anomaly detection, recommendation,
-> scoring — those are implemented as LLM agents (sections 04/05), not trained
-> models.
+That is a deliberate boundary, not an omission. aptkit's analytics capabilities
+(anomaly-monitoring, diagnostic-investigation, recommendation) all run a
+**pre-trained LLM** behind a prompt + tool policy. They produce things that
+*look* ML-shaped — ranked anomalies, recommendations, confidence scores — but
+the "model" is Gemma reasoning over a `WorkspaceDescriptor`, not a fitted
+classifier with learned weights.
 
-There is no training pipeline, no labeled dataset, no feature matrix, no model
-weights, no model registry, and no inference call to a fitted model anywhere in the
-repo. The data model is file- and stream-shaped (trace events, replay artifacts,
-fixtures, workspace metadata) — none of it is training data. Every "intelligent"
-decision in AptKit is made by a pre-trained LLM behind the `ModelProvider.complete()`
-contract.
+## What's ML-adjacent (but isn't trained ML)
 
-This matters for interviews: most candidates have only *consumed* pre-trained
-models. Having *trained* one is the rarer signal. AptKit demonstrates the AI
-engineering discipline (prompts, tool use, evals, bounded loops, replay) — not the
-classical-ML discipline (data quality, feature engineering, train/val/test, drift).
-Do not claim the latter from this codebase.
+```
+  ┌──────────────────────────┬──────────────────┬──────────────────────────┐
+  │ Capability               │ Looks like…      │ But actually is…         │
+  ├──────────────────────────┼──────────────────┼──────────────────────────┤
+  │ anomaly-monitoring agent │ anomaly detection│ LLM scoring metrics      │
+  │                          │ model            │ against 10 prose         │
+  │                          │                  │ categories — no model    │
+  ├──────────────────────────┼──────────────────┼──────────────────────────┤
+  │ recommendation agent     │ a recommender    │ LLM generating ≤3 recs   │
+  │                          │ system           │ from anomaly+diagnosis — │
+  │                          │                  │ no ranking model, no     │
+  │                          │                  │ interaction log          │
+  ├──────────────────────────┼──────────────────┼──────────────────────────┤
+  │ intent classification    │ a text classifier│ keyword heuristic +      │
+  │                          │                  │ one-shot LLM — no trained│
+  │                          │                  │ classifier               │
+  ├──────────────────────────┼──────────────────┼──────────────────────────┤
+  │ precision@k / recall@k   │ ML eval metrics  │ genuinely ML metrics —   │
+  │ scorers                  │                  │ applied to RETRIEVAL,    │
+  │                          │                  │ not to a trained model   │
+  └──────────────────────────┴──────────────────┴──────────────────────────┘
+```
 
-## LLM analogs and their classical-ML counterparts
+The one genuinely ML artifact in the repo is the **ranked-retrieval scorer**
+(`packages/evals/src/precision-at-k.ts`) — `scorePrecisionAtK` / `scoreRecallAtK`.
+These are the same metrics you'd use to evaluate a classifier or a recommender,
+but here they grade RAG retrieval quality. That's the bridge: the reader already
+holds the eval vocabulary from this repo; Section 08 extends it to trained models.
 
-Three AptKit agents occupy the *shape* of a classical-ML system without being one.
-The distinction below is the honest version to give an interviewer.
+## What ML in this codebase would require
 
-| AptKit LLM agent | Classical-ML counterpart | The honest distinction |
-| --- | --- | --- |
-| `anomaly-monitoring-agent` (`packages/agents/anomaly-monitoring`) | Anomaly detection model (isolation forest / autoencoder / LightGBM) | Same architecture — feature extraction → scoring → threshold → severity tier → top-N. But scoring is **LLM judgment against static per-category thresholds**, not a fitted model over a learned baseline distribution. No anomaly log, no labels, no retraining loop. |
-| `recommendation-agent` (`packages/agents/recommendation`) | Recommender model (collaborative filtering / learned ranker) | Same shape — candidate taxonomy, ranked by predicted impact, top-3, confidence field. But candidates are **LLM-generated from a diagnosis**, not retrieved from a catalog; ranking is **prose estimation**, not a model trained on an interaction log. Effectively one "user" (one workspace), so no collaborative signal. |
-| `rubric-judge` / `rubric-improvement-agent` (`packages/evals/src/rubric-judge.ts`, `packages/agents/rubric-improvement`) | A scorer / classifier | Same job — map an input to a score and a verdict. But it is **LLM-as-judge with a structured rubric and a validator**, not a classifier trained on labeled examples. The rubric's calibration examples anchor the scale; they are not a training set. |
+If aptkit grew a trained model, the cleanest fit would be a learned **reranker**
+on top of the cosine retrieval, or a learned **intent classifier** replacing the
+keyword heuristic. Both are written up as Case-B project exercises in
+`08-machine-learning/` and `09-ml-system-design-templates/`. Neither exists today
+— marked `not yet exercised` throughout.
 
-The structural takeaway: AptKit proves the LLM-agent version of these three
-patterns. Replacing the LLM with a trained model in any of them is a real ML
-project — collect labels, engineer features, split, train, evaluate, monitor for
-drift — not a config change. Each template's "How to make it apply" bullet in
-section 09 names that path concretely.
+## not yet exercised
 
-## Where to go next
+- supervised training pipeline (data → features → split → fit → deploy)
+- feature engineering / feature store
+- train/val/test discipline, model selection (LR vs GBT)
+- class imbalance handling, calibration, confusion matrices over a trained model
+- on-device inference, quantization, drift detection, retraining pipelines
 
-- **Foundations** — supervised learning pipeline, feature engineering, train/val/test
-  split discipline, classical metrics: [`08-machine-learning/`](./08-machine-learning/).
-- **Reframes** — the three ML system-design templates and exactly what you would
-  build to make each apply: [`09-ml-system-design-templates/`](./09-ml-system-design-templates/).
-- **What AptKit actually does** — the five live AI features and their specs:
-  [`ai-features-in-this-codebase.md`](./ai-features-in-this-codebase.md).
+These belong to the **classical supervised ML shape** — trained models with
+labeled data, feature engineering, and deployment — which this codebase is not.
+They are taught as new ground in Section 08.

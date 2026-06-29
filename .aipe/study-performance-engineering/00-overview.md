@@ -1,191 +1,108 @@
-# Performance Engineering — Overview
+# Performance Engineering — overview
 
-## The one thing to internalize
+The verdict up front: **aptkit makes good performance *decisions* and has done
+zero performance *measurement*.** There are no budgets, no baselines, no
+profiler runs, no recorded latencies anywhere in the repo. What it has is a set
+of cost-shaping choices baked into code — a bounded agent loop, a batched
+embedder, a vendor-neutral vector contract, a build-time-inlined Studio bundle —
+each with a performance shape you can reason about from the source. This guide
+walks those decisions, names what each costs, and is honest everywhere about
+what is `not yet exercised`: measured, profiled, or budgeted.
 
-**AptKit's performance model is tokens-and-turns, not CPU-and-memory.**
-This is a TypeScript monorepo wrapping LLM agents. The hot path is a
-sequence of HTTP calls to Anthropic or OpenAI — each costing hundreds of
-milliseconds to seconds and billed per token. The local JavaScript work
-(agent loop, JSON parsing, NDJSON encoding, schema rendering) is
-microseconds-to-low-milliseconds and is not the bottleneck. So every perf
-control in this repo is about **bounding model work**: how many billed
-round-trips a run can make, how big each one is, and what each one costs.
+## The map — where performance lives
 
 ```
-  The repo's performance map — where time and money live
+  Performance surfaces, top to bottom
 
-  ┌─ JS process (AptKit) ──────────────────────────────────────┐
-  │  bounded agent loop · bounded JSON scan · NDJSON encode      │
-  │  → microseconds–low ms · NOT the cost                        │
-  └───────────────────────────────┬─────────────────────────────┘
-                                  │ the network hop = the cost
-  ┌─ Provider (Anthropic default / OpenAI) ─▼───────────────────┐
-  │  model inference → 100s ms – seconds PER TURN · billed/token │
-  └──────────────────────────────────────────────────────────────┘
-
-  perf work = (1) cap the number of hops  (turn budget)
-              (2) cap the size of each hop (context guard, truncation)
-              (3) measure the spend        (cost ledger)
-              (4) skip hops entirely        (fixtures, dev/eval)
-              (5) hide the latency you can't cut (streaming)
-              (6) amortize the hops you keep (embed batching)
+  ┌─ Client (apps/studio) ──────────────────────────────────────┐
+  │  537 kB single JS chunk, no code-splitting · markdown inlined│
+  │  at build via ?raw → zero runtime fetch on GitHub Pages      │  → 05
+  └───────────────────────────┬──────────────────────────────────┘
+                              │ agent run = N model round-trips
+  ┌─ Runtime (packages/runtime) ▼────────────────────────────────┐
+  │  runAgentLoop: maxTurns/maxToolCalls cap + forced synthesis   │  → 01
+  │  usage-ledger: per-call tokens → sum → USD (openai-only price)│  → 03
+  └───────────────────────────┬──────────────────────────────────┘
+                              │ tool call: search_knowledge_base
+  ┌─ Retrieval (packages/retrieval) ▼────────────────────────────┐
+  │  embed(texts[]) batched: 1 call/doc · chunker 512/64          │  → 04
+  │  InMemoryVectorStore: O(n·d) scan + full sort, sync           │  → 02
+  │  over-fetch(topK*4)+JS filter (no metadata predicate)         │  → 06
+  └───────────────────────────┬──────────────────────────────────┘
+                              │ same VectorStore contract
+  ┌─ Storage (buffr, out of repo) ▼──────────────────────────────┐
+  │  PgVectorStore: pgvector HNSW · pg.Pool · ef_search UNSET     │  → 02
+  └───────────────────────────────────────────────────────────────┘
 ```
-
-The RAG retrieval pipeline (`@aptkit/retrieval`) adds a second, cheaper
-class of work *below* the model hop — an embedding round-trip (batched) and
-an O(n·d) in-memory vector scan. Neither dethrones the model turn as the
-dominant cost; both are sub-millisecond-to-low-ms at the corpus sizes the
-repo runs. With a *local* Gemma model the turn is slower still — one
-observed `ask.ts` tool-call turn took ~7s (an anecdote, not a benchmark).
-
-`@aptkit/memory` (`conversation-memory.ts`) now layers *episodic memory*
-on the same vector store. It amplifies the linear-scan cost three ways:
-(1) `recall` **over-fetches** `fetchK = max(k*4, 20)` then filters
-client-side — so it scans and transfers up to 4× (or ≥20) rows to return k,
-because the `VectorStore` contract has no metadata filter; (2) memory
-**grows unbounded** — every `remember` adds a row with no eviction or TTL,
-so the already-O(n·d) scan degrades as memory accumulates alongside
-documents in a shared store; (3) `remember` now puts an embedding
-round-trip on the **write path**, not just the read path.
-
-If you read nothing else, read **01-turn-and-tool-budget.md** — the hard
-turn/tool ceiling is the load-bearing control that makes a run's worst-case
-cost a number you can write down before it starts.
 
 ## Ranked findings
 
-1. **The turn-and-tool budget is the load-bearing perf control.** Every
-   agent caps `maxTurns` and `maxToolCalls`, and the loop forces a final
-   answer on the last turn by stripping the tools from the request
-   (`run-agent-loop.ts:98-109`; e.g. `recommendation-agent.ts:86-87`). This
-   bounds both the bill and the latency tail. → **01**
+1. **The O(n·d) linear cosine scan + full sort is the clearest bottleneck**
+   (`packages/retrieval/src/in-memory-vector-store.ts:25-33`) — and it's
+   synchronous inside an `async` signature, so it blocks the event loop for the
+   whole scan. The mitigant is real: it's the zero-cloud *demo* adapter, and
+   production swaps in buffr's pgvector HNSW path behind the identical
+   `VectorStore` contract. The red flag is that nobody has measured the corpus
+   size where the scan starts hurting. → `02-linear-scan-vs-ann-tradeoff.md`.
 
-2. **Cost is measured but blind at the default provider.** A token/cost
-   ledger folds per-turn usage into a row and prices it
-   (`usage-ledger.ts:25-86`) — but `pricingForModel` only knows OpenAI
-   `gpt-4.1-*`, so the default `claude-sonnet-4-6` run reports real tokens
-   yet prints cost as `n/a` (`usage-ledger.ts:71-77`). The instrument has a
-   hole exactly where it's used most. → **02**, and red flag #2 in audit.
+2. **Nothing is measured — no budgets, baselines, or profiling.** This is the
+   meta-finding: every other entry here is reasoned from code, not a stopwatch,
+   because the measurement infrastructure doesn't exist. Per-run `durationMs`
+   and token counts are recorded but never aggregated into a baseline or
+   compared against a target. You can't manage what you don't measure; this is
+   the first gap to close. → `audit.md` lens 2, `03-token-cost-accounting.md`.
 
-3. **A pre-flight guard rejects doomed calls before paying for them** —
-   estimating input tokens and throwing if the prompt won't fit
-   (`context-window-guard.ts:57-71`). The estimate is a deliberately crude
-   `length/3` heuristic (`:100-103`) — a guard rail, not a precise meter.
-   → **03**, red flag #3.
+3. **The bounded agent loop is the repo's one real overload-control mechanism**
+   (`packages/runtime/src/run-agent-loop.ts:98-135`) — a hard `maxTurns` /
+   `maxToolCalls` ceiling plus a forced synthesis turn that strips the tools
+   array so the run terminates with an answer instead of looping. It bounds
+   *depth* (and thus per-run cost), not *concurrency* — there's no backpressure
+   or concurrency limiter anywhere. → `01-bounded-loop-cost-ceiling.md`.
 
-4. **Fixtures are a zero-cost dev/eval path — and explicitly NOT a cache.**
-   `FixtureModelProvider` replays recorded responses for $0 and ~ms
-   (`fixture-provider.ts:11-17`), swapped in instead of live mode. The repo
-   has no runtime model-response cache at all — the single biggest unclaimed
-   cost lever. → **04**, red flag #1.
+Below the top three, the audit ranks: the 537 kB un-split Studio bundle (#3 in
+the red-flag table), no caching layer anywhere (#4), over-fetch-then-filter
+waste (#5), no backpressure (#6), and buffr's untuned HNSW `ef_search` (#7).
 
-5. **Streaming hides latency it can't cut.** NDJSON trace events are flushed
-   to the client live (`vite.config.ts:887-918`), dropping time-to-first-
-   feedback from end-of-run to the first event. Total time is unchanged. → **05**
+## `not yet exercised` — the honest gaps
 
-6. **Bounded JSON extraction avoids unbounded parse work** — a fixed
-   three-rung ladder ending in a throw (`json-output.ts:7-28`). → **06**
-
-7. **The RAG vector search is an O(n·d) linear scan — the exact-search
-   baseline.** `InMemoryVectorStore.search` scores every stored chunk on
-   every query and sorts all n (`in-memory-vector-store.ts:25-33`).
-   Sub-millisecond at the 3–6 doc corpora the repo runs; a wall at large n,
-   where buffr's HNSW-indexed `PgVectorStore` (same `VectorStore` contract)
-   takes over. Ship the cheap exact version, earn the index later. → **07**
-
-8. **Embedding calls are batched; the model-controlled top-k is floored.**
-   `embed(texts[])` POSTs a whole document's chunks in one round-trip
-   (`ollama-embedding-provider.ts:50-74`). The `minTopK` floor clamps a
-   model's `top_k` up — a live fix for Gemma self-selecting `top_k: 1` and
-   starving a multi-part question (`search-knowledge-base-tool.ts:51,80-81`).
-   A local Gemma tool-call turn was observed at ~7s once — an anecdote, not
-   a benchmark; the model turn dominates wall-clock. → **08**
-
-9. **Episodic memory amplifies the linear scan three ways.** `recall`
-   over-fetches `fetchK = max(k*4, 20)` then filters by `meta.kind`
-   client-side (`conversation-memory.ts:94-98`), reading up to 4× (or ≥20)
-   the rows it returns — because the `VectorStore` contract exposes no
-   metadata filter (`retrieval/src/contracts.ts:33-37`). Memory grows
-   unbounded — every `remember` adds a row, no eviction or TTL
-   (`conversation-memory.ts:74-87`) — so the O(n·d) scan (finding 7)
-   degrades as memory piles up alongside documents in a shared store. And
-   `remember` adds an embedding round-trip on the *write* path
-   (`conversation-memory.ts:75-76`), where before only `recall` paid one.
-   All sub-ms at today's row counts and still dwarfed by the model turn — an
-   amplifier on the finding-7 baseline, not a new dominant cost. → **09**
-
-## `not yet exercised` lenses (and when each starts to matter)
-
-- **Model-response caching (prompt cache / response cache)** — none. The
-  highest-leverage missing control; matters now for any repeated prompt.
-- **Latency SLO + p95/p99 percentile tracking** — none; only per-run
-  `durationMs`. Matters when this serves a real request path with users
-  waiting.
-- **CPU/memory profiling, flamegraphs, benchmarking harness** — none, and
-  correctly so: there's no CPU-bound hot path to profile.
-- **Model request batching** — none; each turn is one `complete()`. (Note:
-  *embedding* requests ARE batched — `embed(texts[])` — see finding 8.)
-  Matters with high throughput or provider batch APIs.
-- **Indexed / ANN vector search** — none here; the in-memory store is a flat
-  O(n·d) scan. Matters at large corpus size; the HNSW-indexed `PgVectorStore`
-  in buffr is the proven drop-in behind the same contract. → **07**
-- **Indexed metadata filter on `search`** — none. The `VectorStore` contract
-  is `search(vector, k)` with no `where` clause (`contracts.ts:33-37`), which
-  is *why* `recall` over-fetches and filters client-side. buffr's
-  `PgVectorStore` pushes one scoping filter (`where app_id = $2`,
-  `buffr/src/pg-vector-store.ts:74`) into the DB, but it does **not** yet
-  filter by `kind` either — so even on Postgres a shared memory+document store
-  would over-fetch. Adding `meta->>'kind'` to the contract is the move that
-  kills the amplification. → **09**
-- **Memory eviction / TTL / summarization** — none; `remember` only appends
-  (`conversation-memory.ts:74-87`). Matters over a long-lived conversation
-  history where memory rows come to dominate the scan. The move: a row cap,
-  a time-window, or rolling summarization. → **09**
-- **Embedding-call cost metering** — the embed path emits no usage event.
-  Moot while embeddings are local ($0); matters the moment a paid embedder
-  is wired.
-- **Real backpressure / overload control** (queue, rate limiter,
-  concurrency cap) — none. The fallback chain is failure-handling, not
-  backpressure. Matters the moment concurrent runs share a provider rate
-  limit.
-- **Bundle-size budget, code-splitting, Web-Vitals** — none; Studio is a
-  small dev-preview React app. Matters if Studio becomes a shipped product.
+- **Budgets** — no p95 target, no bundle ceiling, no per-answer token/cost cap
+  written anywhere. The agent-loop caps are *implicit* ceilings, never declared
+  as budgets.
+- **Baselines & profiling** — no benchmark harness, no profiler run, no
+  representative-workload corpus, no before/after numbers. `durationMs` is one
+  sample per run, not a distribution.
+- **Latency tail** — p95/p99 never captured. The dominant term (model
+  round-trips) is structurally obvious but never timed.
+- **Throughput / concurrency / backpressure** — nothing batches, queues, or
+  limits concurrent runs; no contention to measure because nothing fans in.
+- **Caching** — no embedding cache, no query-result cache, no response cache.
+  Every repeat pays full freight.
+- **Client metrics** — no Lighthouse, no FCP/LCP/TTI, no main-thread profile of
+  the in-browser cosine scan.
+- **HNSW tuning** — buffr's `PgVectorStore` never sets `ef_search`; the
+  recall/latency knob sits at default, blind.
 
 ## Reading order
 
-1. **audit.md** — the 8-lens walk; start here for the full picture.
-2. **01-turn-and-tool-budget.md** — the load-bearing control.
-3. **02-token-cost-ledger.md** — measuring the spend (and its gap).
-4. **03-context-window-preflight-guard.md** — failing fast on doomed calls.
-5. **04-fixture-replay-as-zero-cost-path.md** — the $0 dev/eval path.
-6. **05-streaming-for-perceived-latency.md** — hiding latency.
-7. **06-bounded-json-scan.md** — bounded recovery work.
-8. **07-linear-vector-scan.md** — the O(n·d) RAG search baseline vs HNSW.
-9. **08-embedding-batch-and-topk-floor.md** — embed batching + the top-k floor.
-10. **09-memory-recall-overfetch.md** — episodic memory: over-fetch, unbounded
-    growth, and the write-path embed cost on top of the finding-7 scan.
+1. `audit.md` — the 8-lens walk; start here for the full picture.
+2. `01-bounded-loop-cost-ceiling.md` — the loop's cost ceiling (most
+   load-bearing mechanism).
+3. `02-linear-scan-vs-ann-tradeoff.md` — the #1 bottleneck and its contract-based
+   fix.
+4. `03-token-cost-accounting.md` — how runs turn into dollars.
+5. `04-embedding-batching.md` — the one real I/O optimization.
+6. `05-build-time-inlining-zero-fetch.md` — the Studio bundle trade.
+7. `06-over-fetch-then-filter.md` — the cost of a predicate-free contract.
 
 ## Cross-links
 
-- **study-runtime-systems** — the *mechanism* of bounded work and
-  cancellation (the loop, `AbortSignal`); this guide owns the *budget*.
-- **study-debugging-observability** — the `model_usage`/`CapabilityEvent`
-  trace as observability; this guide reads it as the cost/latency instrument.
-- **study-ai-engineering** — cost-of-serving, provider economics, and RAG
-  retrieval quality at the system level; this guide owns per-run measurement
-  and reads precision@k/recall@k as a perf baseline instrument.
-- **study-distributed-systems** — the provider-hop latency and fallback
-  chain; this guide owns the pre-flight guard that avoids the doomed hop.
-- **study-database-systems** — pgvector + HNSW index mechanics (in buffr)
-  that the in-memory linear scan is the exact-search baseline for.
-
-## Background contrast — Rein's other perf work
-
-You've built a real-time frame-budget pipeline before — **contrl**
-(MediaPipe + Vision Camera on-device, pose-landmark → rep counter). That
-system is the *opposite* performance shape: CPU/latency-bound, a hard
-per-frame budget in the hot path, no network. AptKit is token/cost-bound,
-with the network hop *as* the hot path. Same instinct — bound the work,
-measure against a budget — pointed at a different bottleneck. Worth holding
-both in mind: "budget" means frame-time in contrl and billed round-trips
-here.
+- **`study-runtime-systems`** — the loop's execution model, cancellation, the
+  blocked-event-loop mechanics this guide *measures*.
+- **`study-database-systems`** — how pgvector/HNSW serves the sub-linear search
+  and where predicates get pushed down.
+- **`study-ai-engineering`** — RAG retrieval quality (precision@k), embedding
+  choices, the agentic retrieval loop.
+- **`study-frontend-engineering`** — Studio bundling, rendering, and build that
+  `05-` touches.
+- **`study-system-design`** — the architecture-scale tradeoffs behind the
+  contract seams this guide costs out.

@@ -1,118 +1,78 @@
-# 00 — Overview: AptKit's design shape in one page
+# 00 — Overview: the design shape at a glance
 
-Before any single module, here's the whole repo as a design object — the
-layers, where depth lives, and where it doesn't.
-
-```
-  AptKit — packages by layer, marked by design depth
-
-  ┌─ Public surface ──────────────────────────────────────────────┐
-  │  packages/core  →  @rlynjb/aptkit-core  (pure re-exports)      │
-  │  one bundle, 16 packages inlined (v0.4.1). The compat contract.│
-  └───────────────────────────────┬────────────────────────────────┘
-                                  │ re-exports
-  ┌─ Capabilities (agents) ───────▼────────────────────────────────┐
-  │  recommendation · anomaly-monitoring · diagnostic · query ·    │
-  │  rubric-improvement · rag-query (newest)                       │
-  │  ★ 6 classes, ~85% identical wiring — the shallowest layer ★   │
-  └───────────────────────────────┬────────────────────────────────┘
-                                  │ compose
-  ┌─ Building blocks ─────────────▼────────────────────────────────┐
-  │  prompts (data) · tools (registry+policy) · evals (rules) ·    │
-  │  workflows · context (injectProfile) · retrieval (RAG) ·       │
-  │  memory (episodic, over retrieval's contracts)                 │
-  │  retrieval + memory: EmbeddingProvider + VectorStore =         │
-  │  ModelProvider's deep-module shape, reused 3×  → 06, 07        │
-  └───────────────────────────────┬────────────────────────────────┘
-                                  │ depend on
-  ┌─ Foundation (runtime) ────────▼────────────────────────────────┐
-  │  ★ ModelProvider ★  runAgentLoop  structured-generation        │
-  │  json-output  ndjson-stream  usage-ledger  events              │
-  │  the deepest modules in the repo live here                     │
-  └───────────────────────────────┬────────────────────────────────┘
-                                  │ ModelProvider.complete()
-  ┌─ Provider adapters ───────────▼────────────────────────────────┐
-  │  anthropic · openai · gemma · fallback (wrap) · local-guard(wrap)│
-  │  every vendor SDK hidden behind one 3-field interface          │
-  │  gemma: an unusually large body (tool-call emulation) → 06     │
-  └────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Modules ranked by depth (functionality ÷ interface size)
-
-Ousterhout's central metric: a deep module does a lot behind a small
-interface. Here's the repo, best to worst.
+One page to orient before the audit. The job of every module-level design
+decision in aptkit is to keep complexity from leaking across boundaries. Here's
+the whole repo through that single lens, then the four contracts everything
+hangs off.
 
 ```
-  DEEPEST  (big behaviour, tiny surface — copy these)
-  ─────────────────────────────────────────────────────────
-  ModelProvider          3 fields hide every vendor SDK
-                         packages/runtime/src/model-provider.ts:54
-  structural-diff        6 rule types behind one evaluate() walk
-                         packages/evals/src/structural-diff.ts:20
-  runAgentLoop           one call hides the whole tool-using loop,
-                         trace emission, budget, recovery turn
-                         packages/runtime/src/run-agent-loop.ts:76
-  Embedding/VectorStore  3 members each hide HTTP + cosine + dim check;
-                         ModelProvider's shape, reused twice  → 06
-                         packages/retrieval/src/contracts.ts:22
-  ConversationMemory     2 methods hide embed + tagged upsert + over-
-                         fetch-then-filter recall; SAME contracts as 06,
-                         injected store, db-agnostic  → 07
-                         packages/memory/src/conversation-memory.ts:60
-  GemmaModelProvider     3-member ModelProvider; body emulates tool
-                         calls Gemma can't do natively  → 06
-                         packages/providers/gemma/src/gemma-provider.ts:39
+  aptkit — modules as bands, contracts as the seams between them
 
-  MEDIUM   (earns its interface, nothing wasted)
-  ─────────────────────────────────────────────────────────
-  ndjson-stream          streaming decode w/ partial-line handling
-  generateStructured     bounded retry + validate behind one call
-  filterToolsForPolicy   one function, one Set, one map
+  ┌─ Agents (composition layer) ───────────────────────────────────────┐
+  │  RagQueryAgent · recommendation · diagnostic · query · monitoring   │
+  │  each = prompt package + tool policy + loop config + validator      │
+  └───────────────┬──────────────────────────┬──────────────────────────┘
+                  │ runAgentLoop(...)          │ filterToolsForPolicy(...)
+  ┌─ Runtime ─────▼──────────────┐  ┌─ Tools ──▼───────────────────────┐
+  │  runAgentLoop · structured   │  │  ToolRegistry · ToolPolicy        │
+  │  generation · usage ledger   │  │  search_knowledge_base · search_  │
+  │  ── emits ──► CapabilityEvent│  │  memory                           │
+  └──────┬───────────────┬───────┘  └──────────────┬────────────────────┘
+         │ complete()    │ emit()                   │ pipeline.query()
+  ┌─ Providers ▼──┐  ┌─ Trace sink ▼──┐  ┌─ Retrieval ▼─────────────────┐
+  │ Gemma (emul.) │  │ in-memory (st.) │  │ EmbeddingProvider+VectorStore│
+  │ Anthropic     │  │ SupabaseSink    │  │ InMemoryVectorStore · nomic  │
+  │ fallback·guard│  │  (buffr)        │  │ ◄── @aptkit/memory reuses ───┤
+  └───────────────┘  └─────────────────┘  └──────────────────────────────┘
 
-  SHALLOWEST  (interface ≈ body — the fix targets)
-  ─────────────────────────────────────────────────────────
-  the 6 agent classes    each is ~30 lines of identical wiring
-                         around 4 lines of unique logic. RagQueryAgent,
-                         the newest, copied the same skeleton.
-                         see 04-capability-agent-template.md
+  the four narrow contracts (the seams):
+    ModelProvider.complete()        — runtime/src/model-provider.ts:54
+    VectorStore + EmbeddingProvider — retrieval/src/contracts.ts:22-37
+    CapabilityTraceSink.emit()      — runtime/src/events.ts:26
 ```
 
----
+## What to notice first
 
-## The one-sentence verdict
+**The interfaces are tiny and the bodies are big.** `complete()` is one method.
+`VectorStore` is three. `emit()` is one. Behind each sits real machinery —
+Gemma's tool-call emulation, cosine ranking and pgvector, NDJSON streaming or
+Supabase rows. That ratio (big body ÷ small interface = depth) is the repo's
+whole design strategy, and it mostly holds.
 
-**AptKit's foundation is deep and its capability layer is shallow.** The
-runtime contracts (`ModelProvider`, `runAgentLoop`, `structural-diff`, the
-retrieval `EmbeddingProvider`/`VectorStore` pair, and now `ConversationMemory`
-over those same two contracts) are textbook deep modules — narrow interfaces
-hiding real behaviour. The narrow-contract-over-large-body move now appears
-*three* independent times (provider, retrieval, memory): a confirmed house
-style. The six agent classes are the
-opposite: each re-implements the same constructor +
-`listTools → filterToolsForPolicy → renderPromptTemplate → runAgentLoop →
-parse` skeleton, so the duplication that the monorepo extraction was supposed
-to eliminate has reappeared one layer up. That's the single highest-leverage
-fix in the repo (`04-capability-agent-template.md`).
+**The best evidence is reuse you can't see from one file.**
+`@aptkit/memory`'s `remember`/`recall` are literally the RAG index and query
+paths pointed at the same `EmbeddingProvider`/`VectorStore` contracts — zero new
+infrastructure (`conversation-memory.ts:60`). A contract that a second,
+unplanned consumer can adopt unchanged was drawn at the right boundary. That's
+the single strongest design signal in aptkit.
 
----
+## What's weak (named bluntly, fixed constructively)
 
-## The three highest-leverage fixes (ranked)
+1. **The `VectorStore` contract has no metadata filter**, so two modules
+   independently re-implement "over-fetch `k*4` then filter client-side" — the
+   search tool (`search-knowledge-base-tool.ts:88`) and memory
+   (`conversation-memory.ts:94`). Same decision, two places. Fix: add `filter?`
+   to `search`; push the work down into each store.
 
-1. **Collapse the 6-agent boilerplate into one `runCapability<T>()` helper.**
-   ~140 lines of duplicated wiring across six files (the new `RagQueryAgent`
-   added the sixth); the divergent parts (prompt vars, policy, parse, recovery)
-   are already first-class parameters. → `04-capability-agent-template.md`.
+2. **`minTopK` defaults to off** (`search-knowledge-base-tool.ts:51`). The guard
+   that stops a weak local model from starving its own retrieval is opt-*in*.
+   Fix: make the safe value the default; let callers opt out.
 
-2. **Pull the OpenAI-only pricing knowledge out of a hardcoded `if`-ladder.**
-   `usage-ledger.ts:71` knows three model families inline and silently returns
-   `undefined` for everything else (Anthropic always costs `n/a`). The
-   pricing table is data; it's currently control flow. → `audit.md` Lens 5.
+3. **The trace seam is wired twice across two repos** with no shared sink — an
+   in-memory array in `apps/studio/vite.config.ts:540` and `SupabaseTraceSink`
+   in buffr. The interface held, but the observability story is split and aptkit
+   ships no reference implementation. Fix: a `CollectingTraceSink` (and maybe an
+   NDJSON sink) in `@aptkit/runtime`.
 
-3. **Hoist the copy-pasted `buildRecoveryPrompt` evidence formatter into
-   runtime.** The `toolCalls.map(... slice(0, 900))` block is byte-identical
-   in three agents. → `audit.md` Lens 3 and `04`.
+## Where each design move is walked deep
 
-Read `audit.md` next for the full 8-lens walk.
+| if you want to understand… | read |
+| --- | --- |
+| why one 3-method contract carries five providers | `01-deep-provider-module.md` |
+| how Gemma fakes tool-calling without leaking it | `02-emulation-hidden-behind-complete.md` |
+| why the pipeline never names a vendor, and memory reuses it | `03-contract-as-the-product.md` |
+| how the search tool defines model-hallucination errors out of existence | `04-guard-rails-as-information-hiding.md` |
+| the one clean seam that's wired twice (the honest weakness) | `05-injectable-trace-seam.md` |
+| how an agent is assembled from four smaller parts | `06-capability-as-composition.md` |
+
+Then `audit.md` for the full 8-lens walk and the red-flag checklist.

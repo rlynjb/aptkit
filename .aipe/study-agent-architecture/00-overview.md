@@ -1,97 +1,84 @@
-# Agent Architecture in AptKit — Overview
+# Agent Architecture — aptkit
 
-One page to put the whole thing on the map before you open any concept file.
+The one-page orientation. Read this first; everything else zooms in.
 
-## The shape this repo matches: single-agent (with a latent sequential pipeline)
+## The shape this codebase matches
 
-AptKit is a **single-agent codebase**. Six capabilities, each one ReAct-style
-loop with tools, a tool policy, a prompt package, a loop budget, and a
-validator. There is no autonomous planner choosing which agent runs, no
-supervisor delegating to workers, and no agent spawning sub-agents. The repo now
-*ships* an episodic-memory engine (`@aptkit/memory`: `remember`/`recall` + a
-`search_memory` tool), but no capability here wires it into a loop — the
-conversational runtime that does, with a durable `PgVectorStore`, lives in the
-buffr repo. (Trajectory persistence and a multi-device "body" are deferred to that
-separate repo — not present here.) The sixth capability,
-`rag-query`, is the same single-agent shape pointed at a *real vector store* and
-driven by a local Gemma; it is the first agentic-RAG-over-similarity-index
-capability in the repo. Where the spec's multi-agent topologies show up at
-all, they show up as a *latent* pipeline: the three diagnostic agents are
-wired by their **data contracts** (`Anomaly` → `Diagnosis` → `Recommendation`),
-not by a live orchestrator. `investigate(anomaly)` consumes a scan output and
-`propose(anomaly, diagnosis)` consumes an investigation output — but no code in
-the repo currently runs all three end to end. That gap is the single most
-important honest fact in this guide, and it gets its own deep treatment in
-`03-multi-agent-orchestration/03-sequential-pipeline.md`.
+aptkit is **single-agent-per-capability**. There is exactly one agent loop in the repo — `runAgentLoop` (`packages/runtime/src/run-agent-loop.ts`) — and six agents instantiate it, each as a self-contained capability with its own prompt, tool allowlist, loop budget, and output validator. There is **no multi-agent orchestration in aptkit**: the analytics agents (recommendation, anomaly-monitoring, diagnostic-investigation, query, rubric-improvement) do not call each other, do not share state, and do not hand off. They are six separate single-agent capabilities that happen to live in one monorepo.
 
 ```
-  Where the agent loop sits in AptKit
+  Where aptkit sits on the three shapes
 
-  ┌─ App / Studio layer (apps/studio) ───────────────────────────┐
-  │  React panels → POST /api/replay/* → agent.scan()/.answer()  │
-  └───────────────────────────────┬──────────────────────────────┘
-                                  │  one call = one capability run
-  ┌─ Agent layer (packages/agents/*) ─────────────────────────────┐
-  │  MonitoringAgent · DiagnosticAgent · RecommendationAgent      │
-  │  QueryAgent · RubricImprovementAgent                          │
-  │  each = prompt package + tool policy + ★ runAgentLoop ★ + validator │ ← we are here
-  └───────────────────────────────┬──────────────────────────────┘
-                                  │  ToolExecutor seam · ModelProvider seam
-  ┌─ Runtime + Tools layer (packages/runtime, packages/tools) ────┐
-  │  runAgentLoop · CapabilityEvent trace · ToolRegistry/Policy   │
-  └───────────────────────────────┬──────────────────────────────┘
-                                  │  ModelProvider.complete()
-  ┌─ Provider layer (packages/providers/*) ───────────────────────┐
-  │  anthropic · openai · fallback chain · local context guard    │
-  └───────────────────────────────────────────────────────────────┘
+  ┌─ workflow / chain ──────────────────────────────┐
+  │  engineer writes the steps; LLM fills slots      │
+  └──────────────────────────────────────────────────┘
+  ┌─ single-agent ──────────────────────────────────┐
+  │  ★ APTKIT IS HERE ★                              │ ← we are here
+  │  one runAgentLoop; model picks the tool & when   │
+  │  to stop; 6 capabilities, each one actor          │
+  └──────────────────────────────────────────────────┘
+  ┌─ multi-agent ───────────────────────────────────┐
+  │  many coordinating agents in a topology          │
+  │  not yet exercised in aptkit (the 3-stage        │
+  │  monitor→investigate→recommend pipeline lives in │
+  │  the sibling blooming_insights repo)             │
+  └──────────────────────────────────────────────────┘
 ```
 
-## The one file that carries the weight
+That single-agent placement weights this guide. SECTION A (reasoning patterns) and SECTION B (agentic retrieval) carry the load, because that is what the code exercises. SECTION C (multi-agent) is taught as study material with honest `not yet exercised` markers — the topologies aptkit *could* adopt, and the refactor each would cost.
 
-`packages/runtime/src/run-agent-loop.ts`. Every capability in the repo is a
-thin wrapper that hands a prompt, a tool policy, a budget, and a validator to
-`runAgentLoop`. Read that file once and you have read the agent kernel five
-times over. Its load-bearing mechanics:
+## The one loop everything hangs on
 
-- **Bounded ReAct loop** — `for (let turn = 0; turn < maxTurns; ...)`, model
-  proposes tool calls, the harness executes them, results feed back, repeat.
-- **Two budgets, both required** — `maxTurns` (default 8) caps the loop;
-  `maxToolCalls` caps tool spend independently. Either one trips the budget exit.
-- **The forced synthesis turn** — on the last turn (or when the tool budget is
-  spent), the loop drops the tool schemas and appends a `synthesisInstruction`,
-  forcing the model to answer from what it already gathered instead of asking
-  for more queries. This is the most important and most surprising mechanic in
-  the file.
-- **The `ToolExecutor` seam** — the model emits tool *intent*; the harness runs
-  the tool. The model never touches a tool directly. That boundary is the
-  entire control and safety story.
-- **Fallback recovery** — if `parseResult` returns `null`, a one-shot
-  `recoveryPrompt` turn re-asks for the structured shape using the evidence
-  already gathered.
+Every agent in aptkit is the same kernel with a different step function:
 
-## The six capabilities
+```
+  runAgentLoop — the kernel all 6 agents share
+                 packages/runtime/src/run-agent-loop.ts:76
 
-| Capability | Pattern | maxTurns / maxToolCalls | Output |
-| --- | --- | --- | --- |
-| `anomaly-monitoring-agent` | ReAct (scan) | 8 / 6 | `Anomaly[]`, severity-sorted, top 10 |
-| `diagnostic-investigation-agent` | ReAct (hypothesis test) | 8 / 6 | `Diagnosis` + inferred confidence |
-| `recommendation-agent` | ReAct (grounded propose) | 6 / 4 | `Recommendation[]`, ≤3 |
-| `query-agent` | routed ReAct | 8 / 6 | plain-text answer |
-| `rubric-improvement-agent` | self-critique loop | 6 / 3 | scored judgment + next action |
-| `rag-query-agent` | agentic RAG over vector search (local Gemma, tool emulation) | 6 / 4 | cited prose answer, profile-shaped |
+  ┌──────────────────────────────────────────────────┐
+  │  for turn in 0..maxTurns:                         │
+  │    forceFinal = last turn OR budget spent         │
+  │    response = model.complete({ tools unless       │
+  │                                forceFinal })       │  ← step
+  │    if no tool_use blocks: finalText = text; break │  ← success exit
+  │    for each tool_use: tools.callTool(...)         │  ← execute
+  │    messages.push(tool results)                    │  ← accumulate
+  │  (loop ends at maxTurns)                          │  ← budget exit
+  └──────────────────────────────────────────────────┘
+```
+
+The two things that make this a *shipped* loop, not a demo:
+- **The forced final synthesis turn** (`run-agent-loop.ts:101-108`). On the last turn — or once `maxToolCalls` is spent — the loop strips the tool schemas and appends a synthesis instruction, so the model is forced to answer with what it has instead of asking for one more query. This is the most load-bearing mechanic in the repo.
+- **The budget exit** (`maxTurns`, `maxToolCalls`). Nothing guarantees the model ever stops on its own; the caps are the part of the skeleton that bounds the run.
+
+## The standout pattern: agentic retrieval
+
+The most interesting agent-architecture decision in aptkit is that **retrieval is a tool, not a prompt-splice**. `search_knowledge_base` (`packages/retrieval/src/search-knowledge-base-tool.ts:43`) is registered as a `ModelTool`; the model calls it when it judges it needs grounding. The model owns the *when*; the loop owns the *budget*. The `rag-query` agent (`packages/agents/rag-query/src/rag-query-agent.ts`) is the capstone instance — read SECTION B for the full walk.
 
 ## Reading order
 
-Sub-sections run `A → B → C → D → E → F`, then the codebase pattern file:
+```
+  A → B → C → D → E → F → patterns-in-this-codebase
 
-1. `01-reasoning-patterns/` — the loop kernel and the single-agent family (the core)
-2. `02-agentic-retrieval/` — tool-calling-as-retrieval: analytics tools (files
-   01–03) and real vector search via `rag-query` (file 04)
-3. `03-multi-agent-orchestration/` — the latent pipeline, and everything not yet built
-4. `04-agent-infrastructure/` — tool policy, coverage gate, structured-output contract, control envelope
-5. `05-production-serving/` — what the budgets, fallback chain, and context guard buy under a loop
-6. `06-orchestration-system-design-templates/` — the repo reframed as three interview prompts
-7. `agent-patterns-in-this-codebase.md` — the patterns table, grounded in real files
+  A  reasoning-patterns      the loop kernel + ReAct + routing (what aptkit IS)
+  B  agentic-retrieval       retrieval-as-a-tool (the standout)
+  C  multi-agent             study material; not yet exercised in aptkit
+  D  agent-infrastructure    context, memory tiers, tool/MCP, eval, guardrails
+  E  production-serving      cross-turn cache, fan-out, per-tool breaking
+  F  system-design templates aptkit reframed as interview answers
+```
 
-Start with `01-reasoning-patterns/02-agent-loop-skeleton.md`. Everything else
-hangs off it.
+`agent-patterns-in-this-codebase.md` (root) is the table of what aptkit actually runs. Start there if you want the inventory before the theory.
+
+## Honest gaps (named, not hidden)
+
+- **No multi-agent orchestration in aptkit.** No supervisor, no handoff, no agent-to-agent message passing.
+- **No planner / replanning.** Plan-and-execute is not implemented; the loop is ReAct-shaped.
+- **No reflexion loop except rubric-improvement**, which is a self-judging *agentic improvement* loop, not a draft→critique→revise loop over its own answer.
+- **Memory is built but not wired into any agent.** `@aptkit/memory` (`createConversationMemory`, `search_memory` tool) exists and reuses the retrieval contracts, but no aptkit agent loop calls it. Studio lists it in its catalog; buffr's session runtime is the intended consumer. Marked `not yet exercised` throughout.
+
+## See also
+
+- `study-ai-engineering/` — ReAct mechanics, RAG mechanics, tool-calling, agent memory two-layer split, single-call serving
+- `study-prompt-engineering/` — the prompt-level mechanics under the agents' system templates
+- `study-system-design/` — provider/retrieval abstraction seams, replay-centric evaluation

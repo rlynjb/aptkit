@@ -1,550 +1,277 @@
-# 02 — Partial failure, timeouts, retries, backoff
+# 02 — Partial Failure, Timeouts, and Retries
 
-**Industry name(s):** partial failure handling / failover / retry-with-backoff /
-fail-fast / retry-on-parse. **Type:** Industry standard.
-
-This is the one file that genuinely lives in this repo. Read it slowly. It now
-covers three real resilience patterns: **fail-fast** (context guard),
-**failover** (the fallback chain), and **same-target retry-on-parse** (the Gemma
-provider's tool-call nudge loop) — and two flavors of the failure they defend
-against: cloud HTTPS errors and local Ollama-process errors.
+**Industry names:** deadlines · timeouts · retry with backoff and jitter · failure classification (retryable vs terminal) · circuit breaking — *Industry standard.*
 
 ## Zoom out, then zoom in
 
-The fallback chain and the context guard both sit right at the seam — the
-`ModelProvider.complete()` boundary where the failure axis flips. They're the
-code that runs when node B (the provider) misbehaves.
+This is the most consequential file in the guide, because it names the biggest gap
+in the repo. The Ollama boundary is where partial failure is real, and the code
+that crosses it has cancellation but **no deadline.**
 
 ```
-  Zoom out — where partial-failure handling lives
+  Zoom out — where timeouts/retries belong vs where they live today
 
-  ┌─ Service layer (your process) ──────────────────────────────┐
-  │  runAgentLoop ── signal.throwIfAborted() ── bounded turns     │
-  └─────────────────────────────┬────────────────────────────────┘
-                               │ complete() / embed()
-  ┌─ Provider boundary ─────────▼────────────────────────────────┐
-  │  ★ ContextGuard (fail-fast) → Fallback (failover) ★           │ ← we are here
-  │  Anthropic · OpenAI adapters    Gemma (retry-on-parse) · embed │
-  └──────────────┬───────────────────────────────┬────────────────┘
-       HTTPS — timeout/429/5xx │        HTTP localhost — down/loading │
-  ┌─ Cloud provider ─▼────────┐  ┌─ Local Ollama process ─▼──────────┐
-  │  api.anthropic.com / openai │  │  :11434 — ECONNREFUSED / 404 / slow│
-  └─────────────────────────────┘  └────────────────────────────────────┘
+  ┌─ App layer ─────────────────────────────────────────────────────────┐
+  │  runAgentLoop  — has a TURN budget (maxTurns) and a TOOL budget       │
+  │                  (maxToolCalls) ✓  but no per-call wall-clock deadline│
+  └──────────────────────────────┬───────────────────────────────────────┘
+                                 │ provider.complete()
+  ┌─ Provider layer ─────────────▼───────────────────────────────────────┐
+  │  FallbackModelProvider — retries ACROSS providers ✓                   │
+  │  ★ THE GAP: no timeout wraps the call, so a hang never becomes        │
+  │    a failure the fallback can react to ★                              │ ← we are here
+  └──────────────────────────────┬───────────────────────────────────────┘
+                                 │ fetch() — AbortSignal only, no .timeout()
+  ┌─ External ───────────────────▼───────────────────────────────────────┐
+  │  Ollama daemon — can return 500 (→ throws ✓) OR hang (→ nothing ✗)    │
+  └─────────────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: **partial failure** is the defining problem of distributed systems.
-In a single function call, it either returns or throws — two outcomes. Across a
-network (even a localhost socket), there's a third: *you don't know.* The
-request might have succeeded on the other side while your connection died.
-AptKit's answer to "an external service is misbehaving" is three patterns:
-**fail-fast** (don't even make a call that's doomed), **failover** (when one
-provider fails, try the next), and **retry-on-parse** (when a local model
-fumbles the response *format*, nudge it and ask once more). The first two guard
-against transport failure; the third guards against a weak model's bad output —
-a failure mode the cloud SDKs hide but a raw Ollama call exposes.
+Zoom in: a **timeout** turns the most dangerous failure mode — "infinitely slow" —
+into the one your code already handles — "threw an error." Without it, *slow is
+indistinguishable from working*, and every downstream protection (fallback,
+turn budget, the user's patience) waits forever on a box that's never coming back.
 
-## Structure pass — layers, axis, seams
+## Structure pass
 
-Trace the **failure axis** across three nested handlers, all on the request
-path:
+**Layers.** Turn budget (loop) → cross-provider retry (fallback) → per-call
+guard (adapter) → the wire (fetch).
+
+**Axis — trace `what gives up, and when?` down the layers.**
 
 ```
-  "what happens to a failure?" — traced down the request path
+  Axis — "what gives up, and on what signal?" — top to bottom
 
-  ┌──────────────────────────────────────────────┐
-  │ runAgentLoop                                   │ → bounds the blast radius:
-  │                                                │   maxTurns caps how many
-  │                                                │   times you can even try
-  └────────────────────┬───────────────────────────┘
-      ┌────────────────▼─────────────────────────────┐
-      │ FallbackModelProvider                          │ → catches a provider
-      │                                                │   error, classifies it,
-      │                                                │   fails over to the next
-      └────────────────┬───────────────────────────────┘
-          ┌────────────▼─────────────────────────────┐
-          │ ContextWindowGuardedProvider              │ → refuses to call at all
-          │                                           │   if the request is doomed
-          └────────────┬───────────────────────────────┘
-                       ▼
-              the actual HTTPS round-trip (provider SDK)
+  ┌─ runAgentLoop ─────────────────────────────┐
+  │  gives up after maxTurns iterations         │  signal: turn COUNT  ✓
+  └────────────────────┬────────────────────────┘
+       ┌───────────────▼─────────────────────────┐
+       │ FallbackModelProvider                    │  signal: a provider THREW ✓
+       └───────────────┬─────────────────────────┘   (but only if it throws!)
+            ┌──────────▼──────────────────────────┐
+            │ GemmaModelProvider / fetch           │  signal: HTTP non-200 ✓
+            │                                      │  signal: WALL-CLOCK   ✗ MISSING
+            └──────────────────────────────────────┘
 ```
 
-Two seams matter. The **fail-fast seam** (context guard) is where a request
-dies *before* the network — cheap, local, deterministic. The **failover seam**
-(fallback chain) is where one node's failure gets converted into a try against
-a different node. The axis flips at each: above the guard, a too-big request is
-just data; below it, it's a refused call. Above the fallback loop, an error is
-fatal; inside it, it's a reason to try the next provider.
+**Seam — the load-bearing gap.** Two layers give up on a *count* (turns) or an
+*event* (a thrown error). Nobody gives up on the *clock*. The seam where a deadline
+should live — wrapping `fetch` in the adapter — is empty. That's the finding.
 
 ## How it works
 
-### Move 1 — the mental model: a loop over fallbacks
+### Move 1 — the mental model: a deadline is a budget you spend, not a property of the call
 
-You already know the shape from a `fetch()` with a `try/catch` and a retry. The
-fallback chain is that, generalized: try a list of providers in order, catch
-each failure, move on, and only give up when the list is exhausted.
-
-```
-  The failover loop — the kernel
-
-  providers = [primary, secondary, ...]
-  attempts  = []
-  ┌─────────────────────────────────────────────┐
-  │ for each provider in order:                  │
-  │   ├─ is the request cancelled? → abort       │
-  │   ├─ try provider.complete()                 │
-  │   │    success → return response  ◄──────────┼── exit on first win
-  │   └─ catch error:                            │
-  │        ├─ cancelled? → rethrow (don't retry) │
-  │        ├─ record attempt                     │
-  │        └─ shouldFallback? → next  : rethrow  │
-  └─────────────────────────────────────────────┘
-  all failed → throw ProviderFallbackError(attempts)
-```
-
-Three parts make this the pattern, and each breaks something specific if
-removed:
-
-- **The ordered list + early return.** Without it there's no failover at all —
-  you'd call one provider and stop. The early-return-on-success is what makes it
-  "use the first one that works."
-- **`shouldFallback` classification.** Without it, you retry on errors you
-  shouldn't (a malformed-request 400 will fail on *every* provider — retrying
-  wastes time and money). Classification is what separates "this node is down,
-  try another" from "this request is broken, stop."
-- **The aggregated `ProviderFallbackError`.** Without it, when everything fails
-  you lose the per-attempt detail and can't tell *why* each node failed. The
-  aggregation is the observability that makes a total failure debuggable.
-
-### Move 2 — the walkthrough
-
-**Step 1 — fail-fast before the network (the context guard).** Bridge from
-form validation: you don't POST a form you know is invalid; you validate
-client-side first. The context guard does the same for token budget — it
-estimates the request size and refuses if it can't fit, *before* paying for a
-round-trip that the provider would reject anyway.
+You already know this shape from the frontend: a `fetch()` with a loading state
+that you cancel if the user navigates away. A deadline is the same idea, but the
+trigger is the *clock* instead of the *user*. You start a timer; if the response
+doesn't arrive before the timer fires, you abort and treat it as a failure.
 
 ```
-  Fail-fast — refuse the doomed call locally
+  The deadline kernel — a race between the response and a timer
 
-  request ──► estimate input tokens ──► ok?
-                                         ├─ yes → forward to real provider
-                                         └─ no  → emit warning + throw
-                                                  ContextWindowExceededError
-                                                  (no network call made)
+      start ─────────────────────────────────────────────► deadline (e.g. 30s)
+        │                                                       │
+        ├─ fetch() in flight ──────────────► response ✓         │  (wins: use it)
+        │                                                       │
+        └─ fetch() in flight ─────────────────────────────────►✗  (timer wins:
+                                                                    abort, throw,
+                                                                    classify as failure)
+        whichever finishes first wins; the timer guarantees one of them always does
 ```
 
-The boundary condition: the estimate is a heuristic (`charsPerToken`), so it's
-conservative, not exact. It can refuse a request that *would* have fit, or pass
-one that's slightly over. That's fine — fail-fast guards are allowed to be
-approximate as long as they err toward refusing early.
+That guarantee — *one of them always finishes* — is the whole point. Without the
+timer, the top branch (response) is the *only* way the race ends, and if the daemon
+hangs, it never does.
 
-**Step 2 — the sequential try (failover).** Bridge from `Promise` chaining with
-`.catch()`: each `catch` decides whether to recover or rethrow. The fallback
-loop is a sequential — *not* parallel — walk. It tries provider 1, and only if
-it fails does it try provider 2.
+### Move 2 — walking the mechanism
 
-```
-  Sequential failover — one at a time, layers-and-hops
+**The retry budget that DOES exist: maxTurns.** The agent loop will not run
+forever. It caps iterations and forces a final synthesis turn on the last one:
 
-  ┌─ your process ─┐  hop 1: complete()   ┌─ provider 1 ─┐
-  │  fallback loop │ ───────────────────► │  Anthropic   │
-  │                │ ◄─── 503 / timeout ── └──────────────┘
-  │                │
-  │  classify: shouldFallback? yes        ┌─ provider 2 ─┐
-  │                │  hop 2: complete()   │  OpenAI      │
-  │                │ ───────────────────► │              │
-  │                │ ◄─── 200 + response ─└──────────────┘
-  │  return ◄──────┘  (first success wins)
-  └────────────────┘
-```
-
-Why sequential and not parallel (hedged requests)? Parallel would be faster on
-the tail but doubles cost and load on providers you're rate-limited against
-(fallacy #7 — transport cost isn't zero). Sequential is the right default for a
-cost-sensitive library: you only pay for provider 2 when provider 1 actually
-failed. The cost is latency — a failed primary means you eat its full
-timeout before even starting the secondary.
-
-**Step 3 — error classification (`shouldFallback`).** This is the part people
-forget. Not every error means "try another node." A 429 (rate limited) or 503
-(down) → yes, fail over. A 400 (your request is malformed) → no, every provider
-will reject it identically, so stop now. AptKit's default `shouldFallback` is
-`() => true` (fail over on anything), but the hook exists so a caller can inject
-real classification.
-
-```
-  Classification — the decision that prevents pointless retries
-
-  error from provider
-    ├─ AbortError / cancelled  → rethrow immediately (caller wants to stop)
-    ├─ shouldFallback(error)?
-    │     true  → record attempt, try next provider
-    │     false → rethrow (e.g. 400 — broken everywhere)
-    └─ last provider?          → throw ProviderFallbackError(all attempts)
+```ts
+// packages/runtime/src/run-agent-loop.ts:98-109
+for (let turn = 0; turn < maxTurns; turn += 1) {       // ← hard iteration budget
+  signal?.throwIfAborted();                            // ← cooperative cancellation point
+  const budgetSpent = maxToolCalls !== undefined && toolCalls.length >= maxToolCalls;
+  const forceFinal = turn === maxTurns - 1 || budgetSpent;  // ← last turn: no more tools
+  const response = await model.complete({
+    system: forceFinal && synthesisInstruction ? `${system}\n\n${synthesisInstruction}` : system,
+    messages,
+    tools: forceFinal ? undefined : toolSchemas,
+    maxTokens,
+    signal,                                            // ← cancellation flows down
+  });
 ```
 
-**Step 4 — cancellation wins over failover.** The `AbortError` passthrough is
-the subtle correctness move. If the caller aborts mid-chain, you must *not*
-helpfully fail over to the next provider — the caller said stop. So abort errors
-bypass classification entirely and rethrow. This is the seam where in-process
-cancellation (runtime-systems' concern) meets failover (this guide's concern).
+This is a *count-based* budget — it stops the loop from spinning forever on a model
+that keeps asking for tools. But it does **not** bound how long any single
+`model.complete()` takes. One hung call inside one turn hangs the whole loop. The
+budget protects against a fast-but-endless conversation, not a single slow call.
 
-**Step 4.5 — retry-on-parse: the one same-target retry in the repo.** Bridge
-from the agent loop's JSON re-prompt (`03`): when the model returns malformed
-output, you don't fail over — you ask the *same* model again with a corrective
-nudge. The Gemma provider does exactly this for tool-call emulation. Gemma2:9b
-has no native tool-calling, so the provider renders the tools into the system
-prompt and asks for a JSON tool call. If the reply is a *botched* one — it looks
-like an attempt (contains a `{`) but doesn't parse — the provider appends a
-`RETRY_NUDGE` and asks again, up to `maxToolCallAttempts` (default 2).
+**Cross-provider retry: the fallback chain.** This is real, working retry logic —
+across *providers*, not across *attempts to the same provider*:
 
-```
-  Retry-on-parse — the kernel (same target, bounded, format-only)
-
-  for attempt in 0..maxAttempts:
-    reply = ollama.chat(messages + (attempt>0 ? RETRY_NUDGE : []))
-    call  = parseToolCall(reply)
-    ├─ parsed ok        → return tool_use(call)      ◄── success exits
-    ├─ looksLikeAttempt → continue (nudge & retry)   ◄── botched JSON → one more try
-    └─ plain prose      → break (it's a real answer, NOT an error)
-  give up → return text(reply)                       ◄── graceful: raw text, no throw
-```
-
-Three parts make this the pattern, each load-bearing:
-
-- **The bound (`maxToolCallAttempts`).** Without it, a model that *never* emits
-  valid JSON loops forever. The cap is the same instinct as the agent loop's
-  `maxTurns` — every retry loop against an unreliable producer needs a ceiling.
-- **The `looksLikeToolAttempt` gate.** This is the part people get wrong. You
-  only retry if the model *tried and failed* to call a tool (a stray `{`). Plain
-  prose is a *real answer*, not an error — retrying it would nag the model into
-  garbage. Distinguishing "fumbled the format" from "chose to answer directly"
-  is the whole subtlety.
-- **The graceful give-up.** After `maxAttempts`, it returns the raw text instead
-  of throwing. A weak local model degrading to a plain answer beats crashing the
-  run.
-
-Why this is *not* failover and *not* a network retry: the network call
-succeeded — Ollama answered. The failure is *semantic* (wrong format), and the
-fix is to re-ask the same node with better instructions. This is the resilience
-pattern the cloud SDKs give you for free (Anthropic emits structured
-`tool_use` natively) and that a raw local model forces you to build yourself.
-
-**Step 5 — backoff and jitter: the missing hardening.** Here's the honest part.
-AptKit's *failover* has **no delay between attempts** — it tries provider 2
-immediately after provider 1 fails. There's no exponential backoff, no jitter,
-and no retry of the same provider *on a transport error*. (The Gemma
-retry-on-parse loop from Step 4.5 retries the same target, but on a *parse*
-failure after a successful response — not a network error, so it needs no
-backoff: the node isn't overloaded, it just answered badly.) For a two-provider
-failover that's fine — you're switching nodes, not hammering one — but it means
-the transport-level foundation below is `not yet exercised`:
-
-```
-  Exponential backoff with jitter — the textbook pattern (NOT in AptKit)
-
-  attempt 1 ──► fail ──► wait base·2⁰ ± jitter  (e.g. ~1s)
-  attempt 2 ──► fail ──► wait base·2¹ ± jitter  (e.g. ~2s)
-  attempt 3 ──► fail ──► wait base·2² ± jitter  (e.g. ~4s)
-  ...capped at a max delay, with jitter to avoid the
-     thundering herd (every client retrying in lockstep)
+```ts
+// packages/providers/fallback/src/fallback-provider.ts:64-88
+} catch (error) {
+  if (isAbortError(error) || request.signal?.aborted) throw error;  // ← don't retry a cancel
+  const attempt = { providerId: provider.id, model: provider.defaultModel,
+                    error: error instanceof Error ? error.message : String(error) };
+  attempts.push(attempt);                              // ← record WHY each one failed
+  if (!this.shouldFallback(error, provider)) {
+    throw error;                                       // ← failure CLASSIFICATION hook
+  }
+  if (index < this.providers.length - 1) {
+    this.trace?.emit({ type: 'warning', ... });        // ← observable: a fallback happened
+  }
+}
+// ...all providers exhausted:
+throw new ProviderFallbackError(attempts);             // ← terminal: carries every attempt
 ```
 
-The trigger that would make backoff real: **retrying the same provider** after a
-transient 429/503. The moment you retry one node instead of switching nodes,
-you need backoff (to give it time to recover) and jitter (so a fleet of clients
-doesn't synchronize their retries into a self-inflicted DDoS). AptKit sidesteps
-this because it switches nodes instead of retrying one — but a senior engineer
-should name the gap out loud.
+Three things here are textbook-correct. **(1)** Abort errors are re-thrown, not
+retried — you never retry a cancellation, because the caller asked you to stop.
+**(2)** `shouldFallback` is a *failure-classification* hook: it lets the caller say
+"a 400 is my bug, don't try the next provider; a 503 is theirs, do." **(3)**
+`ProviderFallbackError` carries *every* attempt's reason, so the failure is
+debuggable. This is the repo's one genuine failure-handling-across-services pattern,
+and it's well-built.
+
+**The gap, stated precisely.** The fallback loop only advances *on a thrown error*.
+A provider that hangs never throws. So:
+
+```
+  Layers-and-hops — how a hang defeats the fallback chain
+
+  ┌─ FallbackModelProvider ─┐  hop 1: try provider A     ┌─ GemmaProvider A ─┐
+  │  for each provider:     │ ─────────────────────────► │  fetch(:11434)    │
+  │    try complete()       │                            │   ...hangs...     │ ← Ollama wedged
+  │    catch → next         │  hop 2: error? NEVER ARRIVES│                   │
+  │                         │ ◄ - - - - - - - - - - - - - │  (no timeout to   │
+  │  ★ loop is BLOCKED on   │                            │   force a throw)  │
+  │    hop 1 forever ★      │                            └───────────────────┘
+  └─────────────────────────┘
+       provider B (the cloud fallback) is never tried — the chain can't reach it
+```
+
+If provider A is `GemmaModelProvider` against a wedged Ollama, and provider B is a
+cloud Anthropic provider, the *entire point* of the fallback — survive the local
+daemon being down — is defeated by the daemon being *slow* instead of *down*. Down
+throws (`ECONNREFUSED` → caught → B tried). Slow hangs (→ never caught → B never
+tried). A timeout collapses both into "down."
+
+### Move 2.5 — current state vs the fix
+
+```
+  Phase A: today                          Phase B: with a per-call deadline
+  ──────────────────────────              ──────────────────────────────────
+  fetch(url, { signal })                  const ac = new AbortController()
+    signal = caller's cancel only         const t = setTimeout(() => ac.abort(), 30_000)
+                                          fetch(url, { signal: anySignal(signal, ac.signal) })
+  hang → blocks forever                     .finally(() => clearTimeout(t))
+  down  → throws (caught)
+                                          hang → ac fires at 30s → throws (caught) ✓
+  fallback works for DOWN only            down → throws (caught) ✓
+                                          fallback works for BOTH ✓
+```
+
+What *doesn't* change: the fallback loop, the turn budget, the trace, the
+`shouldFallback` classifier — all of them already react correctly to a thrown
+error. The fix is one `AbortController` + `setTimeout` per transport call
+(`gemma-provider.ts:201-215`, `ollama-embedding-provider.ts:60-75`), feeding the
+existing `signal` plumbing. The architecture is ready; the deadline is the missing
+piece. (Note: `AbortSignal.timeout(ms)` does exactly this in one call on modern
+Node.)
 
 ### Move 3 — the principle
 
-Partial failure is the only thing that makes a network call different from a
-local one, and there are a small number of honest responses: **don't make the
-call if it's doomed** (fail-fast), **have a plan B when it fails anyway**
-(failover), and **re-ask the same node when it answered but answered wrong**
-(retry-on-parse). AptKit does all three at the boundaries that need them. The
-discipline that scales beyond this repo: *classify your failures* — not just
-"transient vs permanent" for transport (failover), but "transport failed" vs
-"the response is unusable" (retry-on-parse). Conflating the two is how systems
-fail over on a parse bug, or nag a healthy node into garbage.
+In a distributed system, *the absence of a response is not the absence of work* —
+the far side might be grinding away, or dead, and you cannot tell. A timeout is how
+you make a decision under that uncertainty: "I've waited my budget; I'll treat this
+as failed and act." Retries only help *after* you've decided something failed, and
+you can only decide that if a timeout (or an error) gave you the signal. Timeout
+first, then classify, then retry — in that order, every time.
 
 ## Primary diagram
 
-Everything Move 2 walked — fail-fast, then sequential failover with
-classification and abort passthrough.
+The complete picture: the three budgets that exist, the one that's missing, and
+where retry happens.
 
 ```
-  The full partial-failure path
+  Partial-failure handling in aptkit — what bounds what
 
-  ┌─ runAgentLoop (bounds attempts) ─────────────────────────────┐
-  │  signal.throwIfAborted()  ── cancellation checked first       │
-  └────────────────────────────┬──────────────────────────────────┘
-                              │ complete()
-  ┌─ ContextWindowGuardedProvider (FAIL-FAST) ─▼─────────────────┐
-  │  estimate tokens ─ fit? ── no → throw (no network)            │
-  │                          └─ yes ▼                             │
-  └────────────────────────────────┼─────────────────────────────┘
-  ┌─ FallbackModelProvider (FAILOVER) ─▼─────────────────────────┐
-  │  for provider in [p1, p2, ...]:                               │
-  │    throwIfAborted()                                           │
-  │    try complete() → success? return ◄── first win exits       │
-  │    catch:                                                     │
-  │      abort?         → rethrow (cancellation wins)             │
-  │      shouldFallback → record + next                           │
-  │      else           → rethrow                                 │
-  │  exhausted → throw ProviderFallbackError(attempts)            │
-  └────────────────────────────┬──────────────────────────────────┘
-                              │ HTTPS  ◄── partial failure originates here
-  ┌─ provider APIs ─────────────▼────────────────────────────────┐
-  │  timeout / 429 / 5xx / partial response / success             │
-  └───────────────────────────────────────────────────────────────┘
-
-  MISSING (not yet exercised): backoff, jitter, same-provider retry.
+  ┌─ runAgentLoop ─────────────────────────────────────────────────────┐
+  │  BUDGET 1: maxTurns ........... bounds # of model round-trips    ✓   │
+  │  BUDGET 2: maxToolCalls ....... bounds # of tool executions     ✓   │
+  │  cancellation: signal.throwIfAborted() at each turn             ✓   │
+  └───────────────────────────────┬─────────────────────────────────────┘
+                                  │ complete()
+  ┌─ FallbackModelProvider ───────▼─────────────────────────────────────┐
+  │  RETRY: try providers in order; record each FallbackAttempt     ✓   │
+  │  CLASSIFY: shouldFallback(error) — retryable vs terminal        ✓   │
+  │  CANCEL-SAFE: re-throw AbortError, never retry it               ✓   │
+  └───────────────────────────────┬─────────────────────────────────────┘
+                                  │ complete() → fetch()
+  ┌─ GemmaModelProvider / fetch ──▼─────────────────────────────────────┐
+  │  DEADLINE: per-call wall-clock timeout ............ ✗ MISSING        │
+  │  → a hang here blocks every budget above it, defeats the fallback   │
+  └─────────────────────────────────────────────────────────────────────┘
 ```
-
-## Implementation in codebase
-
-**Use cases.** The fallback chain is reached for whenever a run is configured
-with more than one provider — the production posture where Anthropic is primary
-and OpenAI is the backup, or where a local Gemma is primary and a cloud provider
-is the safety net behind it (`provider-gemma`'s README spells out exactly this
-composition: guard the local model, then put it behind the fallback chain). The
-context guard wraps a local/cheap provider so a too-large prompt is rejected
-before wasting a call — load-bearing for Gemma, whose ~8k context is small and
-easy to overrun (`ask.ts:52` wraps it at `maxTokens: 8192`). The Gemma
-retry-on-parse loop runs on every tool-calling turn against a local model. All
-three run inside the RAG query agent.
-
-**The failover loop, line by line.**
-
-```
-  packages/providers/fallback/src/fallback-provider.ts  (lines 47-89)
-
-  for (let index = 0; index < this.providers.length; index += 1) {  ← ordered walk
-    const provider = this.providers[index];
-    request.signal?.throwIfAborted();        ← cancellation checked BEFORE each try
-    try {
-      const response = await provider.complete(request);  ← the actual hop
-      this.lastSelectedProvider = { ... };   ← record which node won (observability)
-      return { ...response, model: ... };     ← FIRST SUCCESS EXITS the loop
-    } catch (error) {
-      if (isAbortError(error) || request.signal?.aborted) throw error;
-                                              ← cancellation wins: do NOT fail over
-      const attempt = { providerId, model, error: ... };
-      attempts.push(attempt);                 ← accumulate for the aggregate error
-      if (!this.shouldFallback(error, provider)) throw error;
-                                              ← classification: permanent? stop now
-      if (index < this.providers.length - 1)  ← only warn if a fallback remains
-        this.trace?.emit({ type: 'warning', ... });  ← observability on each failover
-    }
-  }
-  throw new ProviderFallbackError(attempts);  ← all nodes failed: aggregate + throw
-       │
-       └─ the throwIfAborted-before-try + abort-passthrough-in-catch is the
-          load-bearing pair: without it, an aborted request would keep failing
-          over to every provider instead of stopping. That's the bug people ship.
-```
-
-**The aggregated error.**
-
-```
-  packages/providers/fallback/src/fallback-provider.ts  (lines 16-24)
-
-  class ProviderFallbackError extends Error {
-    readonly attempts: readonly FallbackAttempt[];   ← every node's failure, kept
-    constructor(attempts) {
-      super(`all model providers failed: ${attempts.map(a =>
-        `${a.providerId}: ${a.error}`).join('; ')}`);  ← human-readable roll-up
-      ...
-    }
-  }
-       │
-       └─ without this, a total outage gives you one opaque "it failed." With it,
-          you get "anthropic: 503; openai: 429" — which is the difference between
-          a 2-minute and a 2-hour debugging session.
-```
-
-**The fail-fast guard.**
-
-```
-  packages/providers/local/src/context-window-guard.ts  (lines 57-71)
-
-  async complete(request) {
-    request.signal?.throwIfAborted();              ← honor cancellation first
-    const estimate = estimateContextWindow(request, this.options);
-    if (!estimate.ok) {                            ← request won't fit?
-      this.options.trace?.emit({ type: 'warning', ... });  ← say why, in the trace
-      throw new ContextWindowExceededError(estimate);      ← refuse BEFORE the network
-    }
-    return this.provider.complete(request);        ← only now pay for the round-trip
-  }
-       │
-       └─ the throw-before-delegate is the whole pattern: a local, cheap,
-          deterministic check that prevents a remote, expensive, certain failure.
-```
-
-**The retry-on-parse loop, line by line.**
-
-```
-  packages/providers/gemma/src/gemma-provider.ts  (lines 62-91)
-
-  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {  ← bounded retry
-    request.signal?.throwIfAborted();          ← cancellation wins, every iteration
-    const messages = attempt === 0             ← first try: plain messages
-      ? baseMessages
-      : [...baseMessages, { role: 'user', content: RETRY_NUDGE }];  ← retry: + nudge
-    lastResponse = await this.chat({ ... });   ← the network call to Ollama
-    raw = lastResponse.message?.content ?? '';
-    if (wantsTool) {
-      const call = parseToolCall(raw);         ← try to decode a tool call
-      if (call) return this.toResponse([tool_use], ...);  ← SUCCESS exits the loop
-      if (looksLikeToolAttempt(raw)) continue; ← botched JSON ('{')? nudge & retry
-    }
-    break;                                     ← plain prose = real answer, stop
-  }
-  return this.toResponse([{ type: 'text', text: raw }], ...);  ← graceful give-up
-       │
-       └─ the looksLikeToolAttempt gate at :86 is load-bearing: without it, a
-          plain-prose answer ("It is sunny in Paris.") would be retried as if it
-          were a failure, nagging the model. With it, only a fumbled tool call
-          (a stray '{') triggers the nudge. "Format wrong" vs "chose prose" is
-          the distinction the whole loop hinges on.
-```
-
-**The Ollama edge — where the local partial failure surfaces.**
-
-```
-  packages/providers/gemma/src/gemma-provider.ts:201-215
-  packages/retrieval/src/ollama-embedding-provider.ts:60-75   (same shape)
-
-  const res = await fetch(`${base}/api/chat`, { ... });  ← localhost socket call
-  if (!res.ok) {                                          ← Ollama answered non-2xx?
-    throw new Error(`ollama HTTP ${res.status}: ${await res.text()}`);
-  }                                                       ← 404 (model not pulled),
-                                                            500 (mid-load) → throw
-       │
-       └─ if Ollama isn't running at all, `fetch` itself rejects (ECONNREFUSED)
-          before this line — that rejection propagates up identically. Either way
-          the error reaches the fallback chain, which can fail over to a cloud
-          provider. A localhost dependency is still a partial-failure source.
-```
-
-**Where backoff/timeout would live, and why they don't (yet).** The Anthropic
-adapter (`packages/providers/anthropic/src/anthropic-provider.ts:28-39`) passes
-`request.signal` straight to `client.messages.create(...)` and sets no explicit
-timeout or `maxRetries` — it relies on the **SDK's built-in retry/timeout
-defaults**, which AptKit doesn't override. The Ollama edges have *no* SDK and
-*no* explicit timeout at all — a hung Ollama call is bounded only by
-`AbortSignal` and the loop's `maxTurns`, never a per-call deadline. So:
-
-- **Explicit timeout:** `not yet exercised` at AptKit's layer — delegated to the
-  SDK for cloud, *absent entirely* for the Ollama edges (no SDK, no default).
-  *Trigger: needing a tighter deadline than the SDK default, e.g. a UI that must
-  respond in 2s, or capping a slow first-token from a cold local model.*
-- **Backoff + jitter:** `not yet exercised`. *Trigger: retrying the same
-  provider on a transient transport error instead of switching nodes.*
-- **Same-target *transport* retry:** `not yet exercised`. The Gemma
-  retry-on-parse loop (Step 4.5) retries the same target on a *parse* failure,
-  but no path retries a node on a *network* failure. *Trigger: a single-provider
-  deployment where there's no second node to fail over to, so a transient 429/503
-  must be retried in place.*
 
 ## Elaborate
 
-The fail-fast / failover pair is older than "distributed systems" as a term —
-it's the resilience core of every networked client. The backoff-with-jitter
-pattern specifically comes from Ethernet's collision avoidance and was
-popularized for cloud APIs by AWS's "exponential backoff and jitter" writeup;
-the insight is that *correlated* retries (every client backing off by the same
-fixed amount) recreate the overload they were meant to relieve, so you randomize.
-AptKit doesn't need it yet because it fails *over* rather than *back*, but the
-day it retries one endpoint, jitter is non-negotiable.
+The "retryable vs terminal" distinction the `shouldFallback` hook exposes is the
+single most underrated idea in failure handling. Most retry bugs are *retrying the
+wrong thing* — hammering a server with a request it will reject every time (a 400),
+or retrying a non-idempotent write and double-applying it. The classifier is where
+you encode "this error means try again" vs "this error means stop." aptkit gives you
+the hook but defaults to `() => true` (retry everything), which is the right default
+for *read-only* model calls but would be dangerous if `complete()` had side effects.
 
-The neighbor `study-networking` owns what "timeout" and "503" actually mean on
-the wire (socket timeouts vs response timeouts, TLS handshake failures);
-`study-runtime-systems` owns the `AbortSignal` mechanics. This file owns the
-*decision* made when those failures surface.
+Backoff and jitter — waiting longer between retries, with randomness so a fleet of
+clients doesn't retry in lockstep and create a thundering herd — are `not yet
+exercised`: the fallback chain tries the next provider *immediately*, with no delay.
+That's correct here because it's trying a *different* provider, not re-hitting the
+same one. Backoff matters when you retry the *same* endpoint; it would attach if you
+added per-provider retry-the-same-one logic.
 
 ## Interview defense
 
-**Q: "A provider call fails. Walk me through what happens."**
-
-Draw the failover loop. "We classify the error first — if it's a cancellation,
-we rethrow; the caller wants to stop. If it's a fail-over-able error, we record
-the attempt and try the next provider. First success wins. If everything fails,
-we throw a `ProviderFallbackError` that carries every attempt's reason."
-
-```
-  complete() → catch → abort? rethrow : shouldFallback? next : rethrow
-                                              │
-                                        exhausted → ProviderFallbackError(all)
-```
-
-Anchor: "`fallback-provider.ts:47-89`. The load-bearing detail people miss is
-the abort passthrough at line 65 — without it, an aborted request keeps failing
-over instead of stopping."
-
-**Q: "Where's your backoff and jitter?"**
-
-Don't bluff. "We don't have them, on purpose — we fail *over* to a different
-node rather than retrying the *same* one, so there's nothing to back off
-against. The moment we add same-provider retry, we need exponential backoff with
-jitter to avoid a thundering herd. That's the trigger."
+**Q: "Walk me through how this handles the model provider being down."**
+"Down and slow are different failures and the code handles them differently —
+that's the interesting part. If Ollama is *down*, the `fetch` throws
+`ECONNREFUSED`, the `FallbackModelProvider` catches it, records a `FallbackAttempt`
+with the reason, and tries the next provider. That path is solid. If Ollama is
+*slow* — daemon wedged, model still loading — the `fetch` has no timeout
+(`gemma-provider.ts:201`), so it hangs, never throws, and the fallback loop is stuck
+on it forever. The fix is a per-call deadline via `AbortController` + `setTimeout`,
+which turns 'slow' into 'threw' so the existing fallback logic can react. The
+architecture's ready; it's a one-function change in the transport."
 
 ```
-  fail OVER (switch nodes)  → no backoff needed   ← what AptKit does
-  fail BACK (retry node)    → backoff + jitter    ← the trigger for adding it
+  sketch while answering
+
+  DOWN:  fetch → ECONNREFUSED → catch → try next provider   ✓ works today
+  SLOW:  fetch → (hang) → never caught → stuck               ✗ needs a deadline
+                          └─ add: AbortSignal.timeout(30_000) → turns into DOWN
 ```
 
-**Q: "You have a retry loop in the Gemma provider AND a fallback chain. Aren't
-those the same thing?"**
+**Q: "When do you NOT retry?"** — The load-bearing answer people forget:
+"Three cases. (1) The caller cancelled — `isAbortError` is re-thrown, never retried.
+(2) The error is *terminal* — a 400/422 means the request is wrong; retrying just
+burns quota. That's what `shouldFallback` classifies. (3) The operation isn't
+idempotent and the first attempt might have partially applied — retrying could
+double-apply. aptkit's model calls are read-only so that last one doesn't bite, but
+it's why you classify before you retry."
 
-"No — they defend against different failures. The fallback chain handles
-*transport* failure: a provider threw, so try a different node. The Gemma loop
-handles *semantic* failure: the call succeeded, Ollama answered, but the answer
-was a malformed tool call — so I re-ask the *same* node with a corrective nudge.
-Different failure, different fix. The tell is that the Gemma retry needs no
-backoff: the node isn't overloaded, it just fumbled the format."
-
-```
-  transport failed → fallback chain → switch to a different node
-  response unusable → Gemma loop     → re-ask the SAME node, nudged
-                                       (bounded by maxToolCallAttempts)
-```
-
-Anchor: "`gemma-provider.ts:62-91`. The load-bearing detail is the
-`looksLikeToolAttempt` gate at :86 — I only retry a *fumbled* tool call, never a
-plain-prose answer, because prose is a real answer, not an error."
-
-## Validate
-
-1. **Reconstruct:** Write the failover loop's kernel from memory — the four
-   branches inside the `catch`.
-2. **Explain:** Why does the abort error bypass `shouldFallback` entirely
-   (`fallback-provider.ts:65`)? What bug appears if it didn't?
-3. **Apply:** A provider starts returning 400s for malformed requests. With the
-   default `shouldFallback = () => true`, what happens — and what should you
-   inject instead?
-4. **Defend:** Argue for sequential failover over parallel hedged requests for
-   this repo, naming the cost you accept (`fallback-provider.ts:50-86`).
-5. **Apply:** Ollama is stopped while a RAG run is mid-question. Trace what
-   throws and where (`ollama-embedding-provider.ts:60-75`), and explain how the
-   fallback chain can — or can't — recover, depending on whether the failure is
-   on the embed edge or the chat edge.
-6. **Defend:** Why does the Gemma retry-on-parse loop (`gemma-provider.ts:62-91`)
-   need *no* backoff, while a same-provider transport retry would? Tie it to
-   *what* failed in each case.
+*Anchor:* `maxTurns` bounds the loop, `shouldFallback` classifies, and the missing
+per-call timeout is the one gap that defeats the fallback.
 
 ## See also
 
-- `01-distributed-system-map.md` — the seam where these handlers sit (now three
-  nodes: your process, cloud, and the local Ollama process).
-- `03-idempotency-deduplication-and-delivery-semantics.md` — what makes a retry
-  *safe* to perform (the Gemma nudge-retry is safe because chat is read-only).
-- `study-networking` — what timeouts and 5xx mean on the wire (and the localhost
-  HTTP hop to Ollama).
-- `study-runtime-systems` — `AbortSignal` and bounded work.
-- `study-ai-engineering` / `study-agent-architecture` — the RAG pipeline and
-  tool-call emulation these failures sit inside.
+- `03-idempotency-deduplication-and-delivery-semantics.md` — why retry-safety needs idempotency
+- `09-distributed-systems-red-flags-audit.md` — the timeout gap is finding #1
+- **study-networking** — socket-level timeouts vs application deadlines
+- **study-runtime-systems** — `AbortSignal`, cooperative cancellation, the event loop
+```

@@ -1,468 +1,297 @@
-# Eval methods — the scoring ladder
+# Eval methods
 
-**Industry names:** exact match, fuzzy/structural match, rubric scoring, LLM-as-judge, pairwise preference, human eval · *Industry standard*
+**Subtitle:** The cheap→expensive scoring ladder · four real scorers in `@aptkit/evals` · *Industry standard*
 
 ## Zoom out, then zoom in
 
-You have an output and a question: *is it good?* The honest answer depends on
-how cheaply you can decide. AptKit doesn't pick one method — it stacks them, and
-the `@aptkit/evals` package is the rung-by-rung implementation. Here's where the
-methods sit relative to the outputs they score.
+Once you have an eval set, you have to *score* against it — and scoring methods
+form a ladder from cheap-and-strict to expensive-and-fuzzy. The principle is to
+climb only as high as the output demands: a fixed-shape JSON object can be checked
+with an exact rule; a free-form paragraph needs a model to judge it. aptkit has a
+scorer at four rungs of that ladder, each its own module in `@aptkit/evals`.
 
 ```
-  Zoom out — where eval methods sit
+  Zoom out — the eval-method ladder (cheap/strict at the bottom)
 
-  ┌─ Outputs under test (from agents) ──────────────────────────────┐
-  │  recommendations · anomalies · diagnoses · query answers        │
-  └───────────────────────────────┬──────────────────────────────────┘
-                                   │  scored by one (or more) rungs
-  ┌─ Method ladder (@aptkit/evals) ─▼───────────────────────────────┐
-  │  exact      structural-diff.ts   (cheap, deterministic)         │
-  │  fuzzy/     detection-scorer.ts  ← precision/recall over a set  │ ← we are here
-  │  precision  precision-at-k.ts    ← ★ ranked-retrieval RULER ★   │
-  │  LLM-judge  rubric-judge.ts      (LLM-as-judge, see 03)          │
-  │  human      [pairwise — NOT shipped] · [review gate — see 01]   │
-  └──────────────────────────────────────────────────────────────────┘
-
-  Two deterministic precision/recall scorers, two targets: detection-scorer
-  grades a SET of detections (categorical); precision-at-k grades a RANKED
-  retrieval list (order-aware). Both are free pure functions below the seam.
+  ┌─ HUMAN ──────────────────────────────────────────────┐  expensive, slow,
+  │  a person reads it                                    │  highest fidelity
+  ├─ RUBRIC / LLM-AS-JUDGE ───────────────────────────────┤
+  │  ★ rubric-judge.ts — a model scores meaning ★         │  fuzzy outputs
+  ├─ RANKED RETRIEVAL ────────────────────────────────────┤
+  │  precision-at-k.ts — ordered list quality             │  retrieval
+  ├─ DETECTION SCORING ───────────────────────────────────┤
+  │  detection-scorer.ts — did it find the right things?  │  set membership
+  ├─ EXACT MATCH / STRUCTURAL RULES ──────────────────────┤
+  │  structural-diff.ts — does the shape/value hold?      │  cheap, strict,
+  └────────────────────────────────────────────────────────┘  deterministic
 ```
 
-Zoom in: you already grade things on a ladder of effort without thinking about
-it — `===` for a number, a regex for a string shape, a code reviewer for "is
-this design any good." Eval methods are the same ladder, formalized. The rule is
-**climb only as far as you must**: exact match is free and unambiguous but only
-works when there's one right answer; an LLM judge handles open-ended quality but
-is slow, costs tokens, and is itself biased (`03`). AptKit implements the bottom
-three rungs concretely and leans on a human gate at the top.
+Now zoom in. The trap beginners fall into is reaching for the LLM judge first
+because it feels powerful. It's the opposite — the judge is the *last* resort,
+because it's slow, costs tokens, and is itself fallible (see
+`03-llm-as-judge-bias.md`). The skill is choosing the lowest rung that can
+actually catch the failure you care about. aptkit's modules let you do exactly
+that, picking the scorer per output type.
 
 ## Structure pass
 
-**Layers.** Two: the *deterministic rules* (structural diff, detection scoring —
-pure functions over JSON, no model) and the *model-in-the-loop judgment* (the
-rubric judge — calls an LLM to score). The boundary between them is the most
-important line in the whole eval layer.
+**Layers.** A capability produces output → a scorer at the right rung evaluates it
+→ the result (`{ok, issues}` or `{ok, score, ...}`) flows into a test assertion or
+a replay summary.
 
-**Axis — cost and determinism: what does one judgment cost, and is it
-repeatable?** Trace it up the ladder:
+**Axis — cost (and with it, determinism).** Trace the cost of a single eval down
+the ladder. `evaluateStructuralDiff` is pure, synchronous, free, and
+deterministic (`structural-diff.ts:20`). `scoreDetections` and `scorePrecisionAtK`
+are the same — pure functions over arrays. `RubricJudge.judge` makes a *model
+call* (`rubric-judge.ts:92`) — async, costs tokens, non-deterministic. Cost and
+determinism move together: the cheap rungs are exact and repeatable, the expensive
+rung is fuzzy and variable. Pick the cheapest rung that still distinguishes pass
+from fail.
 
-```
-  One axis — "cost + determinism of a single judgment"
-
-  exact match       →  free,  100% deterministic, only for one-right-answer
-  structural diff   →  free,  deterministic, checks shape/content rules
-  detection score   →  free,  deterministic, partial-credit precision/recall
-  rubric / LLM-judge→  $$ + latency, NON-deterministic, handles open quality
-  pairwise          →  $$ + latency, non-deterministic, relative not absolute
-  human             →  $$$ + slow, the ground truth everything else approximates
-
-  cost rises and determinism falls as you climb
-```
-
-**Seams.** The load-bearing seam is the **deterministic / model-in-the-loop
-boundary** — the step from `detection-scorer.ts` to `rubric-judge.ts`. Below it,
-a judgment is a pure function: same input, same score, zero cost, fully
-auditable. Above it, a judgment is a model call: it costs tokens, it varies run
-to run, and it can be *wrong about quality* in ways the rungs below cannot. Every
-design decision in the eval layer is "can I stay below this seam?" Study it
-first; `03` is entirely about defending the rung just above it.
+**Seam.** The shared result shape. Every scorer returns an object with `ok:
+boolean` and either `issues` or `score` (`StructuralDiffResult`,
+`DetectionScoreResult`, `RetrievalScoreResult`). Above that seam, a test or a
+Studio summary treats all four uniformly; below it, each scorer is free to be as
+cheap or as expensive as its rung requires.
 
 ## How it works
 
-You know `assert.equal(actual, expected)` and you know "well, a human has to look
-at this one." The method ladder is everything in between, ordered by how much
-ambiguity each rung can absorb. Walk it bottom to top.
-
 ### Move 1 — the mental model
 
-The ladder is a sequence of graders, each handling outputs the rung below can't.
-You climb only when the cheaper rung can't decide.
+This is the **assertion-strength** decision you already make in every test you
+write. `assert(x === 3)` is the strictest, cheapest check — exact equality.
+`assert(arr.includes('a'))` is looser — membership. `assert(result.score > 0.8)`
+is looser still — a threshold. And `assert(reviewer.approves(prose))` is the
+loosest and most expensive — judgment. You don't reach for the fuzzy assertion
+when an exact one works; the same instinct picks the eval rung.
 
 ```
-  The method ladder — climb only when forced
+  Assertion strength  ─analogy─►  eval-method rung
 
-         human review            ◄── ground truth (slow, $$$)
-              ▲
-         pairwise preference     ◄── "A or B?" (relative)
-              ▲
-         LLM-as-judge (rubric)   ◄── "score this against a rubric"
-   ─ ─ ─ ─ ─ ─│─ ─ ─ ─ ─ ─ ─ ─ ─ ─  the model-in-the-loop seam
-              ▲
-         detection score         ◄── partial credit: matched/missed/unexpected
-              ▲
-         structural diff         ◄── shape + must-have content rules
-              ▲
-         exact match             ◄── one right answer, byte-equal
+  x === 3                 ─►   structural-diff: equals / required
+  arr.includes('a')       ─►   detection-scorer: required category found
+  score > 0.8             ─►   precision@k: ranked-list threshold
+  reviewer.approves(text) ─►   rubric-judge: model scores meaning
 ```
 
-The trap is reaching for the LLM judge first because it feels powerful. It's the
-*most* expensive, *least* repeatable rung. Most of what you want to know — "did
-the output have the required fields? did the monitor flag the right category? is
-the answer long enough to be useful?" — is answerable for free, deterministically,
-below the seam.
+A test fails loudly with a wrong assertion *type* — too strict and it's flaky,
+too loose and it passes garbage. Same here: scoring a paragraph with `equals`
+fails on whitespace; scoring a JSON shape with a rubric judge is slow and
+non-deterministic for no gain. Match the rung to the output.
 
-### Move 2 — the step-by-step walkthrough
+### Move 2 — the four scorers, rung by rung
 
-#### Rung 1-2 — structural diff (exact + fuzzy shape rules)
+**Rung 1 — exact match / structural rules (`structural-diff.ts`).** The cheapest
+scorer. `evaluateStructuralDiff` runs a list of typed rules against any JSON-like
+value and returns `{ok, issues}` (`structural-diff.ts:11`):
 
-Start where unit testing starts: assert the output has the right shape. AptKit's
-`evaluateStructuralDiff` is a small rule engine over arbitrary JSON. Each rule
-targets a dot-path and reports a `StructuralIssue` if it fails; zero issues means
-pass.
-
-```
-  Structural diff — six rule types over JSON dot-paths
-
-  value ──► for each rule, walk the path and check:
-     ├─ required      path exists at all
-     ├─ equals        path === expected (deep)            ← exact-match rung
-     ├─ number        |path - expected| <= tolerance       ← fuzzy numeric
-     ├─ arrayCount    array length exact / min / max
-     ├─ containsText  flattened text under path includes "needle"  ← fuzzy text
-     └─ arrayIncludes some item (or item.itemPath) deepEquals value
-
-  issues = []  → ok: true     issues = [..] → ok: false, here's where
+```ts
+export type StructuralDiffRule =
+  | { type: 'required'; path: string }                                  // path exists
+  | { type: 'equals'; path: string; expected: unknown }                 // exact value
+  | { type: 'number'; path: string; expected: number; tolerance?: number } // ± tolerance
+  | { type: 'arrayCount'; path: string; exact?; min?; max? }            // length bounds
+  | { type: 'containsText'; path: string; text: string }               // substring
+  | { type: 'arrayIncludes'; path: string; value: unknown; itemPath? };// membership
 ```
 
-The two interesting rungs hide here. `equals` is the *exact-match* rung — full
-deterministic equality, used when there genuinely is one right value.
-`containsText` is the *fuzzy-text* rung — it flattens the whole subtree under a
-path into one string and checks for a substring (case-insensitive by default),
-so "the diagnosis mentions checkout" passes whether the model says it in
-sentence three or paragraph two. `number` with a `tolerance` is *fuzzy numeric* —
-"about 1500, give or take 50." The boundary condition: `getPath` returns
-`{exists: false}` for a missing path, and most rules treat missing-path as a
-failure, so a typo'd path silently fails the rule rather than throwing. Read your
-issues.
-
-#### Rung 3 — detection scoring (partial credit, precision/recall-style)
-
-Structural diff is pass/fail. But "the anomaly monitor flagged 4 of the 5
-categories it should have" isn't pass/fail — it's *partial credit*. That's what
-`scoreDetections` adds: a precision/recall-style score over a list of detections
-against a set of expectations.
+This is the rung the whole replay backbone rides on:
+`assertReplayArtifactShape` is just a pile of `required` rules plus a few `equals`
+(`assertions.ts:58`) — `schemaVersion === 1`, `provider.id` present, an ISO
+`createdAt`, `eval.ok === true`. Note the `number` rule's `tolerance`
+(`structural-diff.ts:112`): for a metric you assert `42 ± 0.5`, because a float
+that drifts in the last digit shouldn't fail a test.
 
 ```
-  scoreDetections — turn expectations into a 0..1 score
+  Rung 1 — structural rules over a JSON value
 
-  expectations:  requiredCategories, requiredMetrics, requiredScopes,
-                 requiredSeverities, minCount, maxCount
-        │
-        ▼ flatten each required value into one "requirement"
-  requirements = [category:checkout, metric:revenue, severity:high, …]
-        │
-        ▼ for each requirement, does ANY detection match it?
-  matched = [category:checkout, …]      missed = [severity:high]
-        │
-        ▼ also: count violations (too few / too many detections)
-        ▼ also: unexpected = categories present but NOT in requiredCategories
-        │
-        ▼ score = (requirementCount - failedCount) / requirementCount
+  artifact ─► [required schemaVersion, equals provider.id, number(42, tol .5), ...]
+                                │
+                                ▼
+                       { ok, issues:[{path, message}] }   deterministic, free
 ```
 
-The score is the recall-flavored heart of it. `requirementCount` is the total
-number of things you required (every required category/metric/scope/severity,
-plus one each if `minCount`/`maxCount` were set). `failedCount` is how many of
-those went unmet (missed requirements plus count violations). The score is
-`(requirementCount - failedCount) / requirementCount`, floored at 0, and 1 when
-nothing was required. So requiring 5 categories and matching 4 yields 0.8 — a
-graded signal a pass/fail rule can't give you. The boundary condition: `ok` is
-`true` only when there are *zero* issues, so `ok` and `score === 1` move
-together, but a partial run reports `ok: false` *and* a meaningful 0.8 you can
-threshold on. `unexpected` (categories you didn't ask for) is reported but does
-*not* lower the score — it's a precision *signal*, not a penalty. That's a
-deliberate design choice, and a thing to flag in review.
+**Rung 2 — detection scoring (`detection-scorer.ts`).** When the output is a *set*
+of findings — anomalies, categories — exact match is wrong (order and count vary).
+`scoreDetections` asks "did it find the things it should, and not too many extra?"
+(`detection-scorer.ts:29`). It tallies `matched` / `missed` / `unexpected` against
+`requiredCategories`/`metrics`/`scopes`/`severities` and `min`/`maxCount`, then
+returns a fractional `score` (`detection-scorer.ts:73`):
 
-#### The seam — crossing into model-in-the-loop
-
-Everything above is a pure function: free, deterministic, auditable. The moment a
-rule can't be written — "is this recommendation *actually well-reasoned*?", "is
-this answer *clear*?" — you cross the seam into an LLM judge. You pay tokens, you
-lose determinism, and you inherit bias. Cross it only for genuinely open-ended
-quality.
-
-```
-  The seam — what changes when you cross it
-
-  BELOW (structural-diff, detection-scorer)   ABOVE (rubric-judge)
-  ─────────────────────────────────────────   ─────────────────────────
-  pure function over JSON                      model.complete() call
-  $0, deterministic, same score every run      tokens + latency, varies
-  auditable: "failed because path X missing"   auditable only via the
-                                               judge's per-dimension reasons
-  can't judge open-ended quality               that's the whole point
+```ts
+const score = requirementCount === 0 ? 1
+  : Math.max(0, (requirementCount - failedCount) / requirementCount);
+return { ok: issues.length === 0, score, matched, missed, unexpected, issues };
 ```
 
-#### Rung 4 — LLM-as-judge (rubric scoring)
+This is the rung for the anomaly-monitoring agent: you don't care that it returned
+anomalies in a specific order, only that it caught the revenue drop (a required
+metric+scope) and didn't flood you with noise (`maxCount`). It's looser than exact
+match, still pure and deterministic.
 
-Above the seam, AptKit ships `RubricJudge`: a model call constrained by a
-*rubric contract* so it scores against declared dimensions and returns
-structured `{score, reason}` per dimension plus a verdict and one fix. The
-mechanics of *why the contract matters* — bias defense — are the entire subject
-of [03-llm-as-judge-bias.md](03-llm-as-judge-bias.md). For the ladder, the point
-is: this rung handles what no deterministic rule can, at the cost of everything
-the seam diagram lists.
+```
+  Rung 2 — set membership over detections
 
-#### Rungs 5-6 — pairwise and human
+  detections[] ─► required {category, metric, scope, severity} + min/maxCount
+                                │
+                                ▼
+              { ok, score, matched[], missed[], unexpected[] }
+```
 
-Two rungs AptKit doesn't fully ship. **Pairwise preference** ("is answer A or B
-better?") is often more reliable than absolute scoring because relative judgments
-are easier — AptKit has no pairwise comparator. **Human review** is the ground
-truth all the rungs below approximate; in AptKit it appears as the *review gate
-before promoting a replay artifact into a regression fixture* (`01`). Naming what
-isn't built is part of the method: AptKit's automated ladder tops out at the
-rubric judge.
+**Rung 3 — ranked retrieval (`precision-at-k.ts`).** When the output is an
+*ordered list* — search results — you score the top of the list.
+`scorePrecisionAtK` counts distinct relevant ids in the top-k over the window size
+(`precision-at-k.ts:47`):
+
+```ts
+export function scorePrecisionAtK(retrievedIds, relevantIds, k): RetrievalScoreResult {
+  if (k <= 0) return { ...NOT_WELL_FORMED };
+  const total = Math.min(k, retrievedIds.length);   // short list isn't penalised
+  if (total === 0) return { ...NOT_WELL_FORMED };
+  const matched = countDistinctHits(retrievedIds, relevantIds, k);
+  return { ok: true, score: matched / total, matched, total };
+}
+```
+
+Read the `ok` semantics carefully (`precision-at-k.ts:1`): `ok` means
+**well-formed**, *not* "good." A perfectly valid score of `0.0` still has `ok:
+true`; `ok` is only `false` when the metric is undefined (`k <= 0`, empty
+retrieval). That separation — "did the computation make sense" vs "was the result
+good" — is the subtle part. Studio's RAG page scores a fixed corpus this way, and
+buffr grades `/Users/rein/Public/buffr/eval/queries.json` with the same metric.
+
+```
+  Rung 3 — precision@k over a ranked list
+
+  retrievedIds[top-k] ∩ relevantIds  ──►  matched / min(k, retrieved)
+                                            │
+                                            ▼
+                          { ok:well-formed, score, matched, total }
+              ok:false ONLY when k<=0 or nothing retrieved (NOT when score is low)
+```
+
+**Rung 4 — rubric / LLM-as-judge (`rubric-judge.ts`).** The top rung, for outputs
+only a reader can grade — a free-form answer, a recommendation's quality.
+`RubricJudge.judge` calls a model via `generateStructured` to score the subject
+against a `RubricDefinition` and returns per-dimension scores, a verdict, and one
+fix (`rubric-judge.ts:89`). It's async, costs tokens, and is non-deterministic —
+which is why it's the last rung, and why it has its own failure modes
+(`03-llm-as-judge-bias.md`).
+
+```
+  Rung 4 — a model scores meaning
+
+  subject + rubric ─► generateStructured ─► { dimensions:{score,reason}, verdict, fix }
+                          │ model call (async, costs tokens, fuzzy)
+                          ▼
+                  validated against the rubric's own score ranges
+```
 
 ### Move 3 — the principle
 
-A grader's value is `(ambiguity it can absorb) / (cost per judgment)`. Exact
-match absorbs zero ambiguity at zero cost; a human absorbs all of it at maximum
-cost. The engineering is to push as much of your eval as possible *down* the
-ladder — write the structural rule, compute the partial-credit score — and spend
-the expensive model-in-the-loop rung only on the residue that genuinely needs
-judgment. A test suite that LLM-judges things `===` could have caught is paying
-rent on ambiguity it doesn't have.
+Climb the ladder only as far as the output forces you to. A fixed-shape artifact?
+Structural rules — free and exact. A set of findings? Detection scoring. A ranked
+list? precision@k. Free-form prose where meaning is the thing? Only then the LLM
+judge. The win is twofold: cheap rungs are deterministic so they never flake, and
+reserving the judge for prose keeps your eval suite fast and your token bill near
+zero. The shared `{ok, ...}` shape means a test reads identically regardless of
+which rung produced it.
 
 ## Primary diagram
 
-The full ladder with AptKit's implementation on each rung and the deterministic
-seam marked.
-
 ```
-  AptKit's eval method ladder — implementation per rung
+  The eval-method ladder — mapped to aptkit's real scorers
 
-  ┌─ rung 6  HUMAN ─────────────────────────────────────────────────┐
-  │  review gate before promotion (scripts/promote-…, see 01)        │
-  ├─ rung 5  PAIRWISE ──────────────────────────────────────────────┤
-  │  [NOT shipped — no comparator]                                   │
-  ├─ rung 4  LLM-AS-JUDGE ──────────────────────────────────────────┤
-  │  RubricJudge.judge() → {dimensions:{score,reason}, verdict, fix} │
-  │  packages/evals/src/rubric-judge.ts                              │
-  ╞═════════════ model-in-the-loop seam (tokens, non-determinism) ═══╡
-  │  rung 3  DETECTION SCORE                                          │
-  │  scoreDetections() → score = (req - failed)/req, partial credit  │
-  │  packages/evals/src/detection-scorer.ts                          │
-  ├─ rung 2  STRUCTURAL / FUZZY ────────────────────────────────────┤
-  │  evaluateStructuralDiff() — required/number/arrayCount/          │
-  │  containsText/arrayIncludes   packages/evals/src/structural-diff.ts│
-  ├─ rung 1  EXACT MATCH ───────────────────────────────────────────┤
-  │  the `equals` rule (deep equality)                               │
-  └──────────────────────────────────────────────────────────────────┘
+  output type            rung                       module                cost
+  ───────────────────────────────────────────────────────────────────────────
+  fixed JSON shape   ►   exact / structural rules   structural-diff.ts    free, exact
+  set of findings    ►   detection scoring          detection-scorer.ts   free, exact
+  ranked list        ►   precision@k / recall@k     precision-at-k.ts     free, exact
+  free-form prose    ►   rubric / LLM-as-judge      rubric-judge.ts       tokens, fuzzy
+  anything           ►   human review               (not automated)       slowest
+
+  shared seam: every scorer returns { ok, issues } or { ok, score, ... }
+  rule: pick the LOWEST rung that distinguishes pass from fail
 ```
-
-## Implementation in codebase
-
-**Use cases.** The recommendation eval asserts shape with structural rules
-(`assertRecommendationShape` → `assertRequiredPaths`). The anomaly monitor's
-behavioral eval scores its detections with partial credit — Studio's
-`assertMonitoringBehavioralExpectations` calls `scoreDetections` with the
-fixture's required categories/metrics/scopes/severities. The diagnostic eval uses
-`containsText` to assert the conclusion mentions required evidence text. The
-rubric judge (rung 4) drives the rubric-improvement agent (`03`).
-
-**Rung 2 — the structural rule engine**, `packages/evals/src/structural-diff.ts:20-47`:
-
-```
-  packages/evals/src/structural-diff.ts  (lines 20-47)
-
-  export function evaluateStructuralDiff(value, rules) {
-    const issues = [];
-    for (const rule of rules) {
-      switch (rule.type) {
-        case 'required':     assertRequiredRule(value, rule, issues); break;
-        case 'equals':       assertEqualsRule(value, rule, issues); break;   ← exact
-        case 'number':       assertNumberRule(value, rule, issues); break;   ← fuzzy num
-        case 'arrayCount':   assertArrayCountRule(value, rule, issues); break;
-        case 'containsText': assertContainsTextRule(value, rule, issues); break; ← fuzzy text
-        case 'arrayIncludes':assertArrayIncludesRule(value, rule, issues); break;
-      }
-    }
-    return { ok: issues.length === 0, issues };  ← pass = ZERO issues
-  }
-       │
-       └─ a flat rule list, one switch, issues accumulate. `ok` is derived,
-          not asserted — so the issues array IS the failure explanation.
-```
-
-The `containsText` rung is worth seeing because the flattening is the fuzzy part,
-`packages/evals/src/structural-diff.ts:185-192`:
-
-```
-  packages/evals/src/structural-diff.ts  (lines 185-192)
-
-  function collectText(value, normalize) {
-    if (typeof value === 'string') return normalize ? value.toLowerCase() : value;
-    if (Array.isArray(value)) return value.map(v => collectText(v, normalize)).join('\n');
-    if (value && typeof value === 'object')
-      return Object.values(value).map(v => collectText(v, normalize)).join('\n');
-    return '';
-  }
-       │
-       └─ recursively flattens an ENTIRE subtree into one string, then the
-          rule does a substring check. That's why "mentions checkout" passes
-          no matter where in the structure the word appears — fuzzy by design.
-```
-
-**Rung 3 — the partial-credit score**, `packages/evals/src/detection-scorer.ts:71-73`:
-
-```
-  packages/evals/src/detection-scorer.ts  (lines 71-73)
-
-  const requirementCount =
-    required.length + (minCount > 0 ? 1 : 0) + (maxCount !== undefined ? 1 : 0);
-  const failedCount =
-    missed.length + issues.filter(i =>
-      i.path === 'expectations.minCount' || i.path === 'expectations.maxCount').length;
-  const score = requirementCount === 0
-    ? 1
-    : Math.max(0, (requirementCount - failedCount) / requirementCount);
-       │
-       └─ THE formula. Each required category/metric/scope/severity is one
-          requirement; min/maxCount each add one if set. score is the fraction
-          met, floored at 0, and 1 when nothing was required. This is what
-          turns "4 of 5 categories" into 0.8 instead of a flat fail.
-```
-
-It's wired up in `apps/studio/vite.config.ts:1198-1206`, where the monitoring
-behavioral eval passes the fixture's expectations straight into `scoreDetections`.
 
 ## Elaborate
 
-The ladder is folklore made explicit. Exact match and structural assertions come
-straight from unit testing. Precision/recall — what `scoreDetections` approximates
-— is the classic information-retrieval pair: of what you flagged, how much was
-right (precision); of what you should have flagged, how much did you catch
-(recall). AptKit's score is recall-leaning: it divides met requirements by total
-*required*, so it answers "how much of what mattered did you catch," and treats
-`unexpected` (a precision signal) as reportable-but-unpenalized. LLM-as-judge and
-pairwise preference come from the RLHF/eval-harness lineage (e.g. MT-Bench,
-Chatbot Arena) where open-ended quality has no programmable oracle.
-
-The deep idea is the seam: deterministic graders are *oracles* (they know the
-answer), model graders are *approximators* (they estimate it and can be wrong).
-Every rung you can keep below the seam is a rung that never lies to you. That's
-why `03` exists — once you're forced above the seam, you have to actively defend
-against the judge being wrong.
-
-A note on the newest scorer: `scoreDetections` grades an unordered *set* of
-detections, but a retriever returns a *ranked list* where order matters — so the
-RAG stack added a sibling deterministic scorer, `scorePrecisionAtK` /
-`scoreRecallAtK` (`packages/evals/src/precision-at-k.ts`). Same below-the-seam
-property (pure, free, deterministic), different shape: it answers "of the top-k
-retrieved ids, what fraction are relevant" and is the RULER that makes "don't add
-reranking until you measure" executable. Full treatment in
-[05-precision-at-k.md](05-precision-at-k.md).
-
-Adjacent: the sets these methods score
-([01-eval-set-types.md](01-eval-set-types.md)); the bias defense for rung 4
-([03-llm-as-judge-bias.md](03-llm-as-judge-bias.md)); the artifacts the replay
-eval runs these methods over ([04-llm-observability.md](04-llm-observability.md)).
+The field calls these "exact match," "metrics-based," and "model-graded" evals;
+aptkit's four modules are one concrete scorer per band, plus human at the top. The
+detail that separates someone who's *used* these from someone who's read about
+them is the `ok`-vs-`score` distinction in `precision-at-k.ts`: conflating
+"well-formed" with "good" is the classic bug that makes an eval silently pass when
+retrieval returns nothing. aptkit's comment spells it out — `ok:false` only on an
+undefined metric, never on a low score. The other detail is `number` tolerance in
+`structural-diff.ts`: exact-matching a float is how you get a flaky eval, so the
+strict rung still has a knob for the real world. Read `01-eval-set-types.md` for
+*what* you score against, and `03-llm-as-judge-bias.md` for why the top rung is the
+one to distrust.
 
 ## Project exercises
 
-*Provenance: Phase 5 — Evals and observability (C5.x). No `aieng-curriculum.md`
-present; IDs are by-phase convention. Case A — the bottom three rungs exist;
-these add a missing rung and a missing signal.*
+### Add a precision@k regression test from the buffr eval set
+- **Exercise ID:** —  (no curriculum file in repo)
+- **What to build:** a test that loads `/Users/rein/Public/buffr/eval/queries.json`,
+  runs each query through buffr's retrieval, scores with `scorePrecisionAtK`, and
+  asserts the mean precision@k stays above a frozen threshold — turning the 3-doc
+  relevance set into a guarded regression check.
+- **Why it earns its place:** it connects a real relevance set to the actual
+  scorer and demonstrates the `ok`(well-formed) vs `score`(quality) distinction in
+  a real assertion.
+- **Files to touch:** buffr retrieval test dir, reading
+  `/Users/rein/Public/buffr/eval/queries.json` and
+  `packages/evals/src/precision-at-k.ts`.
+- **Done when:** the test passes at current retrieval quality and fails if a
+  relevant doc drops out of the top-k.
+- **Estimated effort:** `1–4hr`
 
-### Exercise — add a pairwise-preference comparator (rung 5)
-
-- **Exercise ID:** `[C5.3]` Phase 5, eval-methods concept, Case A (extend)
-- **What to build:** A `comparePair(subjectA, subjectB, rubric, model)` function
-  in `@aptkit/evals` that asks the model which of two outputs better satisfies a
-  rubric and returns `{winner: 'A'|'B'|'tie', reason}`. Reuse the `RubricJudge`
-  system-prompt scaffolding but produce a relative verdict instead of an absolute
-  score. Defend against position bias by running it twice with A/B swapped and
-  only declaring a winner if both orderings agree (otherwise `tie`).
-- **Why it earns its place:** Pairwise is rung 5 and AptKit has no comparator —
-  the highest missing rung on the automated ladder. The swap-and-agree trick is
-  the textbook position-bias defense (see `03`), so the exercise connects two
-  concepts.
-- **Files to touch:** `packages/evals/src/pairwise-judge.ts` (new),
-  `packages/evals/src/index.ts`, `packages/evals/test/pairwise-judge.test.ts`
-  (use the fixture provider so it's deterministic).
-- **Done when:** A test shows the comparator returns `tie` when the two orderings
-  disagree and a stable winner when they agree.
-- **Estimated effort:** `1-4hr`
-
-### Exercise — report a precision signal in detection scoring
-
-- **Exercise ID:** `[C5.4]` Phase 5, eval-methods concept
-- **What to build:** Extend `DetectionScoreResult` with a `precision` field
-  computed from `unexpected` (detections not in `requiredCategories`) so the
-  score reports both recall (the existing fraction) and precision (matched /
-  (matched + unexpected)). Keep the existing `score` unchanged for compatibility.
-- **Why it earns its place:** The current score is recall-only and silently
-  ignores over-flagging — a monitor that flags every category scores 1.0 today.
-  Adding the precision signal names that blind spot and completes the IR pair.
-- **Files to touch:** `packages/evals/src/detection-scorer.ts`,
-  `packages/evals/test/detection-scorer.test.ts`.
-- **Done when:** A test with 3 required and 2 unexpected detections reports
-  `score: 1` (recall) and `precision: 0.6`, and a no-over-flag case reports
-  `precision: 1`.
+### Add a `number`-tolerance assertion to the monitoring eval
+- **Exercise ID:** —  (no curriculum file in repo)
+- **What to build:** in the anomaly-monitoring tests, assert a detected anomaly's
+  `change.value` matches the expected magnitude within a tolerance using a
+  `structural-diff` `number` rule, instead of an exact equals — so a float that
+  drifts in the last digit doesn't flake the suite.
+- **Why it earns its place:** it shows you know that exact-matching floats is a
+  flakiness source and that the strict rung still needs a tolerance knob.
+- **Files to touch:** `packages/agents/anomaly-monitoring/test/`, reading
+  `packages/evals/src/structural-diff.ts`.
+- **Done when:** the test passes at the recorded value and at value ± tolerance,
+  and fails outside it.
 - **Estimated effort:** `<1hr`
 
 ## Interview defense
 
-**Q: You need to eval an LLM feature. Where do you start — LLM-as-judge?**
+**Q: "How do you decide how to score an eval?"**
+By output type, on a cost ladder. Fixed-shape JSON gets exact structural rules —
+free and deterministic. A set of findings gets detection scoring
+(matched/missed/unexpected). A ranked list gets precision@k. Only free-form prose,
+where meaning is the thing, goes to the LLM judge — because it's slow, costs
+tokens, and is itself fallible. I climb the ladder only as far as the output
+forces me to, so most of my suite is deterministic and fast.
 
 ```
-  exact ─► structural ─► detection score ═seam═► LLM-judge ─► human
-  free, deterministic                     │  $$, non-det, biased
-  answer as much as you can BELOW the seam┘
+  fixed shape → structural-diff   set → detection-scorer
+  ranked list → precision@k       prose → rubric-judge (last resort)
 ```
+Anchor: *pick the cheapest rung that distinguishes pass from fail.*
 
-"No — that's the most expensive, least repeatable rung. I start at the bottom:
-can I assert this with a structural rule? In AptKit that's `evaluateStructuralDiff`
-— required fields, `containsText` for must-have content, `number` with tolerance.
-If it's a list-of-detections problem I want partial credit, so `scoreDetections`
-— `(requirementCount - failedCount)/requirementCount`. I only cross the
-model-in-the-loop seam to `RubricJudge` for genuinely open-ended quality, because
-above that seam I pay tokens, lose determinism, and inherit bias I now have to
-defend against."
-*Anchor: push every judgment below the seam that can live there.*
-
-**Q: The anomaly monitor caught 4 of 5 categories it should have. Pass or fail?**
+**Q: "Your precision@k returns ok:true on a score of zero. Bug?"**
+No — deliberate. `ok` means the metric is *well-formed*, not that the result is
+good. A valid retrieval that found nothing relevant has a true, well-defined score
+of 0.0, so `ok:true, score:0`. `ok` is only `false` when the metric is undefined —
+`k <= 0` or an empty retrieval set, where the denominator would be zero.
+Conflating the two is how an eval silently passes when retrieval returns nothing.
 
 ```
-  requirementCount = 5      failedCount = 1 (one missed)
-  score = (5 - 1) / 5 = 0.8        ok = false (issues present)
+  ok = "computation made sense"   score = "how good"
+  ok:false ONLY on k<=0 / empty retrieval, never on a low score
 ```
-
-"Both, depending on which field you read. `scoreDetections` reports `ok: false`
-because there's an issue, *and* `score: 0.8` because 4 of 5 requirements were met
-— `detection-scorer.ts:71-73`. That partial-credit number is the point: a flat
-pass/fail throws away the signal that we're close. I'd threshold on the score, not
-just `ok`, and note that `unexpected` detections are reported but don't lower the
-score — so over-flagging is invisible to the current formula."
-*Anchor: the score is recall-flavored partial credit, not a boolean.*
-
-## Validate
-
-- **Reconstruct:** From memory, write the `scoreDetections` formula and say what
-  `requirementCount` and `failedCount` each count. Check against
-  `packages/evals/src/detection-scorer.ts:71-73`.
-- **Explain:** Why does `containsText` flatten the entire subtree into one string
-  before checking (`structural-diff.ts:185-192`) rather than checking one field?
-  (So "the output mentions X" passes regardless of where in the structure X
-  appears — fuzzy text match, robust to the model moving content around.)
-- **Apply:** A fixture requires 3 categories and the monitor returns those 3 plus
-  2 categories you didn't require. What's the score, and is that the behavior you
-  want? (Score is 1.0 — `unexpected` doesn't penalize. Whether that's right
-  depends on whether over-flagging matters for your use case; if it does, the
-  formula needs a precision term — exercise C5.4.) Trace
-  `detection-scorer.ts:64-73`.
-- **Defend:** Why keep the deterministic rungs at all instead of just using the
-  rubric judge for everything? (The judge costs tokens, varies run-to-run, and
-  can be wrong about quality; a `required`-field check is free, identical every
-  run, and cannot be fooled. Every judgment kept below the seam is one that never
-  lies. See the seam in `rubric-judge.ts` vs `structural-diff.ts`.)
+Anchor: *separate "well-formed" from "good" — conflating them hides the worst failure.*
 
 ## See also
 
-- [01-eval-set-types.md](01-eval-set-types.md) — the sets these methods score
-- [03-llm-as-judge-bias.md](03-llm-as-judge-bias.md) — defending rung 4 against bias
-- [05-precision-at-k.md](05-precision-at-k.md) — the ranked-retrieval scorer that measures the RAG retriever
-- [04-llm-observability.md](04-llm-observability.md) — running these methods over replay artifacts
-- [../04-agents-and-tool-use/03-react-pattern.md](../04-agents-and-tool-use/03-react-pattern.md) — the loop whose outputs get scored
-- [../../study-prompt-engineering/05-eval-driven-iteration.md](../../study-prompt-engineering/05-eval-driven-iteration.md) — iterating prompts against these scores
+- `01-eval-set-types.md` — what you score against
+- `03-llm-as-judge-bias.md` — why the top rung is the one to distrust
+- `03-retrieval-and-rag/11-rag.md` — the retrieval that precision@k scores
+- `04-llm-observability.md` — the artifact `assertReplayArtifactShape` checks

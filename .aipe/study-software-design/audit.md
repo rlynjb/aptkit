@@ -1,414 +1,401 @@
-# audit.md — the 8 APOSD lenses, walked against AptKit
+# Software Design Audit — aptkit
 
-Pass 1. One section per design lens. Every lens checked; where a principle
-has nothing to bite on, it says so. The deep walks for the significant
-patterns live in the Pass 2 files (`01`–`07`); this audit cross-links rather
-than restating them.
+> *A Philosophy of Software Design* (John Ousterhout), applied to the live
+> aptkit repo. The book is the source for every primitive named here; read it.
+> This file is the **audit** — Pass 1 of the two-pass shape. It walks 8 lenses
+> across the real code. The deep walks for the patterns worth their own file
+> live in the `01-`…`06-` discovered-pattern files; this audit cross-links to
+> them rather than restating.
 
-Source for every term: Ousterhout, *A Philosophy of Software Design*.
+The through-line of the whole book in one sentence: **complexity is the enemy,
+and a deep module — big behaviour behind a small interface — is the weapon.**
+aptkit is a young, unusually disciplined monorepo built around exactly that
+idea: a handful of narrow contracts (`ModelProvider`, `VectorStore`,
+`EmbeddingProvider`, `CapabilityTraceSink`) with substantial, swappable
+implementations hidden behind each. The audit's job is to say where that
+discipline holds, where it leaks, and which one thing to fix first.
 
-> **Updated: 2026-06-24** — re-walked against `@aptkit/memory` (the episodic
-> conversation-memory package: `createConversationMemory` over the SAME
-> `EmbeddingProvider`/`VectorStore` contracts as retrieval, an injected store, an
-> over-fetch-then-filter `recall`, and a `search_memory` tool mirroring
-> `search_knowledge_base`). Now re-exported by `@rlynjb/aptkit-core` (16 packages,
-> v0.4.1). New deep walk: `07-conversation-memory-deep-module.md`.
->
-> Prior update (2026-06-20): `@aptkit/retrieval` and `@aptkit/provider-gemma` —
-> deep walk `06-retrieval-contracts-as-deep-seams.md`.
+```
+  The whole repo through the one lens that matters — interface vs body
+
+  contract (interface)         implementation (body, hidden)
+  ────────────────────         ──────────────────────────────
+  ModelProvider.complete()  →  Gemma tool-call emulation, fallback chain,
+       3 lines                  context-window guard, fixtures   ← DEEP
+  VectorStore (3 methods)   →  cosine scan / pgvector            ← DEEP
+  EmbeddingProvider         →  nomic over local Ollama HTTP      ← DEEP
+  ToolPolicy (2 fields)     →  filterToolsForPolicy              ← thin, fine
+  CapabilityTraceSink       →  in-memory array OR Supabase rows  ← deep body,
+       1 method                                                    seam wired twice
+```
+
+Verdict up front: the module/interface discipline here is **above the bar for a
+repo this size.** The strongest evidence isn't any single module — it's that
+`@aptkit/memory` was built as a *second* consumer of the retrieval contracts
+with zero new infrastructure. That only happens when the original interface was
+drawn at the right place. The weaknesses are real but narrow, and named in the
+lenses below.
 
 ---
 
 ## 1. complexity-in-this-codebase
 
-The diagnostic overview. Ousterhout names three symptoms of complexity:
-**change amplification** (one decision forces edits in many places),
-**cognitive load** (the module nobody wants to touch), and **unknown-unknowns**
-(you can't tell what you'd have to change). Where do they live here?
+The diagnostic overview. Ousterhout's three symptoms of complexity — change
+amplification, high cognitive load, unknown-unknowns — and where each lives.
 
-**Change amplification — the load-bearing contracts.** Five types ripple
-across the whole repo if their shape changes: `ModelProvider`
-(`packages/runtime/src/model-provider.ts:54`), `CapabilityEvent`
-(`packages/runtime/src/events.ts:1`), `ToolRegistry`
-(`packages/tools/src/tool-registry.ts:17`), and the agent
-`*_CAPABILITY_ID`/`toolPolicy` pairs. This is *expected* amplification — these
-are deliberately central. The project context even names them
-"must-not-change constraints." A change to `CapabilityEvent`'s union touches
-the loop emitter, the NDJSON guard (`ndjson-stream.ts:41`), the usage ledger
-(`usage-ledger.ts:25`), and Studio. That's the price of a shared trace
-envelope, and it's a price worth paying.
+**Where a change amplifies across files.** The load-bearing contracts are the
+amplification surface, by design and by the repo's own `context.md`
+("must-not-change constraints"). Change the shape of `ModelProvider`
+(`packages/runtime/src/model-provider.ts:54`) and every provider adapter, the
+agent loop, structured generation, and every agent ripples. Same for
+`VectorStore`/`EmbeddingProvider` (`packages/retrieval/src/contracts.ts:22-37`):
+they're implemented in-repo (`InMemoryVectorStore`, `OllamaEmbeddingProvider`),
+re-consumed by `@aptkit/memory`, and **also implemented out-of-repo by buffr's
+`PgVectorStore`**. A change there amplifies across a repo boundary you can't see
+from here. This is the correct kind of amplification — concentrated at a few
+deliberate contracts — but it's still the highest-leverage risk in the repo, so
+it's named first.
 
-**Cognitive load — the agent classes.** The highest *unnecessary* load is in
-`packages/agents/*/src/*-agent.ts`. Not because any one agent is hard — each
-is ~100 lines — but because to understand the system you read the same
-skeleton five times and have to diff them in your head to find the 4 lines
-that differ. That's cognitive load with no payoff. → `04`.
+**Where cognitive load spikes.** `packages/providers/gemma/src/gemma-provider.ts`
+(216 lines) is the one module that carries genuinely surprising complexity: it
+*emulates a capability the model doesn't have* (tool-calling). To read it you
+have to hold the outbound half (`buildSystemText` renders tools into system
+prose, lines 133-165), the inbound half (`parseToolCall` salvages JSON from
+messy output, 168-182), the retry loop with `RETRY_NUDGE` (62-89), and the
+"is this a botched tool call or real prose?" heuristic (`looksLikeToolAttempt`,
+185-187). That's a lot — but it's all *hidden behind `complete()`*, so the cost
+is paid once, by the reader of this file, and never by callers.
+→ deep walk in `02-emulation-hidden-behind-complete.md`.
 
-**Unknown-unknowns — the pricing table.** `usage-ledger.ts:71`
-`pricingForModel` returns `undefined` for any non-OpenAI provider. Nothing at
-the call site signals that Anthropic cost is *structurally* unknowable, not
-just missing for this run. A reader sees `formatCost` print `n/a` and can't
-tell whether the run was free, uncosted, or a bug. That's the textbook
-unknown-unknown: the information you'd need to reason about it isn't visible
-where you'd look.
+**Where the unknown-unknowns hide.** Two spots. (1) The metadata-filter
+behaviour in `search-knowledge-base-tool.ts:101-106` — `matchesFilter` silently
+*ignores* filter keys absent from a chunk's meta. That's deliberate
+(hallucination tolerance) and commented, but it's a surprise waiting for anyone
+who assumes a filter excludes non-matching rows. (2) The trace seam: there are
+**two** `CapabilityTraceSink` implementations wired independently — an in-memory
+one in `apps/studio/vite.config.ts:540` and `SupabaseTraceSink` in buffr — and
+nothing in aptkit tells you the second exists. → `05-injectable-trace-seam.md`.
 
-**A new unknown-unknown contained well — the dimension one-way door.** The
-retrieval package surfaces a fact that would otherwise be a silent landmine: a
-corpus embedded at one dimension can't be searched by a query of another, or
-ranking returns plausible-but-meaningless results. `assertWiring`
-(`packages/retrieval/src/pipeline.ts:22`) turns that unknown-unknown into a
-loud, immediate config error. This is the *good* handling of the symptom — the
-information you'd need is made visible exactly where you'd hit the bug. Contrast
-with the pricing `undefined` above. → `06`.
-
-**Top 3 hotspots by path:**
-1. `packages/agents/*/src/*-agent.ts` — duplicated wiring (cognitive load).
-2. `packages/runtime/src/usage-ledger.ts:71` — provider pricing as a hidden
-   `if`-ladder (unknown-unknown).
-3. `packages/runtime/src/run-agent-loop.ts:76` — the deepest single module;
-   high *intrinsic* load (it does a lot), but well-contained. Worth knowing it
-   exists; not a defect.
+Top 3 hotspots by path: `gemma-provider.ts` (surprising emulation),
+`search-knowledge-base-tool.ts` (silent filter semantics), the
+`ModelProvider`/`VectorStore` contracts (amplification radius).
 
 ---
 
 ## 2. deep-vs-shallow-modules
 
-> red flags: shallow module, classitis.
+Depth = functionality ÷ interface size. The best module hides the most behind
+the least; the worst has an interface nearly as wide as its body.
 
-**The deepest module — `ModelProvider`.** Three members:
-`id`, `defaultModel?`, `complete(request)`
-(`packages/runtime/src/model-provider.ts:54-58`). Behind that one method sits
-every vendor SDK — Anthropic's content-block flattening, OpenAI's message
-mapping, retry, fallback, token estimation. The interface is about as small
-as an LLM call can be; the body it hides is the largest in the repo. This is
-the canonical deep module. → full walk in `01-model-provider-deep-module.md`.
+**Deepest module (best): the Gemma provider.** Interface: `complete(request) →
+Promise<response>` — one method, inherited from a 3-line type
+(`model-provider.ts:54-58`). Body: the entire tool-call emulation. A caller
+writes `await provider.complete({ messages, tools })` and gets back a normalized
+`tool_use` block exactly as if Anthropic's native API had produced it — never
+seeing the system-prompt rendering, the JSON salvage, or the retry. That's the
+textbook deep module: enormous behaviour, pinhole interface.
+→ `01-deep-provider-module.md`, `02-emulation-hidden-behind-complete.md`.
 
-Runner-up: `runAgentLoop` (`run-agent-loop.ts:76`). The interface is one
-function + an options bag; the body hides the turn loop, forced-synthesis
-final turn, per-tool trace emission, result truncation, budget enforcement,
-and an optional recovery turn. Big behaviour, one entry point.
+Runner-up: `createConversationMemory` (`packages/memory/src/conversation-memory.ts:60`).
+Interface is two methods (`remember`, `recall`). Body hides the kind-tagging,
+the per-conversation id counters (69-71), and the over-fetch-then-filter dance
+that makes recall work in a shared store (89-106). Two methods, a real engine
+behind them.
 
-And `evaluateStructuralDiff` (`structural-diff.ts:20`): one function takes a
-value and a rule list and hides six different assertion strategies behind a
-single switch. → `03`.
+**Shallowest module (worst): `filterToolsForPolicy`**
+(`packages/tools/src/tool-policy.ts:11-23`). Interface: a 2-field `ToolPolicy`
+type plus a function taking `(allTools, policy)`. Body: a `Set` membership
+filter and a field re-map. The interface is about as wide as the body — you
+have to pass the full tool list *and* the policy, and the function does little
+more than a `.filter().map()`. **But this is the right call**, and not a defect
+to fix: it's a pure function, trivially testable, and the thinness is the point
+— policy is data (`ragQueryToolPolicy` is a 2-line const at
+`rag-query-agent.ts:15-18`), and a thin pure function over data is exactly what
+you want for an allowlist. Classitis would be wrapping this in a
+`ToolPolicyManager` class with `addRule`/`evaluate`/`getAllowed` methods. The
+repo *didn't* do that. Praise, not a finding.
 
-**The deep-module move, reused — the retrieval contracts.** `EmbeddingProvider`
-and `VectorStore` (`packages/retrieval/src/contracts.ts:22-37`) are the same
-shape as `ModelProvider`: three members each hiding HTTP transport, cosine
-ranking, and dimension validation. The strongest signal here is *reuse* — the
-repo has a house style for swappable dependencies and applies it again to two
-new seams at once. `GemmaModelProvider`
-(`packages/providers/gemma/src/gemma-provider.ts:39`) is another instance:
-behind the same `ModelProvider` interface sits a whole tool-call *emulation*
-(no native tools array) the caller never sees — an unusually large body behind
-the standard narrow neck. → full walk in `06-retrieval-contracts-as-deep-seams.md`.
+There is **no real classitis in the repo.** The closest thing to an
+over-decomposed surface is the five-package provider split
+(`anthropic`/`openai`/`fallback`/`local`/`gemma`), but each package is a
+genuinely different deep module behind the same contract, so the split earns its
+place — that's information hiding, not classitis.
 
-**The deep-module move, a THIRD time — conversation memory.**
-`createConversationMemory` (`packages/memory/src/conversation-memory.ts:60`) is
-two methods (`remember`, `recall`) over a large hidden body — embedding, id
-namespacing, a tagged upsert, and an over-fetch-then-filter recall — depending on
-*nothing but* the same `EmbeddingProvider`/`VectorStore` contracts retrieval
-defined. The store is constructor-injected behind the contract, so the engine
-never names `PgVectorStore` or `InMemoryVectorStore` (`conversation-memory.ts:18-31`
-documents this explicitly). That's three independent uses of the narrow-contract-
-over-large-body move (`ModelProvider`, the retrieval pair, now memory) — the
-clearest possible confirmation it's a house style, not a one-off. The one new idea
-it adds is a *named workaround* for a missing contract capability, walked in Lens 3
-and `07`. → full walk in `07-conversation-memory-deep-module.md`.
-
-**The shallowest modules — the agent classes.** Take `QueryAgent`
-(`packages/agents/query/src/query-agent.ts:67-103`). The class body is:
-store a prompt in the constructor, then in `answer()` call `listTools`,
-`filterToolsForPolicy`, `renderPromptTemplate`, `runAgentLoop`, and return.
-The interface (`new QueryAgent(opts).answer(question)`) is nearly as complex
-as the body, and the body is mostly forwarding to deeper modules. That's the
-definition of shallow. It's not *classitis* in the worst sense (these aren't
-one-method-per-class fragmentation), but it's six near-identical shallow
-wrappers where one parameterised helper would do — the newest, `RagQueryAgent`,
-copied the same skeleton to wire up retrieval (`04`).
-
-**The fix for the worst:** don't delete the agent classes — their *names*
-and types are part of the public surface. Fold the shared body into one
-`runCapability<T>(config)` runtime helper and let each agent's method become
-"build my config, call the helper." → `04`.
+Fix for the worst: none warranted. If anything grows here, watch for
+`ToolPolicy` sprouting per-tool argument constraints (e.g. "may call
+`search_knowledge_base` but only with `top_k ≤ 10`"); *that* would deepen the
+module and justify more body behind the same narrow `filterToolsForPolicy` call.
 
 ---
 
 ## 3. information-hiding-and-leakage
 
-> red flags: information leakage; the same knowledge edited in two places.
+A leak is a design decision that shows up in two modules, forcing them to change
+together. Find the facts that cross a boundary they shouldn't.
 
-**Leak 1 — the recovery-prompt evidence formatter, copy-pasted three times.**
-The block that turns `toolCalls` into an evidence string —
+**The cleanest hiding in the repo: vendor identity.** The retrieval pipeline
+*never names a vendor* — the header comment at `contracts.ts:1-5` states it as
+an invariant, and the code keeps it: `pipeline.ts` speaks only `embedder` and
+`store`. "nomic", "Ollama", "pgvector" are confined to the adapter files. Swap
+the store and the pipeline doesn't notice. → `03-contract-as-the-product.md`.
 
-```
-  toolCalls.map((call, index) => {
-    const payload = call.error ? { error: call.error } : call.result;
-    return `Query ${index+1}: ${call.toolName} ... slice(0, 200) ... slice(0, 900)`;
-  }).join('\n\n')
-```
+**Leak #1 (real, mild): the embedding dimension is known in three places.**
+`assertWiring` checks it in `pipeline.ts:22-29`; `InMemoryVectorStore` re-checks
+every vector in `in-memory-vector-store.ts:36-42`; and `createConversationMemory`
+checks it *again* at `conversation-memory.ts:62-65`. The same fact — "embedder
+dim must equal store dim" — is enforced at three sites. This is arguably
+defensible (fail-loud-everywhere on a one-way door), but it's the same knowledge
+edited in three files. If the rule ever changes (say, a store that re-projects
+dimensions), all three move together. The fix: let the *store* own dimension
+validation on `upsert`/`search` (it already does, lines 36-42) and have the
+pipeline and memory trust it rather than pre-checking. The pre-checks buy an
+earlier, clearer error message at wiring time; that's the tradeoff keeping them.
 
-— is byte-for-byte identical at `diagnostic-agent.ts:101`,
-`monitoring-agent.ts` (`buildRecoveryPrompt`), and
-`recommendation-agent.ts` (`buildRecoveryPrompt`). The 200/900 truncation
-limits are a *decision* — how much tool evidence to feed back — and that
-decision now lives in three files. Change the limit for one agent and you
-either edit three files or silently diverge. **Same knowledge, edited
-thrice.** Fix: one `formatToolCallsAsEvidence(toolCalls, limits)` in runtime.
+**Leak #2 (the named weakness): metadata-filter semantics live in the tool, not
+the contract.** The `VectorStore.search(vector, k)` contract
+(`contracts.ts:36`) has **no metadata predicate.** So both consumers that need
+filtering re-implement the same workaround on top of it: the search tool
+over-fetches `topK * 4` then post-filters (`search-knowledge-base-tool.ts:88-90`),
+and memory over-fetches `max(k*4, 20)` then filters by `kind`
+(`conversation-memory.ts:94-98`). That's the *same design decision* — "the store
+can't filter, so over-fetch and filter client-side" — made independently in two
+modules. It's a leak: the absence of a contract feature is a fact both modules
+encode. → `04-guard-rails-as-information-hiding.md` walks the tool's version;
+the honest read is that a `filter?` parameter on `VectorStore.search` would pull
+this complexity *down* into each store (pgvector can do it in SQL) and erase the
+duplication. It wasn't added because the in-memory store would gain nothing and
+the contract stayed minimal — a reasonable young-repo call, now ready to revisit.
 
-**Leak 2 — the 16,000-char tool-result truncation.** `run-agent-loop.ts:52`
-caps tool results at `MAX_TOOL_RESULT_CHARS`. That's correctly hidden — the
-agents never see it, the loop owns it. **This is the good version** of the
-same concern as Leak 1: a decision about how much text to carry, hidden
-behind one module. Contrast it directly with the recovery formatter to see
-hiding done right vs. done wrong.
-
-**Leak 3 — provider-id strings.** `usage-ledger.ts:72` branches on
-`provider !== 'openai'` using the literal `'openai'`, which must match
-`OpenAIModelProvider.id`. The fallback provider hardcodes `id = 'fallback'`
-(`fallback-provider.ts:28`). These string ids are a shared vocabulary spread
-across packages with no single enum. Minor, but it's a fact known in two
-modules that must agree.
-
-**Leak 4 (new) — the over-fetch-then-filter trick, now in two consumers.** The
-`VectorStore` contract (`packages/retrieval/src/contracts.ts:34`) has no metadata
-predicate — `search(vector, k)` ranks by cosine and returns the top `k`, nothing
-more. Two consumers need a filter the contract can't express, and both work around
-it the same way: over-fetch a wider net, then filter client-side.
-`search_knowledge_base` does `fetchK = filter ? topK * 4 : topK`
-(`search-knowledge-base-tool.ts:85`); `ConversationMemory.recall` does
-`fetchK = Math.max(k * 4, 20)` then `.filter(h => h.meta.kind === kind)`
-(`conversation-memory.ts:94-98`). **Same workaround, derived twice** — which is
-the textbook signal of a *missing capability in the contract*, not a coincidence.
-To its credit, the memory copy *names* the limitation in a comment at the exact
-line (`conversation-memory.ts:92-93`: "search itself cannot filter by metadata").
-The honest verdict: keep the workaround for now (widening `VectorStore` ripples
-into buffr's `PgVectorStore`, which also implements it), but a *third* consumer
-needing a predicate — multi-tenant `app_id` filtering is the obvious next one —
-is the trigger to deepen the contract with `search(vec, k, filter?)`. → `07`.
-
-**No temporal decomposition found.** The packages are split by responsibility
-(provider / loop / tools / evals), not by execution phase — there's no
-"setup module / runtime module / teardown module" smell. Good.
+**Leak #3 (cross-repo, structural): the trace seam.** `CapabilityTraceSink`
+(`events.ts:26-28`) is a one-method interface. Its body — what actually happens
+to an event — is implemented twice, independently: an in-memory array in
+`apps/studio/vite.config.ts:540-545`, and `SupabaseTraceSink` in buffr. Both are
+correct; neither knows about the other. The seam is clean (the interface held),
+but the *observability story is split across two repos with no shared adapter*,
+and aptkit ships no reference sink. → `05-injectable-trace-seam.md`.
 
 ---
 
 ## 4. layers-and-abstractions
 
-> red flag: pass-through method / pass-through variable.
+Find pass-through methods (a method that just forwards to another with no value
+added) and adjacent layers offering the same abstraction.
 
-**The agent classes are pass-through wrappers.** `QueryAgent.answer()`
-(`query-agent.ts:75`) takes `question`, does a little setup, and forwards to
-`runAgentLoop`. The class adds a *name* and a *type binding* (this is the
-query capability, these are its tools) but little behaviour the layer below
-doesn't already offer. That's close to a pass-through layer — it earns its
-place only through the policy binding and the public-API name, not through
-new logic. → `04`.
+**Mostly clean.** The agent layering is real, not pass-through: each agent
+composes prompt + policy + loop + validator into something the loop alone
+couldn't do. `RagQueryAgent.answer` (`rag-query-agent.ts:62-83`) is the model:
+it lists tools, filters by policy, then calls `runAgentLoop` with a synthesis
+instruction and budgets — that's composition, not forwarding.
+→ `06-capability-as-composition.md`.
 
-**A layer that genuinely earns its place — `filterToolsForPolicy`.**
-`tool-policy.ts:11` sits between "the registry has 49 tools" and "the model
-sees these 7." It's a thin function, but the abstraction it provides
-(least-privilege tool scoping) is not offered by either neighbour. Not a
-pass-through; a real seam.
+**One genuine pass-through, and it's fine: `createRetrievalPipeline`.** The
+pipeline object's `index` and `query` (`pipeline.ts:75-80`) forward straight to
+the free functions `indexDocument`/`queryKnowledgeBase`. That *looks* like a
+pass-through layer. It isn't quite — the closure exists to bind one
+*validated* wiring (the `assertWiring` call at line 74 runs once, then both
+methods trust it), so the layer adds "this wiring is checked" as a guarantee.
+Thin, but it earns its keep. If it didn't run `assertWiring`, it'd be a pure
+pass-through to delete.
 
-**A real pass-through variable — `defaultModel` through the guard.**
-`ContextWindowGuardedProvider` copies `this.defaultModel = provider.defaultModel`
-(`context-window-guard.ts:47`) and `id = provider.id`. That's deliberate and
-correct for a decorator (it must impersonate the wrapped provider's identity),
-so it's a pass-through *by design*, not a smell. → `02`. Worth flagging only
-so you recognise the pattern: a decorator's identity-forwarding is the one
-place pass-through variables are the right call.
+**A pass-through *variable* worth noting: `capabilityId`.** It's threaded from
+each agent's `*_CAPABILITY_ID` const through `runAgentLoop` options
+(`run-agent-loop.ts:79`) into every emitted trace event
+(`run-agent-loop.ts:116, 128, 148`) and onward into the sink. That's a variable
+passed through several layers that none of them *use* except to forward — the
+classic pass-through-variable smell. But it's load-bearing at the *end* of the
+chain (the trace consumer keys on it), and there's no tidy alternative short of
+a context object, which would be heavier. Accept it; it's the cost of
+flat, explicit tracing.
+
+No adjacent layers offering the same abstraction. The provider stack
+(guard → fallback → concrete provider) nests cleanly: each layer adds one thing
+(context-window safety, failover) and they all speak `complete()`. That's
+self-similar layering done right, not redundant layers.
 
 ---
 
 ## 5. pull-complexity-downward
 
-> red flag: avoidable config exposed to callers.
+Find knobs pushed up to callers that the module had enough information to decide
+itself. The book's rule: it is more important for a module to be simple to *use*
+than simple to *implement* — so swallow complexity downward.
 
-**The worst exposed knob — pricing as caller-invisible control flow.**
-This is the *inverse* of an exposed knob: `pricingForModel`
-(`usage-ledger.ts:71`) doesn't expose pricing to callers at all — it buries a
-three-family lookup (`gpt-4.1-nano`, `gpt-4.1-mini`, `gpt-4.1`) in an
-`if`-ladder and returns `undefined` for everything else. The complexity is
-pushed *down*, which is right, but it's encoded as control flow instead of a
-data table, so adding Anthropic pricing means editing the function body, not
-a map. The constructive move: make pricing a `Record<provider, Record<model,
-UsagePricing>>` data structure the function reads. Same hiding, but now the
-knowledge is data you can extend without touching logic. → this is the
-`03`-style rules-as-data move applied to pricing.
+**Done well: the agent loop owns its own termination.** `runAgentLoop` decides
+`forceFinal` from `maxTurns`/`maxToolCalls` internally
+(`run-agent-loop.ts:101-102`) and injects the synthesis instruction itself
+(line 104). The caller doesn't manage the "last turn must produce an answer, not
+another tool call" logic — the loop pulled it down. Good.
 
-**A knob pushed up that maybe shouldn't be — `charsPerToken`.**
-`ContextWindowGuardOptions.charsPerToken` (`context-window-guard.ts:12`) lets
-the caller tune the chars-per-token estimate, defaulting to 3. The module has
-enough information to own a sane default (it does), and almost no caller will
-ever set it. It's a reasonable escape hatch, but it's complexity offered up
-that the module could decide. Verdict: keep it (estimation accuracy is
-model-specific and the default is documented), but know it's the kind of knob
-that earns its place only if a caller actually flips it.
+**Done well: Gemma owns its retry count.** `maxToolCallAttempts` defaults to 2
+inside the provider (`gemma-provider.ts:49`); callers get correct behaviour
+without configuring it. The knob exists for tuning, but the default is the
+module's decision.
 
-**Done right — `runAgentLoop` defaults.** `maxTurns = 8`, `maxTokens = 4096`,
-`outputReserve = 768` (`run-agent-loop.ts:87`, `context-window-guard.ts:51`)
-are all defaulted in the module. Callers *can* override but never *have to*.
-Complexity owned downward. This is the pattern the pricing table should copy.
-
-**Done right, at a tool boundary — the search tool's weak-caller defenses.**
-`createSearchKnowledgeBaseTool` (`search-knowledge-base-tool.ts:51,81`) pulls
-two decisions down so no prompt has to coach the model: a `minTopK` floor
-(`topK = Math.max(requestedTopK, minTopK)`) stops a weak model from starving
-its own retrieval with `top_k: 1`, and the filter
-(`search-knowledge-base-tool.ts:105`) *ignores* keys absent from a chunk's meta
-so a hallucinated filter key degrades to a no-op instead of wiping every result.
-The caller here is an unreliable model rather than a programmer, which is exactly
-why the complexity belongs in the tool, not the prompt. → `06`.
+**The one knob that's pushed up and shouldn't be: `minTopK`.** The search tool
+exposes `minTopK` as an *option set at construction*
+(`search-knowledge-base-tool.ts:38-41, 51`). Its whole reason for existing is to
+stop a weak local model from passing `top_k: 1` and starving its own retrieval —
+which is a fact the *tool* knows (it's wrapping retrieval for an LLM) far better
+than the app wiring it. The comment even explains the failure mode. The default
+is 1 (no floor), so out of the box the guard is *off* — every caller using a
+local model has to know to set it. The fix: default `minTopK` to something like
+2-3 when the tool is used in a local-model context, or detect-and-floor
+internally. The counter-argument that kept it a knob: a cloud model doesn't need
+the floor and the tool can't see which model it's serving. Fair — but a safer
+default with an opt-*out* beats an opt-*in* guard rail.
 
 ---
 
 ## 6. errors-and-special-cases
 
-> red flags: try/except everywhere; special-case sprawl.
+Find exception handling scattered across call sites, and special cases a
+different definition would erase. The best error handling is the error that
+can't happen.
 
-**Errors are defined out, not scattered — mostly.** The strongest move in the
-repo: `decodeNdjsonLine` (`ndjson-stream.ts:65`) *returns* a warning shape
-instead of throwing on malformed JSON. A bad line becomes a value
-(`{ ok: false, warning }`), so callers never wrap NDJSON parsing in
-try/catch — the special case is defined into the normal return type. Same in
-`json-output.ts:30` `parseValidatedJson`, which returns
-`{ ok: false, error }` rather than throwing. This is Ousterhout's "define
-errors out of existence" done deliberately.
+**Defining errors out of existence — the standout.** `matchesFilter`
+(`search-knowledge-base-tool.ts:101-106`) and the `recall` filter
+(`conversation-memory.ts:96-98`) both *define away* a class of failure rather
+than handle it. A weak model hallucinating a filter key like
+`{textContains: "x"}` would, under naive semantics, match nothing and wipe every
+result — an error you'd then have to detect and recover from. Instead the design
+says "a filter key only excludes hits that *have* that key with a different
+value." Hallucinated keys are simply ignored. The special case (empty results
+from a bogus filter) doesn't exist because the definition removed it. That's the
+book's favorite move. → `04-guard-rails-as-information-hiding.md`.
 
-**Errors masked at the right layer — the agent loop.**
-`run-agent-loop.ts:158-168` catches a tool failure, turns it into a
-`tool_result` with `isError: true`, and *keeps the loop running* so the model
-can react. The error never propagates up to the agent; it's masked low, where
-the loop has the context to handle it. Good.
+**Errors masked at a low level.** `cosineSimilarity` returns 0 for a
+zero-magnitude vector instead of `NaN` (`in-memory-vector-store.ts:55-56`) — the
+NaN special case is killed at the lowest possible layer, so nothing upstream
+ever sees it. Same spirit: `queryKnowledgeBase` returns `[]` for an empty
+embedding (`pipeline.ts:57`) rather than throwing.
 
-**Special-case sprawl — the abort-error check, three times.** `isAbortError`
-appears as a standalone helper in `fallback-provider.ts:92` and
-`structured-generation.ts:163`, and inline in `run-agent-loop.ts:219`
-(`error instanceof DOMException && error.name === 'AbortError'`). The same
-"is this a cancellation, not a real failure?" special case is written three
-ways. Minor, but it's a special case that one shared `isAbortError` in runtime
-would erase. The risk if they drift: one path swallows an abort that another
-re-throws.
+**Errors that fail loud, on purpose.** Dimension mismatch throws at wiring time
+in three places (lens 3). That's the deliberate *opposite* choice — a one-way
+door that corrupts ranking silently if allowed, so it's made impossible to
+proceed. Knowing which errors to swallow (NaN, bogus filter) and which to make
+unmissable (dimension) is the actual skill, and the repo gets it right.
 
-**The good aggregation — `ProviderFallbackError`.**
-`fallback-provider.ts:16` collects every provider's failure into one error
-carrying `attempts[]`. Instead of N scattered failures, the caller gets one
-exception that explains the whole chain. Errors aggregated, not multiplied.
-
-**The inverse move, done deliberately — fail loud on the unrecoverable.** Most
-of the repo defines errors *out*; retrieval does the opposite where it's right
-to. A dimension mismatch can't be recovered from (ranking would silently corrupt),
-so `assertWiring` (`pipeline.ts:22`) and `InMemoryVectorStore.assertDimension`
-(`in-memory-vector-store.ts:36`) *throw*, loudly, naming both sides and the fix.
-Two checks for one invariant: once at wiring (config bug), once per vector (a
-lying adapter). Knowing *which* errors to define out and which to make
-impossible-to-miss is the lesson — return-a-warning for malformed NDJSON, throw
-for a dimension mismatch. → `06`.
+**try/catch sprawl? No.** Exception handling is concentrated: the agent loop has
+one try/catch around tool execution (`run-agent-loop.ts:158-168`) that converts
+any tool failure into a `tool_result` with `isError`, so the model can react
+instead of the loop crashing. `generateStructured` has one around the model call
+(`structured-generation.ts:67-81`). Both *aggregate* error handling at the layer
+that can do something with it, rather than scattering it. Clean.
 
 ---
 
 ## 7. readability (names · comments · consistency · obviousness)
 
-**Names — strong.** No `data`/`obj`/`tmp`/`manager` smell anywhere I looked.
-Names carry intent: `forceFinal` (`run-agent-loop.ts:102`), `budgetSpent`,
-`runnableRequirements`, `lastSelectedProvider`. The one mild offender:
-`asRecord` (`anthropic-provider.ts:97`) is a generic name for a specific
-"coerce tool_use input to a record" coercion — fine, but `toToolInput` would
-say why it exists.
+**Names.** Strong overall — no `data`/`obj`/`tmp`/`manager` sprawl. The names
+carry domain meaning: `assertWiring`, `RETRY_NUDGE`, `looksLikeToolAttempt`,
+`buildSynthesisInstruction`, `minTopK`. The one mild offender: `meta:
+Record<string, unknown>` on `VectorChunk`/`VectorHit` (`contracts.ts:11, 18`) is
+honestly untyped, and the *shape* it actually carries (`docId`, `chunkIndex`,
+`text`, `kind`, `conversationId`) is only knowable by reading the producers
+(`pipeline.ts:44`, `conversation-memory.ts:84`). Vague-by-necessity, but a
+documented `ChunkMeta` type for the known keys would prevent a typo'd
+`hit.meta.docID` from silently becoming `undefined`.
 
-**Comments — better than most repos.** Interface comments exist where they
-matter: `/** Capability-scoped allowlist that keeps agents from seeing tools
-outside their role. */` (`tool-policy.ts:4`) tells you *why*, not *what*. The
-`structured-generation.ts:49-53` block comment carries history a comment is
-uniquely good for — "this is the provider-neutral version of Dryrun's
-on-device JSON pipeline." The retrieval package is the strongest example of
-*why*-comments in the repo: `chunker.ts` explains why fixed-size-by-character
-(deterministic, tokenizer-free), `contracts.ts:28-32` documents the dimension
-one-way door at the type, and `matchesFilter`'s comment
-(`search-knowledge-base-tool.ts:102-104`) explains why absent keys are ignored.
-These carry reasoning the code alone can't. Missing: `runAgentLoop`
-(`run-agent-loop.ts:76`), the deepest module in the repo, has *no* interface comment explaining the
-forced-synthesis contract or the recovery turn. The one place a comment would
-carry the most is the one place it's absent.
+**Comments.** Above average — and the right *kind*. The best ones document the
+interface and the *why*, not the code: `contracts.ts:1-5` ("pipeline never names
+a vendor"), the `minTopK` comment explaining the multi-part-question miss
+(`search-knowledge-base-tool.ts:38-41`), the `matchesFilter` rationale (101-104),
+the `store` injection note in memory (`conversation-memory.ts:20-31`). None of
+these restate code; each carries a fact the code can't. The missing one: no
+interface comment on `ModelProvider` itself (`model-provider.ts:54`) — the most
+load-bearing contract in the repo has no doc comment saying what an
+implementation must guarantee (idempotency? streaming? what `usage` means when
+estimated). Add it.
 
-**Consistency — one real split.** Two dependency-injection conventions for
-agents: four agents use `constructor(private readonly options: XOptions)` and
-read `this.options.model`; `RubricImprovementAgent` destructures into
-`private readonly model`, `private readonly tools`, etc.
-(`rubric-improvement-agent.ts:40-55`). Two conventions for one job. Pick one.
+**Consistency.** One real inconsistency: the two retrieval-style tools express
+the same "over-fetch then filter" idea with different magic numbers — `topK * 4`
+in the search tool (line 88) vs `max(k * 4, 20)` in memory
+(`conversation-memory.ts:94`). Same job, two conventions. Minor, but it's
+exactly the kind of drift that says the shared concept wants to live in one
+place (the contract — see lens 3). Also: `search_knowledge_base` uses `top_k`
+with `minTopK` floor; `search_memory` uses `top_k` with no floor
+(`memory-tool.ts:51`) — two tools, two policies for the same parameter.
 
-**Obviousness — the `getPath` string protocol.** `structural-diff.ts:53`
-`getPath(value, 'recommendations.0.title')` splits a dot-path and walks
-objects *and* arrays (numeric segments index arrays). That's a small DSL
-hidden in a string argument — powerful, but a reader has to discover that
-`.0.` means "array index" by reading the implementation. Not wrong, but a
-one-line doc on the path grammar would remove the "huh?". → `03`.
+**Obviousness.** The "huh?" spot: `matchesFilter`'s `!(key in hit.meta)`
+(line 105) reads as a bug on first encounter ("why does a filter *ignore* missing
+keys?") until you read the comment. It's correct and intentional, but it's the
+one place the code surprises you. The comment saves it — which is precisely why
+the comment is load-bearing and must never be deleted in a refactor.
 
 ---
 
-## 8. red-flags-audit (capstone)
+## 8. red-flags-audit
 
-Ousterhout's red flags as a checklist, marked against this repo, sorted by
-severity. This is the actionable index.
+The capstone. Ousterhout's red flags as a checklist against this repo, sorted by
+severity for aptkit. This is the actionable index the rest of the audit feeds.
 
 ```
   red flag                  fires?  where + one-line fix
-  ───────────────────────── ──────  ─────────────────────────────────────
-  Shallow module            YES     6 agent classes ≈ wiring around 4 lines.
-   (highest severity)               Fold body into runCapability<T>().  → 04
+  ───────────────────────── ──────  ─────────────────────────────────────────
+  Information leakage        YES     VectorStore has no metadata filter →
+   (mild→moderate)                   over-fetch+post-filter duplicated in
+                                     search tool (search-knowledge-base-tool
+                                     .ts:88) AND memory (conversation-memory
+                                     .ts:94). Add filter? to the contract.
 
-  Information leakage        YES     buildRecoveryPrompt evidence formatter
-                                    copy-pasted 3×. Hoist to runtime.  → 03/04
+  Avoidable config /         YES     minTopK defaults to 1 (guard off) and is
+   knob pushed up                    a construction knob (search-knowledge-
+                                     base-tool.ts:51). Make the safe value the
+                                     default; opt out, not in.
 
-  Same knowledge twice       YES     isAbortError written 3 ways (fallback,
-                                    structured-gen, loop). One helper.
-                                    ALSO: over-fetch-then-filter derived twice
-                                    (search tool + memory.recall) to work around
-                                    VectorStore having no metadata filter. → 07
+  Same knowledge edited      YES     embedding-dimension check in 3 files
+   in 3 places                       (pipeline.ts:22, in-memory-vector-store
+                                     .ts:36, conversation-memory.ts:62). Let
+                                     the store own it; callers trust it.
 
-  Missing contract capability YES    VectorStore.search has no predicate; two
-                                    consumers over-fetch + filter client-side.
-                                    Commented in memory; deepen contract on the
-                                    3rd consumer (e.g. app_id filter). → 07
+  Hard-to-describe interface MINOR   meta: Record<string,unknown> on Vector
+                                     Chunk/Hit (contracts.ts:11) — known keys
+                                     undocumented. Add a ChunkMeta type.
 
-  Special-case sprawl        MINOR   abort-error check (same as above).
+  Missing interface comment  MINOR   ModelProvider (model-provider.ts:54) has
+                                     no contract doc. Add one.
 
-  Conjoined / config-leak    MINOR   pricing as if-ladder, OpenAI-only,
-                                    returns undefined silently. → usage-ledger:71
-                                    Make it a data table.
+  Non-obvious code           MINOR   matchesFilter ignores absent keys
+                                     (search-knowledge-base-tool.ts:105).
+                                     Reads as a bug; comment saves it. Keep
+                                     the comment.
 
-  Pass-through method        SOFT    agent classes forward to runAgentLoop;
-                                    earn their place only via policy + name. → 04
+  Shallow module / classitis NO      filterToolsForPolicy is thin but
+                                     correctly so (pure fn over data). No
+                                     manager-class sprawl anywhere.
 
-  Vague name                 RARE    asRecord (anthropic-provider:97). Cosmetic.
+  Pass-through method        NO       createRetrievalPipeline forwards but
+                                     adds validated-wiring guarantee
+                                     (pipeline.ts:74). Earns its place.
 
-  Hard to pick interface     NO      ModelProvider is the opposite — exemplary.
+  Temporal decomposition     NO      modules split by responsibility (provider
+                                     / retrieval / memory / tools), not by
+                                     execution phase.
 
-  Comment restates code      NO      comments explain why, not what.
+  try/catch everywhere       NO      error handling aggregated at the loop
+                                     (run-agent-loop.ts:158) and the structured
+                                     call (structured-generation.ts:67).
 
-  Missing interface comment  YES     runAgentLoop (deepest module) has none.
-                                    Document the forced-synthesis + recovery
-                                    contract.
-
-  Nonobvious code            MINOR   getPath dot-path DSL ('.0.' = array index)
-                                    undocumented. → 03
-
-  Temporal decomposition     NO      packages split by responsibility, clean.
-
-  Hidden / surprise control  NO      nothing jumped out.
+  Conjoined methods          NO      no two methods that must be read together
+                                     to understand either.
 ```
 
-**Severity-ranked verdict:** the repo's foundation passes the red-flag
-checklist cleanly — the contracts are deep, errors are defined out, comments
-explain why. Every *firing* flag clusters in one place: the capability/agent
-layer, where six classes duplicate wiring instead of sharing one
-abstraction (and the count keeps growing — `RagQueryAgent` is the newest).
-Fix that one layer (`04`) and most of this table goes quiet.
+**The one to fix first:** add a metadata filter to the `VectorStore.search`
+contract. It collapses two independent over-fetch-then-filter implementations
+into one, pushes the complexity down into each store (pgvector does it in SQL for
+free), and removes the `topK * 4` magic-number drift. It touches a
+must-not-change contract, so it's a deliberate, versioned change — but it's the
+highest-leverage design move available in the repo right now.
 
-The deep walks: `01` (the deep module to copy), `02` (the decorator stack),
-`03` (rules-as-data, which also shows the fix for the pricing flag), `04`
-(the shallow-module fix), `05` (the public surface), `06` (the deep-module move
-reused for retrieval, plus the dimension fail-loud and the weak-caller defenses),
-`07` (the same move a third time for conversation memory, plus the named
-over-fetch-then-filter workaround for a `VectorStore` that can't filter).
+---
+
+## See also
+
+- `README.md` — map, reading order, the through-line, the book source note.
+- `00-overview.md` — one-page orientation to the design shape.
+- `01-deep-provider-module.md` … `06-capability-as-composition.md` — the deep
+  walks for each load-bearing design move.
+- Cross-guide seams: `../study-system-design/` (the same contracts at service
+  altitude — boundaries, the buffr split), `../study-agent-architecture/`
+  (the loop and agentic retrieval as reasoning patterns), `../study-testing/`
+  (the injectable-transport seam as the test boundary, fixtures, replay).

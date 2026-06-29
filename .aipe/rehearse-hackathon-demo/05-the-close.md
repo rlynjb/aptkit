@@ -1,167 +1,155 @@
-# Chapter 5 — The close   (8:45–9:30, 45 seconds)
+# Chapter 05 — The Close + The Ask   (8:45–9:30, 45 sec)
 
 ## Opening hook
 
-Forty-five seconds to end on a beat instead of trailing off into "yeah, so, that's it, any questions?" — which is how most demos die in their last ten seconds, throwing away everything the previous nine minutes built. The close has three moves and they're fast: where it goes next (framed clearly as future, never demoed as if it exists), what you want from the room, and the one sentence you want them repeating to each other on the way out. Land that last line clean and stop talking. The silence after a good last line is yours; don't fill it.
-
-You finish at 9:30, with thirty seconds of buffer before the buzzer. That buffer is on purpose — it means you never get cut off mid-sentence, and it leaves the room a beat to react before Q&A. Finishing early reads as control; finishing late reads as panic.
+Forty-five seconds, and the single most common failure here is trailing off:
+"yeah, so, that's basically it, thanks." You ended a demo that landed a score
+and told a real war story — don't fumble the landing. The close has three jobs:
+point at where it goes next (clearly framed as future, never demoed as if it
+exists), make the ask, and deliver one last line the room repeats to each other
+afterward. Then stop talking. Silence after a strong last line is confidence;
+filler after it is nerves.
 
 ## The time-budget bar
 
-Forty-five seconds. Vision, ask, last line — then stop, with buffer to spare.
-
 ```
   ┌──────────────────────────────────────────────────────────┐
-  │ ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░▓▓▓░░░░░░░░░░░░ │
-  │ 0:00                       8:45 ─ 9:30 ───────────  10:00 │
-  │        THE CLOSE — you own 8:45 to 9:30 (45 sec)         │
-  │              then 0:30 buffer before the buzzer          │
+  │ ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░▓▓▓░░░░░░░░░░░░░░ │
+  │ 1:00 ───────────────────────── 8:45 ─ 9:30 ───────────── 10:00 │
+  │     THE CLOSE — you own 8:45 to 9:30 (45 sec)             │
+  │     then 30 sec buffer to 10:00                           │
   └──────────────────────────────────────────────────────────┘
 ```
 
-## The chapter-opening diagram — the three moves out
+In 45 seconds: name the future (without demoing it), make a concrete ask, land
+the last line — and stop with buffer to spare.
 
-The close is three beats, each shorter than the last, ending on the line. Here's the shape.
+## The chapter-opening diagram — now vs next
 
-```
-  THE CLOSE — three moves, then silence
-
-  [8:45] ┌─ VISION (future, clearly framed) ────────────────┐
-         │  "where this goes next" — NOT demoed, NOT claimed │
-         │  • more agents wiring in persistent memory        │
-         │  • the provider fallback chain running in buffr   │
-         │  • a hosted deploy so it's not just local         │
-         └───────────────────────┬──────────────────────────┘
-                                 │ ~15 sec
-  [9:05] ┌─ THE ASK ─────────────▼──────────────────────────┐
-         │  what you want from THIS room:                    │
-         │  feedback · a conversation · a look at the repo   │
-         └───────────────────────┬──────────────────────────┘
-                                 │ ~10 sec
-  [9:20] ┌─ THE LAST LINE ───────▼──────────────────────────┐
-         │  the one sentence they repeat to each other       │
-         │  → then STOP. Don't fill the silence.             │
-         └──────────────────────────────────────────────────┘
-                                 │
-  [9:30] ─────────────── 0:30 buffer ─────────────── [10:00]
-```
-
-Each box is shorter than the one above it. You're decelerating into a clean stop, not racing the buzzer.
-
-## The body — three moves
-
-### Move 1 — the vision (8:45–9:05): framed as future, never faked
-
-The discipline here is the no-vaporware rule: everything in this move is clearly "next," not "now." You don't show it, you don't imply it exists. You name the direction.
+This is the honest line between what you just demoed and what's ahead. Keep the
+future on the right and never let it cross into the demo.
 
 ```
-  SHOW (nothing new on screen)          SAY (out of your mouth)
-  ──────────────────────────────        ──────────────────────────────────
-  the Studio result still up            "Where this goes next — and to be
-  from the demo                         clear, this part isn't built yet:
-                                        I want to wire persistent memory
-                                        into more of the agents, run the
-                                        provider fallback chain live in the
-                                        production repo so it can fail over
-                                        between models, and put up a hosted
-                                        deploy so it's not only local."
+  NOW (demoed, real)            │  NEXT (future — NOT demoed)
+  ──────────────────────────────┼────────────────────────────────────
+  scored, cited RAG answer in   │  episodic memory wired into agents
+    the browser (no backend)    │    (remember/recall over the SAME
+  same agent live on local      │    contracts — built, not yet wired
+    Gemma via Ollama            │    into an aptkit agent)
+  16 packages published to npm  │  buffr running it as a persistent
+  buffr graduates store to live │    laptop agent on Supabase, with
+    Supabase pgvector           │    the agents schema + history
+  ──────────────────────────────┼────────────────────────────────────
+   ★ this is what they saw      │   this is framed as the road, only
+                                │   said, never shown as if it exists
 ```
 
-The phrase "isn't built yet" is doing real work. It tells the judges you know the difference between what you shipped and what you're dreaming, which is exactly the judgment they're scoring you on. Vaporware framed as shipped is the fastest way to lose a sharp judge's trust.
+The diagram's discipline: everything on the left, you proved on stage.
+Everything on the right, you only *say*. The fastest way to lose a room that
+just trusted you is to describe a future feature as if it were running.
 
-### Move 2 — the ask (9:05–9:20): name what you want
+## The body — three beats in 45 seconds
 
-Be specific about what you want from *this* room. Vague asks ("thanks for watching") get nothing.
+### Beat 1 — the vision (~15 sec, future framed as future)
 
-```
-  ┃ "What I'm after today is the conversation — if you've built
-  ┃  agents and hit the same walls, I want to hear how you
-  ┃  solved them. And the repo's open; I'd love a sharp pair of
-  ┃  eyes on the contracts."
-```
-
-### Move 3 — the last line (9:20–9:30): the one they repeat
-
-This is the sentence you want a judge saying to another judge afterward. It compresses the whole talk to one idea: a real agent, local, that proves its own answers.
+The honest next step is real and grounded: the memory engine already exists on
+the same contracts, and buffr is the runtime that makes it a persistent agent.
 
 ```
-  ┃ "Most RAG demos show you an answer and ask you to trust it.
-  ┃  This one runs on a laptop with no cloud — and shows you the
-  ┃  score that proves the answer was grounded."
+  ┃ "Where this goes: the same two contracts already carry an
+  ┃  episodic memory engine — remember and recall, zero new
+  ┃  infrastructure — so the next step is an agent that remembers
+  ┃  past conversations. And buffr runs the whole thing as a
+  ┃  persistent local agent on Supabase. That's the road. Today
+  ┃  I'm showing you the engine that makes it possible."
 ```
 
-Then stop. Don't add "so, yeah" or "any questions?" Let the line sit. The organizer will open Q&A; your job ended on the period.
+Note the verb tense: "the road," "where this goes." Never "it remembers your
+conversations" — that's future, not demoed.
 
-#### Strong vs weak — the ending
+### Beat 2 — the ask (~15 sec, concrete)
+
+Ask for something specific. Vague asks ("check it out sometime") get nothing.
 
 ```
-┌──────────────────────────────┬──────────────────────────────┐
-│ WEAK CLOSE                   │ STRONG CLOSE                 │
-├──────────────────────────────┼──────────────────────────────┤
-│ "And there's a lot more I    │ "Where it goes next isn't    │
-│ want to do — memory, maybe    │ built yet: memory, a live    │
-│ a hosted version, lots of    │ fallback chain, a hosted     │
-│ ideas. Um, yeah. I think     │ deploy. What I want today is │
-│ that's basically it. Any     │ the conversation and eyes on │
-│ questions?"                  │ the repo. [last line] —      │
-│                              │ then stops, holds the silence.│
-├──────────────────────────────┼──────────────────────────────┤
-│ Why it's weak:               │ Why it works:                │
-│ Trails off. "Maybe," "lots   │ Future is clearly future.    │
-│ of ideas," "basically it"    │ The ask is specific. The     │
-│ all leak uncertainty. The    │ last line compresses the     │
-│ talk deflates in its final   │ whole talk and the silence   │
-│ seconds. Nothing to repeat.  │ after it is earned, not       │
-│                              │ awkward.                     │
-└──────────────────────────────┴──────────────────────────────┘
+  ┃ "What I want from you: it's on npm right now —
+  ┃  at-rlynjb-slash-aptkit-core. If you're building an agent and
+  ┃  you're tired of rebuilding the loop and the eval harness every
+  ┃  time, install it and tell me where it breaks. That feedback is
+  ┃  what I want most."
 ```
+
+### Beat 3 — the last line (~10 sec, then stop)
+
+The sentence you want them repeating. Tie it back to the money shot — the
+score — because that's what they'll remember anyway.
+
+```
+  ┃ "Most AI demos ask you to trust the answer. AptKit hands you
+  ┃  the score next to it. Thanks."
+```
+
+Then stop. Don't add "so yeah, any questions?" — let the line sit; the room
+will start the questions.
+
+### The strong-vs-weak close
+
+```
+  WEAK close                         STRONG close
+  ─────────────────────────────      ─────────────────────────────────────
+  "So that's AptKit, it does a lot   "It's on npm now — install it and tell
+  more than this, there's memory     me where it breaks. Most AI demos ask
+  and a bunch of agents, anyway       you to trust the answer; AptKit hands
+  thanks, any questions?"             you the score next to it. Thanks."
+  (trails off, vague ask, weak        (concrete ask, callback to the money
+  last line)                          shot, hard stop)
+```
+
+The weak close dribbles future features the room can't verify and ends on
+"any questions." The strong close makes one concrete ask and lands a line tied
+to the thing they actually saw.
 
 ## The IF-IT-BREAKS box
 
-No live screen here, but the close has its own failure mode: the buzzer goes early or you've lost the thread. Recovery:
-
 ```
-╔══════════════════════════════════════════════════════════════╗
-║ IF IT BREAKS — the close                                     ║
-║                                                              ║
-║  The buzzer is about to go and you're not at the last line →  ║
-║  skip vision and ask entirely, jump straight to the last      ║
-║  line: "This runs on a laptop with no cloud — and shows you   ║
-║  the score that proves the answer was grounded." Land it,      ║
-║  stop. The last line alone is a complete close.               ║
-║                                                              ║
-║  You blank on the vision items → don't improvise vaporware.   ║
-║  Say "there's a clear next step around persistent memory"     ║
-║  and move to the ask. One honest item beats three vague ones. ║
-╚══════════════════════════════════════════════════════════════╝
+╔══════════════════════════════════════════════════════════════════╗
+║ IF IT BREAKS                                                       ║
+║ No screen needed for the close — it's spoken. The only failure     ║
+║ here is YOUR delivery: trailing off or rushing. If you blank on    ║
+║ the last line, fall back to the one-liner from the cold open —     ║
+║ "AptKit hands you the score next to the answer" — and stop. A      ║
+║ clean short stop beats a rambling recovery.                        ║
+╚══════════════════════════════════════════════════════════════════╝
 ```
 
 ## The "tighten it" treatment
 
-Cut Move 1 (the vision) and Move 2 (the ask), and go straight to the last line. The floor: **the room hears the last line, clean, and you stop on it.** The vision and the ask are nice; the last line is the thing they carry out of the room. If you have ten seconds left, spend all ten on the last line and the silence after it.
+Running long? Cut beat 1 (the vision) entirely and go ask → last line. **Floor:
+you must make the ask and land the last line.** The vision is the most
+droppable thing in the whole presentation — it's future, the room can't see it,
+and ending on the ask + last line is a stronger close than ending on a roadmap.
 
-## One-page run sheet — THE CLOSE
+## The one-page run sheet
 
 ```
-  THE CLOSE          8:45 – 9:30          then 0:30 buffer
-
-  SAY, IN ORDER (decelerating)
-    1. VISION (future, ~15s): "not built yet — persistent memory
-       in more agents, a live fallback chain in the prod repo, a
-       hosted deploy."  ← say "not built yet"
-    2. ASK (~10s): "I want the conversation — if you've hit the
-       same agent walls, tell me. Repo's open, want eyes on it."
-    3. THE LAST LINE (~10s, nail it):
-       "Most RAG demos show an answer and ask you to trust it.
-        This one runs on a laptop with no cloud — and shows you
-        the score that proves the answer was grounded."
-       → STOP. Hold the silence. Don't say "any questions?"
-
-  IF IT BREAKS / BUZZER EARLY
-    Skip vision + ask, jump to the last line, stop.
-
-  TIGHTEN IT
-    Cut vision + ask. Floor: the last line, clean, then silence.
+  ┌─ THE CLOSE — 8:45 to 9:30 ───────────────────────────────────────┐
+  │ BEAT 1 (~15s) vision (FUTURE, framed as future):                  │
+  │   "same contracts already carry a memory engine — remember/recall│
+  │    — next step is an agent that remembers; buffr runs it on       │
+  │    Supabase. That's the road; today I showed the engine."         │
+  │ BEAT 2 (~15s) the ask (CONCRETE):                                 │
+  │   "it's on npm now — @rlynjb/aptkit-core. Install it, tell me     │
+  │    where it breaks. That feedback is what I want."                │
+  │ BEAT 3 (~10s) last line, then STOP:                               │
+  │   "Most AI demos ask you to trust the answer. AptKit hands you    │
+  │    the score next to it. Thanks."                                 │
+  │                                                                   │
+  │ NAIL THIS LINE:                                                   │
+  │   "Most AI demos ask you to trust the answer. AptKit hands you    │
+  │    the score next to it."                                         │
+  │                                                                   │
+  │ Future is SAID, never shown as if it exists. Hard stop, no filler.│
+  │ IF IT BREAKS: blank on the line → fall back to the one-liner, stop.│
+  │ TIGHTEN: cut beat 1. Floor: make the ask + land the last line.    │
+  └───────────────────────────────────────────────────────────────────┘
 ```
-
-Next: the Q&A — prep only, runs after the buzzer.

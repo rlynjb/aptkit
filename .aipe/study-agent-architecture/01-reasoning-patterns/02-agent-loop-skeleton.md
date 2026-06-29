@@ -1,413 +1,211 @@
-# 02 — The Agent Loop Skeleton
+# The Agent Loop Skeleton
 
-*Agent loop / agent runtime / "the harness" — Language-agnostic (the four-part
-skeleton — state, step, execute, terminate — is the same in every framework;
-the names differ).*
+**Project-specific (the kernel) · industry standard (the pattern).** "The agent loop," "the tool-use loop," "the ReAct kernel." Type label: load-bearing skeleton.
 
 ## Zoom out, then zoom in
 
-This is the single most important file in the sub-section, so start by seeing
-exactly how small the thing is and how much sits on top of it.
+Six agents in aptkit. They look different on the surface — one answers questions over a knowledge base, one proposes recommendations, one scores against a rubric. Underneath, they are **the same loop with a different step function**. That loop is `runAgentLoop`, and it lives in exactly one place.
 
 ```
-  How much rides on one 130-line function
+  Zoom out — runAgentLoop is the shared substrate
 
-  ┌─ Studio (apps/studio) ───────────────────────────────────┐
-  │  React panel → POST /api/replay/*                         │
-  └───────────────────────┬───────────────────────────────────┘
-                          ▼
-  ┌─ 5 capabilities (packages/agents/*) ─────────────────────┐
-  │  MonitoringAgent · DiagnosticAgent · RecommendationAgent  │
-  │  QueryAgent · RubricImprovementAgent                      │
-  │  every one of them calls ───────────────┐                 │
-  └─────────────────────────────────────────┼─────────────────┘
-                                            ▼
-  ┌─ THE KERNEL ─────────────────────────────────────────────┐
-  │  ★ runAgentLoop()  packages/runtime/run-agent-loop.ts ★   │ ← we are here
-  │  state · step · execute · terminate                       │
-  └───────────────────────┬───────────────────────────────────┘
-                          ▼
-  ┌─ ModelProvider + ToolExecutor (interfaces) ──────────────┐
-  └──────────────────────────────────────────────────────────┘
+  ┌─ Agent layer (6 capabilities) ──────────────────────────┐
+  │  rag-query · recommendation · anomaly-monitoring ·       │
+  │  diagnostic-investigation · query · rubric-improvement   │
+  └───────────────────────────┬──────────────────────────────┘
+                              │ every one calls
+  ┌─ Runtime layer ───────────▼──────────────────────────────┐
+  │  ★ runAgentLoop ★   packages/runtime/src/run-agent-loop.ts│ ← we are here
+  │  the only agent loop in the repo                          │
+  └───────────────────────────┬──────────────────────────────┘
+                              │ depends only on
+  ┌─ Contract layer ──────────▼──────────────────────────────┐
+  │  ModelProvider.complete() · ToolExecutor.callTool()       │
+  └────────────────────────────────────────────────────────────┘
 ```
 
-One function. Five capabilities depend on it. If it has a bug, all five agents
-have that bug. So we're going to treat it like a load-bearing wall: name each
-part, and for each part state *what breaks if you remove it.* That's the whole
-method here. A skeleton is defined by which bones are structural — pull a
-structural bone and the body collapses; pull a decorative one and nothing
-happens. We find the structural bones by deletion.
-
-The function is `runAgentLoop<T>` at `run-agent-loop.ts:76`. Forget the tracing
-and truncation for a moment — those are decorative. Four bones are structural.
+Isolate the kernel once, here, and the other reasoning-pattern files can refer back to it instead of re-deriving it. Chains-vs-agents answered *is there a loop*; this file answers *what's in the loop, and which parts are load-bearing*.
 
 ## Structure pass
 
-Trace the **state axis** — "where does the conversation live and when does it
-die" — through the loop.
+**Layers:** caller config → loop body → tool execution. **Axis: what bounds the run?** Trace termination across the loop and the surprise is that there are *two* exits, not one.
 
 ```
-  The state axis: where the agent's memory lives
+  "what stops the run?" — traced through runAgentLoop
 
-  Part          Holds                         Lifetime
-  ────────────  ────────────────────────────  ─────────────────────────────
-  messages[]    full conversation so far       born line 94, dies on return
-  toolCalls[]   audit log of every tool run     same — in-memory only
-  ─ ─ ─ ─ ─ ─   ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─   ─ ─ ─ ─ ─ ─ ─ ─ ─ ◄ SEAM
-  (nothing)     no DB, no cache, no episodic    GONE when the function returns
+  ┌──────────────────────────────────────────────┐
+  │ success exit: model emits no tool_use block   │  → LLM decides it's done
+  │ run-agent-loop.ts:132                         │
+  └──────────────────────────────────────────────┘
+  ┌──────────────────────────────────────────────┐
+  │ budget exit: turn === maxTurns-1 OR            │  → CODE forces a stop
+  │ toolCalls.length >= maxToolCalls               │
+  │ run-agent-loop.ts:101-102                     │
+  └──────────────────────────────────────────────┘
 ```
 
-The seam is the return statement. Above it, the agent has full memory of its
-own run. Below it — the instant `runAgentLoop` returns — that memory is garbage
-collected. There is no persistence layer. This is exactly `useState` inside a
-component: the state lives while the component is mounted and vanishes on
-unmount. `messages` is the agent's `useState`, and the function call is the
-mount/unmount boundary. That single fact ("no memory survives the return") is
-why the six agents here are stateless and why the latent pipeline passes data by
-*return value*, not by shared store. (The repo now ships an episodic-memory
-*engine* — `@aptkit/memory`, `remember`/`recall` — but no agent in this loop
-calls it; that's a deliberate engine-vs-wired-loop split covered in
-`../04-agent-infrastructure/02-agent-memory-tiers.md`.) See
-`../03-multi-agent-orchestration/03-sequential-pipeline.md`.
+**The seam that matters** is the budget exit — it's where control is *taken back* from the model. The model can cycle tool calls indefinitely; nothing in its incentive structure says "stop now." The cap is the code reasserting control. People forget this exit exists, and an agent shipped without it burns tokens in a silent loop.
 
-## How it works
+## How it works (load-bearing skeleton)
 
 ### Move 1 — the mental model
 
-The skeleton is four bones: **state** (a growing message array), **step** (one
-model call), **execute** (run the tools the model asked for), and **terminate**
-(two ways out). The loop is just step→execute→step→execute until terminate.
+You know how BFS is just `queue + visited set + dequeue/expand/enqueue + terminate-when-empty`? Strip any one part and it breaks in a named way (no visited set → infinite revisit on a cycle). The agent loop has the same property: four parts, each named by what breaks without it.
 
 ```
-  The four-bone skeleton
+  The kernel — this IS the whole pattern
 
-  ┌──────────────────────────────────────────────────────────────┐
-  │  STATE: messages[] (grows every turn)                          │
-  │                                                                │
-  │   ┌──────────┐   tool_use?   ┌──────────┐   results   ┌──────┐ │
-  │   │  STEP    │──── yes ──────▶│ EXECUTE  │────────────▶│ push │ │
-  │   │ model.   │                │ tools.   │   appended  │ into │ │
-  │   │ complete │◀───────────────│ callTool │   to state  │ msgs │ │
-  │   └────┬─────┘    loop again  └──────────┘             └──────┘ │
-  │        │ no tool_use  OR  budget spent                          │
-  │        ▼                                                        │
-  │   TERMINATE ──▶ return { finalText, toolCalls, parsed }         │
-  └──────────────────────────────────────────────────────────────┘
-   data flows clockwise; state accumulates in messages[] each lap
+  runLoop(state, tools):
+    while not done:
+      action = step(state)           # ← the single LLM call (the "smart" part)
+      if action.is_final:            # ← success exit
+        return action.output
+      result = execute(action, tools)# ← harness runs the tool, not the model
+      state  = accumulate(state, result)   # ← what makes it a loop, not N calls
+      if budget_exceeded(state):     # ← budget exit (the one people forget)
+        return forced_synthesis(state)
 ```
 
-### Move 2 — the bones, one at a time, found by deletion
+### Move 2 — the four load-bearing parts, in aptkit's code
 
-**Bone 1 — STATE: the messages array**
+**Part 1 — state (accumulate). Without it: every turn is amnesiac; you have N independent calls, not a loop.** State is the `messages` array. Each turn pushes the assistant's response and the tool results back onto it, so the next `model.complete` sees the whole history.
 
-```
-  messages[] grows by 2 entries per tool-using turn
-
-  turn 0: [user prompt]
-          └─▶ model says "call get_metric_timeseries"
-  turn 0: [user, assistant(tool_use)]
-          └─▶ harness runs tool
-  turn 0: [user, assistant(tool_use), user(tool_result)]   ← +2
-  turn 1: model sees ALL of the above, decides next step
+```typescript
+// packages/runtime/src/run-agent-loop.ts:94, 124, 189
+const messages: ModelMessage[] = [{ role: 'user', content: userPrompt }];
+// ...each turn:
+messages.push({ role: 'assistant', content: response.content }); // line 124
+// ...after running tools:
+messages.push({ role: 'user', content: toolResults });            // line 189
 ```
 
-Pseudocode: `messages = [userPrompt]; each turn: push assistant reply, push tool
-results.` **Remove it and:** the model has amnesia every turn — it re-asks the
-same query forever because it can't see what it already learned. State is what
-makes the loop *accumulate* instead of *spin.* It's `useState` you append to.
+Drop the pushes and the model re-asks the same question every turn — it never sees what its last tool call returned. The accumulation IS the loop.
 
-**Bone 2 — STEP: one model.complete call**
+**Part 2 — step (the single LLM call). Without it: nothing chooses the next action.** This is the only "smart" part; everything else is plumbing.
 
-```
-  one step = one model call, given all state so far
-
-  model.complete({ system, messages, tools: toolSchemas, maxTokens })
-        │
-        ▼
-  response.content = [ text blocks?, tool_use blocks? ]
+```typescript
+// packages/runtime/src/run-agent-loop.ts:103
+const response = await model.complete({
+  system: forceFinal && synthesisInstruction ? `${system}\n\n${synthesisInstruction}` : system,
+  messages,
+  tools: forceFinal ? undefined : toolSchemas,  // ← tools withheld on the final turn
+  maxTokens,
+});
 ```
 
-Pseudocode: `response = await model.complete({ system, messages, tools })`. The
-model reads the whole conversation and emits either text (it's done) or
-`tool_use` blocks (it wants data). **Remove it and:** there's no agent — the
-loop has nothing to advance it. This is the one I/O-bound `await` per turn, the
-`fetch` of the loop. Everything else is bookkeeping around this call.
+One call per turn. It returns content blocks; some are text, some are `tool_use`. The loop reads those blocks to decide what happens next — it never parses free text for intent.
 
-**Bone 3 — EXECUTE: tools.callTool — the intent/execution seam**
+**Part 3 — execute (run the tool, feed the result back). The model emits *intent*; the harness runs it.** The model never touches the tool directly — that boundary IS the control and safety story.
 
-```
-  the model declares intent; the HARNESS runs it
-
-  model: "I want get_segments({metric:'revenue'})"   ← intent only
-                          │
-                          ▼  harness, NOT the model, does this:
-  tools.callTool('get_segments', {metric:'revenue'})  ← run-agent-loop.ts:159
-                          │
-                          ▼
-  result fed back into messages as a tool_result
+```typescript
+// packages/runtime/src/run-agent-loop.ts:159-187
+const { result, durationMs } = await tools.callTool(toolUse.name, toolUse.input, { signal });
+// ... on throw, the error becomes a tool_result with isError, not a crash:
+resultContent = truncate(JSON.stringify({ error: message }));   // line 167
+toolResults.push({ type: 'tool_result', toolUseId: toolUse.id, content: resultContent,
+                   ...(isError ? { isError: true } : {}) });    // line 181
 ```
 
-Pseudocode: `for each tool_use: result = await tools.callTool(name, args); push
-tool_result`. This is the most important conceptual seam in any agent: **the
-model never runs anything.** It emits a structured request — a name and args —
-and the harness, code you control, executes it through the `ToolExecutor`
-interface (`run-agent-loop.ts:21`). Think of the model as a component
-*dispatching an action* and the harness as the *reducer* that actually performs
-the side effect. **Remove it and:** the model can ask for data but never
-receives any — it hallucinates instead of querying. This seam is also where the
-tool policy and safety live (see `../04-agent-infrastructure/`): because *you*
-run the tool, *you* decide which tools exist.
+Note the failure handling: a thrown tool error is *caught and turned into an observation*, not propagated. The model sees `{ error: ... }` and can route around it — this is the hook that per-tool circuit breaking (SECTION E) would plug into. Also note `truncate` (line 54): tool results are capped at 16k chars so one fat result can't blow the context window.
 
-**Bone 4 — TERMINATE: two exits, success and budget**
+**Part 4 — termination (TWO exits, both required). This is the part people forget.**
 
-```
-  two independent ways the loop ends — both required
+```typescript
+// SUCCESS exit — model returns no tool_use blocks, so it's answering:
+const toolUses = toolUsesFromContent(response.content);
+if (toolUses.length === 0) { finalText = text; break; }   // line 132
 
-  EXIT A (success):  model emits NO tool_use  ──▶ finalText = text; break
-                     run-agent-loop.ts:132-135
-
-  EXIT B (budget):   turn == maxTurns-1  OR  toolCalls >= maxToolCalls
-                     run-agent-loop.ts:101-102  ──▶ forceFinal = true
+// BUDGET exit — forced before the call, by capping the loop:
+const budgetSpent = maxToolCalls !== undefined && toolCalls.length >= maxToolCalls;
+const forceFinal = turn === maxTurns - 1 || budgetSpent;  // line 101-102
 ```
 
-Pseudocode: `if no tool_use: break` (A); `forceFinal = turn==max-1 || budgetSpent`
-(B). **Remove EXIT A and:** the loop wastes turns even after the model is done.
-**Remove EXIT B and:** a model that keeps asking for "one more query" runs
-forever and burns your token budget — the classic runaway-agent failure. You
-need *both*, because the two exits guard different failures: A handles a
-cooperative model, B handles a stuck one.
-
-**The surprising bone — the FORCED SYNTHESIS turn**
-
-Most people stop at "two exits" and miss the load-bearing trick. When EXIT B
-fires, the loop does *not* just stop and return whatever's there. It runs **one
-more model call with the tools removed and a synthesis instruction appended to
-the system prompt** (`run-agent-loop.ts:103-109`):
-
 ```
-  budget hit → DON'T stop → run one final tool-LESS turn
+  Two exits — the success one is obvious, the budget one is load-bearing
 
-  forceFinal = true
-       │
+  turn N:
+    forceFinal?  ──yes──►  strip tools, append synthesis instruction
+       │                   model MUST answer (budget exit)
+       no
        ▼
-  model.complete({
-    system: system + synthesisInstruction,   ← "you have NO more tool calls"
-    tools: undefined,                         ← ★ tools REMOVED ★
-    messages,                                 ← all evidence gathered so far
-  })
+    model.complete(with tools)
        │
+    tool_use blocks?  ──no──►  finalText = text (success exit)
+       │ yes
        ▼
-  model is FORCED to answer from what it has — it cannot ask for more
+    run tools, accumulate, next turn
 ```
 
-`buildSynthesisInstruction` (`run-agent-loop.ts:72`) returns: *"You have NO more
-tool calls available. {middle} Do not say you need more queries."* By passing
-`tools: undefined`, the harness makes tool-calling structurally impossible — the
-model *can't* ask for more even if it wants to. **Remove it and:** the agent
-hits its budget and returns "I need more data to answer" — useless. The forced
-synthesis turn is what converts a budget *cutoff* into a budget *deadline*: the
-model must produce its best answer from the evidence it has. This is the single
-most surprising mechanic in the kernel, and it's why AptKit agents return a real
-answer instead of giving up at the budget. (The exact synthesis *wording* lives
-in `.aipe/study-prompt-engineering/`; here you only need the *mechanism*: drop
-the tools, demand the answer.)
+**The most load-bearing mechanic in aptkit: the forced synthesis turn.** When `forceFinal` is true, the loop does two things (line 104, 108): it appends `synthesisInstruction` to the system prompt and it passes `tools: undefined`. Stripping the tools means the model *physically cannot* emit a tool call — its only move is to answer. The instruction (`buildSynthesisInstruction`, line 72) reinforces it: *"You have NO more tool calls available... Do not say you need more queries."* Without this, a weak model on its last turn will keep asking to search and produce nothing. This converts "ran out of budget" from a failure into a final answer.
+
+### Move 2.5 — skeleton vs hardening
+
+Everything past the four parts is optional hardening aptkit layers on:
+- **Parse-and-recover** (`run-agent-loop.ts:192-201`): if `parseResult` returns null, run one `runRecoveryTurn` (line 204) that re-prompts for *just* the structured output using the evidence already gathered. This is how recommendation/rubric agents salvage a run where the model produced prose instead of JSON.
+- **Trace emission** (`trace?.emit` throughout): `step`, `tool_call_start/end`, `model_usage` events for observability and replay. Not skeleton — the loop runs without a trace sink.
+- **Result truncation** (line 54): a hardening cap on context bloat.
+
+The kernel is the four parts. The recovery turn, the trace, the truncation are hardening. Saying which is which is the lesson.
 
 ### Move 3 — the principle
 
-An agent loop is four bones — state, step, execute, terminate — and the
-hard-won wisdom is all in *terminate*: never let the model decide when to stop
-unilaterally. Give it two exits and a forced last word.
+An agent is `step + execute + accumulate + terminate`, and termination needs BOTH a success condition and a hard budget. aptkit's defaults (`maxTurns = 8`, `run-agent-loop.ts:87`) bake the budget into the skeleton; the agents tighten it (rag-query: 6/4; rubric: 6/3). Naming the budget exit unprompted is the signal you've shipped an agent loop, not just read about one.
 
 ## Primary diagram
 
-The full kernel, all four bones plus the forced synthesis turn and the
-post-loop parse/recovery tail.
-
 ```
-  runAgentLoop — the complete skeleton (run-agent-loop.ts:76-202)
+  runAgentLoop — the full kernel, one frame
+  packages/runtime/src/run-agent-loop.ts:76
 
-  messages = [userPrompt]                            ← STATE  (line 94)
-  ┌──────────────────────────────────────────────────────────────────┐
-  │ for turn in 0..maxTurns:                          (line 98)        │
-  │   budgetSpent = toolCalls >= maxToolCalls         (line 101)       │
-  │   forceFinal  = turn==max-1 OR budgetSpent         (line 102) EXIT B│
-  │                                                                    │
-  │   response = model.complete({                      (line 103) STEP │
-  │     system: forceFinal ? system+synthesis : system,                │
-  │     tools:  forceFinal ? undefined : toolSchemas,  ← FORCED SYNTH  │
-  │     messages })                                                    │
-  │                                                                    │
-  │   push assistant(response) into messages           (line 124)      │
-  │                                                                    │
-  │   if no tool_use:  finalText = text; BREAK         (line 132) EXIT A│
-  │                                                                    │
-  │   for each tool_use:                               (line 139)EXECUTE│
-  │     result = tools.callTool(name, args)            (line 159)      │
-  │     push tool_result into messages                 (line 189)      │
-  └──────────────────────────────────────────────────────────────────┘
-  parsed = parseResult(finalText)                     (line 194)       │
-  if parsed==null and recoveryPrompt: runRecoveryTurn (line 196)       │
-  return { finalText, toolCalls, parsed }             (line 201) ◄ state dies here
+  ┌─ config (from the agent) ─────────────────────────────┐
+  │  system · userPrompt · toolSchemas · maxTurns ·        │
+  │  maxToolCalls · synthesisInstruction · parseResult     │
+  └───────────────────────────┬────────────────────────────┘
+                              ▼
+  ┌─ loop body (per turn) ─────────────────────────────────┐
+  │  forceFinal = lastTurn OR budgetSpent          (:101)  │
+  │  response = model.complete(tools unless forceFinal)(:103)│ ← STEP
+  │  messages.push(assistant)                       (:124) │ ← ACCUMULATE
+  │  no tool_use? → finalText; break               (:132)  │ ← SUCCESS EXIT
+  │  for tool_use: callTool → tool_result          (:159)  │ ← EXECUTE
+  │  messages.push(tool results)                    (:189) │ ← ACCUMULATE
+  └───────────────────────────┬────────────────────────────┘
+                              │ loop ends at maxTurns      ← BUDGET EXIT
+                              ▼
+  ┌─ post-loop ────────────────────────────────────────────┐
+  │  parseResult(finalText); null? → runRecoveryTurn (:192) │ ← hardening
+  └─────────────────────────────────────────────────────────┘
 ```
-
-Read it top to bottom once; the only non-obvious arrows are the two `forceFinal`
-ternaries on lines 104 and 106 — that's the forced synthesis turn.
-
-## Implementation in codebase
-
-**Use case: every capability is this kernel + a thin wrapper.** A wrapper's job
-is to (1) render a system prompt, (2) filter tools to a policy, (3) set the two
-budgets, (4) supply a parser. The kernel does the rest.
-
-The kernel, with the four bones marked — `run-agent-loop.ts`:
-
-```ts
-// STATE (line 94): the agent's only memory, dies on return
-const messages: ModelMessage[] = [{ role: 'user', content: userPrompt }];
-const toolCalls: ToolCallRecord[] = [];
-
-for (let turn = 0; turn < maxTurns; turn += 1) {              // line 98
-  // EXIT B precondition (line 101-102): both budgets feed one boolean
-  const budgetSpent = maxToolCalls !== undefined && toolCalls.length >= maxToolCalls;
-  const forceFinal = turn === maxTurns - 1 || budgetSpent;
-  // STEP + FORCED SYNTHESIS (line 103-109): tools dropped when forceFinal
-  const response = await model.complete({
-    system: forceFinal && synthesisInstruction ? `${system}\n\n${synthesisInstruction}` : system,
-    messages,
-    tools: forceFinal ? undefined : toolSchemas,   // ← tools removed = can't ask for more
-    maxTokens, signal,
-  });
-  messages.push({ role: 'assistant', content: response.content });   // grow STATE (line 124)
-  const toolUses = toolUsesFromContent(response.content);
-  if (toolUses.length === 0) { finalText = text; break; }            // EXIT A (line 132-135)
-  // EXECUTE (line 139-189): harness runs each tool the model asked for
-  for (const toolUse of toolUses) {
-    const { result } = await tools.callTool(toolUse.name, toolUse.input, { signal }); // line 159
-    // ...push tool_result into messages (line 189)
-  }
-}
-```
-
-`buildSynthesisInstruction` — `run-agent-loop.ts:72`:
-
-```ts
-// line 72: the forced-synthesis wording the wrappers fill in the middle of
-export function buildSynthesisInstruction(middle: string): string {
-  return `You have NO more tool calls available. ${middle} Do not say you need more queries.`;
-}
-```
-
-The post-loop tail — parse, then one-shot recovery — `run-agent-loop.ts:192-199`:
-
-```ts
-let parsed: T | null = null;
-if (options.parseResult) {
-  parsed = options.parseResult(finalText);                 // line 194
-  if (parsed === null && options.recoveryPrompt) {         // parse failed
-    const recoveryText = await runRecoveryTurn(options, options.recoveryPrompt(toolCalls)); // line 196
-    parsed = recoveryText === null ? null : options.parseResult(recoveryText);
-  }
-}
-```
-
-`runRecoveryTurn` (`run-agent-loop.ts:204`) is a *fresh-message* one-shot: a new
-conversation containing only the evidence and a "output ONLY the structured
-shape, never ask for more data" system prompt (line 211-216). It's a second
-forced-synthesis attempt for the case where the first answer parsed to garbage.
-
-**The wrappers** all look the same — here's where the budgets get set:
-
-- `monitoring-agent.ts:76-77` — `maxTurns: 8, maxToolCalls: 6`
-- `diagnostic-agent.ts:73-74` — `maxTurns: 8, maxToolCalls: 6`
-- `recommendation-agent.ts:86-87` — `maxTurns: 6, maxToolCalls: 4`
-- `query-agent.ts:94-95` — `maxTurns: 8, maxToolCalls: 6`
-- `rubric-improvement-agent.ts:75-77` — `maxTurns: 6, maxToolCalls: 3, maxTokens: 2400`
-
-Defaults if a wrapper omits them: `maxTurns: 8`, `maxTokens: 4096`,
-`maxToolCalls` optional (`run-agent-loop.ts:87-89`).
 
 ## Elaborate
 
-**Origin.** This skeleton is the operational core of the ReAct paper (Yao et
-al., 2022) once you strip the prompting and keep only the control flow. The
-modern "agent harness" — a host loop that owns state and tool execution while
-the model only emits intents — is the dominant production shape (Anthropic's
-tool-use loop, the OpenAI assistants loop, every framework's `AgentExecutor`).
-AptKit's version is deliberately small and un-frameworked.
-
-**Adjacent concepts.** The two budgets are *defense in depth*: `maxTurns` bounds
-*conversation length*, `maxToolCalls` bounds *external work* — a model can burn
-many turns reasoning without calling tools, or many tool calls in one turn, so
-you bound both. The `signal` (AbortSignal) threaded through is cancellation —
-the same `AbortController` you pass to `fetch`. The truncation
-(`MAX_TOOL_RESULT_CHARS`, line 52) is a *decorative* bone: remove it and you
-risk overflowing context, but the loop still runs — it's a guard, not structure.
+This kernel is the ReAct loop with the Thought-Action-Observation steps collapsed into provider content blocks (text = thought, tool_use = action, tool_result = observation). It's also the substrate SECTION C builds on: multi-agent is N of this skeleton composed. When the agents are genuinely independent it's "N loops merged" (fan-out); the moment one needs another's output you're traversing a dependency DAG with a supervisor and a merge strategy — not running N copies. aptkit runs N *separate* copies today (the six capabilities don't compose), so it's the simplest case.
 
 ## Interview defense
 
-**Q: "Walk me through your agent loop. What stops it?"**
+**Q: Walk me through your agent loop.**
+Four parts. Step is one `model.complete` per turn. Execute runs the tool through the harness — the model emits intent, my code runs it, errors become observations not crashes. Accumulate pushes assistant + tool results onto the messages array; that's what makes it a loop. Terminate has two exits: success when the model stops emitting tool calls, and a budget exit at `maxTurns`/`maxToolCalls`.
 
 ```
-  two exits, and you need both
-
-  cooperative model  ──▶ stops asking ──▶ EXIT A (no tool_use, break)
-  stuck model        ──▶ keeps asking ──▶ EXIT B (budget) ──▶ forced synthesis
+  step → execute → accumulate → {success exit | budget exit}
 ```
+*Anchor: termination needs BOTH exits. The budget one is the one people forget.*
 
-Anchor: "Two exits — success and budget — and the budget exit doesn't just stop,
-it strips the tools and forces a final answer from the evidence on hand."
-
-**Q: "Who actually runs the tools — the model?"**
+**Q: What happens when the budget runs out mid-investigation?**
+The forced synthesis turn. On the last turn I strip the tool schemas — so the model literally can't ask for another search — and append an instruction telling it to answer with what it has. That turns "out of budget" into a final answer instead of a hang. It's the single most load-bearing mechanic in the loop.
 
 ```
-  intent vs execution — the seam every agent has
-
-  model: emits {name, args}   ← intent, structured, runs nothing
-  harness: tools.callTool()   ← execution, your code, your policy (line 159)
+  forceFinal → tools: undefined + "no more queries" → model MUST answer
 ```
+*Anchor: withholding the tools is the enforcement; the instruction is the nudge.*
 
-Anchor: "The model dispatches an action; my harness is the reducer that
-performs it — that seam is where the tool policy and safety live."
-
-**Q: "What happens when the agent hits its budget mid-investigation?"**
-
-```
-  budget hit ─▶ forceFinal=true ─▶ tools:undefined + synthesis prompt
-            ─▶ model MUST answer from evidence (can't ask for more)
-```
-
-Anchor: "It doesn't fail — it runs one tool-less turn that turns the cutoff into
-a deadline. That forced synthesis turn is the part people miss." This is the
-load-bearing skeleton part: the budget exit is worthless without the forced
-synthesis turn behind it.
-
-## Validate
-
-- **Reconstruct:** Redraw the four-bone skeleton from memory and label each bone
-  with its line in `run-agent-loop.ts` (state 94, step 103, execute 159,
-  terminate 102+132).
-- **Explain:** Why does `forceFinal` set `tools: undefined` instead of just
-  appending a "stop now" instruction? (`run-agent-loop.ts:106` — making it
-  structurally impossible beats asking nicely; the model can't emit a tool_use
-  if no tools are offered.)
-- **Apply:** A new capability needs at most 2 external queries but lots of
-  reasoning. Which budget do you tighten and which do you leave? (tighten
-  `maxToolCalls` to 2, leave `maxTurns` generous — see the two-budget rationale;
-  `recommendation-agent.ts:86-87` is the precedent at 6/4.)
-- **Defend:** A teammate wants to drop the forced synthesis turn "to save a model
-  call." What breaks? (the agent returns "I need more queries" at every budget
-  hit — `buildSynthesisInstruction`'s whole reason for existing,
-  `run-agent-loop.ts:72`.)
+**Q: How do you keep one big tool result from blowing the context window?**
+`truncate` at 16k chars per result. It's hardening, not skeleton — but without it a single fat query result poisons every downstream turn.
 
 ## See also
 
-- [01-chains-vs-agents.md](01-chains-vs-agents.md) — why this loop exists at all
-- [03-react.md](03-react.md) — the reasoning pattern this kernel implements
-- [05-reflexion-self-critique.md](05-reflexion-self-critique.md) — same kernel,
-  the model judges instead of produces
-- [07-routing.md](07-routing.md) — the one-shot `classifyIntent` call that is
-  *not* this loop
-- `../03-multi-agent-orchestration/03-sequential-pipeline.md` — why state dying
-  on return forces value-passing between agents
-- `../04-agent-infrastructure/` — the tool policy that lives at the execute seam
-- `.aipe/study-prompt-engineering/` — the synthesis + recovery prompt *wording*
+- `01-chains-vs-agents.md` — the boundary this loop sits behind
+- `03-react.md` — the loop's step function, prompted ReAct-style
+- `05-guardrails-and-control.md` (SECTION D) — the budget exit as part of the control envelope
+- `02-agentic-retrieval/01-agentic-rag.md` — this loop with retrieval as the tool
+- `study-ai-engineering/04-agents-and-tool-use/03-react-pattern.md` — the T-A-O mechanics (cross-ref)

@@ -1,261 +1,177 @@
-# 03 — Stacks, Queues, Deques, and Heaps
+# Stacks, Queues, Deques & Heaps
 
-**Industry name(s):** Stack (LIFO), queue (FIFO), deque, append-only log, round-robin scheduling, priority queue / binary heap. Type label: Language-agnostic foundation.
+**Industry name(s):** LIFO stack · FIFO queue · double-ended queue · binary heap / priority queue — *Industry standard*
+
+> **Status in aptkit: `not yet exercised` as explicit structures.** No `Stack`, `Queue`, `Deque`, or `Heap` class runs anywhere in aptkit's source. You've built `BinaryHeap.ts` and `PriorityQueue.ts` from scratch — this file is mostly curriculum, with **one real seam**: the top-k selection in `search` is precisely the problem a heap solves, and the repo solves it with a full sort instead. That seam is the lesson.
+
+---
 
 ## Zoom out, then zoom in
 
-Ordering disciplines decide *what gets processed next*. AptKit has two of them in real use — an append-only message log (the agent transcript) and a modulo round-robin scheduler (the content workflow) — and two that are `not yet exercised`: an explicit stack, and a heap/priority queue. The exercised pair is worth a careful walk because they're easy to miss: they don't *look* like a queue or a stack, but they're playing exactly those roles.
+These ordering disciplines don't appear as data structures in aptkit — but the *problem one of them solves* is sitting in the hottest path. Here's where a heap *would* live if the corpus grew.
 
 ```
-  Zoom out — ordering disciplines in AptKit
+  Zoom out — the one place an ordering discipline is latent
 
-  ┌─ Runtime: agent loop ────────────────────────────────┐
-  │  messages[]  ── APPEND-ONLY LOG (FIFO read order)     │ ← exercised
-  │    push(assistant), push(tool results), repeat        │
-  └───────────────────────────┬───────────────────────────┘
-                              │
-  ┌─ Workflows ───────────────▼───────────────────────────┐
-  │  planContentVariant  ── ROUND-ROBIN via index % n      │ ← exercised
-  └───────────────────────────┬───────────────────────────┘
-                              │
-  ┌─ (absent) ────────────────▼───────────────────────────┐
-  │  explicit stack            not yet exercised           │
-  │  heap / priority queue     not yet exercised           │ ← your reincodes PQ
-  └────────────────────────────────────────────────────────┘
+  ┌─ Retrieval layer ───────────────────────────────────────────┐
+  │  InMemoryVectorStore.search:                                │
+  │    hits.sort(...)        ← FULL sort: O(n log n)            │
+  │    .slice(0, k)          ← then keep top-k                  │
+  │                                                              │
+  │    ★ a MIN-HEAP of size k would do this in O(n log k) ★      │
+  │       (the curriculum seam — not what the repo does)        │
+  └──────────────────────────────────────────────────────────────┘
+
+  ┌─ everywhere else ───────────────────────────────────────────┐
+  │  no stack, no queue, no deque, no priority queue            │
+  │  the agent loop is a flat counted for-loop, not a work queue│
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: a queue serves in arrival order (FIFO), a stack in reverse-arrival order (LIFO), a deque from both ends, and a heap serves by *priority* regardless of arrival. AptKit needs the first idea (process the conversation in order) and a scheduler that *cycles* fairly (round-robin), but it never needs priority ordering — because nothing here has a "most urgent next item" among many. We'll walk the two it has, then be precise about why the heap isn't there and exactly what would summon it.
+Zoom in: a heap is a priority-ordered structure where the min (or max) is always at the root, `O(log n)` to insert or extract. The top-k retrieval problem — "give me the k highest-scoring chunks" — is the textbook use case. aptkit chooses a full sort instead, and that choice is correct *for now* for a reason worth understanding.
+
+---
 
 ## Structure pass
 
-**Layers.** Runtime (the message log that the loop reads in order), workflows (the round-robin that picks the next variant's section+angle).
+**Layers (curriculum):** stack (LIFO, call-stack/undo), queue (FIFO, work scheduling), deque (both ends), heap (priority extraction).
 
-**Axis — trace "what's processed next?"** across the orderings.
+**Axis — ordering discipline:** trace "what determines what comes out next?"
 
 ```
-  One axis — "what gets served next?" — across orderings
+  One axis — "what comes out next?" — across the four structures
 
-  queue (FIFO)      next = oldest unserved      arrival order
-  stack (LIFO)      next = newest unserved      reverse arrival
-  round-robin       next = (i+1) mod n          cyclic, fair
-  heap (priority)   next = highest priority     ignores arrival   ← absent
-
-  aptkit's message log: read FIFO (turn order)
-  aptkit's scheduler:   round-robin (cyclic fairness)
-  aptkit's ranking:     full sort + slice, NOT a heap (see 06)
+  stack  → the LAST thing in        (LIFO)   — recursion, undo
+  queue  → the FIRST thing in       (FIFO)   — BFS frontier, job queue
+  deque  → either end, your choice            — sliding-window maxima
+  heap   → the HIGHEST PRIORITY one (by key) — top-k, Dijkstra, scheduling
 ```
 
-**Seam.** The interesting boundary is between *round-robin* (the workflow's "serve each angle in turn, fairly") and *priority ordering* (a heap's "serve the most important first"). The axis-answer — what's served next — flips from "next in the cycle" to "highest priority." AptKit sits firmly on the round-robin side: its scheduling goal is *coverage/fairness across angles*, not *urgency*. That's why there's no heap. The seam is conceptual here, not in code — but knowing which side of it a problem sits on is how you decide between modulo and a priority queue.
+**Seam — full-sort vs heap-select at the top-k boundary.** aptkit's `search` answers "what comes out next?" with "sort everything, take the front k." A heap answers it with "maintain only the k best." The axis-answer (how ordering is achieved) flips across that seam — and it's the only place in aptkit where one of these structures is even relevant.
+
+---
 
 ## How it works
 
-### Move 1 — the mental model
+### Move 1 — the mental model (the heap, and the seam)
 
-You know these from the call stack and from event queues. A stack is your function call stack — last-in, first-out, the most recent frame returns first. A queue is the browser's event loop task queue — first-in, first-out, tasks run in arrival order. Round-robin is what a fair scheduler does: A, B, C, A, B, C — cycle through everyone before repeating. A heap is the odd one out — it serves by priority, like a hospital triage where the sickest go first regardless of arrival.
-
-```
-  The kernels — what comes off next
-
-  QUEUE          STACK          ROUND-ROBIN        HEAP
-  [a b c]        [a b c]        cycle 0..n-1       sorted-ish by key
-   ↑take          take↑          i, (i+1)%n,...     take-min/max
-  serve a        serve c        a,b,c,a,b,c        serve highest pri
-  FIFO           LIFO           fair cycle         priority, O(log n)
-```
-
-AptKit reaches for two of these: read the message log in arrival order (queue-like FIFO), and pick the next content variant by cycling (round-robin). It never reaches for the heap, because no problem here is "find the highest-priority item among many, repeatedly."
-
-### Move 2 — the two exercised disciplines
-
-**The message log — append-only, read in order (FIFO).** Bridge from the event-loop task queue: the agent loop maintains a `messages` array that only ever grows by appending, and the model reads the whole thing in order each turn. It's a transcript, not a work queue you pop from — but the *discipline* is queue-like: items are consumed in the order they arrived, never reordered.
+You built `BinaryHeap.ts` with `heapifyUp`/`heapifyDown` and a `PriorityQueue.ts` on top of it — so the mechanism is yours already. The shape: a binary heap is an array where each parent is `≤` (min-heap) or `≥` (max-heap) its children, so the extreme element is always at index 0. Top-k via a heap is "keep a min-heap of size k; for each new score, if it beats the heap's min, evict the min and insert."
 
 ```
-  Message log — append-only, FIFO read order
+  Pattern — top-k via a bounded min-heap (the seam aptkit does NOT take)
 
-  turn 0:  push(user prompt)                  [u]
-           model reads [u] → emits tool_use
-           push(assistant reply)              [u, a]
-           push(tool results)                 [u, a, t]
-  turn 1:  model reads [u, a, t] → ...
-           push(assistant)                    [u, a, t, a]
-           push(tool results)                 [u, a, t, a, t]
-  ─────────────────────────────────────────────────────────
-  grows by ~2 per turn, read front-to-back, never reordered
+  maintain heap of size k=3, min at root:
+
+  scores stream in: 0.9  0.3  0.7  0.8  0.2  0.95 …
+  heap (min at top):
+    [0.9]              insert 0.9
+    [0.3, 0.9]         insert 0.3
+    [0.3, 0.9, 0.7]    insert 0.7      ← heap full (size 3)
+    0.8 > min(0.3)?    yes → evict 0.3, insert 0.8 → [0.7,0.9,0.8]
+    0.2 > min(0.7)?    no  → skip
+    0.95 > min(0.7)?   yes → evict 0.7, insert 0.95 → [0.8,0.9,0.95]
+
+  result: the 3 highest, in O(n log k) — never sorted the rest
 ```
 
-What breaks if you reordered it: the model loses the causal thread — a tool result must follow its tool call, an answer must follow the question. The append-only, in-order discipline *is* the conversation's integrity. The boundary condition is unbounded growth — defended by `maxTurns` (the log can't grow past ~2·maxTurns entries) and per-result truncation (`truncate`, 16k chars). It's a queue that's *capped*, not a queue you drain.
+Versus what aptkit *actually* does: sort all `n` then slice — `O(n log n)`, simpler code, exact ties handled by sort stability. The heap is the asymptotic win when `k << n`; the sort wins on simplicity when `n` is small.
 
-**Round-robin scheduling — `index % n`, cyclic fairness.** Bridge from a fair task scheduler: the content workflow needs to generate N variants of a document, spreading them across the document's sections *and* across a set of "angles" (e.g. different framings). It does this with modulo: variant `i` gets section `i % sectionCount` and angle `i % angleCount`. As `i` climbs, both cycle independently, so coverage is even.
+### Move 2 — the walkthrough
 
-```
-  Execution trace — round-robin over 3 sections, 2 angles
+#### The repo's choice: full sort + slice, not a heap
 
-  sections = [S0, S1, S2]   angles = [A0, A1]
+Here's the actual top-k in aptkit, and it's deliberately *not* a heap:
 
-  variant 0: section 0%3=S0  angle 0%2=A0     (S0, A0)
-  variant 1: section 1%3=S1  angle 1%2=A1     (S1, A1)
-  variant 2: section 2%3=S2  angle 2%2=A0     (S2, A0)
-  variant 3: section 3%3=S0  angle 3%2=A1     (S0, A1)
-  variant 4: section 4%3=S1  angle 4%2=A0     (S1, A0)
-  ─────────────────────────────────────────────────────
-  sections cycle every 3, angles every 2 — coprime-ish
-  spread means no (section, angle) pair repeats for a while
+```ts
+// packages/retrieval/src/in-memory-vector-store.ts:31-32
+hits.sort((a, b) => b.score - a.score);   // sort ALL n hits: O(n log n)
+return hits.slice(0, Math.max(0, k));     // keep top-k: O(k)
 ```
 
-What breaks without the modulo: you'd either always hit section 0 (no coverage) or need an explicit cursor you increment and wrap by hand (the modulo *is* the wrap, done arithmetically). The boundary condition the repo guards: empty inputs — `planContentVariant` throws if `sections.length === 0` or `angles.length === 0`, because `i % 0` is `NaN` and would silently corrupt the schedule. That guard is load-bearing.
+Why the full sort and not your `PriorityQueue.ts`? Three reasons, all honest tradeoffs:
 
-### Move 2.5 — current state vs future state: the heap
+1. **`n` is tiny.** The in-memory store holds a handful of docs. `O(n log n)` and `O(n log k)` are indistinguishable at `n = 50`. The heap's win only shows up when `k << n` with large `n`.
+2. **The full sorted list is sometimes useful.** `recall` over-fetches `max(k*4, 20)` then filters by `kind` (`conversation-memory.ts:94`) — it wants *more* than k from the sort, so a size-k heap would be the wrong tool there anyway.
+3. **Simplicity is correctness.** `Array.sort` is one line, battle-tested, and stable. A hand-rolled bounded heap is more code to get wrong — and you'd only reach for it under a measured latency need.
 
-The heap is `not yet exercised`, and it's worth being precise about why, because you've built one (`BinaryHeap.ts`, `PriorityQueue.ts` in `reincodes`) and the instinct might be to reach for it.
+The boundary condition where this flips: once `n` is large (tens of thousands of chunks) *and* you only need a small `k`, the full sort wastes work ordering chunks you'll throw away. That's the point where you'd reach for either a heap-based partial sort or — better — an index that never scans all `n` (file **04**, **05**).
+
+#### Why there's no queue in the agent loop
+
+A natural instinct: "isn't the agent loop a work queue?" No — and naming why teaches the queue concept by contrast. `runAgentLoop` (`run-agent-loop.ts:98`) is a flat counted `for` loop with a fixed bound. There's no frontier of pending work to dequeue, no FIFO ordering of tasks. Each turn is: call model, maybe execute the tools it asked for *immediately* (`run-agent-loop.ts:139-187`), append results, repeat. Tools are processed in the order the model returned them — an array iteration, not a queue with enqueue/dequeue discipline. If aptkit ever did *speculative multi-step planning* with a backlog of pending sub-tasks, a queue (or priority queue, by expected value) would enter. It doesn't, so it hasn't.
 
 ```
-  Phase A (now)              vs   Phase B (would summon a heap)
+  Contrast — what aptkit has vs what a work-queue would be
 
-  rank ≤10 anomalies:             top-k where k ≪ n and n is large:
-    full sort O(n log n)            heap of size k, O(n log k)
-    + slice(0, 10)                  e.g. top 10 of 100,000 candidates
-
-  bounded concurrency:            bounded-concurrency scheduler:
-    not present                     min-heap of next-available-times,
-                                    pop earliest, schedule, push back
-
-  cost of switching now: real complexity for zero measurable gain —
-  n is single/double digits, so full sort already wins.
+  aptkit (flat loop):           a work-queue agent (NOT aptkit):
+  for turn in 0..maxTurns:        queue = [root_task]
+    resp = model.complete()       while queue not empty:
+    for tool in resp.tools:         task = queue.dequeue()  ← FIFO/priority
+      run immediately               subtasks = expand(task)
+                                     queue.enqueue(subtasks) ← frontier grows
 ```
-
-The honest call: AptKit's "serve next" problems are all small (≤10 anomalies, ≤3 recommendations) or cyclic (round-robin), and neither benefits from a heap. A heap earns its O(log n) overhead only when you repeatedly extract the extreme from a *large, changing* collection. Nothing here is large and changing — *yet*. The trigger that would flip this to Phase B: a bounded-concurrency worker pool over many pending tasks (min-heap keyed by ready-time), or top-k selection where k ≪ n on a genuinely large candidate set. The newest package, `@aptkit/retrieval`, is the first place the second trigger gets close: `InMemoryVectorStore.search` (`in-memory-vector-store.ts:31-32`) sorts *all* scored chunks then slices the top-k, so once a corpus grows past a handful of documents a size-k heap (O(n log k)) would beat the full sort — though the bigger win there is skipping the linear scan entirely with an ANN index, not the heap (see `05`, `06`). Still not exercised, but no longer hypothetical. See `06` for the top-k discussion in depth.
 
 ### Move 3 — the principle
 
-The ordering discipline you pick encodes *what "next" means* for your problem. FIFO means "in arrival order" — right for a transcript. Round-robin means "fairly cycle" — right for spreading work evenly. A heap means "by priority" — right only when there's a meaningful priority among many items and you extract the extreme repeatedly. Choosing the wrong discipline (a heap for a 10-item list, a queue where you needed priority) is a complexity mismatch in both directions. AptKit's two choices are correctly matched; the heap's absence is a correct match too.
+**A full sort is a heap you didn't bother to bound — and at small `n` that's the right call.** The top-k problem always *can* use a heap; whether it *should* depends on whether `k << n` and whether `n` is large enough for the asymptotic gap to beat the simplicity of `sort().slice()`. aptkit picks simplicity because its `n` is small and it sometimes wants more than `k` anyway. Knowing *when* the heap earns its place — not reflexively reaching for it — is the senior move.
+
+---
 
 ## Primary diagram
 
-The two exercised orderings in one frame, side by side with the absent heap.
+The seam in one frame: what aptkit does, and the heap it could grow into.
 
 ```
-  AptKit ordering disciplines — exercised vs absent
+  Top-k selection — aptkit's choice vs the heap alternative
 
-  ┌─ EXERCISED ─────────────────────────────────────────┐
-  │  message log (runtime)        round-robin (workflows)│
-  │  ┌───────────────┐            i % sections           │
-  │  │ u → a → t → a │ FIFO       i % angles              │
-  │  │ append-only   │ read       cyclic, fair spread     │
-  │  │ capped by     │ in order   guard: throw on empty   │
-  │  │ maxTurns      │                                    │
-  │  └───────────────┘                                    │
-  └──────────────────────────────────────────────────────┘
-  ┌─ NOT YET EXERCISED ─────────────────────────────────┐
-  │  stack (LIFO)     — no explicit use                  │
-  │  heap / PQ        — your reincodes PQ; summoned by    │
-  │                     top-k(k≪n, large n) or a bounded  │
-  │                     concurrency scheduler             │
-  └──────────────────────────────────────────────────────┘
+  CURRENT (aptkit, small n):
+    all hits ──► Array.sort (O(n log n)) ──► slice(0,k) ──► top-k
+    + simple, exact, stable; sometimes over-fetches >k (recall)
+    − orders n-k chunks it discards
+
+  CURRICULUM SEAM (large n, k << n):
+    stream hits ──► size-k min-heap ──► drain ──► top-k
+    + O(n log k), never fully sorts
+    − more code; only helps when k << n AND n large
+
+  BETTER AT SCALE (file 04/05):
+    don't scan n at all ──► ANN index (HNSW) ──► ~O(log n) candidates
+    the real production answer (buffr's PgVectorStore)
 ```
 
-## Implementation in codebase
-
-**Use cases.** The message log is built and appended on every turn of every agent run (`run-agent-loop.ts`). Round-robin scheduling runs whenever the content workflow generates variants for a source document — it's the workflow's core fairness mechanism.
-
-The append-only log — `packages/runtime/src/run-agent-loop.ts` (lines 94, 124, 189):
-
-```
-  const messages: ModelMessage[] = [{ role: 'user', content: userPrompt }];  ← line 94, seed
-  ...
-  messages.push({ role: 'assistant', content: response.content });            ← line 124
-  ...
-  messages.push({ role: 'user', content: toolResults });                      ← line 189
-       │
-       └─ append-only. The model reads `messages` whole each turn (passed to
-          model.complete). Order = causal order: a tool_result block must follow
-          its tool_use. Reordering breaks the conversation. Growth is capped by
-          the maxTurns loop bound (~2 entries/turn), not by draining.
-```
-
-Round-robin scheduling — `packages/workflows/src/content-generation-workflow.ts` (lines 139–157, `planContentVariant`):
-
-```
-  export function planContentVariant(options): ContentVariantPlan {
-    if (options.sections.length === 0)
-      throw new Error('planContentVariant requires at least one section');   ← guard: i % 0
-    if (options.angles.length === 0)
-      throw new Error('planContentVariant requires at least one angle');     ← guard: i % 0
-
-    const sectionIndex = options.variantIndex % options.sections.length;     ← cycle sections
-    return {
-      sourceHash: options.sourceHash,
-      variantIndex: options.variantIndex,
-      sectionIndex,
-      totalSections: options.sections.length,
-      section: options.sections[sectionIndex],
-      angle: options.angles[options.variantIndex % options.angles.length],   ← cycle angles
-    };
-       │
-       └─ two independent modulo cursors. variantIndex climbs monotonically; both
-          section and angle wrap on their own period. The empty-input throws are
-          load-bearing: i % 0 = NaN would index `undefined` and corrupt the plan
-          silently.
-  }
-```
-
-And the driver that climbs `variantIndex` — same file, `ensureGeneratedContent` (lines 92–98): `baseIndex` continues past existing variants, and the loop increments `variantIndex` until enough fresh variants exist or a skip budget (`maxSkips`) is exhausted. That skip budget is itself a small bounded-retry — when a generator returns `null`, it advances to the next variant index rather than failing, up to `lastIndex`.
+---
 
 ## Elaborate
 
-Stacks and queues are the two fundamental linear orderings, and the choice between them is the choice between LIFO and FIFO — recursion uses a stack (the call stack), breadth-first processing uses a queue. Round-robin is a scheduling classic: it's how time-sharing OSes give each process a fair slice, and modulo arithmetic is the cleanest way to express "wrap around" without a manual cursor.
+The binary heap was invented for heapsort (1964) and is the backbone of priority queues — Dijkstra's algorithm, event-simulation schedulers, top-k streaming, Huffman coding. The "bounded min-heap for top-k" pattern is one of the most common real-world heap uses: log aggregators, search rankers, and recommendation systems all keep a size-k heap to find the best results over a large stream without sorting it. Your `PriorityQueue.ts` with `updatePriority` is exactly the variant Dijkstra needs (decrease-key) — a step beyond what top-k requires.
 
-The heap is where your `reincodes` work shines and AptKit stays quiet. A binary heap gives O(log n) insert and O(log n) extract-min/max with a flat array and `heapifyUp`/`heapifyDown` — no pointers, cache-friendly. It's the backing structure for a priority queue, which is the backing structure for Dijkstra (your `Graph2.ts` + `PriorityQueue.ts`). AptKit has none of these because it has no shortest-path, no large top-k, no priority scheduling. The day it grows a worker pool that must run the *next-ready* task among many, the min-heap-by-ready-time is the move — and you've already built it.
+aptkit hasn't reached for any of this because its retrieval set is small and its loop is flat. The honest framing: the heap is a *latent* structure here — the problem exists (top-k), the structure that solves it optimally is one you've built, and the repo correctly declines to use it until the input size justifies it. That's not a gap in your knowledge; it's a gap in the repo's *need*.
 
-For how the agent loop's bounded iteration relates to runtime execution (event loop, cancellation), see `study-runtime-systems`. For why the message log's truncation and turn cap are framed as backpressure, see `study-performance-engineering`.
+---
 
 ## Interview defense
 
-**Q: "Is there a queue in this codebase? Where?"**
+**Q: aptkit does top-k retrieval. Why a full sort and not a heap?**
 
-Functionally yes, structurally implicit. The `messages` array in the agent loop is an append-only log read in FIFO order — items consumed in arrival order, never reordered, because a tool result must follow its call. It's not a queue you pop from; it's a capped transcript. The cap is `maxTurns`, which bounds its growth to ~2 entries per turn.
-
-```
-  push(a) push(t) push(a) push(t) ...   read front→back each turn
-  capped by maxTurns, not drained
-```
-
-Anchor: *it's a FIFO log, not a work queue — and the load-bearing detail is that order = causal order.*
-
-**Q: "Why round-robin via modulo instead of a queue or a heap for the content scheduler?"**
-
-The goal is *fair coverage* across sections and angles, not priority and not draining. Modulo gives that in one line per dimension: `i % n` cycles with no manual cursor or wrap logic. A queue would force you to refill it each cycle; a heap would impose priority ordering the problem doesn't have. The only sharp edge is `i % 0`, guarded by the empty-input throws.
+> Because `n` is small. The full sort is `O(n log n)`, a size-k min-heap is `O(n log k)` — but with a few dozen chunks they're indistinguishable, and the sort is one stable, correct line versus a hand-rolled heap. There's also a case where the heap is the *wrong* tool: `recall` over-fetches `max(k*4, 20)` from the sort to filter by metadata afterward, so it wants more than k. I'd switch to a bounded heap only when `n` is large, `k << n`, and a profile shows the sort costing real latency — and even then I'd prefer an ANN index that never scans all `n`.
 
 ```
-  variant i → (i % sections, i % angles) → fair spread, no cursor
-  guard i % 0 = NaN with an explicit throw ← the part people forget
+  sort+slice: O(n log n), simple, exact   ← aptkit (small n)
+  size-k heap: O(n log k), k<<n large n
+  ANN index:  ~O(log n), no full scan     ← production (buffr HNSW)
 ```
 
-Anchor: *round-robin is the right discipline when the goal is fairness, not urgency — and the modulo IS the wrap.*
+**Q: Is the agent loop a queue?**
 
-**Q: "When would you add a heap here?"**
+> No — it's a flat counted `for` loop with a fixed turn bound, not a frontier you enqueue/dequeue. Tools requested in a turn run immediately in array order. A queue would enter only if the agent did speculative multi-step planning with a backlog of pending sub-tasks; aptkit's loop is single-track, so there's no work queue.
 
-When there's a repeated extract-extreme over a large, changing collection. Two concrete triggers: top-k where k ≪ n and n is large (a size-k heap beats a full sort), or a bounded-concurrency scheduler (min-heap keyed by next-ready-time, pop earliest). Neither exists today — anomalies are ≤10, so a full sort already wins, and there's no worker pool. Adding a heap now would be complexity with no measurable benefit.
+Anchor: *the top-k heap is latent in aptkit — the problem is there, the structure is correct to defer until `k << n` at large `n`.*
 
-```
-  heap pays off:  extract-extreme × many,  n large
-  here:           n ≤ 10  →  full sort wins  →  no heap
-```
-
-Anchor: *a heap earns its log n only on a large, changing collection you extract from repeatedly — AptKit has neither, so its absence is correct.*
-
-## Validate
-
-**Reconstruct.** Write the round-robin assignment for variant indices 0–5 over 2 sections and 3 angles. (Check: section = i%2, angle = i%3.) State why `planContentVariant` throws on empty arrays.
-
-**Explain.** In `run-agent-loop.ts`, why must `messages.push` for tool results (line 189) come *after* the assistant push (line 124) within a turn? (Answer: the tool_result blocks reference the tool_use ids from the assistant message; the provider requires the result to follow its call, so order is a contract, not a preference.)
-
-**Apply to a scenario.** The content workflow needs to generate variants but should never reuse the same (section, angle) pair until all pairs are exhausted. Does plain modulo guarantee that? (Answer: not in general — `i % sections` and `i % angles` cycle on independent periods, so pairs repeat with period `lcm(sections, angles)`; if the counts share a factor, some pairs never appear. The fix is index over the *product* space, or step angle by a value coprime to the count. This is the limit of the current scheduler — worth knowing it's coverage-fair, not exhaustive-unique.)
-
-**Defend the decision.** Someone wants the anomaly ranking (`monitoring-agent.ts:87`) to use your `PriorityQueue` instead of a sort. Defend the sort. (Answer: n ≤ 10 and k = 10 means you want *all* of them ordered, not the top few of many — a heap gives no advantage when k ≈ n and n is tiny. The sort is simpler and already O(n log n) on a trivial n. The PQ is the right tool for Dijkstra's frontier, not for sorting ten items.)
+---
 
 ## See also
 
-- `06-sorting-searching-and-selection.md` — the comparator sort + slice top-k that does the job a heap would, and when binary search applies.
-- `01-complexity-and-cost-models.md` — why the message log's growth is bounded and amortized O(1).
-- `05-graphs-and-traversals.md` — where a queue (BFS frontier) and a heap (Dijkstra) *would* appear if the repo grew a real graph.
-- `study-runtime-systems` (neighboring guide) — the agent loop as bounded iteration with cancellation.
+- **06-sorting-searching-and-selection.md** — the full sort aptkit uses instead of a heap, and partial-selection alternatives.
+- **02-arrays-strings-and-hash-maps.md** — the hit array the sort operates on.
+- **05-graphs-and-traversals.md** — HNSW, the structure that removes the need to rank all `n` at all.
+- **08-dsa-foundations-practice-map.md** — where heap practice lands in the plan.

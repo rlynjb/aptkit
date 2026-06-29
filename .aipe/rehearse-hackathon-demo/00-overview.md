@@ -1,124 +1,114 @@
-# Hackathon Demo — aptkit (the run-of-show)
+# Hackathon Demo — AptKit + Studio (run-of-show)
 
-This is the book you read once front-to-back to rehearse, then run from the one-page sheets at the back of each chapter. It is built around one fact: you have **ten minutes and a buzzer**, and the room decides in the first ninety seconds whether to keep watching. Every chapter owns a slice of that clock, opens with a bar showing where it sits, and tells you exactly what to drop when you're running long.
+You have ten minutes and a room that decides in the first ninety seconds
+whether this is real. This book is the script. Read it front-to-back once
+with a timer, then hold the run sheets while you present. The whole thing is
+built around one hard rule: **finish early, with breathing room.** Going long
+is how a hackathon demo loses — the buzzer cuts you off before the close, or
+the judges stop listening at minute eleven.
 
-I've watched a hundred of these. The demo that loses buries the wow in minute eight, or spends three minutes on a title slide and a problem statement nobody asked for, or crashes live and the presenter freezes and apologizes twice. The demo that wins opens cold on the thing already working and never lets the room look away. That second one is the demo we're building for aptkit — and you have an unfair advantage: your best surface, Studio's RAG page, **runs entirely in the browser with no backend**, so the thing that's supposed to wow them physically cannot crash on stage.
+The demo is the centerpiece. Everything else has a ceiling; the demo has a
+floor. The single moment the room goes "oh" — the **money shot** — is the
+eval score (precision@1 = 1.00) landing right next to a correct, cited answer,
+with NO backend, **and it lands at ~2:30, inside the first third.**
 
 ## The whole slot on one timeline
 
-This is the shape of the ten minutes. Read it left to right; the demo owns the fat middle and the money shot lands early, inside the first third.
+Here is the entire ten minutes as one picture — every chapter, its budget,
+and where the money shot fires.
 
 ```
-  APTKIT — THE TEN-MINUTE RUN-OF-SHOW
+  THE TEN-MINUTE RUN-OF-SHOW — AptKit + Studio
 
   0:00 ┌──────────────────────────────────────────────────────┐
-       │ 01  COLD OPEN + ONE-LINER              0:00 – 1:00    │  1:00
+       │ 01  COLD OPEN + ONE-LINER                  0:00–1:00  │ 1:00
   1:00 ├──────────────────────────────────────────────────────┤
-       │ 02  THE DEMO  (centerpiece)            1:00 – 6:00    │  5:00
-       │      ★ MONEY SHOT lands by ~3:00 ★                    │
-       │        score appears next to a grounded, cited        │
-       │        answer — no backend, no cloud                  │
+       │ 02  THE DEMO (centerpiece)                 1:00–6:00  │ 5:00
+       │      ★ MONEY SHOT — scored cited answer  ~2:30        │
+       │      beat 2: replay a real agent trace               │
+       │      beat 3: the local `ask` CLI (Gemma)             │
   6:00 ├──────────────────────────────────────────────────────┤
-       │ 03  UNDER THE HOOD                     6:00 – 8:00    │  2:00
-       │      one diagram: two contracts + emulated tools     │
+       │ 03  UNDER THE HOOD — two contracts diagram 6:00–8:00  │ 2:00
   8:00 ├──────────────────────────────────────────────────────┤
-       │ 04  THE BUILD STORY                    8:00 – 8:45    │  0:45
+       │ 04  THE BUILD STORY — 16 pkgs, the hard part 8:00–8:45│ 0:45
   8:45 ├──────────────────────────────────────────────────────┤
-       │ 05  THE CLOSE + THE ASK                8:45 – 9:30    │  0:45
+       │ 05  THE CLOSE + THE ASK                    8:45–9:30  │ 0:45
   9:30 ├──────────────────────────────────────────────────────┤
-       │      buffer / breathing room           9:30 – 10:00   │  0:30
+       │     buffer / breathing room                9:30–10:00 │ 0:30
  10:00 └──────────────────────────────────────────────────────┘
 
-       06  THE Q&A  ← prep only; runs after the buzzer, never
-                      counts against the ten minutes
+       06  THE Q&A  ← prep only; runs after the clock
 ```
 
-The discipline this timeline enforces: **the demo has a floor, everything else has a ceiling.** If you're bleeding time, you cut under-the-hood, then the build story, then the close — in that order. You never cut the demo below the point where the room sees the score land next to a grounded answer. That moment is the whole presentation; protect it.
+If your real slot is shorter, scale every budget down proportionally — but
+keep the demo's share largest and keep the money shot inside the first third.
+Cut from under-the-hood, build story, and close first; never cut the demo
+below the point where the room sees the score land.
 
-## The master demo diagram — what the app does in one screen
+## The master demo diagram — what the app does
 
-This is the picture of what they're about to watch, and it recurs in chapter 02. Hold it in your head: a question goes in, retrieval pulls chunks, a local model grounds an answer, and an eval scores whether the retrieval was actually right — all rendered live on one page.
-
-```
-  WHAT THE ROOM SEES — Studio's RAG Query workspace
-
-  ┌─ UI: apps/studio (React 18 + Vite) ───────────────────────────┐
-  │  [ pick a question ▼ ]                      [ Run fixture ]    │
-  │                                                               │
-  │  Eval: Passing   Precision@1: 1.00   Recall@3: 1.00   ← ★     │
-  │  ────────────────────────────────────────────────────────    │
-  │  Answer:  "The author works as a software engineer…           │
-  │            [work.md] … flat white, oat milk … [coffee.md]"    │
-  │  Retrieved chunks:  ▓ work.md (relevant)  ▓ coffee.md (rel.)  │
-  │                     ░ stack.md                                │
-  │  Trace:  step → tool_call(search) → tool_result → step        │
-  └───────────────────────────────┬───────────────────────────────┘
-                                  │ all of this runs IN THE BROWSER
-  ┌─ In-browser engine (no server) ▼──────────────────────────────┐
-  │  keyword-hash embedder  →  InMemoryVectorStore (cosine)        │
-  │  →  search_knowledge_base tool  →  recorded Gemma responses    │
-  │  →  scorePrecisionAtK / scoreRecallAtK                         │
-  └────────────────────────────────────────────────────────────────┘
-        the same RagQueryAgent runs on a REAL local Gemma+Ollama
-        via the CLI, and on live Supabase pgvector in buffr —
-        the in-browser version just swaps in deterministic parts
-        so it can't break on stage
-```
-
-The one thing to internalize from this diagram: the page is showing a real agent loop — real `RagQueryAgent`, real `InMemoryVectorStore`, real eval scorers — wired to deterministic stand-ins (a keyword-hash embedder and recorded model responses) so the demo is repeatable. You're not faking the agent; you're making it deterministic. That distinction is what you own honestly in the build story.
-
-## The rehearsal order
-
-Three passes. Do them in order; don't skip to running the sheets cold.
+This is the one-screen picture of what you are showing. You will return to it
+in chapter 02; pin it in your head now.
 
 ```
-  FIRST PASS ───────► Read all seven chapters front-to-back. Then
-                      run the demo once, end-to-end, with a timer
-                      visible. Note where you ran long.
+  AptKit Studio — RAG Query Agent (in-browser, deterministic, no backend)
 
-  SECOND PASS ──────► Run it again holding ONLY the one-page run
-                      sheets at the back of each chapter. The book
-                      taught you the beats; now prove you can run
-                      them from the card.
+  ┌─ Browser (apps/studio) ───────────────────────────────────────────┐
+  │                                                                    │
+  │   you pick a question  ──►  [ Run fixture ]                        │
+  │                                  │                                 │
+  │            ┌─────────────────────▼─────────────────────┐          │
+  │            │ REAL retrieval pipeline (no network):      │          │
+  │            │   fake keyword-hash embedder (64-dim)      │          │
+  │            │   + InMemoryVectorStore (cosine scan)      │          │
+  │            │   + recorded Gemma responses replay loop   │          │
+  │            └─────────────────────┬─────────────────────┘          │
+  │                                  │                                 │
+  │   ┌──────────────┐   ┌───────────▼──────────┐   ┌──────────────┐  │
+  │   │ Answer        │   │ Retrieved chunks      │  │ Eval         │  │
+  │   │ (grounded +   │   │ relevant ones light   │  │ Precision@1  │  │
+  │   │  cited [doc]) │   │ up green; scores shown│  │  = 1.00  ★   │  │
+  │   └──────────────┘   └───────────────────────┘   └──────────────┘ │
+  │                                                   + live trace      │
+  └────────────────────────────────────────────────────────────────────┘
 
-  NIGHT BEFORE / ───► Read only the run sheets. Time the money shot
-  MORNING OF          specifically — say the line, click Run, watch
-                      the clock. It must land by 3:00. If it slips
-                      past 3:30, your cold open is too long; cut it.
+  ★ the money shot = that 1.00 sitting next to a correct cited answer
 ```
 
-One rehearsal rule that matters more than the others: **rehearse the IF-IT-BREAKS path too.** Once, on purpose, pretend the dev server won't start and practice opening the static GitHub Pages build instead. The recovery only works if your hands already know it.
+The point this picture makes for the room: a retrieval-quality *score* — the
+thing AI teams argue about in code review — is rendered live, next to the
+answer, in a page that cannot break on stage because it has no backend to
+fail.
 
-## Where this connects to the rest of the system
-
-This book *presents* the project. It is not the only book about it.
+## Suggested rehearsal order
 
 ```
-  THIS BOOK (rehearse-hackathon-demo) ──► SHOW the work in 10 min
-                                          a room watches a clock
+  FIRST PASS   read all 7 files in order; run the demo once
+               end-to-end with a timer. Note where you run long.
 
-  rehearse-interview-defense/ ──────────► DEFEND the work after
-                                          "how does it actually
-                                          work?" — the 8-chapter
-                                          deep walk, same code
+  SECOND PASS  run it again holding ONLY the one-page run sheets
+               at the bottom of each chapter. Time the money shot —
+               it must land by 2:30.
 
-  study-system-design/ , study-ai-       ► UNDERSTAND the work —
-  engineering/ (concept files)             the deepest follow-ups,
-                                           one file per pattern
+  NIGHT BEFORE read only the run sheets. Rehearse the cold open and
+  / MORNING OF the money-shot line out loud until they're muscle memory.
+               Open the STATIC_DEMO Pages build once so you know the
+               backup works.
 ```
 
-When a judge in Q&A pushes past demo depth — "how does the emulated tool-calling actually parse?", "how does pgvector scale?" — that's where the interview-defense book takes over. This book gets you through the ten minutes; that one gets you through the conversation after. Keep the defense book's chapter 02 (the architecture walk) and chapter 05 (the failure story) within reach for the Q&A.
+## What to have open before you start
 
-## The seven files
+- Studio dev server running: `npm run dev -w @aptkit/studio`, RAG Query Agent
+  page (route `#rag-query`). Money shot lives here.
+- A second tab on the GitHub Pages build (base `/aptkit/`) as the live backup.
+- A terminal with `npm run ask -w @aptkit/agent-rag-query` ready, IF Ollama is
+  up. If it isn't, you skip that beat — it's the first thing to cut.
+- Screenshots of a passing scored result saved locally (last-resort backup).
 
-| File | Beat | Clock | What it is |
-|------|------|-------|------------|
-| `00-overview.md` | — | whole slot | This run-of-show + the master demo diagram |
-| `01-the-cold-open.md` | Cold open | 0:00–1:00 | Open on the thing working + the one-liner |
-| `02-the-demo.md` | The demo | 1:00–6:00 | The click-path + the money shot by ~3:00 |
-| `03-under-the-hood.md` | Under the hood | 6:00–8:00 | One diagram: two contracts + emulated tools |
-| `04-the-build-story.md` | Build story | 8:00–8:45 | What shipped + the hard part cracked |
-| `05-the-close.md` | The close | 8:45–9:30 | Vision (framed as future) + the ask + last line |
-| `06-the-qa.md` | Q&A | post-buzzer | The questions judges always ask + answers |
+## How this book connects to the rest
 
-Read on. Chapter 01 is the sixty seconds that decide whether the rest of this matters.
+This book *presents* AptKit. When a judge wants the "how does it actually work"
+depth after the clock, chapter 06 (Q&A) handles the standard probes, and the
+interview-defense book in `.aipe/rehearse-interview-defense/` (if generated)
+carries the deep follow-ups. The study guides under `.aipe/study-*` are the
+substrate behind both. For this room, on this clock: pace and the demo win.

@@ -1,254 +1,239 @@
-# 04 — Consistency models and staleness
+# 04 — Consistency Models and Staleness
 
-**Industry name(s):** consistency models / CAP / strong vs eventual consistency
-/ read-your-writes / staleness. **Type:** Industry standard.
-**Status in AptKit:** ~ weak analog (the re-sent message history) + mostly
-`not yet exercised`.
+**Industry names:** read-your-writes · stale reads · eventual consistency · convergence · monotonic reads — *Industry standard.*
 
 ## Zoom out, then zoom in
 
-Consistency is about *agreement between copies of data.* AptKit has almost
-nothing here because it has almost no replicated state — there's one copy of
-everything, in one process. The honest mapping: the only "shared state" between
-your process and the provider is the conversation history, and AptKit keeps it
-consistent the brute-force way — by re-sending the whole thing every turn.
+Consistency is about *what a read sees* relative to *what was written.* The repo has
+one real instance worth studying: episodic memory written at the *end* of a turn,
+read at the *start* of future turns. That gap — write-then-later-read — is where
+staleness lives.
 
 ```
-  Zoom out — where consistency would live (mostly empty here)
+  Zoom out — where staleness can appear
 
-  ┌─ Service layer (one copy of all state, in memory) ───────────┐
-  │  messages[] ── the conversation history (re-sent each turn)   │ ← the only analog
-  └─────────────────────────────┬────────────────────────────────┘
-                               │ complete() re-sends full messages[]
-  ┌─ Provider boundary ─────────▼────────────────────────────────┐
-  │  provider holds NO state between calls (stateless per call)    │
-  └───────────────────────────────────────────────────────────────┘
-
-  no replicas · no cache · no DB → no staleness, no read-your-writes problem
+  ┌─ buffr ChatSession ─────────────────────────────────────────────────┐
+  │  ask(q):                                                             │
+  │    1. recall (search the store)  ──── READS the corpus + memory      │ ← reads here
+  │    2. agent.answer()                                                  │
+  │    3. memory.remember(turn)      ──── WRITES this turn into the store │ ← writes here
+  └──────────────────────────────┬───────────────────────────────────────┘
+                                 │ store.search / store.upsert
+  ┌─ Vector store ───────────────▼───────────────────────────────────────┐
+  │  ★ a read in step 1 of turn N+1 sees the write from step 3 of turn N  │
+  │    ONLY if the write committed first — within one process it does ★    │ ← we are here
+  └─────────────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: a **consistency model** is the contract for what a read can observe
-relative to recent writes. *Strong* (linearizable): a read always sees the
-latest write. *Eventual*: reads may see stale data, but copies converge if
-writes stop. *Read-your-writes*: you at least see your *own* recent writes.
-AptKit is trivially strongly consistent because there's only one copy of each
-datum — there's nothing to be stale relative to.
+Zoom in: a **consistency model** is the contract for "if I write X then read, do I
+see X?" The strongest is *read-your-writes* — you always see your own writes. The
+weakest useful one is *eventual consistency* — you see them *eventually*, after some
+convergence delay. aptkit is single-writer and single-store, so it gets the strong
+guarantee almost for free — but the *best-effort memory write* and the *over-fetch-
+then-filter recall* introduce two real staleness wrinkles.
 
-## Structure pass — layers, axis, seam
+## Structure pass
 
-Trace the **state axis** — "where does this datum live, and is there more than
-one copy?":
+**Layers.** Read path (recall / search) → store → write path (remember / upsert).
+
+**Axis — trace `does a read see the latest write?` across the turn boundary.**
 
 ```
-  "how many copies of this datum exist?" — down the layers
+  Axis — "read-your-writes?" — within a turn vs across turns vs across sessions
 
-  ┌────────────────────────────────────────────┐
-  │ in-memory state (messages, toolCalls, trace)│ → ONE copy. trivially consistent.
-  └────────────────────┬───────────────────────┘
-      ┌────────────────▼─────────────────────────┐
-      │ filesystem artifacts (artifacts/replays/) │ → ONE copy, written once,
-      │                                            │   read-only after. no convergence
-      └────────────────┬───────────────────────────┘
-          ┌────────────▼─────────────────────────┐
-          │ provider conversation state           │ → ZERO copies held remotely;
-          │                                       │   re-sent each turn (stateless)
-          └───────────────────────────────────────┘
+  ┌─ within one ask() call ───────────────────┐
+  │  remember() is AWAITED before ask returns  │  → write committed, but...
+  └──────────────────────┬──────────────────────┘
+       ┌─────────────────▼────────────────────────┐
+       │ across turns, same session                │  → next recall SEES it ✓
+       │ (same pool, same store)                   │     (read-your-writes holds)
+       └─────────────────┬────────────────────────┘
+            ┌────────────▼──────────────────────────┐
+            │ if remember() FAILED (caught/swallowed)│  → next recall MISSES it ✗
+            └─────────────────────────────────────────┘     (silent staleness)
 ```
 
-There's no seam where copies diverge, because there are no copies. The axis
-never flips — that's the finding. The provider being stateless-per-call (you
-re-send `messages` every turn) is what *eliminates* the consistency problem at
-the boundary.
+**Seam.** The consistency guarantee flips on whether `remember()` *succeeded*.
+Because the failure is swallowed (`session.ts:64-69`), a dropped memory creates a
+*permanent* stale gap — future recalls behave as if that turn never happened. That's
+the only real consistency hazard in the repo, and it's a deliberate trade.
 
 ## How it works
 
-### Move 1 — the mental model: CAP, and why AptKit doesn't pay its tax
+### Move 1 — the mental model: a read is a snapshot of whatever committed before it
 
-You know the shape from a cache: the cache and the database are two copies of the
-same data, and they can disagree (stale cache). CAP says: when the network
-*partitions* (the two copies can't talk), you must choose — stay **C**onsistent
-(refuse reads/writes until they reconnect) or stay **A**vailable (serve possibly
-stale data). You can't have both during a partition.
-
-```
-  CAP — the forced choice during a partition (general)
-
-  network partition splits the copies:
-       copy A ──╳── copy B   (can't sync)
-
-       choose C: refuse to serve → consistent but unavailable
-       choose A: serve anyway    → available but possibly stale
-
-  AptKit pays NO CAP tax: one copy → no partition between copies → no choice
-```
-
-AptKit never faces this choice because it never has two copies of the same datum
-to keep in sync. CAP is a tax on *replication*; with no replication, the bill is
-zero.
-
-### Move 2 — the one analog, and the absences
-
-**The analog: re-sending history as "consistency by resend."** The provider
-holds no memory of your conversation between `complete()` calls. So how does turn
-3 know about turn 1? You re-send the entire `messages` array every turn. There's
-no risk of the provider's copy going stale relative to yours because the provider
-*has no copy* — it gets a fresh, complete snapshot each call.
+You already know this from a database read after a form submit: if the `INSERT`
+committed, the next `SELECT` sees it; if the insert is still in flight, the select
+might not. Memory recall is the same: it sees whatever `remember()` finished writing
+before the recall's `search()` ran.
 
 ```
-  Consistency by resend — the stateless-per-call trick
+  Read-your-writes — the read sees writes that committed before it
 
-  turn 1: complete([m0])             provider sees: [m0]
-  turn 2: complete([m0, m1, r1])     provider sees: [m0, m1, r1]   ← full resend
-  turn 3: complete([m0, m1, r1, ...]) provider sees: everything    ← never stale
+  turn N:    ... answer ... ──► remember(turn N)  ──[commit]──┐
+                                                              │
+  turn N+1:  recall(q) ──► search() ─────────────────────────┴──► SEES turn N ✓
+                            (because the upsert committed first)
 
-  cost: bandwidth grows each turn. benefit: zero consistency bugs.
+  but if remember(turn N) threw and was swallowed:
+  turn N+1:  recall(q) ──► search() ───────────────────────────► turn N MISSING ✗
+                            (no error surfaced — silently stale)
 ```
 
-This is a real (if humble) distributed-systems choice: trade bandwidth for the
-total elimination of distributed state. It's why there's no session affinity, no
-sticky routing, no "did the provider remember my context" problem.
+### Move 2 — walking the mechanism
 
-**The one real durability seam (new): memory's injected store.** `@aptkit/memory`
-is the first place a piece of state's *durability* is a choice rather than a
-constant. The same `remember`/`recall` logic
-(`packages/memory/src/conversation-memory.ts:73-107`) runs over an ephemeral
-`InMemoryVectorStore` (dies on exit) or a durable `PgVectorStore` (survives
-restarts, in `buffr`). With the ephemeral store the consistency story is
-unchanged — one copy, dies with the process. With the *durable* store, a new
-hazard appears that isn't a stale-read problem but an **id-collision** one:
+**Step 1 — the write is awaited, so within a session you get read-your-writes.**
+buffr writes the turn into the same store the next recall reads:
 
-```
-  The counter-vs-durable-store mismatch (inference)
-
-  in-process counter Map      durable store (PgVectorStore, in buffr)
-  (resets to 0 on restart)     (rows for convId 'c1' already persisted)
-        │                              │
-  restart →  counter['c1'] = 0         rows: memory:c1:0, memory:c1:1 exist
-        │                              │
-  resume 'c1', remember() ──► id = memory:c1:0  ──► UPSERT collides → overwrites
-                                                      the original turn 0 silently
+```ts
+// buffr/src/session.ts:60-70
+async ask(question: string): Promise<string> {
+  await persistMessage(pool, conversationId, 'user', question);
+  const answer = await agent.answer(question);   // ← internally recalls from the store
+  await trace.flush();
+  try {
+    await memory.remember({ conversationId, question, answer });  // ← AWAITED write
+  } catch {
+    // swallow: memory is best-effort, the turn already succeeded   ← the staleness source
+  }
+  return answer;
+}
 ```
 
-The counter (`conversation-memory.ts:71,78-79`) is **ephemeral state assuming a
-single, never-restarted process**: ids are unique only because one in-process
-`Map` hands them out monotonically. Resume the same conversation against a store
-that *remembers* the old rows and the id-generation invariant breaks — the new
-turn 0 overwrites the persisted turn 0. **This is an inference, not an observed
-bug: aptkit only ever wires the in-memory store, where counter and rows die
-together, so the mismatch can't occur here. It becomes real only in `buffr`, the
-moment a durable store is paired with a resumable conversationId across a
-restart.** The fix is to derive `n` from the store (count existing rows for the
-conversation) or use a content/uuid id instead of an in-process counter — see
-`09` R7.
+Because `remember` is `await`ed and the store is the same object held across turns,
+turn N+1's recall *will* see turn N's exchange — *if the write succeeded*. That's
+genuine read-your-writes within a session. The single store and single writer make
+it nearly automatic.
 
-**The absences (`not yet exercised`):**
+**Step 2 — the staleness wrinkle: a swallowed write is permanently stale.** The
+`catch {}` is the deliberate trade. The reasoning (in the comment) is sound: a
+memory write failing must not cost the user the answer they already have. But the
+consequence is honest staleness — if the Ollama embed call for `remember` fails (no
+timeout, could even hang then get aborted), that turn never enters memory, and *no
+future recall will ever see it.* There's no retry, no reconciliation, no dead-letter.
+It's at-most-once memory, which means eventually-incomplete memory.
 
-- **Stale reads / eventual consistency:** none. *Trigger: a read replica or a
-  cache in front of any data source.*
-- **Read-your-writes:** none. *Trigger: writing to a primary and reading from a
-  replica that lags.*
-- **Convergence (CRDTs, anti-entropy):** none. *Trigger: two writable copies of
-  the same state (e.g. offline-first sync — which Rein's `buffr`/`dryrun`
-  projects exercise, but AptKit does not).*
+**Step 3 — recall over-fetches because the store has no metadata filter.** The
+second wrinkle is about *reading the right rows*, not staleness per se. Memory and
+documents share one collection (tagged by `meta.kind`), and the `VectorStore`
+contract has no metadata predicate — so recall asks for *more* than it needs, then
+filters client-side:
+
+```
+  // @aptkit/memory recall: over-fetch then filter by kind
+  recall(query, k):
+    hits = store.search(embed(query), k * SOME_FACTOR)   // ← over-fetch
+    return hits.filter(h => h.meta.kind === 'memory').slice(0, k)  // ← client-side filter
+```
+
+Why this matters for consistency: if documents heavily outrank memory rows for a
+query, the over-fetch window might not contain `k` memory rows even though they
+exist — a *read* that misses present data. That's not staleness (the data is
+current); it's an *incomplete read* caused by ranking + a missing server-side
+filter. Same family of bug: the read doesn't reflect the full truth in the store.
+
+### Move 2.5 — what's strong vs what's `not yet exercised`
+
+```
+  Comparison — consistency guarantees here vs the ones that don't apply
+
+  guarantee                  status in this repo
+  ─────────────────────────  ────────────────────────────────────────────
+  read-your-writes           HOLDS within a session (single writer/store) ✓
+                             BREAKS silently if remember() is swallowed   ⚠
+  monotonic reads            trivially holds — one store, no replicas       ✓
+  eventual consistency       N/A — there's nothing to converge (one copy)   —
+  stale REPLICA reads        not yet exercised — no read replica            —
+  cross-region convergence   not yet exercised — single region              —
+```
+
+The classic distributed staleness — "I read from a replica that lags the primary by
+200ms" — *cannot happen here*, because there is one Postgres and one in-memory store.
+Single-copy data is automatically consistent. Staleness only enters through the
+*application-level* gap (swallowed write, incomplete read), not through replication
+lag. That's the honest frame: aptkit's consistency hazards are in the app logic, not
+the storage topology.
 
 ### Move 3 — the principle
 
-**Consistency is a tax on replication; if you don't replicate, you don't pay
-it.** The strongest consistency guarantee is the one you get for free by having a
-single copy. AptKit's design — one process, one copy, stateless provider calls —
-is the cheapest possible consistency story, and it's correct precisely because
-the workload doesn't need replication.
+Strong consistency is cheap when you have one copy of the data and one writer — you
+get read-your-writes almost for free. It gets expensive the moment you add a second
+copy (a replica, a cache, a second region), because now a read can hit a copy that
+hasn't caught up. aptkit pays none of that cost because it has one copy. The lesson:
+*don't add replicas for "scale" before you need them* — each one converts a free
+strong guarantee into a staleness problem you now have to reason about. Know which
+guarantee you're trading away before you add the copy.
 
 ## Primary diagram
 
 ```
-  Consistency landscape — AptKit's position
+  Consistency in aptkit — single writer, single store, two app-level wrinkles
 
-  STRONG ──────────────────────────────────────── EVENTUAL
-   one copy                                       many copies,
-   always current                                 converge later
-      ▲                                                ▲
-      │                                                │
-   AptKit lives HERE                            not yet exercised
-   (single copy of all state;                  (trigger: any replica,
-    provider stateless per call)                cache, or 2nd writer)
+  ┌─ buffr ChatSession (single writer) ─────────────────────────────────┐
+  │  turn N:   answer ──► await remember(N) ──[commit OR swallow]──┐      │
+  │  turn N+1: recall(q) ──► search() ────────────────────────────┘      │
+  └──────────────────────────────┬───────────────────────────────────────┘
+                                 │
+  ┌─ single vector store (no replicas) ──▼───────────────────────────────┐
+  │  read-your-writes HOLDS ✓ (one copy, one writer)                     │
+  │  wrinkle 1: swallowed remember() → that turn permanently stale ⚠      │
+  │  wrinkle 2: over-fetch+filter → present memory rows can be missed ⚠   │
+  └─────────────────────────────────────────────────────────────────────┘
+
+  NOT present: replica lag, eventual consistency, cross-region convergence
 ```
-
-## Implementation in codebase
-
-**Use cases.** Every multi-turn agent run re-sends history; the consistency
-"mechanism" is just the loop pushing onto `messages` and passing the full array.
-
-**Consistency by resend, in the loop.**
-
-```
-  packages/runtime/src/run-agent-loop.ts  (lines 94, 124, 189, 103-109)
-
-  const messages = [{ role: 'user', content: userPrompt }];  ← the single copy of state
-  ...
-  messages.push({ role: 'assistant', content: response.content });  ← append turn result
-  ...
-  messages.push({ role: 'user', content: toolResults });            ← append tool results
-  ...
-  const response = await model.complete({ system, messages, ... }); ← re-send the WHOLE array
-       │
-       └─ the provider gets the complete history every call. there's no remote
-          session to go stale — the full state ships on every request. that's the
-          entire consistency story, and it's why there are zero staleness bugs.
-```
-
-**`not yet exercised`:** no cache, no replica, no second datastore anywhere in
-the repo. Artifacts under `artifacts/replays/` are write-once / read-only — they
-never need convergence.
 
 ## Elaborate
 
-CAP (Brewer's conjecture, proven by Gilbert & Lynch) is the most-cited and
-most-misused result in the field. The nuance worth knowing: it only forces a
-choice *during a partition* — when the network is healthy, you can have both C
-and A. The PACELC extension adds: even without a partition (Else), you trade
-Latency vs Consistency. AptKit escapes both because it has no replicas to
-partition and no replica reads to slow down. Rein's offline-first projects
-(`buffr`'s SQLite-primary-with-Supabase-mirror, `dryrun`'s GitHub-as-backend)
-are where she's actually *touched* convergence — AptKit deliberately doesn't.
+The consistency-model hierarchy (linearizable → sequential → causal → eventual) was
+formalized to answer one question for *replicated* systems: when copies disagree,
+what's the weakest contract that's still useful? aptkit sits *above* that entire
+hierarchy because it isn't replicated — it's effectively linearizable by virtue of
+having one copy. That's worth saying plainly in an interview: most "consistency"
+questions assume replication, and the honest answer for this repo is "I don't have
+that problem yet; my staleness is application-level, not replication-level."
+
+The over-fetch-then-filter pattern is a *consistency-vs-capability* trade forced by
+the contract: keeping `VectorStore` vendor-neutral (no metadata predicate) means the
+filter moves to the client, which means reads can be incomplete under adversarial
+ranking. The fix — a metadata filter in the contract, or a dedicated memory
+collection — would attach the moment recall completeness matters more than contract
+minimalism.
 
 ## Interview defense
 
 **Q: "What's your consistency model?"**
-
-"Single-copy strong consistency, for free — there's exactly one copy of every
-datum, in one process. The provider is stateless per call; we re-send the full
-conversation history every turn, so there's no remote session to go stale. We
-pay no CAP tax because we don't replicate."
+"Single writer, single store, so read-your-writes holds for free — turn N+1's recall
+sees turn N's memory because the write is awaited and the store is the same object.
+There's no replication, so no replica-lag staleness, no eventual consistency to
+reason about. My two real wrinkles are both application-level: a swallowed
+`remember()` makes a turn permanently invisible to future recalls, and the over-
+fetch-then-filter recall can miss present memory rows if documents outrank them.
+Neither is a topology problem; both are logic I chose for good reasons."
 
 ```
-  one copy → no partition between copies → no C-vs-A choice → strong, free
+  sketch
+
+  ONE store, ONE writer → read-your-writes free ✓
+  wrinkle: remember() catch{} → that turn silently stale forever ⚠
+  wrinkle: search(k*f) then filter kind → present rows can fall outside the window ⚠
 ```
 
-**Q: "When would you need eventual consistency here?"**
+**Q: "When would staleness actually bite you?"** — the load-bearing answer:
+"Two ways. One, if I add a read replica behind `PgVectorStore.search` for scale —
+then a recall could hit a replica that hasn't applied the latest `remember`, and
+read-your-writes breaks at the topology level. Two, today, if the embed call for
+`remember` fails — it's swallowed, so that memory is gone with no retry. The second
+is real now; the first is `not yet exercised` but it's the first thing replication
+would cost me."
 
-"The moment a second copy of any state appears — a read replica, a cache, an
-offline client. None exist today. If I added a hosted artifact store with a read
-replica, I'd inherit read-your-writes as a real concern. That's the trigger."
-
-## Validate
-
-1. **Reconstruct:** State the CAP choice and explain why AptKit never has to make
-   it.
-2. **Explain:** How does turn 3 of an agent run "know" about turn 1 when the
-   provider holds no state? Cite the mechanism (`run-agent-loop.ts:94,124,189`).
-3. **Apply:** You add a Redis cache for `WorkspaceDescriptor` lookups. Which
-   consistency problem appears, and what's the cheapest acceptable model?
-4. **Defend:** Argue that "consistency by resend" is the right call here, naming
-   the cost it pays (`run-agent-loop.ts:103-109`).
-5. **Apply (new):** `@aptkit/memory`'s id counter resets on restart
-   (`conversation-memory.ts:71`). Explain why that's harmless with the in-memory
-   store but an id-collision hazard once a durable `PgVectorStore` resumes the
-   same conversation post-restart. What's the cheapest fix?
+*Anchor:* read-your-writes holds because of one store + awaited write; the swallowed
+`remember()` (`session.ts:67`) is the one real staleness source.
 
 ## See also
 
-- `01-distributed-system-map.md` — state ownership across the map.
-- `05-replication-partitioning-and-quorums.md` — what you'd add to get multiple
-  copies (and the consistency cost that follows).
-- `study-database-systems` — datastore-local consistency (AptKit has none).
+- `03-idempotency-deduplication-and-delivery-semantics.md` — the at-most-once memory write
+- `05-replication-partitioning-and-quorums.md` — where replica-lag staleness would enter
+- `07-clocks-coordination-and-leadership.md` — ordering vs consistency
+- **study-database-systems** — isolation levels, MVCC, snapshot reads inside Postgres
+```

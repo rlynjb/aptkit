@@ -1,176 +1,162 @@
-# Chapter 1 — The cold open   (0:00–1:00, 1 minute)
+# Chapter 01 — The Cold Open + One-Liner   (0:00–1:00, 1 min)
 
 ## Opening hook
 
-Sixty seconds. That's all the cold open gets, and it's the most expensive minute you have, because it's the one where the room is still deciding whether to look up from their phones. The single most common way to waste it is to spend it on yourself — "Hi, I'm Rein, I've been working on a project called aptkit, it's a TypeScript toolkit, let me give you some background…" By the time you reach a sentence that matters, the room has filed you under "another tooling project" and stopped listening.
+You get sixty seconds before the room decides whether to keep watching. The
+single most common way to waste them is a title slide and "hi, I'm Rein, today
+I'm going to show you a project called AptKit that does..." — by the time you
+reach the verb, three judges are reading their phones. Don't introduce
+yourself. Don't explain what RAG is. Open on the thing already half-working and
+say the one sentence that frames everything that follows.
 
-Don't do that. Open on the thing already working. The first frame the room sees should be Studio sitting there with a grounded, cited, *scored* answer on screen — the destination, shown up front, before you've explained anything. Then you say one sentence that names what they're looking at. You earn the next nine minutes in this one, and you earn them by showing, not by introducing.
+You have a real advantage most demos don't: your money shot is two clicks away
+and it can't crash. So the cold open's only job is to make the room *want* to
+see the score land. Point at the screen, name the tension AI teams actually
+feel — "is the answer grounded, and can I prove it?" — and promise to show it
+proven, live, in the next ninety seconds.
 
 ## The time-budget bar
 
-You own the first minute. Inside it you must get the room looking at the screen and land one sentence they could repeat.
-
 ```
   ┌──────────────────────────────────────────────────────────┐
-  │ ▓▓▓▓▓░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ │
-  │ 0:00 ─── 1:00 ──────────────────────────────────── 10:00  │
-  │        COLD OPEN — you own 0:00 to 1:00 (1 min)           │
+  │ ▓▓▓▓▓░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ │
+  │ 0:00 ─── 1:00 ─────────────────────────────────────── 10:00 │
+  │     THE COLD OPEN — you own 0:00 to 1:00 (1 min)            │
   └──────────────────────────────────────────────────────────┘
 ```
 
-## The chapter-opening diagram — the attention curve
+In this minute you must: land the hook, say the one-liner, and have the RAG
+Query Agent page already on screen so the demo starts in motion.
 
-The reason the cold open is built this way is the shape of a room's attention over ten minutes. It is highest in the first fifteen seconds and it decays unless you spend something to hold it. Here's the curve, and where your beats have to land on it.
+## The chapter-opening diagram — the room's attention curve
 
-```
-  ROOM ATTENTION OVER THE SLOT — spend the opening, bank the rest
-
-  attention
-    high │█
-         │█▓
-         │█▓▓                    ★ money shot re-spikes it
-         │█▓▓░                  ╱│
-         │█▓▓░░░              ╱  │
-         │█▓▓░░░░░░       ╱╲╱    │
-    low  │█▓▓░░░░░░░░░░╱        ░░░░░░░░░░░░░░░
-         └┬───┬───────┬─────────┬──────────────► time
-          0  0:15    1:00      3:00           10:00
-          │   │        │         │
-          │   │        │         └─ demo keeps it up here
-          │   │        └─ one-liner banks attention into the demo
-          │   └─ THE THING WORKING on screen, no title slide
-          └─ the 15s that decide everything — open IN MOTION
-```
-
-The takeaway from that curve: you cannot earn attention back as cheaply as you can lose it at second one. So the cold open spends the screen — the working result — to bank attention that the demo and the money shot then re-spike. Open flat with a title slide and you start the whole talk climbing out of a hole.
-
-## The body — the two beats in order
-
-The cold open is two beats and nothing else: the hook (the thing working, on screen) and the one-liner (the sentence they repeat). No agenda slide, no "a little about me," no problem statement that runs sixty seconds on its own.
-
-### Beat 1 — the hook (0:00–0:25): open on the result
-
-Before you say a word, Studio is already on screen showing a completed run — the default question answered, the chunks lit up, the score reading 1.00. You did the run during setup so the room's first frame is the destination.
+This is what you are managing in the first minute: a room's attention spikes
+when something moves on screen and decays through any sentence that sounds like
+setup. The cold open spends the spike, it doesn't waste it.
 
 ```
-  SHOW (on screen)                      SAY (out of your mouth)
-  ──────────────────────────────        ──────────────────────────────────
-  Studio's RAG page, already            "This is a question — 'what does the
-  showing a finished run: the           author do for work, and how do they
-  answer with [work.md] and             take their coffee' — answered by a
-  [coffee.md] citations, the            language model running with no cloud
-  chunks highlighted, the metrics       behind it. And the number up top is
-  row reading Precision@1: 1.00         my system checking whether the answer
-                                        was actually grounded in the right
-                                        notes — live."
+  ATTENTION over the first 90 seconds
+
+  high │      ★ (you open ON the page, mid-motion)
+       │     ╱ ╲                                  ╱── money shot (ch02)
+       │    ╱   ╲___                          ___╱
+  att. │   ╱        ╲___ one-liner lands ___╱
+       │  ╱             ╲________________╱
+  low  │ ╱   ← title slide + self-intro would live here, decaying
+       └──────────────────────────────────────────────────────►
+        0:00      0:20        0:40         1:00          time
+
+  rule: never spend the opening spike on setup the room doesn't need yet
 ```
 
-Notice what the SAY track does and doesn't do. It does not say "here you can see the Studio interface, and on the left we have the answer panel." That narrates the screen; the room can see the screen. It speaks the *value*: a real answer, no cloud, and a number that says the answer is trustworthy. The screen does the showing; your mouth does the meaning.
+The takeaway from the curve: your first words ride the spike from the page
+already being on screen. The one-liner lands while attention is still high,
+and you hand straight to the demo before it can decay.
 
-### Beat 2 — the one-liner (0:25–1:00): name it in one sentence
+## The body — the two beats
 
-Now, with the working thing on screen, you drop the one sentence that tells them what category to put this in. The shape is "X is a Y that does Z for W." Yours:
+### Beat 1 — the hook (0:00–0:25)
 
-```
-  ┃ "aptkit is a local-first agent toolkit that runs a whole
-  ┃  RAG agent on your laptop with no cloud — and shows you,
-  ┃  visually, whether the answer was actually grounded."
-```
-
-Then one breath of context — your second sentence, no more — that says why this is your project to be showing:
+Open with Studio already on the RAG Query Agent page (route `#rag-query`),
+question selected, nothing run yet. Your first sentence is about the *problem
+the room recognizes*, not about you.
 
 ```
-  ┃ "I've shipped RAG before on the cloud with GPT-4. This time
-  ┃  I built the whole thing from the contracts up and ran a
-  ┃  local model I had to teach to call tools."
+  SHOW (on screen)                 SAY (out loud)
+  ───────────────────────────      ──────────────────────────────────
+  Studio, RAG Query Agent page,    "Every team shipping an AI feature
+  question loaded, the Eval        argues about the same thing: is the
+  metric reading 'Pending'         answer actually grounded in the data,
+                                   or is the model making it up — and can
+                                   you prove it in a number?"
+  hover the 'Precision@1'          "I built the proof. Watch this score."
+  metric (still Pending)
 ```
 
-That's it. That second line is doing quiet work: it tells the judges this isn't your first RAG system, and it plants "a local model I had to teach to call tools" — the hook you'll pay off in under-the-hood. Don't explain it now. Drop it and move to the demo.
+### Beat 2 — the one-liner (0:25–0:55)
 
-#### Strong vs weak — the open
-
-This is the failure mode worth teaching against, because nearly everyone defaults to the weak version.
+Now name what AptKit is in one sentence, in the "X is a Y that does Z for W"
+shape. Keep it concrete — a toolkit, not a platform.
 
 ```
-┌──────────────────────────────┬──────────────────────────────┐
-│ WEAK OPEN                    │ STRONG OPEN                  │
-├──────────────────────────────┼──────────────────────────────┤
-│ Title slide: "aptkit — an    │ Studio on screen, a grounded │
-│ agent toolkit." You: "Hi,    │ scored answer already there. │
-│ I'm Rein. So, agents are     │ You: "This answer came from  │
-│ really hot right now, and    │ a model on a laptop, no      │
-│ I wanted to explore building │ cloud — and that number is   │
-│ a toolkit for them. Let me   │ my system proving it's        │
-│ walk you through the         │ grounded." Then the one-liner.│
-│ architecture first…"         │                              │
-├──────────────────────────────┼──────────────────────────────┤
-│ Why it's weak:               │ Why it works:                │
-│ Forty seconds before         │ The room sees the payoff at  │
-│ anything happens. The room   │ second one. The one-liner    │
-│ has heard "agents are hot"   │ lands AFTER they care, so it │
-│ a dozen times today. You're  │ sticks. You've spent the     │
-│ climbing out of a hole.      │ screen to bank attention.    │
-└──────────────────────────────┴──────────────────────────────┘
+  ┃ "AptKit is a TypeScript toolkit that packages the reusable
+  ┃  parts of an AI agent — the agent loop, the providers, the
+  ┃  RAG pipeline — so you can build a grounded, evaluated agent
+  ┃  without rebuilding the plumbing every time."
 ```
+
+Then point the room straight at what they're about to see, so the demo opens
+with momentum already built:
+
+```
+  ┃ "And the whole retrieval pipeline runs right here in the
+  ┃  browser — no backend — so in about a minute you'll watch a
+  ┃  real eval score land next to a cited answer."
+```
+
+That's the handoff. You stop talking about it and click `Run fixture`.
+
+### The strong-vs-weak open
+
+The contrast that decides this minute:
+
+```
+  WEAK open                          STRONG open
+  ─────────────────────────────      ─────────────────────────────────
+  "Hi, I'm Rein. So, AI is a big     Studio already on screen; first
+  space right now, and one of the    words name the tension the room
+  hard problems is retrieval. Let    feels: "is it grounded, can you
+  me first explain what RAG is..."   prove it?" — then the one-liner.
+  → 40 seconds gone, nothing moved   → page is live, room is leaning in
+```
+
+The weak open buries the project behind a definition the room already knows.
+The strong open spends the attention spike on the screen and the stakes.
 
 ## The IF-IT-BREAKS box
 
-The cold open shows a result on screen, so it has a failure mode: the page isn't showing a finished run when you start talking. Here's the recovery — and the reason it's nearly free is that this page is deterministic.
-
 ```
-╔══════════════════════════════════════════════════════════════╗
-║ IF IT BREAKS — the opening frame isn't there                 ║
-║                                                              ║
-║  The page is blank / shows "No fixture run yet" when you      ║
-║  start →  Keep talking, hit Run fixture once as you say the   ║
-║  hook. It's deterministic and in-browser; it completes in     ║
-║  well under a second. Say: "let me run it live for you" and   ║
-║  let the result land ON the one-liner — that's an even        ║
-║  stronger open than a pre-loaded screen.                      ║
-║                                                              ║
-║  The whole dev server is dead → open the static GitHub Pages  ║
-║  build (the STATIC_DEMO fixture-only deploy) on your phone or ║
-║  a backup tab and run the same fixture there. Same page,      ║
-║  same result, no local server needed.                        ║
-║                                                              ║
-║  Never open with an apology. No "sorry, let me get this up."  ║
-║  The room reads confidence off your first ten seconds.        ║
-╚══════════════════════════════════════════════════════════════╝
+╔══════════════════════════════════════════════════════════════════╗
+║ IF IT BREAKS                                                       ║
+║ The Studio page won't load when you go to open cold → don't        ║
+║ open cold on a blank screen. Open cold on the SAY line instead:    ║
+║ say the grounded/prove-it hook and the one-liner from memory       ║
+║ while you switch to the GitHub Pages tab (base /aptkit/). The      ║
+║ words carry the first 30 seconds with no screen at all. Never      ║
+║ apologize twice; keep moving toward the score.                     ║
+╚══════════════════════════════════════════════════════════════════╝
 ```
 
 ## The "tighten it" treatment
 
-If a previous presenter ran long and the organizer is waving you to start, drop the second sentence of the one-liner — the AdvntrCue/growth-arc line. Keep the hook and the core one-liner. The floor you must not cut below: **the room sees a working, scored answer on screen, and hears one sentence naming what aptkit is.** Below that you haven't opened, you've just started talking.
+If you're already behind before you start (the slot ran short, the prior
+presenter ate your setup time), drop the second one-liner sentence — the
+"runs in the browser, no backend" promise — and let the demo prove it instead
+of pre-announcing it. **Floor: you must still say the core one-liner.** The
+room needs to know what AptKit *is* before they watch it work, or the money
+shot lands without a frame.
 
-## One-page run sheet — COLD OPEN
+## The one-page run sheet
 
 ```
-  COLD OPEN          0:00 – 1:00          (no money shot here)
-
-  BEFORE YOU SPEAK
-    • Studio's RAG page is up, default fixture already RUN —
-      grounded answer + citations + Precision@1: 1.00 on screen
-
-  SAY, IN ORDER
-    1. "This is a question answered by a model running with no
-        cloud — and that number up top is my system checking the
-        answer was actually grounded. Live."
-    2. THE ONE-LINER (nail it):
-       "aptkit is a local-first agent toolkit that runs a whole
-        RAG agent on your laptop with no cloud — and shows you,
-        visually, whether the answer was actually grounded."
-    3. "I've shipped cloud RAG before. This time I built it from
-        the contracts up and ran a local model I taught to call
-        tools."  ← plants the under-the-hood hook
-
-  IF IT BREAKS
-    Blank page → hit Run live on the hook line (it's instant).
-    Server dead → open the static GitHub Pages build.
-    Never apologize.
-
-  TIGHTEN IT
-    Drop sentence 3 (the growth-arc line). Floor: working scored
-    answer on screen + one sentence naming aptkit.
+  ┌─ COLD OPEN — 0:00 to 1:00 ───────────────────────────────────────┐
+  │ MONEY SHOT timing: not here — it lands in ch02 at ~2:30           │
+  │                                                                   │
+  │ SAY, in order:                                                    │
+  │   1. hook: "every team argues about the same thing — is the       │
+  │      answer grounded, and can you prove it in a number?"          │
+  │   2. "I built the proof. Watch this score."                       │
+  │   3. one-liner: "AptKit is a TypeScript toolkit that packages     │
+  │      the reusable parts of an AI agent..."                        │
+  │   4. handoff: "...the whole pipeline runs in the browser, no      │
+  │      backend — in a minute you'll see a real score land."         │
+  │                                                                   │
+  │ NAIL THIS LINE:                                                   │
+  │   "I built the proof. Watch this score."                          │
+  │                                                                   │
+  │ IF IT BREAKS: open on the SAY line, not the screen; switch to     │
+  │   the Pages tab while you talk.                                   │
+  │ TIGHTEN: drop the "no backend" promise; let the demo prove it.    │
+  │   Floor: still say the core one-liner.                            │
+  └───────────────────────────────────────────────────────────────────┘
 ```
-
-Next: the demo. This is the chapter that wins or loses the slot — five minutes, and the money shot has to land by 3:00.

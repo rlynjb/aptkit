@@ -1,275 +1,148 @@
-# 01 — Chains vs Agents
+# Chains vs Agents — the boundary
 
-*Chain / agent boundary — Industry standard (LangChain coined "chain"; the
-chain-vs-agent split is now language-agnostic vocabulary).*
+**Industry standard.** "Workflow vs agent," "static chain vs autonomous loop." Type label: pattern boundary.
 
 ## Zoom out, then zoom in
 
-Before you decide *what* shape an LLM workflow takes, look at where that
-decision sits in AptKit and what it constrains downstream.
+Before any reasoning pattern, the first question: is there a loop at all? Here's where that boundary sits in aptkit.
 
 ```
-  Where the chain/agent decision sits
+  Zoom out — the control-flow boundary in aptkit
 
-  ┌─ App / Studio (apps/studio) ─────────────────────────────┐
-  │  one button click = one capability run                   │
-  └───────────────────────────┬──────────────────────────────┘
-                              ▼
-  ┌─ Capability (packages/agents/*) ─────────────────────────┐
-  │  scan() / investigate() / propose() / answer()           │
-  │  ★ CHAIN-OR-AGENT? you choose here, once, per capability ★│ ← we are here
-  └───────────────────────────┬──────────────────────────────┘
-                              ▼
-  ┌─ Kernel (packages/runtime/run-agent-loop.ts) ────────────┐
-  │  the loop that runs only because the answer was "agent"  │
-  └───────────────────────────┬──────────────────────────────┘
-                              ▼
-  ┌─ Tools (packages/tools) ─────────────────────────────────┐
-  │  analytics queries the loop fires on demand              │
-  └──────────────────────────────────────────────────────────┘
+  ┌─ Caller layer (a capability's public method) ────────┐
+  │  RagQueryAgent.answer()   RecommendationAgent.propose│
+  │  classifyIntent()  ← a CHAIN step (one call, no loop)│
+  └───────────────────────────┬──────────────────────────┘
+                              │ hands a system prompt + tools
+  ┌─ Loop layer ──────────────▼──────────────────────────┐
+  │  ★ runAgentLoop ★  ← the AGENT: model picks next move │ ← we are here
+  │  run-agent-loop.ts:76                                 │
+  └───────────────────────────┬──────────────────────────┘
+                              │ emits tool-call intent
+  ┌─ Tool layer ──────────────▼──────────────────────────┐
+  │  ToolRegistry.callTool — the harness runs it          │
+  └───────────────────────────────────────────────────────┘
 ```
 
-That one decision — chain or agent — is the most consequential architectural
-choice in the whole stack, and it's made implicitly. Here's the thing you
-already know from frontend, restated: a **chain is a `.then()` chain you wrote
-by hand.** You decided, at code-authoring time, "fetch the user, *then* fetch
-their orders, *then* render." Three steps. Always three. The number of steps is
-a fact about your *code*, not about the *data*. An **agent is a `while` loop
-where the model decides the next step each iteration**, and crucially *decides
-when to stop.* You did not write the step count. You wrote the *budget*. The
-model spends it.
-
-The reason this matters for AptKit: when you investigate why conversion dropped,
-you don't know in advance whether the answer takes one query or five. Maybe the
-first query shows it's mobile-only and you're done. Maybe it's a campaign that
-ended, and you need three more queries to confirm. The step count *depends on
-what the model finds.* You cannot write that as a `.then()` chain without
-writing every branch. So AptKit chose agents.
+The distinction is structural. In a **chain**, you the engineer wrote the steps; the model fills a slot but never chooses what comes next. In an **agent**, the model writes the steps at runtime — it decides which tool to call and when to stop. aptkit has both, and the cleanest way to see the line is `classifyIntent` (a chain) calling into `runAgentLoop` (an agent).
 
 ## Structure pass
 
-Trace the **control axis** — "who decides the next step" — down the layers.
+**Layers:** caller → loop → tool. **Axis to trace: who decides control flow?** Hold that one question constant and watch the answer flip as you descend.
 
 ```
-  The control axis: who picks the next step
+  "who decides control flow?" — traced down aptkit's layers
 
-  Layer              Who decides "what runs next"      Step count known when?
-  ─────────────────  ────────────────────────────────  ──────────────────────
-  Chain (hand-coded) YOU, at author time                compile time   ← fixed
-  ─ ─ ─ ─ ─ ─ ─ ─ ─  ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─  ─ ─ ─ ─ ─ ─ ─ ─ ◄ SEAM
-  Agent loop         THE MODEL, each turn               runtime         ← variable
+  ┌───────────────────────────────────────┐
+  │ caller: classifyIntent (query agent)  │  → CODE decides (one call,
+  │ query/src/intent.ts:13                │     fixed: classify then route)
+  └───────────────────────────────────────┘
+      ┌─────────────────────────────────────┐
+      │ loop: runAgentLoop                  │  → LLM decides (picks tool,
+      │ run-agent-loop.ts:98                │     picks when to stop)
+      └─────────────────────────────────────┘
+          ┌─────────────────────────────────┐
+          │ tool: callTool                  │  → TOOL just runs
+          └─────────────────────────────────┘
 ```
 
-The seam is exactly where control flips from *you* to *the model*. Above the
-dashed line, a human author wrote the order and it never changes. Below it, the
-model emits a tool-use intent and the harness obeys, turn after turn, until the
-model stops emitting intents. Everything hard about agents — non-determinism,
-budgets, forced termination, the need to validate output — lives below that
-seam, because that's where you gave up knowing the step count in advance.
+**The seam that matters** is between caller and loop: control flips from CODE to LLM. That's load-bearing — it's the boundary where you hand the steering wheel to the model. `classifyIntent` deliberately stays a chain (you don't want the router to freewheel); `answer()` hands off to the loop because the retrieval path can't be predicted.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-A chain is a pipeline whose nodes are fixed; an agent is a loop whose body is
-"ask the model, do what it says, feed the result back."
+You know how a `fetch()` chain is `.then().then().then()` — you wrote every link, the data just flows through? That's a chain. Now picture a `while` loop where the *condition and the body* are chosen by something else on every iteration — you wrote the loop, but not what it does each pass. That's an agent.
 
 ```
-  Chain (fixed) vs Agent (model-driven)
+  Chain (engineer writes the steps) vs Agent (model writes them)
 
-  CHAIN                              AGENT
-  ┌──────┐                           ┌─────────────────────────────┐
-  │step A│                           │  ask model ──▶ tool intent? │
-  └──┬───┘                           │     ▲              │ yes     │
-     ▼                               │     │              ▼         │
-  ┌──────┐   author wrote            │     │         run tool       │
-  │step B│   this order              │     │              │         │
-  └──┬───┘                           │     └──────────────┘         │
-     ▼                               │           feed result back   │
-  ┌──────┐                           │                  │ no intent │
-  │step C│                           │                  ▼           │
-  └──────┘                           │            final answer      │
-  done after 3, always               └─────────────────────────────┘
-                                     done after N, where MODEL picks N
+  CHAIN:  input → [classify] → [route] → output
+                  ▲ you wrote this order; LLM fills each slot
+
+  AGENT:  ┌─────────────────────────────────────┐
+          │  Reason  → model picks next action   │
+          │     │                                │
+          │     ▼                                │
+          │  Act     → call a tool               │
+          │     │                                │
+          │     ▼                                │
+          │  Observe → read result               │
+          │     └──── loop or stop (model/budget)│
+          └─────────────────────────────────────┘
 ```
 
-### Move 2 — the moving parts
+### Move 2 — the walkthrough
 
-**The fixed-vs-variable step count**
+**The chain in aptkit: `classifyIntent`.** The query agent first runs a fixed classify-then-route step. One model call, no tools, no loop — the model fills a single slot (one word), and *your code* decides what happens with it.
 
-```
-  chain:  steps = 3                  (a constant in your source)
-  agent:  steps = ?  bounded by budget, chosen by the model at runtime
-```
-
-In a chain you write `await a(); await b(); await c();`. The `3` is in the
-source. In an agent you write `for (turn = 0; turn < maxTurns; turn++)` and the
-model decides whether each turn calls a tool or finishes. The literal in the
-source is now a *ceiling*, not a *count*.
-
-**The decision authority**
-
-```
-  chain author:  "I know the steps. I encode them."
-  agent author:  "I don't know the steps. I give the model tools + a budget."
+```typescript
+// packages/agents/query/src/intent.ts:13
+const response = await model.complete({
+  system: 'Classify the user query as exactly one word: monitoring / diagnostic / recommendation...',
+  messages: [{ role: 'user', content: query }],
+  maxTokens: 16,            // ← tiny budget: this is a slot-fill, not a reasoning loop
+});
+return parseIntent(text);   // ← intent.ts:4 — YOUR code maps the word to a route
 ```
 
-You reach for an agent precisely when you cannot enumerate the branches. If you
-*can* enumerate them, a chain is cheaper, faster, deterministic, and easier to
-test — don't reach for an agent out of fashion.
+The model never sees a tool here. It can't decide to "search first" or "ask a clarifying question." It fills the slot; the chain moves on. That's the whole point of using a chain for routing — it's deterministic and cheap.
 
-**The cost of the flip**
+**The agent in aptkit: `runAgentLoop`.** Contrast `RagQueryAgent.answer()` — it hands the model a tool schema and a loop, and the model decides whether and when to call `search_knowledge_base`.
 
-```
-  what you gain:  handles unknown-length problems
-  what you pay:   non-determinism, token cost per turn, must bound the loop,
-                  must validate output (the model can return garbage)
-```
-
-### Move 3 — the principle
-
-Choose an agent only when the step count is a property of the *data*, not of
-the *code*. If you can write the steps down, write them down.
-
-## Primary diagram
-
-The full picture: one decision, made once per capability, that determines
-whether control stays with you or moves to the model.
-
-```
-  Chain vs Agent — the one decision and its consequences
-
-   Can you enumerate the steps in advance?
-              │
-        ┌─────┴─────┐
-       YES          NO
-        │            │
-        ▼            ▼
-   ┌─────────┐  ┌──────────────────────────────────┐
-   │  CHAIN  │  │  AGENT (runAgentLoop)             │
-   │ .then() │  │  for turn in 0..maxTurns:         │
-   │ fixed N │  │    model picks tool or finishes   │
-   │ no loop │  │    harness runs tool, feeds back  │
-   └─────────┘  │  model picks N, bounded by budget │
-                └──────────────────────────────────┘
-   cheap,         handles unknown depth,
-   deterministic  costs tokens + non-determinism
-```
-
-AptKit took the right branch for analytics investigation: the step count is a
-property of the data.
-
-## Implementation in codebase
-
-**Use case: scanning for anomalies.** You don't know how many analytics queries
-prove a checkout drop is real — one if it's obvious, five if you have to rule
-out segments, campaigns, and seasonality. So `scan()` is an agent, not a chain.
-
-`packages/agents/anomaly-monitoring/src/monitoring-agent.ts:57` — `scan()`
-hands the model a tool policy and a budget, then delegates the loop:
-
-```ts
-// monitoring-agent.ts:66-83  — the "agent" branch in code form
-const { parsed } = await runAgentLoop<Anomaly[]>({
-  capabilityId: ANOMALY_MONITORING_CAPABILITY_ID,
-  model: this.options.model,        // ← the decider
-  tools: this.options.tools,        // ← what it may run
-  system, userPrompt,
-  toolSchemas,                      // ← the menu the model picks from each turn
-  maxTurns: 8,                      // ← the ceiling, NOT the step count
-  maxToolCalls: 6,                  // ← second ceiling (see 02-agent-loop-skeleton)
-  // ...
+```typescript
+// packages/agents/rag-query/src/rag-query-agent.ts:66
+const { finalText } = await runAgentLoop({
+  model: this.options.model,
+  tools: this.options.tools,          // ← the model can now act
+  toolSchemas,                         // ← it's told what's available
+  maxTurns: 6, maxToolCalls: 4,        // ← but the LOOP owns the budget
+  synthesisInstruction: buildSynthesisInstruction(...),
 });
 ```
 
-Note what is *absent*: there is no `await queryA(); await queryB();`. The number
-of queries is decided inside `runAgentLoop`, turn by turn, by the model.
+The model owns *when* to search; the loop owns *how many times*. That split is the agent. **The boundary condition that breaks people:** if you give an agent no budget exit, it can loop tool calls forever — the model has no obligation to ever stop. aptkit's `maxTurns`/`maxToolCalls` are not optional polish; they're what makes the agent shippable. (Full treatment in `02-agent-loop-skeleton.md`.)
 
-The actual loop — the literal `for` that makes this an agent and not a chain —
-is `packages/runtime/src/run-agent-loop.ts:98`:
+### Move 3 — the principle
 
-```ts
-// run-agent-loop.ts:98 — the loop body the model drives
-for (let turn = 0; turn < maxTurns; turn += 1) {
-  // ask model; if it emits no tool_use, break (success exit, line 132-135)
-  // else run the tools and loop again
-}
+Use a chain when you know the steps in advance; use an agent when the steps depend on what the model finds. The cost of an agent is unpredictability — variable step count, variable cost, harder debugging. aptkit pays that cost exactly where it's worth it (retrieval, multi-tool investigation) and refuses to pay it where it isn't (intent classification stays a chain).
+
+## Primary diagram
+
 ```
+  aptkit's chain→agent handoff, end to end
 
-Contrast: the intent classifier at `packages/agents/query/src/intent.ts:12`
-(`classifyIntent`) is *not* an agent — it's a single `model.complete` call with
-no loop, no tools, `maxTokens: 16`. That's a one-shot chain step. The repo uses
-both shapes deliberately: a loop where depth is unknown, a single call where the
-job is "classify into one word." See `07-routing.md`.
+  ┌─ Caller (query agent) ───────────────────────────────┐
+  │  classifyIntent  ──one call, no tools──►  intent word │  CHAIN
+  │  parseIntent(word)  ──►  pick which agent to run       │
+  └───────────────────────────┬──────────────────────────┘
+                              │ control flips here (the seam)
+  ┌─ Loop (runAgentLoop) ─────▼──────────────────────────┐
+  │  model.complete(tools) ⇄ callTool  ⇄ accumulate       │  AGENT
+  │  exit on: no tool_use (success) OR maxTurns (budget)  │
+  └───────────────────────────────────────────────────────┘
+```
 
 ## Elaborate
 
-**Origin.** "Chain" entered the vocabulary via LangChain (2022) as a name for
-composed LLM calls. "Agent" predates LLMs by decades in AI, but the modern
-LLM-agent sense — a loop where the model picks tools — crystallized around the
-ReAct paper (2022). The chain/agent distinction is now language-agnostic
-interview vocabulary regardless of framework.
-
-**Adjacent concepts.** A *chain with a conditional* (route to branch A or B,
-each fixed) is still a chain — one decision, then fixed steps; that's
-`07-routing.md`. A *chain that loops a fixed number of times* (map over 10 items)
-is still a chain — the count is in your code. The line is strictly: did the
-*model* choose how many steps? Not "is there a loop."
+The chains-vs-agents line is the entry point to the whole reasoning-pattern family: every pattern below (ReAct, plan-and-execute, reflexion) is a way of structuring what happens *inside* the loop. aptkit lands firmly on the agent side for its capabilities, but it's disciplined about it — the cheap, predictable parts (intent routing, dimension validation) stay as code, not as model decisions.
 
 ## Interview defense
 
-**Q: "When would you NOT use an agent?"**
+**Q: Is aptkit a workflow or an agent system?**
+Single-agent. One loop, `runAgentLoop`, six capabilities on top of it. The model picks the tool and picks when to stop; that's the agent signature. But I keep the router (`classifyIntent`) as a deterministic chain step — you don't hand the steering wheel to the model for a job a one-word classification solves.
 
 ```
-  Decision tree you defend out loud
-
-  step count enumerable?  ──YES──▶  chain   (cheaper, deterministic, testable)
-          │
-          NO
-          ▼
-  steps depend on model's findings?  ──YES──▶  agent (pay for it knowingly)
+  caller (CODE decides) ═══seam═══► loop (LLM decides)
+  classifyIntent                    runAgentLoop
 ```
+*Anchor: the line is "who chooses the next step." Code in the router, model in the loop.*
 
-Anchor: "If I can write the `.then()` chain, I write the chain — an agent is
-what I reach for when the data, not my code, decides the step count."
-
-**Q: "What does choosing an agent cost you?"**
-
-```
-  the bill for moving control to the model
-
-  determinism   ─lost─▶  must test against behavior, not exact output
-  step count    ─lost─▶  must add a budget (maxTurns / maxToolCalls)
-  output trust  ─lost─▶  must parse + validate (model can return garbage)
-```
-
-Anchor: "The loop is the easy part; the budget and the output validator are the
-tax you pay for not knowing the step count."
-
-The load-bearing skeleton part this surfaces: the *budget* exists only because
-you chose an agent — it's the price of the flipped control axis. That budget is
-the subject of the next file.
-
-## Validate
-
-- **Reconstruct:** Without looking, draw the chain-vs-agent decision tree.
-  Where in `monitoring-agent.ts` is the "agent" branch taken? (line 66, the
-  `runAgentLoop` call).
-- **Explain:** Why is `intent.ts:12` `classifyIntent` a chain step and not an
-  agent? (one `model.complete`, no loop, no tools).
-- **Apply:** Given a new task — "summarize the 3 highest-severity anomalies" —
-  is that a chain or an agent? (chain: you know the steps — scan, sort, take 3,
-  summarize; the sort+slice at `monitoring-agent.ts:86-88` is literally a
-  hand-coded chain step bolted onto the agent's output).
-- **Defend:** Argue against a teammate who wants to make `classifyIntent` an
-  agent loop. (It classifies into one of three words; the step count is one;
-  adding a loop adds cost and non-determinism for zero gain.)
+**Q: Why not make routing an agent too?**
+Cost and debuggability. An agent router adds variable latency and a larger failure surface for a job that a single classify call does deterministically. I'd only escalate it to an agent if classification started failing on ambiguous queries that need a tool to disambiguate.
 
 ## See also
 
-- [02-agent-loop-skeleton.md](02-agent-loop-skeleton.md) — the loop you get when
-  you take the agent branch
-- [03-react.md](03-react.md) — the specific agent shape all five AptKit
-  capabilities use
-- [07-routing.md](07-routing.md) — a chain-with-a-conditional (still a chain)
-- `../agent-patterns-in-this-codebase.md` — the patterns table
+- `02-agent-loop-skeleton.md` — the kernel the agent side runs
+- `07-routing.md` — the chain-side router in full
+- `study-ai-engineering/04-agents-and-tool-use/01-agents-vs-chains.md` — the mechanics walk (cross-ref)

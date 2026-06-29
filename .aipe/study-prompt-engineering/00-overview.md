@@ -1,113 +1,93 @@
-# Overview — the prompt surface of AptKit
+# 00 — Overview: the prompt surface of aptkit
 
-One page. Where prompts live, what touches them, and the one path every prompt
-travels from a TypeScript string literal to a parsed, validated result.
+*One-page orientation. Where prompts live, what they touch, and which file owns
+each concept.*
 
-## The whole thing in one map
+I've shipped enough LLM features to know the trap: people treat "the prompt" as
+one string in one file. In a real system the prompt is a *surface* — it spans
+the system text, the schema you hand the model, the user content you splice in,
+the retry you fire when parsing fails, and the eval that tells you whether your
+last edit helped or quietly broke something. aptkit is small enough to see the
+whole surface at once, which is exactly why it's a good thing to study.
 
-Here's the entire prompt-engineering surface of this repo as layered bands.
-Find the prompt, follow it down to the parsed result.
+## Zoom out — the whole prompt surface in one map
+
+Here's every place a prompt is assembled, sent, parsed, or judged in this repo.
+This is the picture the rest of the guide zooms into.
 
 ```
-  AptKit prompt surface — string literal to validated output
+  The aptkit prompt surface — assemble → send → parse → judge
 
-  ┌─ Prompt layer (packages/prompts/src) ───────────────────────────┐
-  │  QUERY_PROMPT  RECOMMENDATION_PROMPT  MONITORING_PROMPT  ...      │
-  │  each wrapped in a PromptPackage { id, version, capabilityId,    │
-  │  system, variables[], examples[] }                              │
-  └───────────────────────────┬─────────────────────────────────────┘
-                              │  renderPromptTemplate(system, {schema, ...})
-                              │  {var} → value substitution
-  ┌─ Context layer (packages/context) ─▼────────────────────────────┐
-  │  schemaSummary(workspace) → the {schema} string injected above   │
-  └───────────────────────────┬─────────────────────────────────────┘
-                              │  rendered system string
-  ┌─ Runtime layer (packages/runtime) ─▼────────────────────────────┐
-  │  runAgentLoop: turn loop, tool calls, then on the LAST turn      │
-  │  appends buildSynthesisInstruction(...) → forced final answer    │
-  │  parseAgentJson + parseResult → recovery re-prompt on parse fail │
-  └───────────────────────────┬─────────────────────────────────────┘
-                              │  Provider.complete(request)
-  ┌─ Provider layer (packages/providers) ▼──────────────────────────┐
-  │  anthropic | openai | fallback chain | local context-window guard│
-  └───────────────────────────┬─────────────────────────────────────┘
-                              │  validated typed result
-  ┌─ Eval layer (packages/evals) ▼──────────────────────────────────┐
-  │  replay artifact → structural-diff / detection-scorer /          │
-  │  rubric-judge → promote to fixture → deterministic replay        │
-  └──────────────────────────────────────────────────────────────────┘
+  ┌─ Authoring layer (prompts as code) ───────────────────────────────┐
+  │  packages/prompts/src/{query,diagnostic,recommendation,           │
+  │     monitoring}.ts   — PromptPackage: system + vars + examples     │
+  │  packages/context/src/profile-injector.ts  — injectProfile()      │
+  └───────────────────────────────┬───────────────────────────────────┘
+                                  │  render {vars}, inject profile
+  ┌─ Assembly layer (per call) ───▼───────────────────────────────────┐
+  │  run-agent-loop.ts  — system + tool schemas + forced synthesis    │
+  │  structured-generation.ts — system + strictSuffix on retry        │
+  │  gemma-provider.ts buildSystemText() — schemas rendered INTO text │
+  └───────────────────────────────┬───────────────────────────────────┘
+                                  │  HTTP → provider
+  ┌─ Model layer ─────────────────▼───────────────────────────────────┐
+  │  Anthropic / OpenAI (native tools)  ·  Gemma (emulated tools)      │
+  └───────────────────────────────┬───────────────────────────────────┘
+                                  │  raw text / tool_use blocks back
+  ┌─ Parse layer (tolerant) ──────▼───────────────────────────────────┐
+  │  json-output.ts parseAgentJson() — fence-strip + substring scan   │
+  │  gemma-provider.ts parseToolCall() — JSON → {tool, arguments}     │
+  └───────────────────────────────┬───────────────────────────────────┘
+                                  │  validated output
+  ┌─ Judge layer (evals gate changes) ─▼──────────────────────────────┐
+  │  evals/rubric-judge.ts (Claude judges output)                     │
+  │  evals/precision-at-k.ts (retrieval quality)                      │
+  └────────────────────────────────────────────────────────────────────┘
 ```
 
-## The one path, in words
+## Zoom in — the five things worth internalizing
 
-A prompt in AptKit is never a free-floating string. It's the `system` field of
-a `PromptPackage` carrying `id`, `version`, and `capabilityId`
-(`packages/prompts/src/types.ts:13`). At call time the agent renders it —
-`renderPromptTemplate` swaps every `{var}` for a value
-(`packages/prompts/src/types.ts:24`) — injecting deterministic context like the
-workspace schema (`packages/context/src/workspace-summary.ts:11`). The rendered
-string becomes the `system` for `runAgentLoop`
-(`packages/runtime/src/run-agent-loop.ts:76`), which runs the tool-calling turns
-and, critically, **forces a final answer** on the last turn by appending a
-synthesis instruction (`run-agent-loop.ts:104`). The output text gets parsed and
-validated; on a parse miss, a recovery turn re-injects the prior tool results and
-asks once more for the structured answer (`run-agent-loop.ts:195`).
+1. **Prompts here are code, not strings.** Each agent's prompt is a
+   `PromptPackage` with an `id`, `version`, and `capabilityId`
+   (`packages/prompts/src/types.ts:13`). That's the provenance that lets you
+   answer "which prompt produced this output" six months from now.
 
-Two newer additions extend this surface without changing the path. The **Gemma
-provider** (`packages/providers/gemma/src/gemma-provider.ts:133`) handles a model
-with no native tool API by *emulating* tool calls in prompt text — it renders the
-tools into the system prompt and parses a JSON tool call back out, with a
-`RETRY_NUDGE` corrective turn on a botched parse (the weak-local-model end of the
-structured-output spectrum; 02). The **rag-query agent**
-(`packages/agents/rag-query/src/rag-query-agent.ts:20`) adds two prompt-text
-techniques: a grounding/citation system template ("search first, ground answers,
-cite sources, say so if not found"; 12) and a prepended user **profile** injected
-by `injectProfile` (`packages/context/src/profile-injector.ts:25`) before
-rendering (the persona section of the anatomy; 01).
+2. **Structured output is a pipeline, not an instruction.** `generateStructured`
+   (`packages/runtime/src/structured-generation.ts:54`) generates, extracts,
+   validates, and retries with a stricter nudge. The prompt text saying "return
+   JSON" is the *weakest* part of that pipeline.
 
-A third addition, **`@aptkit/memory`**, adds two prompt-template surfaces without
-changing the path. `defaultFormat(turn)`
-(`packages/memory/src/conversation-memory.ts:44`) is a turn-format-as-template:
-it renders one Q/A exchange into the single string that is *both* embedded and
-re-injected on recall (`Past exchange — user asked: "<q>"...`). And the
-`search_memory` tool **description**
-(`packages/memory/src/memory-tool.ts:36`) is a when-to-recall steering prompt —
-its "Use when the answer may depend on something discussed earlier" sentence
-steers tool selection, in contrast to `search_knowledge_base`'s when-clause-free
-description (`packages/retrieval/src/search-knowledge-base-tool.ts:55`). Both
-covered in 01.
+3. **The Gemma provider is the deepest prompt-engineering artifact in the repo.**
+   Gemma has no native tool-calling, so `buildSystemText`
+   (`gemma-provider.ts:133`) renders the tool JSON schemas straight into the
+   system prompt and demands a single JSON object back, with `RETRY_NUDGE`
+   (`gemma-provider.ts:35`) as the corrective re-prompt. This is prompt
+   engineering doing a job an API would otherwise do.
 
-## What's load-bearing here
+4. **The loop's last turn forces an answer.** `buildSynthesisInstruction`
+   (`run-agent-loop.ts:72`) appends "You have NO more tool calls available… Do
+   not say you need more queries." That single line stops the classic failure
+   where the model keeps asking for tools it no longer has.
 
-Three mechanics carry the weight, and they're the ones to look at first:
+5. **Evals close the loop.** `rubric-judge.ts` is Claude judging another model's
+   output against a rubric; `precision-at-k.ts` scores retrieval. Without these,
+   every prompt edit is a vibe.
 
-1. **The forced-synthesis turn** (`buildSynthesisInstruction`,
-   `run-agent-loop.ts:72`). The single most important prompt mechanic in the
-   repo. Without it, a tool-using agent runs out of turns mid-thought and never
-   emits the JSON you parse. Covered in 02 and 09.
+## What's `not yet exercised`
 
-2. **Parse-then-validate-then-recover** (`parseAgentJson` +
-   `parseResult` + `recoveryPrompt`). The repo never trusts the model to emit
-   clean JSON. It extracts from a fence, validates at the boundary, and
-   re-prompts on failure. Covered in 02.
+Being honest about the gaps is half of senior prompt work:
 
-3. **The PromptPackage envelope** (`id` + `version` + `capabilityId`). Prompts
-   are versioned code with provenance, not strings scattered through handlers.
-   Covered in 03.
+- **No few-shot example library.** Examples live as inline literals
+  (`packages/prompts/src/query.ts:80`), not a curated, versioned set.
+- **No prompt caching.** Grep the repo for `cache_control` — nothing. The static
+  prefixes (schema, tool list) are re-sent every call.
+- **No automated prompt optimization** (DSPy-style). Prompts are hand-authored.
+- **No per-model eval matrix.** Prompt drift across model upgrades is a known
+  risk (concept 03) but isn't tracked by a regression suite keyed on model id.
+- **No self-critique / self-consistency** wired into any agent.
 
-## What this repo does NOT do (read these honestly)
+## Where to go next
 
-- No provider `response_format` / native tool-calling-for-output. Hosted
-  structured output is JSON-in-a-markdown-fence parsed defensively. (The Gemma
-  provider *emulates* tool calling by rendering tools into the system prompt and
-  parsing a JSON tool call back out — prompt-text, not provider-enforced.) See 02.
-- No real tokenizer. Token budgeting is a `length / 3` heuristic in the local
-  context guard. See 04.
-- No prompt-cache / `cache_control` directives. See 04.
-- No self-critique or self-consistency loop. See 10.
-- No input delimiters or instruction-hierarchy framing. One explicit prompt-text
-  guardrail exists — the rag-query agent's grounding/citation instructions. See 12.
-- No forbidden-opening lists or rotation history. See 13.
-
-Each of those is a buildable target, not a hidden failure. The files name the
-exact gap and what closing it would cost.
+Read in numeric order. The operational concepts (01–05) are the discipline; the
+techniques (06–13) are the moves. Cross-link to `../study-ai-engineering/` for
+the RAG and serving depth, and `../study-testing/` for the eval mechanics.

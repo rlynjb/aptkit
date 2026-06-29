@@ -1,384 +1,228 @@
-# 06 — Sorting, Searching, and Selection
+# Sorting, Searching & Selection
 
-**Industry name(s):** Comparator sort, linear search, classification scan, top-k selection (sort-and-slice), over-fetch-then-filter-then-slice (post-filtered top-k / windowed selection), binary search, partitioning / quickselect. Type label: Language-agnostic foundation.
+**Industry name(s):** comparison sort · ranking · top-k selection · linear/binary search · partial selection (quickselect) — *Industry standard*
+
+---
 
 ## Zoom out, then zoom in
 
-Sorting and searching are the everyday algorithms, and AptKit uses the everyday subset: comparator `sort` to rank, `slice` to cap (top-k), and linear scans to classify and match. What it does *not* use is the asymptotically clever subset — binary search and partition-based selection (quickselect) — because its inputs are tiny and mostly unsorted, so the clever versions buy nothing. This file walks the exercised patterns and is precise about why the two absent ones are absent. The newest addition is a *fourth* exercised pattern: `@aptkit/memory`'s `recall` does **over-fetch-then-filter-then-slice** — it ranks a wider window than it needs, post-filters by a predicate, then truncates to k. That's a top-k variant forced by a contract that can't filter during the search itself.
+This is the second repo-grounded core. The single most-run algorithm in aptkit is a *sort* — `hits.sort()` inside the vector store — and the answer it produces, the top-k slice, is a *selection*. Ranking is what aptkit does.
 
 ```
-  Zoom out — ordering and lookup in AptKit
+  Zoom out — where sorting/selection lives in aptkit
 
-  ┌─ Agent layer ────────────────────────────────────────┐
-  │  anomaly ranking: sort(by severity desc) + slice(0,10)│ ← top-k via full sort
-  └───────────────────────────┬───────────────────────────┘
-                              │
-  ┌─ Retrieval / memory layer ▼───────────────────────────┐
-  │  search: cosine score → sort desc → slice(0,k)        │ ← top-k via full sort
-  │  recall: over-fetch max(k*4,20) → filter → slice(0,k) │ ← post-filtered top-k
-  └───────────────────────────┬───────────────────────────┘
-                              │
-  ┌─ Evals / context layer ───▼───────────────────────────┐
-  │  detection match: linear scan required × detections   │ ← linear search
-  │  coverage classify: scan requirements → full/lim/unav │ ← linear classify
-  └───────────────────────────┬───────────────────────────┘
-                              │
-  ┌─ Infra ───────────────────▼───────────────────────────┐
-  │  replay list: readdir + .sort() (filename order)      │ ← lexicographic sort
-  └───────────────────────────┬───────────────────────────┘
-                              │
-  ┌─ (absent) ────────────────▼───────────────────────────┐
-  │  binary search · quickselect    not yet exercised      │
-  └────────────────────────────────────────────────────────┘
+  ┌─ Retrieval layer ───────────────────────────────────────────┐
+  │  ★ InMemoryVectorStore.search ★                              │
+  │    cosineSimilarity → SCORE each chunk     (the comparator)  │
+  │    hits.sort(desc by score) → RANK         (O(n log n))      │
+  │    .slice(0, k) → SELECT top-k             (the answer)      │
+  └───────────────────────────┬─────────────────────────────────┘
+                              │ scored by
+  ┌─ Eval layer ──────────────▼─────────────────────────────────┐
+  │  precision@k / recall@k → was the top-k SELECTION good?     │
+  │  (packages/evals/src/precision-at-k.ts)                     │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: a comparator sort orders a list by a key you derive (O(n log n)); a linear search/classify touches every element once (O(n)); top-k by sort-and-slice orders everything then takes a prefix (O(n log n), fine when n is small). Over-fetch-then-filter-then-slice is top-k with a twist — when you can't filter *during* the ranking, you rank a wider window (fetch more than k), filter that window by a predicate, then truncate to k; the over-fetch is a margin so the filter still leaves you k survivors. Binary search is the O(log n) lookup that *requires sorted input*, and quickselect is the O(n)-average way to get top-k *without* full sorting — both win only at scale AptKit doesn't have.
+Zoom in: sorting orders by a key; selection keeps only the best few; searching finds a target. aptkit ranks chunks by cosine score, selects the top-k, and then *evaluates* that selection with precision/recall. The three operations — score, rank, select — are the spine of retrieval, and they're all here in real code.
+
+---
 
 ## Structure pass
 
-**Layers.** Agent (rank anomalies/recommendations), evals/context (match detections, classify coverage), infra (sort replay filenames).
+**Layers:** the comparator (cosine score), the sort (full ordering), the selection (top-k slice), the evaluation (was the selection right?).
 
-**Axis — trace "ordering need": *does this operation require the data sorted, and how much of it does it touch?*** across the patterns.
+**Axis — exactness vs work:** trace "how much work to get a correct ranking?"
 
 ```
-  One axis — "ordering need + how much touched" — across patterns
+  One axis — "how much work for a correct top-k?"
 
-  comparator sort   produces order   touches all, O(n log n)
-  linear classify   needs no order   touches all once, O(n)
-  top-k (sort+slice)produces order, then takes prefix, O(n log n)
-  over-fetch+filter produces order on a WIDER window, filters, takes prefix
-  +slice            (post-filtered top-k — fetchK > k as a margin)
-  binary search     REQUIRES order   touches log n   ← absent
-  quickselect       needs no order   touches ~n avg  ← absent (top-k shortcut)
-
-  the flip: binary search is the only one that PRESUPPOSES sorted
-  input — and aptkit never maintains a sorted collection to search,
-  so it never qualifies.
+  full sort + slice (aptkit) → order ALL n, keep k     O(n log n) — exact
+  partial sort / heap        → order only what's needed O(n log k) — exact
+  quickselect                → partition to k-th only   O(n) avg  — exact, unordered
+  ANN graph (buffr)          → approximate nearest      O(log n)   — APPROXIMATE
 ```
 
-**Seam.** The load-bearing boundary is between *operations that touch every element* (sort, linear scan — what AptKit does) and *operations that exploit sorted structure to touch a fraction* (binary search — what it doesn't). The axis-answer flips at "is the collection kept sorted and searched repeatedly?" AptKit sorts *to produce an output order* (then discards), never to *maintain a searchable index*. That's why binary search has no home here: there's no long-lived sorted collection to binary-search into.
+**Seam — exact ranking (aptkit) vs approximate ranking (buffr).** aptkit's sort produces a provably-correct ordering. The production swap to HNSW (file **05**) gives up exactness for speed. The exactness axis flips across that boundary — and precision@k (this file's eval) exists precisely to *measure* how much exactness an approximate store loses.
+
+---
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You've built all five comparison sorts with visualizers, so the shape is muscle memory: a comparator says "does a come before b?", and the sort rearranges until that holds for every pair. Top-k is the move you reach for when you only want the best few: sort everything, take the front slice. Linear search is the `.find`/`.filter` you write daily — touch each element, keep the matches.
+You've animated all five comparison sorts, so the mechanics are reflexive. The retrieval insight is simpler than the sorts themselves: **ranking is sort-by-a-derived-key.** The key isn't stored on the chunk — it's *computed per query* (cosine similarity to the query vector), so you score first, then sort by that ephemeral score, then take the front of the ordered list. The "search" in `search_knowledge_base` is really a *rank-and-select*, not a find-this-target search.
 
 ```
-  The kernels — three shapes AptKit uses
+  Pattern — score, rank, select (the retrieval spine)
 
-  COMPARATOR SORT          LINEAR SCAN              TOP-K (sort+slice)
-  [3,1,2] by key           [a,b,c,d]                sort desc → [9,7,4,1]
-  compare pairs            test each once           slice(0,2) → [9,7]
-  → [1,2,3]                → keep matches            full sort, take front
-  O(n log n)               O(n)                      O(n log n), fine if n small
+  chunks:   c0    c1    c2    c3    c4
+  score:   0.31  0.88  0.42  0.91  0.20   ← cosine(query, chunk)
+              │     │     │     │     │
+              ▼     ▼     ▼     ▼     ▼
+  sort desc: [0.91][0.88][0.42][0.31][0.20]   ← rank ALL by score
+  slice(k=2): ─┴─────┴─                         ← SELECT top-2
+  result:    [c3, c1]
 ```
 
-AptKit reaches for the comparator sort to rank, the linear scan to classify and match, and sort-and-slice for top-k. It never reaches for binary search (no sorted collection to search) or quickselect (top-k on tiny n doesn't need the O(n) shortcut).
+### Move 2 — the walkthrough
 
-### Move 2 — the three exercised patterns
+#### The comparator: cosine similarity is the sort key
 
-**Comparator sort by a derived key — ranking anomalies.** Bridge from `arr.sort((a,b) => a.price - b.price)`: the monitoring agent ranks anomalies by *severity*, but severity is a string (`'critical'`, `'warning'`, ...), so it maps each to a numeric rank via a lookup table and sorts descending on that. The comparator is `severityRank[b] - severityRank[a]` — the table turns an unordered category into an orderable number.
+Before any sort there's a comparator. aptkit's is cosine similarity — the dot product of two vectors over the product of their magnitudes, in `[-1, 1]`:
 
-```
-  Comparator sort by derived key — severity ranking
-
-  anomalies: [{sev:"warning"}, {sev:"critical"}, {sev:"info"}]
-
-  severityRank table: {critical:3, warning:2, info:1}   ← category → number
-       │ sort((l,r) => rank[r.sev] - rank[l.sev])  ← descending
-       ▼
-  [{sev:"critical"=3}, {sev:"warning"=2}, {sev:"info"=1}]
-  O(n log n), n = number of anomalies (small)
-```
-
-The load-bearing detail: sorting by a *derived numeric key* via a lookup table is how you order categorical data. Without the rank table you'd be sorting strings lexicographically — `"critical" < "info" < "warning"` alphabetically, which is meaningless for severity. The table *is* the ordering definition.
-
-**Top-k by sort-and-slice — capping the output.** Bridge from "show the top 10": after sorting, `slice(0, 10)` takes the most-severe ten. This is top-k done the simple way — sort all, take the front. It's O(n log n), and that's fine because n (anomaly count) is small.
-
-```
-  Top-k via sort + slice — full sort, take prefix
-
-  sorted desc: [c, c, w, w, w, i, i, ... up to n]
-                └────── slice(0, 10) ──────┘
-                take the front 10            discard the rest
-  O(n log n) sort dominates; for small n, simpler than a heap
+```ts
+// packages/retrieval/src/in-memory-vector-store.ts:46-57
+function cosineSimilarity(a: number[], b: number[]): number {
+  let dot = 0; let magA = 0; let magB = 0;
+  for (let i = 0; i < a.length; i += 1) {
+    dot  += a[i]! * b[i]!;        // numerator: alignment of the two vectors
+    magA += a[i]! * a[i]!;        // |a|²
+    magB += b[i]! * b[i]!;        // |b|²
+  }
+  const denom = Math.sqrt(magA) * Math.sqrt(magB);
+  return denom === 0 ? 0 : dot / denom;   // 0 on a zero vector → avoid NaN
+}
 ```
 
-The alternative — a size-k heap (O(n log k)) or quickselect (O(n) average) — wins only when k ≪ n and n is large. Here k=10 and n is rarely above 10, so the full sort is both simpler and effectively free. Picking sort-and-slice here is the *correct* choice, not a lazy one.
+This is `O(d)` per comparison (`d` = 768). It's the sort *key generator* — every chunk gets one score against the query. The boundary condition the code guards (`denom === 0 ? 0`): a zero-length vector would divide by zero and produce `NaN`, which sorts unpredictably and poisons the ranking. Returning `0` keeps the comparator total and the sort well-defined.
 
-**Over-fetch-then-filter-then-slice — top-k when you can't filter during the search.** Bridge from a SQL `WHERE … ORDER BY … LIMIT k`: there, the database filters *first*, then ranks the survivors, then caps. Now take that away. Imagine the only query you're allowed is "give me the k nearest, no WHERE clause" — you can rank, but you can't say "only memory rows." That's exactly `@aptkit/memory`'s situation: the `VectorStore.search` contract is `(vector, k)` with no metadata predicate, and the memory rows may share a store with documents, so a plain `search(vector, k)` could come back full of documents and zero memories. The fix is to *rank a wider window than you need, filter that window, then truncate*: over-fetch `fetchK = max(k*4, 20)`, drop the non-memory rows, take the first k that survive.
+#### The sort: full comparison sort, descending by score
 
-```
-  Over-fetch → filter → slice — post-filtered top-k
+The rank itself is one line — `Array.sort` with a descending-score comparator:
 
-  want k=5 memory rows, but search can't filter by kind
-       │
-       ▼ search(vector, fetchK = max(5*4, 20) = 20)   ← rank a WIDER window
-  ranked 20: [doc doc MEM doc MEM MEM doc MEM doc MEM ...]
-       │ .filter(h => h.meta.kind === "memory")        ← drop the wrong kind
-       ▼
-  survivors (in rank order): [MEM MEM MEM MEM MEM ...]
-       │ .slice(0, 5)                                  ← truncate to k
-       ▼
-  top-5 memories            the extra 15 fetched were the MARGIN
+```ts
+// packages/retrieval/src/in-memory-vector-store.ts:31
+hits.sort((a, b) => b.score - a.score);   // descending: highest score first
 ```
 
-The load-bearing part is the *margin* — why `k*4`-or-`20` and not just `k`. If you fetched exactly k and the top-k were all documents, you'd filter down to zero memories and return nothing, even though relevant memories sat at rank k+1. Over-fetching a multiple of k (here 4×) gives the filter room: as long as at least k of the first `fetchK` ranked rows are memories, you still return a full k. The `max(…, 20)` floor handles small k — at k=1, `k*4=4` is too thin a margin, so it clamps up to a 20-row window. Drop the over-fetch and the method silently under-returns whenever documents crowd the top of the ranking; that's the bug the margin prevents.
+`Array.sort` in V8 is Timsort — a stable, adaptive merge/insertion hybrid, `O(n log n)` worst case. Two things matter here. **Stability:** equal scores keep their insertion order, so ties are deterministic (the map-iteration order). **It's a full sort:** every one of the `n` hits is ordered, even though only `k` survive the slice. That's the work file **03** flagged a heap could save — but at aptkit's small `n` the full sort wins on simplicity. The boundary condition: `b.score - a.score` on `NaN` scores would be undefined ordering — which is exactly why the comparator above never returns `NaN`.
 
-And here's the honest boundary condition: this is *best-effort*, not exact. If memories are genuinely sparse — fewer than k memory rows exist in the entire top-`fetchK` window — you get back fewer than k, and there's no second fetch to backfill. You're trading exactness for a single round-trip. The real fix is a metadata filter pushed *into* the index (a `WHERE kind = 'memory'` the store evaluates while ranking), which is precisely what a `PgVectorStore` with a `meta` column would add — see the contract seam below. Until then, over-fetch-then-filter is the right call: it's one search call, it's correct whenever memories aren't pathologically rare in the top window, and it needs nothing the `(vector, k)` contract doesn't already give.
+#### The selection: top-k by slice
 
-**Linear search and classify — matching and gating.** Bridge from `.some`/`.filter`: detection scoring asks, for each required category/metric/scope, "is there *any* detection matching it?" — a linear `.some` per requirement. Coverage classification scans each requirement and labels it full/limited/unavailable. Both touch every element once, O(n), with no sorting because no ordering is needed — only presence.
+Selection is the array slice — and the defensive `Math.max(0, k)`:
 
-```
-  Linear classify — touch each, label it, no order needed
-
-  required = [cat:A, metric:B, scope:C]
-    for each req:
-      detections.some(d => matches(d, req))  → matched | missed
-  ────────────────────────────────────────────────────────
-  also splits unexpected = detections whose category ∉ expected
-  O(required × detections), both small → effectively linear
+```ts
+// packages/retrieval/src/in-memory-vector-store.ts:32
+return hits.slice(0, Math.max(0, k));   // top-k; clamp negative k to 0
 ```
 
-The boundary condition in detection scoring: the `unexpected` partition. After matching required against detections, it also scans detections for categories *not* in the expected set — using a `Set` for the expected lookup so the "is this unexpected" check is O(1) per detection. That's the matched/missed/unexpected three-way split, and it's pure linear scanning over small lists.
+This is "selection by sort-then-truncate." A pure selection algorithm (quickselect) would find the k-th largest in `O(n)` average *without* fully ordering — but you'd get an unordered top-k and have to sort the survivors anyway, and aptkit *wants* them ordered (the model reads them best-first). So full-sort-then-slice is the right shape here even though quickselect is asymptotically cheaper for the pure "which k" question. The boundary condition: `Math.max(0, k)` stops a negative `k` from `slice`'s negative-index behavior (which would count from the end and return garbage).
 
-### Move 2.5 — current state vs future state: binary search and quickselect
+#### The minTopK floor: a selection-size guard against a weak model
 
-```
-  Phase A (now)                    Phase B (would summon them)
+There's a subtle selection bug the retrieval tool defends against — a weak local model asking for `top_k: 1` and starving its own multi-part question. The tool floors the selection size:
 
-  BINARY SEARCH
-  replay list: readdir + .sort()   a large SORTED index searched
-  then LINEAR eval over all        repeatedly by key (find replay
-  → never searches the sorted      with id X, or range [A,B]) →
-  list, just iterates it           binary search O(log n), or a DB index
-
-  QUICKSELECT (top-k without sort)
-  top-10 of ≤10 anomalies →        top-k where k ≪ n and n is LARGE
-  full sort already wins           (top 10 of 100,000) → quickselect
-                                   O(n) avg, or a size-k heap O(n log k)
-  ── retrieval is the FIRST place this trigger gets close ──
-  search() sorts ALL n chunks      a corpus of thousands of chunks,
-  then slices top-5: fine while    topK=5 → sorting all n to keep 5 is
-  n is a handful of docs           wasteful → size-k heap O(n log k),
-                                   or skip the scan entirely (ANN, see 05)
+```ts
+// packages/retrieval/src/search-knowledge-base-tool.ts:55, 82-84
+const minTopK = Math.max(1, options.minTopK ?? 1);
+// ...
+const requestedTopK = typeof args.top_k === 'number' && args.top_k > 0 ? args.top_k : defaultTopK;
+const topK = Math.max(requestedTopK, minTopK);   // floor the selection size
 ```
 
-The honest read: AptKit sorts the replay filenames (`replay-runner.ts:43`) purely for *deterministic iteration order*, then walks all of them linearly to eval — it never *searches* that sorted list, so binary search still has nothing to do. The top-k story is the one that moved. Anomaly ranking is top-10 of ≤10, so a full sort wins forever. But `InMemoryVectorStore.search` sorts *all* n chunks to return topK (default 5), and the moment a corpus grows past a handful of documents, that's exactly the k ≪ n, large-n shape where a size-k heap (O(n log k)) beats the full O(n log n) sort — and where skipping the linear scan altogether with an ANN index beats both. So the quickselect/heap trigger is no longer purely hypothetical: retrieval is the first place in the repo where it has something real to bite on. It just hasn't bitten yet because the store is in-memory with a tiny corpus. The triggers stay the scale triggers from `01`: a large sorted index searched by key (→ binary search, or really a database index), or top-k where k ≪ n on a large n (→ heap or quickselect, or an ANN index for retrieval specifically).
+This is a selection-size policy, not an algorithm — but it's the difference between a correct retrieval and a missed answer. If the model picks `top_k: 1` for a question needing three sources, `minTopK` overrides it. The lesson: the *size* of a selection is itself a correctness parameter, not just a performance knob.
+
+#### Evaluating the selection: precision@k and recall@k
+
+Once you have a top-k, how good was it? That's `study-ai-engineering`'s domain conceptually, but the *algorithm* is a set-intersection over the selected window, and it lives here:
+
+```ts
+// packages/evals/src/precision-at-k.ts:47-57
+export function scorePrecisionAtK(retrievedIds, relevantIds: ReadonlySet<string>, k): RetrievalScoreResult {
+  if (k <= 0) return { ...NOT_WELL_FORMED };
+  const total = Math.min(k, retrievedIds.length);   // denominator: actual window size
+  if (total === 0) return { ...NOT_WELL_FORMED };
+  const matched = countDistinctHits(retrievedIds, relevantIds, k);  // |top-k ∩ relevant|
+  return { ok: true, score: matched / total, matched, total };
+}
+```
+
+```
+  Execution trace — precision@k over a selection
+
+  retrievedIds = [c3, c1, c9, c1, c4]   relevantIds = {c1, c3, c7}   k = 3
+  topK = slice(0,3) = [c3, c1, c9]
+  seen = {}
+    c3 in relevant? yes → seen={c3}
+    c1 in relevant? yes → seen={c3,c1}
+    c9 in relevant? no  → seen={c3,c1}
+  matched = |seen| = 2     total = min(3, 5) = 3
+  precision@3 = 2/3 = 0.67
+```
+
+precision@k = "of the k I selected, what fraction were relevant?"; recall@k (`precision-at-k.ts:68-78`) = "of all relevant, what fraction did I select?" — same `countDistinctHits`, different denominator (`relevantIds.size`). The `ok` flag separates *well-formed* from *good*: a real score of `0` still has `ok: true`; `ok: false` means the metric is *undefined* (`k <= 0` or empty denominator). That distinction is the careful part — never conflate "the selection was bad" with "the metric couldn't be computed."
 
 ### Move 3 — the principle
 
-Match the algorithm to the data's size and whether it's already ordered. Sort when you need an output order on a manageable list; linear-scan when you only need presence or a label; sort-and-slice for top-k when n is small. Reserve binary search for a *maintained* sorted collection you search repeatedly, and quickselect/heap for top-k when k ≪ n and n is large. Reaching for the clever O(log n) or O(n)-select algorithm on a 10-element list is the same mistake as reaching for a heap there — complexity with no payoff. AptKit's choices are correctly sized.
+**Retrieval is score → rank → select, and the cheapest correct version depends on whether you need the survivors ordered.** aptkit full-sorts because it's small and wants the top-k ordered for the model; quickselect or a bounded heap would win at scale on the pure "which k" question; an ANN graph wins at large scale by giving up exactness. And the *size* of the selection (`minTopK`) is a correctness parameter, not a tuning knob. precision@k closes the loop — it measures whether the selection algorithm, exact or approximate, actually surfaced the relevant items.
+
+---
 
 ## Primary diagram
 
-The three exercised patterns in one frame, with the two absent ones.
+The full score-rank-select-evaluate pipeline.
 
 ```
-  Sorting/searching/selection in AptKit
+  aptkit retrieval — sorting, selection, and its evaluation
 
-  ┌─ EXERCISED ─────────────────────────────────────────┐
-  │  RANK:    severityRank table → sort desc → slice(0,10)│
-  │           (top-k via full sort, n small)              │
-  │  RANK:    cosine score → sort desc → slice(0,k)        │
-  │           (retrieval top-k, brute-force k-NN)          │
-  │  SELECT:  search(fetchK=max(k*4,20)) → filter kind →   │
-  │           slice(0,k)  (memory recall: post-filtered    │
-  │           top-k, over-fetch is the margin)             │
-  │  MATCH:   required.some(matches) → matched/missed     │
-  │           + unexpected via Set → 3-way split (linear) │
-  │  CLASSIFY:scan requirements → full/limited/unavailable│
-  │  ORDER:   readdir + .sort() → deterministic iteration │
-  └────────────────────────────────────────────────────────┘
-  ┌─ NOT YET EXERCISED ─────────────────────────────────┐
-  │  binary search — needs a maintained sorted index      │
-  │  quickselect   — needs top-k with k ≪ n, large n      │
-  │  → both summoned by scale the repo doesn't have yet    │
-  └────────────────────────────────────────────────────────┘
+  SCORE   cosineSimilarity(query, chunk)  O(d) each, d=768
+            guard: zero vector → 0 (no NaN to poison the sort)
+            ↓
+  RANK    hits.sort((a,b)=>b.score-a.score)  Timsort, O(n log n), stable
+            (full sort: orders all n even though k survive)
+            ↓
+  SELECT  .slice(0, max(0,k))   top-k, ordered best-first
+            policy: topK = max(requested, minTopK)  ← floor vs weak model
+            ↓
+  EVALUATE scorePrecisionAtK / scoreRecallAtK
+            matched = |top-k ∩ relevant|   (distinct, via Set)
+            precision = matched / min(k, retrieved)
+            recall    = matched / |relevant|
+            ok=false ⇒ metric undefined (≠ score 0)
+
+  scale swap: full sort (exact) → HNSW graph (approximate, file 05)
+              precision@k is how you measure what approximation costs
 ```
 
-## Implementation in codebase
-
-**Use cases.** The severity sort + slice runs at the end of every anomaly-monitoring run to produce a ranked, capped output. The cosine-score sort + slice runs on every `InMemoryVectorStore.search` — i.e. every RAG query — to return the top-k most-similar chunks. The over-fetch-then-filter-then-slice runs on every `ConversationMemory.recall` — when an agent pulls relevant past exchanges out of a (possibly shared) vector store. Detection matching runs in eval scoring against expected categories/metrics/scopes. Coverage classify runs pre-model. The replay filename sort runs whenever a batch eval lists artifacts.
-
-The comparator sort + top-k slice — `packages/agents/anomaly-monitoring/src/monitoring-agent.ts` (lines 35, 86–88):
-
-```
-  const severityRank: Record<Anomaly['severity'], number> = {  ← line 35: category → number
-    /* critical: 3, warning: 2, info: 1, ... */
-  };
-  ...
-  return [...parsed]
-    .sort((left, right) => severityRank[right.severity] - severityRank[left.severity])  ← desc by rank
-    .slice(0, 10);                                            ← top-k cap
-       │
-       └─ the rank table is the ordering DEFINITION — without it, sorting the
-          severity strings would order them alphabetically (meaningless). The
-          [...parsed] copy avoids mutating the parsed array in place. slice(0,10)
-          is top-k by full sort: correct because n is small, a heap would be overkill.
-```
-
-The second top-k — cosine-score ranking in retrieval — `packages/retrieval/src/in-memory-vector-store.ts` (lines 25–57):
-
-```
-  async search(vector: number[], k: number): Promise<VectorHit[]> {
-    this.assertDimension(vector, 'query vector');
-    const hits: VectorHit[] = [];
-    for (const chunk of this.chunks.values()) {                  ← line 28: LINEAR SCAN, every chunk
-      hits.push({ id: chunk.id, score: cosineSimilarity(vector, chunk.vector), meta: chunk.meta });
-    }                                                            ←   derive the sort key per chunk: O(d) each
-    hits.sort((a, b) => b.score - a.score);                      ← line 31: comparator sort, score DESC
-    return hits.slice(0, Math.max(0, k));                        ← line 32: top-k slice (Math.max guards k<0)
-  }
-       │
-       └─ same sort-and-slice shape as the anomaly ranking, but the derived key is a
-          NUMERIC cosine score, not a table lookup. Total cost: O(n·d) to score every
-          one of n chunks at d dimensions, then O(n log n) to sort. This is brute-force
-          (exact) nearest-neighbor — it always returns the true top-k, paying a full
-          scan to do it. The Math.max(0, k) is the boundary guard: a negative k slices
-          to empty instead of throwing.
-```
-
-And `cosineSimilarity` (`:46-57`) is the derived-key function — one O(d) pass accumulating `dot`, `magA`, `magB`, then `dot / (√magA · √magB)`, returning 0 when a vector has zero magnitude so the score is never `NaN`. This is the only place AptKit ranks by a *computed numeric score* rather than a lookup-table rank or a string comparison — see `01` for why O(n·d) is the cost that actually scales here, and `05` for the ANN/HNSW index that replaces this scan once n is large.
-
-The post-filtered top-k — `recall` over a possibly-shared store — `packages/memory/src/conversation-memory.ts` (lines 89–106), with the contract it works around at `packages/retrieval/src/contracts.ts` (lines 33–37):
-
-```
-  // contracts.ts:33-37 — the constraint:
-  search(vector: number[], k: number): Promise<VectorHit[]>;   ← (vector, k) only — NO metadata filter
-
-  // conversation-memory.ts:89-106 — the workaround:
-  async recall(query, k = 5): Promise<MemoryHit[]> {
-    const [vector] = await embedder.embed([query]);
-    if (!vector) return [];
-    const fetchK = Math.max(k * 4, 20);              ← line 94: over-fetch a WIDER window (the margin)
-    const hits = await store.search(vector, fetchK); ← rank fetchK candidates, not k
-    return hits
-      .filter((h) => h.meta?.kind === kind)          ← line 97: drop rows that aren't memory
-      .slice(0, k)                                    ← line 98: truncate to the asked-for k
-      .map((h) => ({ id: h.id, score: h.score, text: ..., conversationId: ... }));
-  }
-       │
-       └─ the order is the whole lesson: over-fetch → filter → slice. search() can't take a
-          "kind === memory" predicate, so recall ranks fetchK = max(k*4, 20) rows and filters
-          AFTER. The k*4 multiple is the margin: if the top k were all documents, fetching only k
-          would filter to zero; the wider window leaves room for k survivors. The max(…, 20) floor
-          stops the margin going too thin at small k. It's best-effort, not exact — if fewer than k
-          memories sit in the top-fetchK window, recall returns fewer than k with no backfill. The
-          exact fix is a metadata filter pushed INTO the store (a pgvector WHERE kind='memory'),
-          which the (vector, k) contract deliberately doesn't expose yet.
-```
-
-Linear match + the matched/missed/unexpected split — `packages/evals/src/detection-scorer.ts` (lines 51–82):
-
-```
-  for (const requirement of required) {                       ← linear over requirements
-    if (matchesRequirement(detections, requirement.kind, requirement.value)) {  ← .some scan
-      matched.push(label);
-    } else {
-      missed.push(label);                                     ← missed = required, not found
-      issues.push({ ... });
-    }
-  }
-  const expectedCategories = new Set(expectations.requiredCategories ?? []);  ← Set for O(1) lookup
-  const unexpected = detections
-    .map((d) => d.category)
-    .filter((c) => expectedCategories.size > 0 && !expectedCategories.has(c))  ← not expected
-    .map((c) => `category:${c}`);
-       │
-       └─ classic set-difference framed as detection scoring: matched (required ∩ found),
-          missed (required − found), unexpected (found − expected). All linear scans over
-          small lists; the Set makes the "unexpected" membership O(1) per detection.
-```
-
-And `matchesRequirement` (`:85`) is the inner linear `.some` — for each requirement it scans detections until one matches on the right field (category/metric/scope/severity). O(required × detections), both small.
-
-The deterministic filename sort — `packages/evals/src/replay-runner.ts` (lines 40–43):
-
-```
-  return entries
-    .filter((entry) => entry.isFile() && extname(entry.name) === '.json')  ← keep .json files
-    .map((entry) => join(dir, entry.name))
-    .sort();                                                  ← lexicographic, deterministic order
-       │
-       └─ sorted for REPRODUCIBLE iteration (evals must run in stable order), NOT to
-          search it. The list is then walked linearly to eval each artifact. This is
-          why binary search never appears — nothing searches the sorted list by key.
-```
+---
 
 ## Elaborate
 
-Comparison sorts top out at O(n log n) — that's the proven lower bound for comparison-based ordering, and merge/quick/heap sort all hit it (your visualizers show the constant-factor and stability differences). JavaScript's `Array.prototype.sort` is a hybrid (typically Timsort-family) and is stable in modern engines, which matters when ties should preserve input order. The repo leans on the engine's sort rather than hand-rolling — correct, since the from-scratch versions are a learning exercise, not a production need.
+The "sort by a computed key then take the front" shape is universal in ranking systems — search engines, feed ranking, recommendation. The interesting engineering is almost always in the *comparator* (here, cosine similarity) and the *selection size*, not the sort algorithm, which is a solved problem you delegate to the standard library. Quickselect (Hoare, 1961) is the answer when you need *only* the k-th element or an unordered top-k — `O(n)` average by partitioning toward the pivot without fully sorting; it's worth knowing precisely so you can say *why* aptkit doesn't use it (it wants the survivors ordered).
 
-Binary search is the payoff of *maintaining* order: O(log n) lookup, but only on sorted data, and keeping data sorted under insertion is itself O(n) per insert into an array (which is why you'd reach for a balanced tree — see `04`). Quickselect is the elegant top-k shortcut: partition like quicksort but recurse into only one side, O(n) average to find the k-th element without fully sorting. Both are absent here for the same reason: no large sorted collection, no large top-k. The triggers are scale triggers, and at AptKit's scale the simple O(n log n) and O(n) operations are the right complexity budget. For the cost reasoning behind "small n means don't optimize," see `01`.
+precision@k and recall@k come from information retrieval, decades older than embeddings. Their job in aptkit is to make retrieval quality a *number* so the eval harness can catch a regression — swap the embedding model or the store and precision@k tells you if relevance dropped. That's the bridge to `study-ai-engineering` (RAG quality) and `study-testing` (regression baselines): the selection algorithm here produces the ranking; those guides measure and guard it.
+
+Binary search, notably, is `not yet exercised` — aptkit never searches a *sorted* array for a target. The sort here is for ranking, and the result is consumed as a top-k slice, never binary-searched. Naming the absence is the point: the "search" in this system is rank-and-select, not target-find.
+
+---
 
 ## Interview defense
 
-**Q: "How does the monitoring agent rank anomalies, and why that approach?"**
+**Q: Walk me through the most-run algorithm in aptkit.**
 
-Maps each severity string to a numeric rank via a lookup table, sorts descending on that rank, then `slice(0, 10)` for top-k. The rank table is the ordering definition — sorting the strings directly would order them alphabetically, which is wrong for severity. It's top-k by full sort, which is correct here because n is small; a heap would be over-engineering.
-
-```
-  severity string → rank table → number → sort desc → slice(0,10)
-  full sort beats a heap when n is tiny ← the part people over-think
-```
-
-Anchor: *rank-table-then-sort is how you order categorical data, and full-sort top-k is right when n is small.*
-
-**Q: "Why is there no binary search anywhere?"**
-
-Because nothing maintains a sorted collection that it searches by key. The one sort (replay filenames) is for deterministic iteration order, then the list is walked linearly to eval — never searched. Binary search needs a maintained sorted index and repeated key lookups; that pattern only appears at a scale this repo doesn't have. At that scale I'd use a database's B-tree index, not hand-rolled binary search.
+> `InMemoryVectorStore.search`. It scores every chunk against the query with cosine similarity — `O(d)` per chunk, `d=768` — pushes `{id, score, meta}` into a hit array, sorts it descending by score with `Array.sort` (Timsort, stable, `O(n log n)`), and slices the top-k. Score, rank, select. The comparator guards against a zero vector returning `NaN`, which would scramble the sort; the slice clamps negative k to 0. It's a full sort even though only k survive — correct because `n` is small and the model wants the survivors ordered best-first.
 
 ```
-  sort filenames → iterate all linearly   (never search by key)
-  binary search needs: maintained sorted index + repeated lookup
+  score (cosine, O(d)) → sort (Timsort O(n log n)) → slice(top-k)
 ```
 
-Anchor: *binary search needs a searched sorted index — the repo sorts for order, never to search, so it never qualifies.*
+**Q: Why a full sort and not quickselect, which is `O(n)`?**
 
-**Q: "Memory's `recall` over-fetches `max(k*4, 20)` then filters down to k. Why not just fetch k?"**
+> Quickselect gives you the k-th element or an unordered top-k in `O(n)` average — but I need the top-k *ordered*, because the model reads them best-first, so I'd have to sort the survivors anyway. At aptkit's small `n` the full sort is simpler and the asymptotic difference is invisible. Quickselect or a bounded heap earns its place only when `n` is large and `k << n`. And at *real* scale the right move isn't a cleverer selection at all — it's an ANN index that never ranks all `n`, which is what precision@k lets me measure the accuracy cost of.
 
-Because the vector store's `search` is `(vector, k)` with no metadata filter, and memory rows can share a store with documents. If I fetched exactly k and the top k were all documents, the `kind === 'memory'` filter would leave me zero results even though relevant memories sat just below. So I over-fetch a wider window — `k*4`, floored at 20 — rank that, filter, then slice to k. The over-fetch is a *margin*: as long as at least k of the top `fetchK` ranked rows are memories, I still return a full k. It's best-effort, not exact — if memories are pathologically sparse in that window I under-return — and the real fix is pushing the filter into the index, which a pgvector store would do.
+**Q: What does `ok: false` mean in the precision@k result?**
 
-```
-  fetch k only   → top-k all docs → filter → ZERO memories (bug)
-  fetch k*4 (20) → filter → slice(0,k) → k survivors (margin saves it)
-```
+> That the metric is *undefined*, not that the selection was bad. `ok: false` happens only when `k <= 0` or the denominator is zero (nothing retrieved, or no relevant ids). A genuine precision of `0` — selected k items, none relevant — still has `ok: true`. Separating "couldn't compute" from "computed and it's zero" stops a degenerate input from masquerading as a quality failure.
 
-Anchor: *the over-fetch is the margin that survives the post-filter — fetch exactly k and a crowded top truncates you to nothing.*
+Anchor: *retrieval is score → rank → select; aptkit full-sorts because it's small and wants ordered survivors, and precision@k measures what an approximate selection would cost.*
 
-**Q: "When would you replace the sort-and-slice with quickselect or a heap?"**
-
-When top-k has k ≪ n and n is large — top 10 of 100,000. Then a size-k heap (O(n log k)) or quickselect (O(n) average) beats the full O(n log n) sort meaningfully. Here k=10 and n is rarely above 10, so the full sort is simpler and effectively free. I'd switch only when a profiler showed the sort mattering, which it won't at this scale.
-
-```
-  k ≪ n, large n → heap O(n log k) or quickselect O(n)
-  here k≈n, tiny n → full sort wins on simplicity
-```
-
-Anchor: *the top-k shortcut pays off only when k ≪ n and n is large — neither holds, so sort-and-slice is correct.*
-
-## Validate
-
-**Reconstruct.** Write the severity ranking from memory: rank table, `sort((l,r) => rank[r] - rank[l])`, `slice(0, 10)`. State why sorting the severity strings directly would be wrong.
-
-**Explain.** In `detection-scorer.ts`, describe the matched/missed/unexpected three-way split as set operations (intersection, difference, difference) and say why the `unexpected` check uses a `Set` (O(1) membership per detection vs O(expected) per detection with an array).
-
-**Apply to a scenario.** The eval system grows to 200,000 saved replay artifacts and you need to find the one with a specific `capabilityId` and `createdAt`. Is the current `readdir + sort + linear scan` still fine? What changes? (Answer: linear scan over 200k is now slow per lookup; if you query repeatedly by key, you want an index — sort by the key and binary-search, or move to a database with a B-tree index. This is the exact trigger that summons binary search / an index, absent today because n is small.)
-
-**Defend the decision.** Someone wants the anomaly ranking to use quickselect "for O(n) performance." Defend the sort-and-slice. (Answer: quickselect's O(n) average beats O(n log n) only at large n; here n ≤ 10, so log n is ~3 — the asymptotic win is invisible and quickselect adds partitioning complexity and a worst case. The full sort is simpler, stable, and free at this size. Premature optimization.)
-
-**Apply to memory recall.** `ConversationMemory.recall` (`conversation-memory.ts:89-106`) over-fetches `max(k*4, 20)`, filters by `kind`, then slices to k. Two questions: (a) what concrete bug does the over-fetch prevent, and (b) when does this post-filter approach *still* fail, and what's the exact fix? (Answer: (a) without the margin, a top-k crowded with documents filters down to fewer than k — or zero — memories, silently under-returning. (b) it still fails when genuine memories are sparser than k inside the top-`fetchK` window; there's no backfill fetch, so you get < k. The exact fix is a metadata predicate pushed into the store — a pgvector `WHERE kind='memory'` evaluated during ranking — which the `(vector, k)` contract doesn't yet expose.)
-
-**Apply to retrieval.** `InMemoryVectorStore.search` (`in-memory-vector-store.ts:25-33`) scores every chunk with cosine, sorts all of them, then slices the top-5. Two questions: (a) why is the full sort fine *now*, and (b) what's the first thing you'd change as the corpus grows — the sort, or the scan? (Answer: (a) a few documents chunk to a handful of vectors, so sorting all to keep 5 is free. (b) Change the *scan* first, not the sort — the O(n·d) scoring of every vector is what dominates at scale, and the fix is an ANN index (HNSW) that skips most vectors, not a heap that merely makes the keep-top-5 step O(n log k). A size-k heap is the smaller, second optimization; the linear scan is the real bottleneck. See `05` for the HNSW graph index.)
+---
 
 ## See also
 
-- `01-complexity-and-cost-models.md` — why "small n" makes these O(n log n) / O(n) operations effectively free.
-- `02-arrays-strings-and-hash-maps.md` — the `Set` that makes the `unexpected` membership check O(1), and the linear scans' hash-lookup complement.
-- `03-stacks-queues-deques-and-heaps.md` — the heap that top-k *would* use if k ≪ n and n were large (retrieval is the first place that gets close).
-- `04-trees-tries-and-balanced-indexes.md` — the balanced index binary search needs but the repo lacks.
-- `05-graphs-and-traversals.md` — the HNSW *graph* index that replaces retrieval's linear-scan k-NN at scale (the bigger optimization above a heap).
-- `02-arrays-strings-and-hash-maps.md` — `cosineSimilarity` as the derived sort key, the chunker that produces the vectors this file ranks, and memory's per-conversation counter `Map` that pairs with `recall`'s post-filtered selection.
-- `study-ai-engineering` (neighboring guide) — detection scoring and precision@k as eval metrics, and `@aptkit/memory`'s recall as episodic-memory retrieval, viewed as AI mechanics rather than selection arithmetic.
+- **02-arrays-strings-and-hash-maps.md** — the hit array the sort orders and the sets precision@k intersects.
+- **03-stacks-queues-deques-and-heaps.md** — the heap-based partial selection aptkit declines to use.
+- **05-graphs-and-traversals.md** — the approximate (HNSW) alternative to exact full-sort ranking.
+- **01-complexity-and-cost-models.md** — the `O(n log n)` cost of the sort in context.
+- `study-ai-engineering` / `study-testing` — precision@k as RAG-quality metric and regression baseline.

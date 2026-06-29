@@ -1,69 +1,65 @@
-# Study — Performance Engineering (AptKit)
+# Study — Performance Engineering (aptkit)
 
-A per-repo performance-engineering study guide for the AptKit monorepo.
-**The central fact: for an LLM system the dominant cost and latency is the
-model round-trip — tokens and turns — not CPU or memory.** Every perf
-control in this repo bounds, measures, skips, or hides model work. The
-guide is read through that lens throughout.
+Measurement and optimization of this repo: budgets, baselines, profiling,
+latency, throughput, memory, I/O, rendering, caching, batching, backpressure,
+and cost. Grounded in real files. **The honest headline: nothing here is
+measured yet** — this guide walks the repo's performance *decisions* and names
+everywhere a budget, baseline, or profile is `not yet exercised`.
 
-This is an **audit-style** guide: Pass 1 is a single lens audit; Pass 2 is
-a set of discovered-pattern files named after the real perf patterns the
-repo exercises.
+This is an audit-style guide — two passes:
+
+- **Pass 1** is `audit.md`: an 8-lens walk of the whole repo, each lens grounded
+  in `file:line` or marked `not yet exercised`, ending in a ranked red-flag
+  table.
+- **Pass 2** is the numbered pattern files: one per performance pattern the repo
+  actually exercises.
 
 ## Reading order
 
-1. **00-overview.md** — the map, ranked findings, and the `not yet
+1. **`00-overview.md`** — the map, ranked findings, and the full `not yet
    exercised` list. Start here.
-2. **audit.md** — Pass 1. The 8-lens walk (budget, baselines/profiling,
-   latency/tail, CPU/memory, I/O/network, caching/batching/backpressure,
-   rendering, red-flags). Honest `not yet exercised` where a lens finds
-   nothing.
-3. **Pass 2 — discovered patterns:**
-   - **01-turn-and-tool-budget.md** — the load-bearing control: a hard
-     turn/tool ceiling + forced-synthesis turn that bounds the bill and the
-     latency tail.
-   - **02-token-cost-ledger.md** — measuring spend (tokens → USD), and the
-     gap: cost is `n/a` for the default Anthropic provider.
-   - **03-context-window-preflight-guard.md** — failing fast on a call that
-     won't fit, via a crude `length/3` token estimate.
-   - **04-fixture-replay-as-zero-cost-path.md** — the $0, deterministic
-     dev/eval path (a test double, explicitly *not* a runtime cache).
-   - **05-streaming-for-perceived-latency.md** — NDJSON trace streaming that
-     drops time-to-first-feedback without changing total time.
-   - **06-bounded-json-scan.md** — bounded JSON extraction that can't be
-     turned into a CPU sink.
-   - **07-linear-vector-scan.md** — the RAG search is an O(n·d) flat cosine
-     scan: the exact-search baseline, with buffr's HNSW index as the proven
-     drop-in behind the same `VectorStore` contract.
-   - **08-embedding-batch-and-topk-floor.md** — embeddings batch a whole
-     document into one round-trip; the `minTopK` floor stops a weak local
-     model (Gemma) from starving its own retrieval by asking for `top_k: 1`.
-   - **09-memory-recall-overfetch.md** — `@aptkit/memory`'s episodic recall on
-     the same vector store: it over-fetches `max(k*4, 20)` rows to filter by
-     `kind` client-side (no metadata filter on the contract), grows unbounded
-     with no eviction, and puts an unbatched embed on the write path —
-     amplifying the file-07 linear scan three ways.
+2. **`audit.md`** — Pass 1, the 8-lens audit.
+3. **`01-bounded-loop-cost-ceiling.md`** — the agent loop's hard turn/tool-call
+   ceiling + forced synthesis turn. The repo's one real overload control.
+4. **`02-linear-scan-vs-ann-tradeoff.md`** — the O(n·d) in-memory cosine scan
+   vs buffr's pgvector HNSW, behind one contract. The #1 bottleneck.
+5. **`03-token-cost-accounting.md`** — per-call tokens → summed → priced in USD;
+   provider-neutral, openai-only pricing, no aggregated baseline.
+6. **`04-embedding-batching.md`** — the plural `embed(texts[])` contract: one
+   HTTP round-trip per document.
+7. **`05-build-time-inlining-zero-fetch.md`** — Studio's `?raw` markdown
+   inlining and the 537 kB single-chunk bundle trade.
+8. **`06-over-fetch-then-filter.md`** — fetching `topK*4` then pruning in JS to
+   work around a predicate-free `VectorStore` contract.
 
-## What's honestly absent
+## Pattern files at a glance
 
-No model-response cache (the biggest unclaimed lever), no latency SLO or
-percentile tracking, no CPU/memory profiling, no *model* request batching
-(embeddings ARE batched), no indexed/ANN vector search here (the in-memory
-store is a flat scan; buffr's HNSW-indexed pgvector is the contracted
-drop-in), no metadata filter on the `VectorStore` contract (which is why
-memory recall over-fetches), no memory eviction/TTL/summarization, no real
-backpressure, no bundle-size budget. The overview and audit name when each
-would start to matter. The repo's perf model is tokens-and-turns; these gaps
-are about traffic and scale it doesn't yet have.
+| File | Pattern | Load-bearing capability |
+| --- | --- | --- |
+| `01` | bounded loop cost ceiling | hard worst-case round-trip / cost bound + clean termination |
+| `02` | linear scan vs ANN | swap exact O(n) scan for sub-linear HNSW with no rewrite |
+| `03` | token cost accounting | provider-neutral USD-per-run reconstructed from the trace |
+| `04` | embedding batching | 1 round-trip per doc instead of N |
+| `05` | build-time inlining | serverless static deploy with zero runtime doc fetch |
+| `06` | over-fetch then filter | filtered retrieval over a predicate-free contract |
 
-## Cross-links to neighbor guides
+## Partition — what this guide owns vs neighbors
 
-- **study-runtime-systems** — the loop/cancellation *mechanism* behind the
-  budget.
-- **study-debugging-observability** — the trace events this guide reads as a
-  cost/latency instrument.
-- **study-ai-engineering** — cost-of-serving, provider economics, and RAG
-  retrieval quality (precision@k/recall@k as a perf baseline).
-- **study-distributed-systems** — provider-hop latency and the fallback chain.
-- **study-database-systems** — pgvector + HNSW (in buffr), the indexed
-  contrast to the in-memory linear scan.
+```
+  study-performance-engineering  MEASURES and improves bottlenecks (this guide)
+  study-runtime-systems          explains the execution model (loop, event loop, cancel)
+  study-database-systems         explains the storage engine (pgvector, HNSW, query exec)
+  study-system-design            explains architecture-scale tradeoffs
+```
+
+A finding belongs to the generator that owns the mechanism. This guide
+cross-links rather than re-teaches.
+
+## Cross-links
+
+- `study-runtime-systems` — the loop and event-loop mechanics behind `01`/`02`.
+- `study-database-systems` — pgvector/HNSW and predicate push-down behind
+  `02`/`06`.
+- `study-ai-engineering` — RAG quality, embeddings, agentic retrieval.
+- `study-frontend-engineering` — bundling/rendering/build behind `05`.
+- `study-system-design` — the contract seams these costs hang on.

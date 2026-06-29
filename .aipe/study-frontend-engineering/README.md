@@ -1,33 +1,54 @@
-# Study — Frontend Engineering (AptKit Studio)
+# Study — Frontend Engineering (aptkit / Studio)
 
-The frontend layer of this repo is exactly one app: `apps/studio` — a React 18 + Vite preview/replay UI for the agent capabilities packaged in the monorepo. There is no other frontend. So this guide is a deep read of one well-shaped SPA, not a survey of many surfaces.
+The frontend in this repo is **Studio** (`apps/studio/`) — React 18 + Vite +
+TypeScript, a single-page preview/replay UI for the agent toolkit. This guide
+is an *audit* of that surface: what's actually there, anchored to real files,
+written for someone who already ships React/Vue every day. No on-ramp. We skip
+"what's a hook" and spend the words on what's specific and interesting *here*.
 
-What makes Studio worth studying is not the framework choices (vanilla React 18, hooks, CSS-in-file) — those are the boring, correct defaults. What's worth studying is the **handful of patterns it leans on hard**: consuming a chunked NDJSON response in the browser and painting trace events live, a hand-rolled `useState` router, one generic `AgentReplayShell` composed across panels via render props, a stale-run guard that keeps an interleaved stream from corrupting the UI, and — newest — a real retrieval pipeline run *deterministically in the browser*, plus in-app docs that inline markdown at build time so they survive a backend-less static deploy.
-
-This is your home turf (7+ years Vue/React). No on-ramp. The files below lead with what's non-obvious in *this* repo.
+The short version of "what's interesting": there is **no router library, no
+data-fetching library, and no client state library** — and the app is better
+for it. A 40-line hash router, `useState` everywhere, build-time-inlined
+markdown and JSON fixtures, and a single generic replay shell carry the whole
+thing. That's the story this folder tells.
 
 ## Reading order
 
-1. **`00-overview.md`** — one page. Rendering mode in a sentence, the component tree, the stream→state→render data flow, the three highest-leverage patterns named with file paths. Skim only this and you know what Studio is.
-2. **`audit.md`** — Pass 1. The 8-lens frontend audit. Every lens named against real `file:line` evidence, with `not yet exercised` called honestly (and there's a lot of it — Studio is a dev tool, not a product surface).
-3. The pattern files (Pass 2), in dependency order:
-   - **`01-live-stream-consumption.md`** — the load-bearing mechanic. Browser `ReadableStream` → runtime NDJSON decoder → incremental `setState` → live trace render.
-   - **`02-stale-run-guard.md`** — the `runCounter` ref that makes the live stream safe under re-runs. The part everyone forgets.
-   - **`03-shared-replay-shell.md`** — one generic component (`AgentReplayShell<F, M, R>`) driving five of the six workspaces via render-prop slots.
-   - **`04-hand-rolled-router.md`** — routing as a single `useState<StudioView>` switch in `App()`. No react-router. Why that's the right call here.
-   - **`05-fixture-provider-mode-switch.md`** — the fixture→anthropic→openai mode state machine and the provider-availability gating that rides on it.
-   - **`06-replay-artifact-hook.md`** — `useReplayArtifacts`, the generic hook that owns the save→load→promote server-state lifecycle.
-   - **`07-static-demo-gated-ui.md`** — the `STATIC_DEMO` build flag that ships the same bundle to a live dev server and a static GitHub Pages demo, gating every backend-touching button and effect.
-   - **`08-build-time-markdown-docs.md`** — `DocPage`: `docs/*.md` imported via Vite `?raw` (inlined at build, no fetch), compiled by `react-markdown`, with a github-slugger TOC whose `#slug` anchors match `rehype-slug` heading ids. Works in the static Pages build.
-   - **`09-deterministic-in-browser-rag.md`** — `RagQueryWorkspace`: a real `@aptkit/retrieval` pipeline (fake embedder + `InMemoryVectorStore` + `search_knowledge_base` tool) running entirely in the browser, recorded Gemma responses driving the loop, scored live with precision@k / recall@k. The custom-page-vs-shell split.
+1. **`00-overview.md`** — one page. Rendering mode, the state graph in one
+   diagram, the network seam in one diagram, the three highest-leverage
+   patterns named with file paths. Skim only this and you know the repo.
+2. **`audit.md`** — the 8-lens frontend audit. Every lens walked against real
+   `file:line` evidence, `not yet exercised` named honestly where it applies.
+3. **Pattern files** (`01`–`06`) — one per load-bearing frontend pattern this
+   repo actually exercises. Each is a full concept walk (zoom out → structure
+   pass → how it works → interview defense).
 
-## Cross-links to neighboring guides
+## The discovered patterns
 
-The partition is sharp. This guide owns the **framework-and-platform layer**. Mechanism-level teaching lives next door:
+```
+  01  hash-router-with-section-anchors    main.tsx — 40-line router, no lib
+  02  build-time-markdown-docs            DocPage.tsx — ?raw + rehype-slug TOC
+  03  deterministic-in-browser-rag        RagQueryWorkspace + agent-runners.ts
+  04  generic-replay-shell                AgentReplayShell.tsx — one render-prop host
+  05  fixture-as-build-input              fixtures.ts + vite.config.ts JSON imports
+  06  scripted-theme-transform            scripts/*.mjs — CSS rewritten by a script
+```
 
-- **`study-networking`** — the NDJSON wire format, chunked transfer, `content-type: application/x-ndjson`, the `x-accel-buffering: no` header that defeats proxy buffering. The bytes on the wire are theirs; how the browser *consumes* them into UI state is ours (`01-live-stream-consumption.md`).
-- **`study-system-design`** — `ndjson-stream-handoff` and `client-stream-handoff` patterns. Where the trace stream originates server-side and the contract across the boundary. We pick it up at `fetch().body`.
-- **`study-runtime-systems`** — the `for await...of` async-iterator consumption, the event-loop interleaving of stream chunks with React renders, `TextDecoder` statefulness across chunk boundaries. The execution model is theirs; the UI consequence is ours.
-- **`study-performance-engineering`** — bundle size, FCP/LCP as numbers, the re-render cost of `[...current, event]` per trace event.
-- **`study-software-design`** — module depth of `AgentReplayShell` and `useReplayArtifacts` as deep generic modules.
-- **`study-security`** — the `resolveReplayPath` traversal guard, `.env` key handling. Trust boundaries are theirs.
+## Cross-links (where the seam hands off)
+
+- **`study-system-design`** — where state and data *live* at the system level;
+  the dev-server `/api/*` middleware as a service boundary; the fixture →
+  replay → promote → fixture loop. Studio is the thin client over that.
+- **`study-ai-engineering`** — the actual RAG pipeline, embeddings, agent loop,
+  precision@k/recall@k. `03-deterministic-in-browser-rag.md` is the *frontend
+  half*; the mechanism lives there.
+- **`study-performance-engineering`** — bundle size, FCP/LCP as *numbers*. This
+  guide names rendering shape; it doesn't measure it.
+- **`study-software-design`** — the deep-module argument for `AgentReplayShell`
+  and `useReplayArtifacts` (the generics, what they hide). We name it; the
+  Ousterhout lens lives there.
+- **`study-networking`** — NDJSON-over-fetch streaming semantics on the wire
+  (`api.ts` `runReplayStream`). We name the seam; the transport lives there.
+- **`study-security`** — `target="_blank" rel="noopener"`, `react-markdown`'s
+  default sanitization, no `dangerouslySetInnerHTML`. Trust boundaries live
+  there.

@@ -1,77 +1,83 @@
-# 00 — Overview: the AptKit runtime, in one frame
+# Study — Runtime Systems (aptkit, as-built)
 
-Before any concept, the whole machine. AptKit runs in two runtimes — Node.js (the Studio dev server, the `scripts/*.mjs` entry points, the per-package test runner, the new `npm run ask` RAG CLI) and the browser (the React/Vite Studio UI). Both are single-threaded. The unit of concurrency in both is *not* a thread — it's an awaited Promise scheduled on one event loop. A third Node-process target now exists too: the local Ollama HTTP server (`http://localhost:11434`) that the Gemma provider and the embedding provider both `fetch` against — same awaited-I/O shape, just a localhost socket instead of a vendor HTTPS one.
+Where does work execute, what does it own, and what breaks under concurrency or overload? This guide answers that for aptkit specifically — the bounded agent loop, the provider transports, the in-memory vector scan, the NDJSON stream, and the Studio browser app — grounded in real files.
+
+## Verdict first — the shape of execution in this repo
 
 ```
-  AptKit runtime map — two single-threaded event loops, NDJSON between them
+  aptkit's runtime, in one frame
 
-  ┌─ Browser runtime (1 event loop) ───────────────────────────────────┐
-  │  React Studio UI                                                    │
-  │    fetch('/api/stream/...')  ──►  decodeNdjsonStream (async gen)    │
-  │    onEvent(event) → setState → re-render                            │
-  └───────────────────────────────┬─────────────────────────────────────┘
-                                   │  HTTP POST, response = NDJSON stream
-                                   │  (one record per line, flushed live)
-  ┌─ Node runtime (Vite dev server, 1 event loop) ─▼────────────────────┐
-  │  middleware handler (async)                                         │
-  │    └─► runReplay() ──► Agent.propose() ──► runAgentLoop()           │
-  │                                                │                     │
-  │         ┌──────────── the bounded loop ────────▼──────────┐         │
-  │         │ for turn 0..maxTurns:                            │         │
-  │         │   signal.throwIfAborted()   ← cancellation check │         │
-  │         │   await model.complete()    ← network I/O task   │         │
-  │         │   for each tool_use:                             │         │
-  │         │     await tools.callTool()  ← sequential, 1@time │         │
-  │         └──────────────────────┬────────────────────────────┘       │
-  │                                │ each emit() → res.write(ndjson)     │
-  └────────────────────────────────┘                                    │
-            │                                                            │
-  ┌─ Provider SDK boundary ────────▼───────────────────────────────────┐
-  │  Anthropic / OpenAI SDK → HTTPS → model API (awaited, signal-aware) │
-  └─────────────────────────────────────────────────────────────────────┘
+  ┌─ Process boundary: ONE Node process (CLI / test / Vite dev server) ─────┐
+  │                                                                          │
+  │   ┌─ libuv event loop ─────────────────────────────────────────────┐   │
+  │   │                                                                  │   │
+  │   │   runAgentLoop ──await──► model.complete() ──await──► tools      │   │
+  │   │   (sequential for-loop)   (HTTP via fetch)            (await)     │   │
+  │   │         │                                                        │   │
+  │   │         └── CPU work runs INLINE on this one thread:             │   │
+  │   │             cosine scan, JSON.parse, sort — no worker offload    │   │
+  │   └──────────────────────────────────────────────────────────────────┘ │
+  │                                                                          │
+  │   No worker_threads · no child_process (except npm pack) · no cluster    │
+  │   No SIGTERM/SIGINT handler · no graceful shutdown · single process      │
+  └──────────────────────────────────────────────────────────────────────────┘
+                              │ NDJSON over HTTP (Studio dev server only)
+                              ▼
+  ┌─ Browser process: apps/studio (React 18, its own event loop) ───────────┐
+  │   fetch() → ReadableStream.getReader() → decodeNdjsonStream (async gen)   │
+  └──────────────────────────────────────────────────────────────────────────┘
 ```
 
-Everything below the UI is *one Node process, one thread, one loop*. The "parallelism" you might expect — running tool calls at once, fanning out fixture replays — is **not here**. Work is strictly sequential `await` inside `for` loops. That's the single most important fact about this runtime, and it's a deliberate fit for an LLM agent loop where each step depends on the last.
+The call here: **aptkit is a single-process, single-threaded, async-I/O-bound TypeScript runtime.** Almost everything that takes time is a network `await` (an HTTP call to Ollama or a cloud SDK). The CPU work that exists — cosine similarity, JSON parsing, array sorts — runs inline on the same event-loop thread and is small at current scale. There is no thread pool you wrote, no worker, no OS-level parallelism. The Studio is a separate browser process with its own event loop, reached only over HTTP NDJSON.
 
-## The through-line question
+## The most consequential mechanisms, ranked
 
-> Where does work execute, what does it own, and what breaks under concurrency or overload?
+1. **The bounded agent loop (`runAgentLoop`, `packages/runtime/src/run-agent-loop.ts:76`).** A sequential `for` loop with a hard `maxTurns` bound, a `maxToolCalls` budget, a forced final synthesis turn, and `signal.throwIfAborted()` at the top of every iteration. This is the single most important runtime structure in the repo — every agent's execution, cost, and cancellation behavior flows through it. → `02`, `07`.
 
-For AptKit the answers are unusually clean:
-- **Where:** one event loop per runtime; tasks are awaited Promises, never threads.
-- **Owns:** each run owns its own `messages` array and `toolCalls` array on the stack/heap of one async call tree — no shared mutable state between runs.
-- **Breaks under concurrency:** almost nothing, *because there is no in-process concurrency to break*. The race surface is the filesystem (two promotes writing the same path) and the provider API (rate limits), not in-memory state.
-- **Breaks under overload:** the loop is bounded (`maxTurns`, `maxToolCalls`, `maxTokens`, `MAX_TOOL_RESULT_CHARS`), so a runaway agent is capped — but there's **no backpressure** on the NDJSON stream and **no timeout** on the awaited model call.
+2. **The in-memory cosine scan (`InMemoryVectorStore.search`, `packages/retrieval/src/in-memory-vector-store.ts:25`).** The one place real CPU work happens in the hot path — an `async` method with no `await` inside, doing an O(n·d) loop plus a full sort, blocking the event loop for its whole duration. Fine at corpus sizes of dozens; the first thing that bites under scale. → `03`, `05`.
 
-## Ranked findings — what to look at first
+3. **The sequential fallback chain (`FallbackModelProvider.complete`, `packages/providers/fallback/src/fallback-provider.ts:47`).** A try/catch `for` loop over providers, each `await`ed in turn, with abort short-circuiting. Combined with Gemma's retry loop and structured-generation's retry, aptkit's failure handling is "retry in sequence, never in parallel." → `02`, `07`.
 
-The teacher's verdict, most consequential first. Evidence in `08-runtime-systems-red-flags-audit.md`.
+## Reading order
 
-1. **The bounded agent loop is the heart of the runtime, and it's well-bounded.** Four independent budgets cap a single run: `maxTurns` (default 8, recommendation 6, rag-query 6), `maxToolCalls` (recommendation 4, rag-query 4), `maxTokens` (4096), and `MAX_TOOL_RESULT_CHARS` (16,000). The `forceFinal` flag strips tools on the last turn so the model *must* answer instead of looping forever. `run-agent-loop.ts:98-135`, `:52-57`. This is the load-bearing mechanism — see `07`. **New:** the Gemma provider adds a *second, nested* bounded loop *inside* one `model.complete()` — a parse-retry loop capped by `maxToolCallAttempts` (default 2) that re-asks Gemma for valid tool-call JSON, with `signal.throwIfAborted()` before the loop and inside every iteration (`packages/providers/gemma/src/gemma-provider.ts:52-92`). Two bounded-and-cancellable loops now nest. See `07`.
+```
+  01-runtime-map                          the process / task / resource map as-built
+   ↓
+  02-processes-threads-and-tasks          one process, async tasks, no threads
+   ↓
+  03-event-loop-and-async-io              the libuv loop, await points, the blocking scan
+   ↓
+  04-shared-state-races-and-synchronization   why single-thread JS sidesteps most races
+   ↓
+  05-memory-stack-heap-gc-and-lifetimes   allocation, the buffered-everything choices, GC
+   ↓
+  06-filesystem-streams-and-resource-lifecycle   fs.promises, the NDJSON stream, descriptors
+   ↓
+  07-backpressure-bounded-work-and-cancellation  maxTurns, AbortSignal, the missing pieces
+   ↓
+  08-runtime-systems-red-flags-audit      ranked execution-model risks
+```
 
-2. **Cancellation is threaded end-to-end via one `AbortSignal`, but it's cooperative — it only fires at `await` boundaries.** `signal?.throwIfAborted()` at the top of every turn (`run-agent-loop.ts:99`), passed into `tools.callTool` (`:159`), into `model.complete` (`:108`), through the fallback chain (`fallback-provider.ts:52,65`), down to the SDK's native `{ signal }` (`anthropic-provider.ts:38`, `openai-provider.ts:47`), and into the stream decoder (`ndjson-stream.ts:112,123`). A synchronous hot loop would ignore it — there isn't one here. See `07`.
+## `not yet exercised` in this repo
 
-3. **Tool calls run strictly one at a time — no `Promise.all`.** The loop `await`s each tool inside a `for...of` (`run-agent-loop.ts:139-189`). When a model requests three independent tools in one turn, they execute serially. Same in every `scripts/*.mjs` (`for...of` + `await`, e.g. `replay-promoted-fixtures.mjs:28-40`) and in the new RAG indexing path — `ask.ts:44` indexes documents one at a time (`for (const doc of CORPUS) await pipeline.index(doc)`). The one place the new code *does* batch is the embed call itself: `indexDocument` hands the whole chunk array to the embedder in a single `await embedder.embed(texts)` (`pipeline.ts:40`), so chunks of one doc embed together, but docs index serially. See `02`, `08`.
+These are real runtime-systems concerns the codebase does not currently touch. Each file says when it would become relevant.
 
-4. **NDJSON streaming has no backpressure.** The Studio handler calls `res.write(...)` per event and never checks the return value or waits for `drain` (`vite.config.ts:906-909`). For human-paced agent traces this never matters; under a flood of events to a slow client it buffers unboundedly in the Node process. See `06`, `08`.
+- **OS threads / `worker_threads` / `cluster`** — none anywhere. All CPU work is on the main thread. (`02`, `05`)
+- **`child_process` for real work** — only `spawnSync` in `scripts/pack-core-standalone.mjs:68` to shell out to `npm pack`; never for concurrent or hot-path work. (`02`)
+- **Filesystem streaming** — every file read/write is buffered (`fs.promises.readFile`/`writeFile`); no `createReadStream`/`createWriteStream`. (`06`)
+- **Backpressure on the producer side** — the agent loop has no queue, no concurrency limiter (`p-limit`), no rate limiter. Bounds are on iteration count, not on throughput. (`07`)
+- **Signal handling / graceful shutdown** — no `process.on('SIGTERM'/'SIGINT')`, no drain-then-exit. (`07`)
+- **Locks / atomics / channels / shared-memory concurrency** — none, and on a single thread mostly unnecessary; the one shared-state seam is the `lastSelectedProvider` mutation. (`04`)
+- **Parallel fan-out** — no `Promise.all`/`allSettled`/`race` over independent work anywhere in `packages/`. Embedding, indexing, and provider fallback are all strictly sequential. (`02`, `03`)
 
-5. **The awaited model call has no timeout.** `await model.complete()` can hang as long as the SDK's own defaults allow; the only escape is the external `AbortSignal`. There's no `Promise.race` against a deadline in the loop. The new local providers inherit this — the Gemma `fetch` and the embed `fetch` against Ollama have no timeout either (`gemma-provider.ts:203-214`, `ollama-embedding-provider.ts:62-74`). See `07`, `08`.
+## Partition — what lives here vs next door
 
-6. **The new vector search is a synchronous brute-force scan, and the agent's `AbortSignal` never reaches the embed call.** `InMemoryVectorStore.search` runs `cosineSimilarity` over *every* stored chunk on the JS thread in one synchronous span (`in-memory-vector-store.ts:25-33`) — fine for a 3-doc demo corpus, a loop-blocking hazard if the corpus ever grows large. Separately, `OllamaEmbeddingProvider.embed` *accepts* an `AbortSignal` and threads it to the socket (`ollama-embedding-provider.ts:50-57`), but the pipeline → tool → agent path never passes one, so the agent's kill switch stops the model call yet can't abort an in-flight embedding HTTP request. See `03`, `07`, `08`.
+```
+  study-runtime-systems   HOW code executes inside one machine/runtime (this guide)
+  study-system-design     WHERE components live, how requests cross boundaries
+  study-distributed-systems  coordination across processes under partial failure
+  study-performance-engineering  measuring + optimizing the costs named here
+  study-networking        the HTTP/transport layer the awaits sit on
+```
 
-7. **`@aptkit/memory` is the same async-embed-then-sync-filter shape — same cancellation gap, plus one piece of ephemeral in-process state.** `conversation-memory.ts`'s `recall` does an `await embedder.embed([query])` then `await store.search(...)`, then a *synchronous* `.filter(kind).slice(k).map(...)` span over the over-fetched hits (`conversation-memory.ts:89-105`) — no new loop, just another consumer of the existing embed/search execution shared with the RAG pipeline. Two execution-relevant notes: (a) neither `recall` nor `remember` takes an options/signal arg (`:37-38`), so the agent's `AbortSignal` is dropped one seam earlier than the pipeline gap — the `search_memory` tool handler `await`s `memory.recall(query, topK)` with no signal (`memory-tool.ts:52`); same dead end as finding 6. (b) A per-conversation counter `Map` (`:71`) is module/closure state held *across* calls so repeated turns get distinct ids — in-process, unbounded (one entry per `conversationId`, never evicted), and lost on restart (ties to durability). See `03`, `04`, `07`, `08`.
-
-## `not yet exercised` — honestly absent
-
-These are real runtime-systems topics that this repo does **not** contain. Each file marks where it's relevant and what would introduce it.
-
-- **Worker threads / `Worker` / `worker_threads`.** No multi-threading anywhere. Verified: no `worker_threads`, `new Worker`, `SharedArrayBuffer`, or `Atomics` in any source file. (Rein built a *separate* real-time on-device ML pipeline in `contrl` with Worklets-core + a frame-rate latency budget — that's the closest thing in the portfolio to a hot-path worker, but it lives in another repo, not here.) See `02`.
-- **Process pools / clustering / `child_process` fan-out.** Scripts are single sequential Node processes. No `cluster`, no worker pools. See `02`.
-- **Mutexes / semaphores / locks / atomics.** No shared mutable state across concurrent tasks means nothing to lock. See `04`.
-- **Manual memory management / object pools / arena allocation.** V8 GC handles everything; no `Buffer` pooling or manual frees. See `05`.
-- **Stream backpressure handling (`drain`, `pipe`, highWaterMark tuning).** Streaming is fire-and-forget `res.write`. See `06`.
-- **Deadlines / per-call timeouts / graceful shutdown handlers.** No `Promise.race(timeout)`, no `process.on('SIGTERM')` drain. See `07`.
-
-## Why this is the right frame
-
-An LLM agent loop is *inherently* sequential — turn N's tool results are turn N+1's input. Threads buy you nothing when each step waits on the previous one's network round-trip. The honest runtime story here isn't "they forgot to parallelize" — it's "the workload is a chain of dependent awaited I/O, and the single-threaded event loop is exactly the right tool for that." The interesting engineering is in the *bounds* (budgets) and the *escape hatch* (cancellation), not in concurrency primitives. That's where files 07 and 08 spend their time.
+Cross-links to neighbors appear at the seams inside each file.

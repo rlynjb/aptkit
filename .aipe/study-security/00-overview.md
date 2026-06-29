@@ -1,97 +1,55 @@
-# Security overview — one page
+# Overview — the trust map of aptkit + buffr
 
-Before any lens, the whole picture. AptKit's trust story centers on the model
-boundary — now in two flavors, keyed cloud and no-auth local Gemma — plus the
-publish boundary, two assets worth protecting, and five controls that guard
-them. Everything else in a standard security checklist is `not yet
-exercised` because the repo has no surface for it — and saying so plainly is
-half the audit.
+One page to orient before the audit. Here's the whole security picture in a single frame, then the verdict: the single worst exposure, ranked first.
 
-## The system as trust bands
-
-The same monorepo, x-rayed along the trust axis: what can each side see,
-reach, or tamper with?
+## The whole thing, one diagram
 
 ```
-  AptKit along the trust axis — what each band can reach
+  aptkit (toolkit) + buffr (runtime) — the trust boundaries
 
-  ┌─ Developer machine (TRUSTED) ───────────────────────────────────┐
-  │  .env  ──►  provider adapters  ──►  agent loop (runs tool calls) │
-  │  keys      (read process.env)        ▲          │               │
-  │                                      │          ▼               │
-  │                            tool schemas    InMemoryToolRegistry │
-  │                            (filtered)       (holds ALL handlers)│
-  └──────────────────────────────────────┬──────────────────────────┘
-                                          │  request (system+messages+tools)
-  ┌─ Model provider (UNTRUSTED) ──────────▼──────────────────────────┐
-  │  Anthropic / OpenAI (keyed, TLS) — returns text + tool_use       │
-  │  Gemma / Ollama (LOCAL, no key, plain HTTP) — tool calls PARSED  │
-  │  from prose; transport unauthenticated (★ new boundary ★)        │
-  │  this output is NOT trusted: it's parsed, validated, gated       │
-  └──────────────────────────────────────┬──────────────────────────┘
-                                          │  NDJSON trace (no secrets)
-  ┌─ Studio browser tab (localhost) ──────▼──────────────────────────┐
-  │  React UI renders trace + outputs — never receives a key         │
-  └───────────────────────────────────────────────────────────────────┘
-                                          │  git push / npm publish
-  ┌─ Public surface (HOSTILE) ────────────▼──────────────────────────┐
-  │  GitHub repo + @rlynjb/aptkit-core tarball — anything that       │
-  │  leaked into a committed artifact is now world-readable          │
-  └───────────────────────────────────────────────────────────────────┘
+  ┌─ UNTRUSTED ─────────────────────────────────────────────────────┐
+  │  Human question string                                          │
+  │  Indexed documents (could contain adversarial text)             │
+  └──────────────────────────────┬───────────────────────────────────┘
+                                 │  no sanitization beyond JSON parse
+                                 ▼
+  ┌─ SEMI-TRUSTED: the model ────────────────────────────────────────┐
+  │  Gemma (local) / Anthropic / OpenAI via ModelProvider.complete() │
+  │  decides: which tool, what args, when to stop                    │
+  │                                                                   │
+  │  CONTROLS that box it:                                            │
+  │   filterToolsForPolicy  — sees only allowed tools (01)           │
+  │   maxTurns / maxToolCalls — bounded work (02)                    │
+  │   minTopK + matchesFilter — bad args can't starve/wipe (03)      │
+  │   parseAgentJson         — tolerant, never eval()s output        │
+  └──────────────────────────────┬───────────────────────────────────┘
+                                 │  tool call → handler
+                                 ▼
+  ┌─ TRUSTED: storage (lives in buffr) ──────────────────────────────┐
+  │  PgVectorStore   — pg `$1..$8` params, `where app_id = $2` (04)  │
+  │  SupabaseTraceSink — persists FULL trajectory to agents.messages │
+  │  agents schema   — app_id column, NO row-level security          │
+  └──────────────────────────────────────────────────────────────────┘
+                                 ▲
+  ┌─ SECRETS ───────────────────┴────────────────────────────────────┐
+  │  .env (both repos, gitignored): ANTHROPIC_API_KEY, OPENAI_API_KEY,│
+  │  DATABASE_URL (with password). Never in source, never in bundle. │
+  └──────────────────────────────────────────────────────────────────┘
+
+  ┌─ DEV-ONLY side surface: Studio Vite middleware ──────────────────┐
+  │  ~14 /api/* routes, no auth (localhost dev server)               │
+  │  resolveReplayPath gates file writes to artifacts/replays/ (05)  │
+  └──────────────────────────────────────────────────────────────────┘
 ```
 
-## The three assets
+## The verdict — what to worry about, in order
 
-- **API keys** (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, plus their `_MODEL`
-  names) — live only in `.env`, gitignored. Compromise = someone runs up your
-  provider bill or impersonates you to the provider. The local Gemma/Ollama
-  path carries **no key** — a different trust profile that trades key-leak risk
-  for an unauthenticated-transport risk (see control 5 below).
-- **Artifacts and fixtures** — JSON recorded from real runs
-  (`artifacts/replays/*.json`, `packages/agents/*/fixtures/`). Committed to
-  git and **inlined into the published npm bundle** via `bundledDependencies`.
-  Compromise = a stray secret or sensitive workspace datum ships to the
-  public registry.
-- **Conversation memory** (NEW) — `@aptkit/memory` stores raw past
-  question/answer pairs as durable vector rows
-  (`packages/memory/src/conversation-memory.ts`); live in buffr's Postgres
-  (`agents.chunks`). Compromise = a typed secret/PII is durably retained, **or**
-  a past turn's injected instruction is recalled into a later session.
-  This asset both holds sensitive data *and* is itself an untrusted recall
-  channel back into the prompt (see control 6 below).
+This repo is a young AI toolkit, not a production multi-tenant service. The honest framing: the LLM/agent-security controls are real and deliberate, while the classic web controls (authn, authz, rate limiting, input sanitization) are mostly **not yet exercised** because there's no public HTTP surface that needs them yet. Rank the exposures by what an attacker could actually reach:
 
-## The six controls (the Pass-2 pattern files)
+1. **app_id tenancy with no RLS — the worst latent exposure.** `agents.chunks` / `conversations` / `messages` / `profiles` all carry an `app_id` column (`buffr/sql/001_agents_schema.sql`), and `PgVectorStore.search` filters `where app_id = $2` (`buffr/src/pg-vector-store.ts:74`). But that filter lives in *application code only*. The database has no row-level security. The day a second tenant shares this Postgres and any query path forgets the `app_id` predicate — or `appId` is ever taken from caller input instead of the trusted config — one tenant reads another's conversations. Today buffr hardcodes `appId: 'laptop'`, so it's latent, not live. **See `04-app-id-tenancy-without-rls.md`.**
 
-| Control | Guards | Where |
-| --- | --- | --- |
-| Tool-policy filtering | LLM least-privilege | `01-tool-policy-enforcement-by-omission.md` |
-| Secret-scan guard | artifact/fixture data-exposure | `02-secret-scan-guard.md` |
-| Server-side key boundary | key confidentiality + path traversal | `03-server-side-key-boundary.md` |
-| Validated output gate | untrusted model output | `04-validated-model-output-gate.md` |
-| Local-model tool-call boundary | model-driven dispatch over a no-auth local transport | `05-local-model-tool-call-trust-boundary.md` |
-| Conversation-memory trust surface | persistent injection, retention/PII, shared-store mixing, cross-conversation scoping | `06-conversation-memory-trust-surface.md` |
+2. **Full conversation trajectories persisted as a PII surface.** `SupabaseTraceSink` writes *every* event — user questions, assistant text, tool args, tool results, token counts — into `agents.messages` (`buffr/src/supabase-trace-sink.ts:53-85`). That table is the richest data in the system and has no field-level access control and no redaction. Whatever a user types, and whatever the retrieval surfaces, lands in durable storage. Combined with finding 1, it's the highest-value target.
 
-The sixth row is the exception that proves the framing: it is the one pattern
-file that documents a surface the engine **opens** rather than a control it
-*enforces* — the only filter `@aptkit/memory` applies is `kind` (memory vs
-document), and every other trust decision (scoping, retention, provenance) is
-left to the caller. It earns a file because it is a recurring, deliberate
-recall mechanism, not a one-off gap.
+3. **The model is untrusted input that flows into a prompt unsanitized.** A user question goes straight into `agent.answer(question)` and into the prompt; indexed documents (which the model retrieves and reads) could carry adversarial instructions. There is no prompt-injection defense — the mitigations that *do* exist (tool allowlist, bounded loop) limit the *blast radius* of a hijacked model rather than preventing the hijack. This is `not yet exercised` as a defended threat, and it's the right next thing to build.
 
-## What's deliberately out of scope
-
-These are `not yet exercised` — not gaps to fix, structural facts of a
-library/dev-tool with no deployed multi-user surface:
-
-- **Authentication / authorization** — no login, no sessions, no users. The
-  only "caller" is the developer running it locally.
-- **CSRF / CORS hardening** — the Studio API is a local Vite dev server on
-  `localhost:4187`, reachable only from the dev's own machine.
-- **Rate limiting** — bounded by the agent loop's turn/tool-call budgets for
-  cost, not by a request limiter; there's no public ingress to limit.
-- **SQL injection** — no database. "Data" is files and NDJSON streams.
-- **Encryption at rest / audit logging of access** — no persisted user data
-  store, no access events to log.
-
-The full per-lens walk, with the constructive move for each real gap, is in
-`audit.md`.
+The good news, and why this repo reads as security-literate despite the gaps: the controls that *are* here are the right ones for an agent system. Least-privilege tool policy (01), a bounded loop (02), and hallucination-tolerant tool args (03) are exactly the three things that keep a semi-trusted model from becoming a fully-trusted one. Read those three first — they're the load-bearing positives — then the two gaps (04, 05) and the full lens walk in `audit.md`.

@@ -1,443 +1,268 @@
-# RAG — retrieve, augment, generate
+# RAG — Retrieval-Augmented Generation
 
-**Industry names:** RAG, retrieval-augmented generation, grounded generation ·
-*Industry standard*
+**Subtitle:** RAG · grounded generation over a private corpus · *Industry standard*
 
 ## Zoom out, then zoom in
 
-This is the anchor file — every other concept in this section is a part of the
-machine assembled here. RAG is the end-to-end pipeline: fetch relevant text, get
-it in front of the model, let it answer over it. AptKit now ships this for real
-via `@aptkit/agent-rag-query` — and it ships the *agentic* shape: the model calls
-`search_knowledge_base` mid-loop, gets ranked chunks back as a TOOL RESULT, and a
-forced synthesis turn makes it answer over them with citations. The augment seam
-is the tool boundary, not a pre-rendered prompt block.
+RAG is the spine of aptkit. Here's where it sits: the agent asks for a tool, the
+tool runs the retrieval pipeline, the pipeline reaches an embedder and a store,
+and the ranked chunks come back up to ground the model's answer.
 
 ```
-  Zoom out — how RAG attaches in AptKit (agentic: retrieve-as-a-tool)
+  Zoom out — RAG across the layers
 
-  ┌─ Retrieval layer (packages/retrieval) — EXISTS ──────────────────┐
-  │  query ─► embed ─► InMemoryVectorStore.search ─► top-k chunks     │
-  └──────────────────────────────────┬───────────────────────────────┘
-                                      │  ranked chunks (TOOL RESULT)
-  ┌─ Runtime loop (runAgentLoop) ──────▼───────────────────────────────┐
-  │  model turn ─► calls search_knowledge_base ─► tool result back ─┐  │
-  │      ▲                                                          │  │
-  │      └──────────── loop (maxTurns 6, maxToolCalls 4) ◄──────────┘  │
-  │  forced synthesis turn: answer OVER the chunks, cite sources  ◄ ★  │
-  └──────────────────────────────────┬───────────────────────────────┘
-                                      │  ModelProvider.complete()
-  ┌─ Provider layer ──────────────────▼────────────────────────────────┐
-  │  guarded Gemma (local) / fixture                                    │
-  └─────────────────────────────────────────────────────────────────────┘
+  ┌─ Capability ──────────────────────────────────────────────┐
+  │  rag-query agent — "answer grounded in the knowledge base" │
+  └───────────────────────────┬────────────────────────────────┘
+                              │ calls tool: search_knowledge_base
+  ┌─ Retrieval pipeline ──────▼────────────────────────────────┐
+  │  ★ index: doc→chunk→embed→upsert ★                          │ ← we are here
+  │  ★ query: query→embed→search→rank ★                         │
+  └──────────────┬───────────────────────────┬─────────────────┘
+                 │ embed()                    │ search()
+  ┌─ Embedder ───▼──────────┐   ┌─ Vector store ▼──────────────┐
+  │ nomic-embed-text, 768d  │   │ InMemory (cosine) / PgVector │
+  └─────────────────────────┘   └──────────────────────────────┘
 ```
 
-Zoom in: **RAG = retrieve → augment → generate.** You already shipped a one-shot
-version in AdvntrCue (embed query → ANN over pgvector → top-k into a GPT-4 prompt
-→ answer). AptKit's is the *successor*: retrieval is a tool the model steers, not
-a block someone splices in before the call. The pattern's whole job is the same —
-ground generation in text the model didn't have at training time. The single most
-important judgment call is *when not to use it* — which this file ends on.
+Now zoom in. You already shipped RAG once (AdvntrCue: pgvector + GPT-4), so the
+shape is familiar — retrieve, augment, generate. What's worth studying in aptkit
+is that the pipeline is built from scratch over two swappable contracts, and the
+agent reaches it as a *tool* rather than as bespoke control flow. The model
+decides *when* to retrieve; the pipeline decides *what* comes back.
 
 ## Structure pass
 
-**Layers.** Three, and the names are the pipeline: *retrieve* (a function of the
-query → chunks), *augment* (the chunks reach the model — in AptKit, as a tool
-result mid-loop), *generate* (the model answers, grounded). All three exist in
-AptKit now: retrieve (`packages/retrieval`: embed + `InMemoryVectorStore` +
-search), augment (`search_knowledge_base` returns ranked chunks into the loop),
-generate (`runAgentLoop`'s forced synthesis turn).
+**Layers.** Pipeline (index/query) → contracts (embedder, store) → adapters
+(nomic, in-memory/pg). Two paths run through the same wiring: indexing writes,
+querying reads.
 
-**Axis — where does the answer's *evidence* come from?** Trace it across the
-layers. Without RAG, evidence comes only from model weights (training data) plus
-whatever's already in the prompt. With RAG, evidence comes from the *index* —
-external, updatable text fetched at request time. RAG moves the source of truth
-out of the weights and into a store you control.
+**Axis — state.** Who owns the corpus? Trace it: the pipeline owns no state (it's
+pure functions over a wiring); the `VectorStore` owns the vectors; the document
+text lives in `meta.text` on each chunk. The pipeline is stateless glue between a
+stateful store and a stateless embedder.
 
-**Seam.** The load-bearing seam is the augment boundary: the moment retrieved
-chunks reach the model. In AptKit that is the `search_knowledge_base` **tool
-boundary** — the model emits a tool call, the handler runs the query path, and
-the ranked chunks come back as a tool result the next turn reads. It flips the
-*trust/freshness* axis — text in the weights is frozen at training time; chunks
-returned at this seam are as fresh as your index. Get this seam wrong (citations
-without source ids, chunks returned without the `[docId]` label) and the model
-can't attribute claims or tell you where an answer came from.
+**Seam.** The load-bearing boundary is the pair of contracts in
+`contracts.ts` — `EmbeddingProvider` (`:22`) and `VectorStore` (`:33`). The axis
+"who knows about the vendor?" flips here: above, the pipeline names no vendor;
+below, nomic and in-memory/pgvector live. A dimension guard (`pipeline.ts:22`)
+makes the seam fail loud if an embedder and store disagree.
 
 ## How it works
 
-You already know the shape: a `fetch()` that grabs data, then a render that
-interpolates it into a template. RAG is that — fetch relevant chunks, interpolate
-them into the prompt — with the fetch being a similarity search instead of a REST
-call.
-
 ### Move 1 — the mental model
 
-The shape is a three-stage pipe. The query forks: it goes to the retriever to
-fetch evidence, and the evidence rejoins it in the prompt before the model sees
-anything.
+You know how `Array.prototype.filter` + `sort` gives you "the items matching a
+predicate, ranked"? RAG is that, but the predicate is *semantic similarity* and
+the ranking is *cosine score*. Retrieve the few most-similar chunks, paste them
+into the prompt, let the model answer from them instead of from frozen training
+data.
 
 ```
-  RAG — the three-stage pipe (AptKit: agentic / retrieve-as-a-tool)
+  RAG — the kernel
 
-        user query
-           │
-           ▼
-        model turn ──► "call search_knowledge_base(query)"  ◄ the model decides
-           │
-           ▼  retrieve: embed(query) → InMemoryVectorStore.search → top-k chunks
-        ┌─────────────────── augment ─────────────────────────────┐
-        │  ranked chunks come BACK as a TOOL RESULT into the loop  │
-        │  each as "[docId] snippet"  (the citation form)          │
-        └───────────────────────────┬─────────────────────────────┘
-                                     ▼
-                  forced synthesis turn: generate OVER the chunks
-                                     │
-                                     ▼
-                          grounded answer + citations
+  question ─► embed ─► search store ─► top-k chunks ─► stuff prompt ─► answer
+                                          │                              │
+                                          └── cite these ────────────────┘
+   the model answers FROM the chunks, not from memory — that's the whole trick
 ```
 
-The brain to hold: retrieval is just-in-time context, and in AptKit the model
-*pulls* it — it issues the search itself rather than receiving a pre-built block.
-The model stays generic; the per-request context arrives as a tool result.
+### Move 2 — the two paths
 
-### Move 2 — the pipeline, one stage at a time
+**Index path: doc → chunk → embed → upsert.** Before you can retrieve, the corpus
+must be embedded and stored. `indexDocument` (`pipeline.ts:32`) is the whole write
+side:
 
-**Stage 1 — retrieve.** Embed the query, search the index, take the top-k chunks.
-This is everything the first ten files in this section build: chunking decided
-the units, embeddings made them comparable, the vector DB stores them, hybrid +
-rerank order them best-first.
-
-```
-  Stage 1 — retrieve (assembled from the earlier files)
-
-  query ─embed─► q
-     │
-     ▼  search index (dense, or hybrid + RRF)
-  candidate chunks [c_a, c_b, c_c, c_d, ...]
-     │
-     ▼  rerank (cross-encoder)  ── optional but high-leverage
-  top-k = [c_b, c_a, c_d]      ← best-first, k small (3–8)
+```ts
+export async function indexDocument(doc, wiring) {
+  assertWiring(wiring);                       // fail loud if dims disagree
+  const texts = chunkText(doc.text);          // 512-char windows, 64 overlap
+  if (texts.length === 0) return;
+  const vectors = await wiring.embedder.embed(texts);   // one embed call, batched
+  const chunks = texts.map((text, i) => ({
+    id: `${doc.id}#${i}`,                     // stable id: docId#chunkIndex
+    vector: vectors[i]!,
+    meta: { ...(doc.meta ?? {}), docId: doc.id, chunkIndex: i, text },  // text rides along
+  }));
+  await wiring.store.upsert(chunks);
+}
 ```
 
-The boundary that bites: k is a budget, not "more is better." Past a point,
-extra chunks dilute the signal and burn context window. Retrieve narrow.
-
-**Stage 2 — augment.** The chunks reach the model as a tool result, each carrying
-a source id so the model (and you) can attribute claims. In AptKit the
-`search_knowledge_base` handler builds that result: it maps each `VectorHit` to a
-`citation` string of the form `[docId] snippet`. That `[docId]` prefix is the
-attribution; the synthesis turn is instructed to cite it.
+The detail that matters: `text` is stored *in the chunk's meta*. That's what lets
+the search tool build a citation later without a second lookup.
 
 ```
-  Stage 2 — augment via the search_knowledge_base tool boundary
+  Index path — write side
 
-  ┌─ Runtime loop (runAgentLoop) ─────────────────────────────────┐
-  │  model turn ─► tool call: search_knowledge_base(query)         │
-  └───────────────────────────────┬───────────────────────────────┘
-                                   │ handler runs the query path
-  ┌─ Retrieval layer ─────────────▼───────────────────────────────┐
-  │  pipeline.query ─► hits ─► toResult: "[docId] snippet"  ◄ cite │
-  └───────────────────────────────┬───────────────────────────────┘
-                                   │ ranked results return as TOOL RESULT
-  ┌─ Runtime loop ────────────────▼───────────────────────────────┐
-  │  next model turn reads the chunks; synthesis turn answers      │
-  └────────────────────────────────────────────────────────────────┘
-
-   the chunks are never spliced into the system prompt — they ride back
-   through the tool channel, which is what makes this AGENTIC RAG
+  doc {id,text} ─► chunkText ─► ["…512c…","…512c…"] ─► embed ─► [v0,v1]
+                                                                  │
+                          upsert chunks {id:"doc#0", vector:v0, meta:{…,text}}
+                                                                  ▼
+                                                          ┌─ VectorStore ─┐
+                                                          │  the corpus   │
+                                                          └───────────────┘
 ```
 
-The boundary: never return chunks without a source id. The `[docId]` label is
-what lets the model attribute a claim and what stops a citation-free answer.
-Unlabelled chunks are an attribution black hole.
+**Query path: query → embed → search → rank.** The read side is `queryKnowledgeBase`
+(`pipeline.ts:50`):
 
-**Stage 3 — generate.** `runAgentLoop` runs the model over the loop, and after
-the tool result lands it issues a *forced synthesis turn* — the
-`synthesisInstruction` tells the model to "answer the question directly and
-concisely, citing the sources you retrieved." That's the turn that turns chunks
-into a grounded answer. If the loop produces nothing, the agent returns a fixed
-`FALLBACK_ANSWER` rather than a fabricated one.
-
-```
-  Stage 3 — generate, instructed to ground
-
-  system: "Always call search_knowledge_base first. Ground every answer in the
-           retrieved chunks and cite their sources. If the KB doesn't contain
-           the answer, say so plainly rather than guessing."
-  loop:   model ─► search_knowledge_base ─► chunks back ─► synthesis turn
-     │
-     ▼  ModelProvider.complete()
-  answer grounded in the chunks, with [docId] citations
-     │
-     ├─ chunks don't contain it → "say so plainly" (not a hallucination)
-     └─ loop produced no text   → FALLBACK_ANSWER
+```ts
+export async function queryKnowledgeBase(query, wiring, topK = 5) {
+  assertWiring(wiring);
+  const [vector] = await wiring.embedder.embed([query]);  // embed the query the SAME way
+  if (!vector) return [];
+  return wiring.store.search(vector, topK);               // cosine top-k
+}
 ```
 
-The boundary: the system prompt's "ground every answer in the retrieved chunks /
-if the KB lacks it, say so" is what converts retrieval into *grounding*. Without
-it the model blends retrieved text with its own priors and you lose the one
-guarantee RAG offers.
-
-### Move 2.5 — the above-threshold rule (when NOT to add RAG)
-
-This is the judgment that separates someone who's read about RAG from someone
-who's run it. RAG has a real cost: an index to build and keep fresh, an extra
-embed + search hop per request, latency, and a new failure mode (retrieves the
-wrong chunks → confidently wrong answer). You add it *only* when the task needs
-knowledge the model doesn't have and that changes over time.
+The query is embedded by the *same provider* as the corpus — that's why the
+dimension guard matters. `store.search` ranks by cosine and returns the top-k
+`VectorHit`s (`in-memory-vector-store.ts:25`).
 
 ```
-  The above-threshold rule — does this task even need RAG?
+  Query path — read side
 
-  Does the answer depend on text NOT in the model's weights
-  AND that text changes / is private / is large?
-        │                                   │
-       yes                                  no
-        │                                   │
-        ▼                                   ▼
-  RAG earns its place               DON'T add RAG.
-  (private docs, fresh data,        Prompt-stuff it, fine-tune,
-   large corpus)                    or just let the model answer.
-
-  AptKit now has BOTH sides live, which is exactly how you read the rule:
-    • rag-query agent  → YES: a prose KB, grounded by VECTOR search
-    • analytics agents → NO:  queryable metrics, grounded by EXACT tool calls
-  Both ground via tools; only one needs a similarity index. The data shape
-  decides. (Tool-call grounding is agentic retrieval — see
-  .aipe/study-agent-architecture/02-agentic-retrieval/.)
+  "what ORM?" ─► embed ─► qv ─► store.search(qv, 5) ─► [hit,hit,hit] sorted by score
+                                       │
+                              cosine(qv, each chunk.vector), sort desc, slice 5
 ```
 
-The takeaway: AptKit ships both answers to the rule. The rag-query agent earns a
-vector index because its source is a prose corpus where "relevant" is fuzzy. The
-analytics agents deliberately don't — their source is queryable analytics, so a
-tool that fetches the exact metric beats a similarity search every time. The rule
-isn't abstract anymore: it's literally the line AptKit draws between its two kinds
-of agent.
+**Augment + generate.** The retrieved chunks reach the model through the tool
+result. The rag-query agent's system prompt orders the model to call
+`search_knowledge_base` first and ground every answer in the returned chunks,
+citing sources, and to say so plainly when the corpus has nothing
+(`rag-query-agent.ts:20-27`). The "augment" step is just: the tool result becomes
+a `tool_result` message the model reads on its next turn (`run-agent-loop.ts:189`).
+
+```
+  Augment + generate — through the agent loop
+
+  model turn 1: "call search_knowledge_base('ORM')"
+       │
+  tool result: { results: [ "[setup.md] We use Drizzle…", … ] }  ◄─ appended as a message
+       │
+  model turn 2: reads chunks → "You use Drizzle ORM [setup.md]."  ◄─ grounded + cited
+```
+
+### Move 2.5 — current state vs future state
+
+aptkit's RAG runs end to end today on the in-memory store with local nomic + Gemma.
+The only thing that changes for production durability is the store: buffr fills
+`PgVectorStore` (pgvector + HNSW) behind the same `VectorStore` contract. Nothing
+in `indexDocument`/`queryKnowledgeBase`/the agent changes.
+
+```
+  Phase A (aptkit, now)            Phase B (buffr, durable)
+  ┌────────────────────┐          ┌────────────────────────┐
+  │ InMemoryVectorStore│          │ PgVectorStore          │
+  │ cosine over array  │   same   │ pgvector <=>, HNSW idx  │
+  │ forgets on exit    │ contract │ persists across runs    │
+  └────────────────────┘          └────────────────────────┘
+   pipeline + agent: IDENTICAL on both
+```
 
 ### Move 3 — the principle
 
-RAG decouples *what the model knows* from *what the model was trained on*: the
-weights provide reasoning and language, the index provides current, private,
-specific facts. The art is the augment seam (clean, attributed evidence) and the
-discipline is the threshold (don't retrieve when the model — or a direct tool
-call — already has the answer).
+RAG is only as good as retrieval — a great model over bad chunks gives confident
+wrong answers. So the engineering investment goes into the retrieval contracts and
+their failure modes (the hallucinated-filter bug, the `minTopK` floor), not into
+the model. Build the pipeline so the vendor is swappable and the failure modes are
+visible, and the "generation" half mostly takes care of itself.
 
 ## Primary diagram
 
-The whole pipeline, every stage and the AptKit seam labelled.
-
 ```
-  RAG end to end — AptKit agentic shape (retrieve-as-a-tool)
+  RAG end to end in aptkit
 
-  ┌─ Generate loop (packages/runtime: runAgentLoop) ───────────────────┐
-  │  system="always search first; ground answers; cite; else say so"   │
-  │  model turn ─► tool call ────────────────┐                         │
-  │      ▲                                    │                         │
-  │      │  tool result (ranked chunks)       ▼                         │
-  │  ┌─ Augment ──────────────────────────────────────────────────┐    │
-  │  │  search_knowledge_base handler: toResult → "[docId] snippet" │    │
-  │  └─────────────────────────────┬──────────────────────────────┘    │
-  │                                │ runs the query path                │
-  │  ┌─ Retrieval (packages/retrieval) ─────────────────────────────┐  │
-  │  │  query ─embed─► InMemoryVectorStore.search ─► top-k chunks    │  │
-  │  └──────────────────────────────────────────────────────────────┘  │
-  │  forced synthesis turn ─► grounded answer + [docId] citations  ◄ ★  │
-  └────────────────────────────────────────────────────────────────────┘
-       provider: guarded Gemma (local) / fixture
+  ┌─ rag-query agent (capability) ─────────────────────────────────────┐
+  │  system: "always search first, ground answers, cite, refuse if none"│
+  └───────────────┬──────────────────────────────▲─────────────────────┘
+         tool call │                              │ grounded answer
+  ┌─ search_knowledge_base tool ─▼────┐           │
+  │  topK = max(requested, minTopK)   │           │
+  └───────────────┬───────────────────┘           │
+                  │ pipeline.query                 │
+  ┌─ pipeline ────▼────────────────────────────────┴──────────┐
+  │  INDEX  doc→chunk(512/64)→embed(nomic,768)→store.upsert    │
+  │  QUERY  query→embed→store.search(cosine top-k)→VectorHit[] │
+  └───────────────┬───────────────────────────────────────────┘
+                  ▼
+  ┌─ VectorStore ── InMemory (aptkit)  |  PgVector + HNSW (buffr) ─┐
+  └────────────────────────────────────────────────────────────────┘
 ```
-
-## Implementation in codebase
-
-**Shipped, as agentic RAG.** The agent is `RagQueryAgent` in
-`packages/agents/rag-query/src/rag-query-agent.ts`. It wires a model (a guarded
-Gemma), a tool registry holding `search_knowledge_base`, an optional injected
-profile, and runs `runAgentLoop` with a least-privilege policy and a forced
-synthesis turn. The whole augment-and-ground discipline lives in three places:
-the system prompt, the tool policy, and the loop config.
-
-```
-  packages/agents/rag-query/src/rag-query-agent.ts  (lines 14-83)
-
-  export const ragQueryToolPolicy = {                       ← lines 15-18
-    capabilityId: RAG_QUERY_CAPABILITY_ID,
-    allowedTools: [SEARCH_KNOWLEDGE_BASE_TOOL_NAME],   ← least privilege: search ONLY
-  };
-
-  const DEFAULT_SYSTEM_TEMPLATE = [                          ← lines 20-27
-    'Always call search_knowledge_base first ...',     ← retrieve before answering
-    'Ground every answer in the retrieved chunks and cite their sources.',
-    'If the KB does not contain the answer, say so plainly rather than guessing.',
-  ].join('\n');
-
-  const FALLBACK_ANSWER = "I couldn't find anything ...";  ← line 31, no-result floor
-
-  await runAgentLoop({                                       ← lines 66-80
-    system: this.system, userPrompt: question, toolSchemas,
-    maxTurns: 6, maxToolCalls: 4,                      ← bounded agentic loop
-    synthesisInstruction: buildSynthesisInstruction(
-      'Now answer the question directly and concisely, citing the sources ...',
-    ),                                                 ← the forced grounding turn
-  });
-       │
-       └─ no chunk block is spliced into `system`. The chunks arrive as a TOOL
-          RESULT during the loop; the synthesis turn answers over them.
-```
-
-The grounding-with-citation is produced in the tool, not the prompt — the handler
-turns each ranked hit into a `[docId] snippet` string:
-
-```
-  packages/retrieval/src/search-knowledge-base-tool.ts  (lines 108-118)
-
-  function toResult(hit: VectorHit): SearchKnowledgeBaseResult {
-    const docId = typeof hit.meta.docId === 'string' ? hit.meta.docId : hit.id;
-    const text  = typeof hit.meta.text  === 'string' ? hit.meta.text  : '';
-    const snippet = text.length > 160 ? `${text.slice(0, 157)}...` : text;
-    return {
-      id: hit.id, score: hit.score,
-      citation: snippet ? `[${docId}] ${snippet}` : `[${docId}]`,  ← the citation
-      meta: hit.meta,
-    };
-  }
-       │
-       └─ the `[docId]` prefix is the attribution the synthesis turn cites.
-          (The tool also has a minTopK floor — stops a weak local model from
-          starving its own retrieval by passing top_k: 1.)
-```
-
-AptKit now ships BOTH halves of the lineage: a real vector index (chunk → embed →
-`InMemoryVectorStore`), and the agentic loop that steers it. The analytics agents
-still ground via exact tool calls (no vectors) — the above-threshold rule made
-real, in the same repo.
 
 ## Elaborate
 
-RAG (Lewis et al., 2020) named the pattern of conditioning generation on
-retrieved passages, but the *idea* — answer over fetched evidence — predates
-neural retrieval (open-domain QA, search-then-read). Its rise tracks the LLM era
-because it solves the two things weights can't: staleness (training cutoff) and
-privacy (your data was never in the corpus).
-
-The frontier has moved past one-shot RAG toward *agentic* retrieval (retrieve,
-read, decide whether to retrieve again) — which is exactly the shape the rag-query
-agent has: the model calls `search_knowledge_base` inside `runAgentLoop` and the
-loop bounds the back-and-forth. AptKit ships BOTH the vector foundation and the
-agentic loop over it — vector search behind a tool the agent steers. The analytics
-agents are the same agentic shape over *non*-vector tools (see
-`.aipe/study-agent-architecture/02-agentic-retrieval/`); the rag-query agent is
-that shape over a similarity index, which is what you reach for once the source is
-a prose corpus instead of structured analytics endpoints.
-
-Adjacent: the augment block is prompt engineering
-([../02-context-and-prompts/](../02-context-and-prompts/)); grounding's failure
-mode (confidently wrong on bad retrieval) is an eval concern
-([../05-evals-and-observability/](../05-evals-and-observability/)); and the same
-pipeline pointed at the agent's *own past* is conversation memory
-([13-conversation-memory.md](13-conversation-memory.md)) — RAG over history, shipped
-as `@aptkit/memory`.
+RAG was invented to fix two LLM limits: models don't know your private data, and
+their public knowledge is frozen at training time. Retrieval injects fresh,
+specific knowledge at query time. The "above-threshold" rule still applies — don't
+add RAG to features that work without it; hand-picked retrieval (recency, explicit
+relations) often beats vector search at small scale. aptkit earns RAG because the
+corpus is open-ended (a personal knowledge base). Read `04-vector-databases.md` for
+the storage swap and `04-agents-and-tool-use/03-react-pattern.md` for how the agent
+decides *when* to retrieve.
 
 ## Project exercises
 
-*Provenance: Phase 2B — RAG pipeline (C2.x). No `aieng-curriculum.md` present;
-IDs are by-phase convention. **Case A — RAG is implemented (rag-query agent);
-these exercises run it, measure it, and extend it past in-memory.***
-
-### Exercise — run the agent, then measure its retrieval with precision@k
-
-- **Exercise ID:** `[A2B.1]` Phase 2B, RAG anchor concept
-- **What to build:** First run the live demo path
-  (`npm run ask -w @aptkit/agent-rag-query`) against a small indexed corpus and
-  watch the loop call `search_knowledge_base` and cite sources. Then add a
-  `scorePrecisionAtK` (from `packages/evals`) harness over a labelled query set so
-  the agent's retrieval has a number, not a vibe — a fixture provider keeps it
-  deterministic.
-- **Why it earns its place:** It closes the loop from "it answers" to "its
-  retrieval is *good*" — the difference between a demo and a measured capability.
-- **Files to touch:** a test under `packages/agents/rag-query/test/` (or
-  `packages/retrieval/test/`) that indexes a fixture corpus, runs queries, and
-  asserts a precision@k floor.
-- **Done when:** A test reports precision@k for a handful of labelled queries and
-  asserts it stays above a threshold; the demo answers a known question with a
-  `[docId]` citation and answers an out-of-corpus question with the fallback.
+### Add a "no relevant chunk" threshold to the query path
+- **Exercise ID:** —  (no curriculum file in repo)
+- **What to build:** a relevance floor in `queryKnowledgeBase` (or the tool) that
+  drops hits below a cosine-score threshold, so the agent gets an empty result
+  rather than three weak chunks, and answers "I couldn't find that" honestly.
+- **Why it earns its place:** "refuse over hallucinate" is the single most-probed
+  RAG behavior in interviews; wiring the threshold proves you control the
+  precision/recall tradeoff at the retrieval seam.
+- **Files to touch:** `packages/retrieval/src/pipeline.ts`,
+  `packages/retrieval/src/search-knowledge-base-tool.ts`, a new test in
+  `packages/retrieval/test/`.
+- **Done when:** a unit test shows a low-similarity query returns `[]` and the
+  rag-query agent emits the fallback answer.
 - **Estimated effort:** `1–4hr`
 
-### Exercise — swap InMemoryVectorStore for a durable store, same contract
-
-- **Exercise ID:** `[A2B.2]` Phase 2B, persistence-behind-the-contract concept
-- **What to build:** Stand the rag-query agent up over a durable `VectorStore`
-  (the `PgVectorStore` / Supabase implementation) instead of `InMemoryVectorStore`,
-  with no change to the pipeline or the agent — the swap happens entirely behind
-  the `VectorStore` contract. Note: `PgVectorStore` lives in the separate **buffr**
-  repo (out of aptkit scope); aptkit ships the in-memory store and the contract.
-- **Why it earns its place:** It proves the seam is real — a different storage
-  engine drops in without the agent noticing — and it's the actual path from a toy
-  in-memory index to a production one.
-- **Files to touch:** in buffr, a `PgVectorStore` implementing aptkit's
-  `VectorStore`; in aptkit, only the wiring that constructs the pipeline.
-- **Done when:** The same `RagQueryAgent` answers identically whether wired to the
-  in-memory or the pg-backed store, proven by running the same query set through
-  both.
+### Run the RAG agent against buffr's PgVectorStore end to end
+- **Exercise ID:** —  (no curriculum file in repo)
+- **What to build:** wire the rag-query agent to buffr's `PgVectorStore` and index
+  a handful of docs, proving the contract swap is transparent.
+- **Why it earns its place:** demonstrates the seam works — same agent, durable
+  store, persists across runs.
+- **Files to touch:** `/Users/rein/Public/buffr/src/session.ts`,
+  `/Users/rein/Public/buffr/src/pg-vector-store.ts`,
+  `/Users/rein/Public/buffr/sql/001_agents_schema.sql`.
+- **Done when:** indexing once and querying in a *new* process returns grounded
+  answers without re-indexing.
 - **Estimated effort:** `1–2 days`
 
 ## Interview defense
 
-**Q: Walk me through a RAG pipeline. Where does the retrieved text actually go?**
+**Q: "Walk me through your RAG pipeline."**
+Two paths over two contracts. Index: chunk the doc into 512-char windows, embed
+each with nomic (768-dim), upsert into the store with the text in the chunk's meta.
+Query: embed the question the same way, cosine-search the store for top-k, hand the
+chunks to the model as a tool result, model answers from them and cites. The vendor
+is swappable — in-memory for tests, pgvector+HNSW in buffr.
 
 ```
-  retrieve ─► augment ─► generate   (agentic: retrieve-as-a-tool)
-
-  model ─► search_knowledge_base ─► chunks back as TOOL RESULT ─► synthesis ─► answer
-                                       └── the augment seam: the tool boundary
+  index: doc→chunk→embed→upsert        query: q→embed→search→rank→stuff→answer
+  the model answers FROM chunks; retrieval quality is the whole ballgame
 ```
+Anchor: *RAG is only as good as retrieval — a great model over bad chunks is confidently wrong.*
 
-"Three stages: retrieve — embed the query, search the index, take top-k; augment
-— get those chunks in front of the model with source ids; generate — run the
-model with an instruction to ground in them and cite. In our codebase it's
-*agentic* RAG: the model calls `search_knowledge_base` mid-loop, the handler runs
-the query path and returns ranked chunks as a tool result — each as `[docId]
-snippet` — and a forced synthesis turn in `runAgentLoop` answers over them. The
-augment seam is the tool boundary, not a block spliced into the system prompt.
-That's the agentic shape — the model pulls retrieval rather than receiving it."
-*Anchor: in agentic RAG the model steers retrieval; the augment seam is the tool
-result, not a pre-rendered prompt block.*
+**Q: "What's the load-bearing part people forget?"**
+That the query must be embedded by the *same* provider as the corpus, at the same
+dimension — otherwise cosine ranks garbage. aptkit guards it: `assertWiring`
+(`pipeline.ts:22`) throws at wiring time on a dimension mismatch, and the store
+re-checks every vector. A silent dimension mismatch corrupts ranking with no error.
 
-**Q: When would you NOT add RAG?**
-"When the task doesn't need external, changing, or private text — or when a
-direct tool call already fetches the exact answer. We have both cases live in one
-repo: the rag-query agent uses a vector index because its source is a prose KB,
-while the analytics agents call a metric tool — exact data, no similarity search —
-so RAG there would be pure cost. The data shape decides: fuzzy-relevant prose gets
-vectors; queryable facts get a tool."
-*Anchor: don't retrieve when a direct tool call already has the exact answer.*
-
-## Validate
-
-- **Reconstruct:** Write the three stages from memory — retrieve / augment /
-  generate — and map each to AptKit: retrieve = `packages/retrieval` embed +
-  `InMemoryVectorStore.search`; augment = the `search_knowledge_base` tool result;
-  generate = `runAgentLoop`'s forced synthesis turn
-  (`rag-query-agent.ts:66-80`).
-- **Explain:** Where does the citation come from, and why does it matter? (The
-  tool handler's `toResult` builds `[docId] snippet` at
-  `search-knowledge-base-tool.ts:108-118`; the `[docId]` prefix is the attribution
-  the synthesis turn cites — without it the answer can't say where it came from.)
-- **Apply:** The analytics agents answer over read-only analytics tools. Should
-  they use vector RAG? (No — above-threshold rule fails; they fetch exact data by
-  tool call. The rag-query agent is the YES case — a prose KB grounded by vector
-  search. Same agentic shape, different tool.)
-- **Defend:** Why does the retriever live in `packages/retrieval` and reach the
-  model through a tool rather than a prompt block? (Keeping retrieval behind the
-  `search_knowledge_base` tool boundary lets the model *steer* it inside the loop —
-  agentic RAG — and keeps the embedder/store deps out of the runtime contract.)
+```
+  embedder.dimension ≠ store.dimension ─► throw at wiring time (fail loud)
+   the corpus and the query MUST share one embedding space
+```
+Anchor: *same embedder, same dimension, or the cosine scores are meaningless.*
 
 ## See also
 
-- [01-embeddings.md](01-embeddings.md) — the retrieve stage's first step
-- [03-chunking-strategies.md](03-chunking-strategies.md) — the unit you retrieve
-- [06-hybrid-retrieval-rrf.md](06-hybrid-retrieval-rrf.md) — better retrieval ordering
-- [07-reranking.md](07-reranking.md) — the precision pass before augment
-- [../05-evals-and-observability/05-precision-at-k.md](../05-evals-and-observability/05-precision-at-k.md) — how to measure the agent's retrieval quality
-- [13-conversation-memory.md](13-conversation-memory.md) — the same pipeline over past exchanges (`@aptkit/memory`)
-- [../04-agents-and-tool-use/05-agent-memory.md](../04-agents-and-tool-use/05-agent-memory.md) — the short-term vs long-term taxonomy
-- `.aipe/study-agent-architecture/` — the orchestration/loop internals the rag-query agent runs on
-- the **buffr** repo — durable persistence (`PgVectorStore`/Supabase) and the live precision@k-over-real-corpus eval run (out of aptkit scope)
+- `04-vector-databases.md` — the store swap (in-memory vs pgvector)
+- `03-chunking-strategies.md` — the 512/64 chunker
+- `01-embeddings.md` — what the 768-dim vector means
+- `04-agents-and-tool-use/02-tool-calling.md` — how search reaches the model
+- `05-evals-and-observability/01-eval-set-types.md` — how retrieval is graded (precision@k)

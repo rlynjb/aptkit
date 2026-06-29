@@ -1,318 +1,214 @@
-# 01 — The database-systems map
+# 01 · The Database Systems Map
 
-**Subtitle:** Datastore topology / durability boundary — *Project-specific
-(filesystem-as-store)*
-
----
+**Industry name(s):** storage-engine topology / persistence boundary. **Type:** Project-specific (the aptkit↔buffr split).
 
 ## Zoom out, then zoom in
 
-Okay — here's the whole thing. In a normal web app this diagram has a fat
-box at the bottom labelled "Postgres" or "DynamoDB," a connection pool above
-it, and a driver translating your calls into wire protocol. Find that box in
-AptKit and you won't: there is no engine, no pool, no driver. The bottom
-band is the filesystem, and the only thing that talks to it is the Vite dev
-server's middleware.
+You already know the shape of a swappable backend from frontend work: you code against `fetch()` and the API can be REST, GraphQL, or a mock in a test — the caller never changes. This guide's whole map is that pattern applied to a *datastore*. There is one interface, `VectorStore`, and two things behind it: a JavaScript `Map` in aptkit, and Postgres in buffr.
 
 ```
-  Zoom out — where the "datastore" lives in AptKit
+  Zoom out — where the datastore sits in the stack
 
-  ┌─ UI layer (apps/studio) ──────────────────────────────────┐
-  │  React replay shell → fetch()                             │
-  └───────────────────────────┬───────────────────────────────┘
-                              │  HTTP (localhost dev only)
-  ┌─ Service layer (Vite middleware) ─────────────────────────┐
-  │  ★ THIS FILE: the four query paths live here ★            │ ← we are here
-  │  writeFile · readdir · readFile · validate                │
-  └───────────────────────────┬───────────────────────────────┘
-                              │  node:fs/promises
-  ┌─ "Storage" layer (filesystem) ────────────────────────────┐
-  │  artifacts/replays/*.json   ·   fixtures/promoted/*.json  │
-  └───────────────────────────────────────────────────────────┘
+  ┌─ Agent layer (aptkit) ─────────────────────────────────┐
+  │  RagQueryAgent → runAgentLoop → search_knowledge_base   │
+  │  tool                                                   │
+  └────────────────────────────┬────────────────────────────┘
+                               │  pipeline.query(text, k)
+  ┌─ Retrieval pipeline (aptkit) ──▼────────────────────────┐
+  │  embed(query) → store.search(vector, k) → ranked hits   │
+  └────────────────────────────┬────────────────────────────┘
+                               │  ★ VectorStore contract ★  ← we are here
+                               │  (dimension, upsert, search)
+            ┌──────────────────┴───────────────────┐
+  ┌─ aptkit ▼──────────────┐        ┌─ buffr ───────▼─────────┐
+  │ InMemoryVectorStore    │        │ PgVectorStore           │
+  │ Map<id, VectorChunk>   │        │ → Supabase Postgres     │
+  │ NOT durable            │        │   + pgvector  DURABLE   │
+  └────────────────────────┘        └─────────────────────────┘
 ```
 
-**Zoom in.** The question this file answers: *given that there's no engine,
-what plays the role of one?* The answer is four code paths — write, read,
-commit, validate — each a few lines of `node:fs`. Knowing where each lives
-and what it does (and does not) guarantee is the map you need before any of
-the later files make sense. The pattern is "filesystem as a single-writer
-append-only store," and that's what we'll trace.
+Zoom in: the concept this file owns is the **durability boundary** — the line where data stops living in process memory and starts living on disk with a write-ahead log behind it. In aptkit that line doesn't exist (everything is RAM). In buffr it sits exactly at the `PgVectorStore` boundary. Every other concept in this guide hangs off that single line.
 
----
+## The structure pass
 
-## Structure pass
+**Layers.** Three, top to bottom: the agent/tool layer that *asks* for data, the retrieval pipeline that *shapes* the request into `embed → search`, and the store that *executes and preserves* it. The store layer is the only one that splits into two implementations.
 
-Before the mechanics, read the skeleton. Three layers (UI, service,
-filesystem). One axis held constant — **state ownership: who owns the bytes,
-and is anything mutable?** Then the seams where that answer flips.
+**Axis — trace "where does the data physically live, and does it survive a restart?" down the layers:**
 
 ```
-  One axis — "who owns the bytes, is it mutable?" — down the stack
+  One question down the layers: "does this survive a process restart?"
 
-  ┌───────────────────────────────────┐
-  │ UI: React component state         │  → owns nothing durable; ephemeral
-  └───────────────────────────────────┘
-      ┌───────────────────────────────┐
-      │ Service: Vite middleware      │  → owns the write decision, holds
-      └───────────────────────────────┘    nothing; stateless between calls
-          ┌───────────────────────────┐
-          │ Filesystem: *.json files  │  → owns the bytes; APPEND-ONLY
-          └───────────────────────────┘    (files written once, never edited)
+  ┌──────────────────────────────────────────┐
+  │ agent / tool layer                        │  → nothing persists; pure call
+  └──────────────────────────────────────────┘
+  ┌──────────────────────────────────────────┐
+  │ retrieval pipeline                        │  → nothing persists; pure functions
+  └──────────────────────────────────────────┘
+  ┌──────────────────────────────────────────┐
+  │ store layer (InMemoryVectorStore)         │  → NO  — Map dies with the process
+  └──────────────────────────────────────────┘
+  ┌──────────────────────────────────────────┐
+  │ store layer (PgVectorStore → Postgres)    │  → YES — heap + WAL on disk
+  └──────────────────────────────────────────┘
 
-  the answer flips at the bottom seam: above it, all state is ephemeral;
-  below it, state is durable AND immutable-by-convention
+  the answer flips at the store layer, and ONLY there — that flip is the durability boundary
 ```
 
-**The load-bearing seam** is the bottom one — the `node:fs` boundary. Every
-contract that a database would normally enforce (atomicity, durability,
-ordering) either lives at this seam as a convention or doesn't exist:
-
-- **Write contract:** the service writes a *new* file with a unique
-  timestamped name. It never opens an existing file for update. That
-  convention — not a lock — is what makes concurrent writes safe.
-- **Read contract:** the service lists the directory and sorts filenames.
-  The ordering guarantee depends entirely on the filename format being
-  chronologically sortable as a string.
-- **Durability contract:** none beyond "`writeFile` resolved." No fsync.
-
-Those three are the joints. The mechanics below hang on them, and files
-`02`–`08` each pick one joint and go deep.
-
----
+**Seam.** The load-bearing boundary is the `VectorStore` contract in `packages/retrieval/src/contracts.ts:33-37`. Above it: vendor-neutral pipeline logic that never names Postgres or a Map. Below it: two implementations where the durability axis flips. The contract is what lets buffr drop Postgres in with zero pipeline change — and it's also why the schema had to drop a foreign key (see How it works).
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You already know the shape of a CRUD app: a handler takes a request, calls
-the database, the database does the durable part, returns rows. AptKit is
-that shape with the database box replaced by `node:fs/promises` and the
-"rows" replaced by whole JSON files. The underlying strategy in one
-sentence: **treat each saved artifact as an immutable file, name it so the
-directory listing sorts itself, and validate shape only when you read it
-back.**
+The shape is a single narrow interface with two implementations, where one implementation is the "build it with zero infrastructure" version and the other is the "make it durable" version. The pattern is **the repository/adapter seam**: the application depends on an abstract store, concrete stores plug in underneath.
 
 ```
-  the pattern: file-per-record, write-once, list-to-query
+  The contract seam — three methods, two implementors
 
-         write                      read
-   ┌──────────────┐          ┌──────────────────┐
-   │ build object │          │ readdir(dir)     │
-   │ in memory    │          │   ↓ filter .json │
-   └──────┬───────┘          │   ↓ sort names   │  ← the "index"
-          │                  │   ↓ readFile each│
-          ▼                  │   ↓ JSON.parse   │
-   ┌──────────────┐          │   ↓ validate     │  ← the "constraint"
-   │ writeFile(   │          └──────────────────┘
-   │  ts-slug.json)│                  ▲
-   └──────┬───────┘                   │
-          └────── never overwrites ───┘
-                  (each write is a new row)
+                     VectorStore (the contract)
+            ┌───────────────────────────────────────┐
+            │  dimension: number                    │
+            │  upsert(chunks): Promise<void>        │
+            │  search(vector, k): Promise<VectorHit>│
+            └───────────────┬───────────────────────┘
+                  implements │ implements
+          ┌─────────────────┴──────────────────┐
+   InMemoryVectorStore                   PgVectorStore
+   (aptkit, a Map)                       (buffr, Postgres)
 ```
 
-### Move 2 — the four paths, one at a time
+The kernel here is that the contract has **exactly three things** and `upsert` takes *chunks*, not documents. That single design choice ripples all the way into the SQL schema — keep it in mind, it's the load-bearing part.
 
-**The write path.** This is the `/api/replay/save` middleware. You know how
-an `INSERT` takes a row and the database picks where to put it? Here the
-handler picks the location itself by constructing a filename, then writes
-the whole object. What concretely happens: it normalizes the artifact
-(a partial integrity check), builds a filename from
-`createdAt + fixture.id + provider.id + '-studio'`, makes the directory if
-needed, and writes. The boundary condition: the filename must be unique, or
-the write silently clobbers a prior artifact. Uniqueness rides on the
-millisecond-precision timestamp prefix.
+### Move 2 — the walkthrough
 
-```
-  Layers-and-hops — the write path
+**The contract itself.** This is the whole database abstraction, in seven lines:
 
-  ┌─ UI ─────────┐ hop 1: POST /api/replay/save  ┌─ Service ────────┐
-  │ replay shell │ ────────{ artifact } ───────► │ vite middleware  │
-  └──────────────┘ hop 4: { path } ◄──────────── └────────┬─────────┘
-                                            hop 2 │ normalize+name
-                                                  ▼
-                                         ┌─ Filesystem ──────┐
-                                         │ writeFile(new.json)│  hop 3
-                                         └────────────────────┘
+```ts
+// packages/retrieval/src/contracts.ts:33-37
+export type VectorStore = {
+  dimension: number;                                  // the one-way door: corpus dim must match query dim
+  upsert(chunks: VectorChunk[]): Promise<void>;       // write path — takes CHUNKS, not documents
+  search(vector: number[], k: number): Promise<VectorHit[]>; // read path — vector in, top-k out
+};
 ```
 
-**The read path.** This is `listReplayArtifacts` (for the CLI eval) and
-`listReplaySummaries` (for Studio). Like a `SELECT * FROM replays ORDER BY
-created_at`, except the "table" is a directory and the "ORDER BY" is a
-filename sort. What concretely happens: `readdir` returns directory entries,
-filter to `.json`, sort, then read and parse each one. The boundary
-condition: this is a **full scan every time** — there is no index to consult,
-so cost is O(number of files) for every list.
+Notice what's *not* here: no `delete`, no `update`, no transaction handle, no `documents` concept. The store only knows about chunks (id + vector + meta). That minimalism is deliberate — and it's what forces the buffr schema decision below.
 
-**The commit path.** This is `npm run promote:replay`. It takes one chosen
-artifact and writes it into `fixtures/promoted/` as the new authoritative
-baseline. Think of it as the moment you decide "this read is now the source
-of truth" — a manual `COMMIT` of a specific record into a different table.
-The boundary condition: promotion strips and rewrites the payload, so the
-promoted file is a *derived* record, not a byte copy.
+**Implementation A — the Map.** aptkit's store is a `Map` plus a linear scan:
 
-**The validate path.** This is `assertReplayArtifactShape` and friends. It's
-the integrity layer, but it runs at read time. What concretely happens: the
-parsed object is checked against a list of required paths plus type and
-range rules. The boundary condition: nothing forces validation before a
-write lands, so a bad artifact can sit on disk indefinitely.
+```ts
+// packages/retrieval/src/in-memory-vector-store.ts:11-33
+private readonly chunks = new Map<string, VectorChunk>();    // the entire "database"
+
+async upsert(chunks: VectorChunk[]): Promise<void> {
+  for (const chunk of chunks) {
+    this.assertDimension(chunk.vector, `chunk "${chunk.id}"`);
+    this.chunks.set(chunk.id, chunk);                        // upsert == Map.set (id collision overwrites)
+  }
+}
+async search(vector: number[], k: number): Promise<VectorHit[]> {
+  for (const chunk of this.chunks.values())                 // FULL SCAN — every chunk, every query
+    hits.push({ id: chunk.id, score: cosineSimilarity(vector, chunk.vector), meta: chunk.meta });
+  hits.sort((a, b) => b.score - a.score);                   // sort all, then slice top-k
+  return hits.slice(0, Math.max(0, k));
+}
+```
+
+No index, no durability, no transaction. `upsert` is `Map.set`; "atomic" is free because JS is single-threaded and the whole op is synchronous inside one tick. This is the *control case* — a store with none of the mechanisms the rest of this guide teaches.
+
+**Implementation B — Postgres, and the dropped FK.** buffr maps the same three methods onto SQL. Here's the schema seam that proves the contract is load-bearing:
+
+```sql
+-- buffr/sql/001_agents_schema.sql:14-27
+create table if not exists agents.chunks (
+  id text primary key,
+  document_id text,            -- SOFT link to documents.id — deliberately NO foreign key
+  app_id text not null default 'laptop',
+  chunk_index int not null,
+  content text not null,
+  embedding vector(768) not null,
+  embedding_model text not null default 'nomic-embed-text:v1.5',
+  meta jsonb not null default '{}'
+);
+-- Drop the FK on databases migrated before this change (idempotent).
+alter table agents.chunks drop constraint if exists chunks_document_id_fkey;
+```
+
+The comment in the SQL says it plainly: *"the VectorStore contract upserts chunks with no notion of a documents row, so a hard FK would break drop-in parity."* The contract's `upsert(chunks)` can be called with chunks whose `document_id` has no matching `documents` row (memory rows do exactly this — `buffr/src/session.ts:52`). A foreign key would reject those inserts. So buffr *removed referential integrity* to preserve interface parity. That's the seam asserting itself against the schema.
+
+**The layers-and-hops view — how a query crosses the boundary in buffr:**
+
+```
+  Layers-and-hops — a search request crossing into Postgres (buffr)
+
+  ┌─ Pipeline (aptkit) ─┐  hop 1: store.search(vec, k)   ┌─ PgVectorStore ─┐
+  │ queryKnowledgeBase  │ ──────────────────────────────►│ (buffr)         │
+  └─────────────────────┘  hop 4: VectorHit[] ◄────────── └────────┬────────┘
+                                                          hop 2 SQL │ over pg.Pool
+                                                                    ▼
+                                                          ┌─ Supabase Postgres ─┐
+                                                          │ HNSW scan on        │
+                                                          │ agents.chunks       │
+                                                          └─────────────────────┘
+                                                          hop 3: rows ▲
+```
+
+Hop 2 is where the durability boundary is crossed: above it, JS objects; below it, on-disk rows with a WAL behind them.
 
 ### Move 3 — the principle
 
-When you remove the database, you don't remove its *jobs* — you redistribute
-them. AptKit pushed indexing into the filename, atomicity into the
-write-once convention, and integrity into read-time assertions. That's the
-generalizable lesson: a "no database" system is really a database whose
-mechanisms are scattered across naming conventions and validation code.
-Knowing which job lives where is how you reason about it.
-
----
+A narrow store contract is a *commitment*: every guarantee you want (referential integrity, transactions, durability) either fits through the three methods or gets dropped. buffr chose to drop the FK rather than widen the contract — interface parity beat schema-level integrity. The general lesson: the shape of your storage interface silently decides which database features you're allowed to use.
 
 ## Primary diagram
 
-The full map, every path and boundary labelled.
-
 ```
-  AptKit persistence — all four paths, one frame
+  The full map — agent down to disk, both stores
 
-  ┌─ UI (apps/studio) ────────────────────────────────────────────┐
-  │   AgentReplayShell                                            │
-  └───┬──────────────────────────────────────────────┬───────────┘
-      │ save                                          │ list
-      ▼                                               ▼
-  ┌─ Service (vite.config.ts) ────────────────────────────────────┐
-  │  /api/replay/save (364-383)        /api/replays (349-362)     │
-  │     normalize (1497) → writeFile      readdir → sort (983)    │
-  │                                                               │
-  │  promote:replay (script)            assertReplayArtifactShape │
-  │     read+rewrite → writeFile           (assertions.ts:58)     │
-  └───┬──────────────────────────────────────────────┬───────────┘
-      │ append-only                                   │ full scan
-      ▼                                               ▼
-  ┌─ Filesystem ──────────────────────────────────────────────────┐
-  │  artifacts/replays/*.json     fixtures/promoted/*.json        │
-  │  durability boundary = writeFile resolves (NO fsync)          │
-  └───────────────────────────────────────────────────────────────┘
+  ┌─ aptkit ────────────────────────────────────────────────────────┐
+  │  RagQueryAgent ─► search_knowledge_base tool ─► retrieval pipeline│
+  │                                                  │ embed+search   │
+  │                          ┌───────────────────────▼──────────────┐ │
+  │                          │     VectorStore contract (3 methods)  │ │  ◄ the seam
+  │                          └───────┬───────────────────┬──────────┘ │
+  │              InMemoryVectorStore ▼                    │            │
+  │              Map · full scan · NO durability          │            │
+  └───────────────────────────────────────────────────────┼───────────┘
+                                                            │ buffr implements
+  ┌─ buffr ──────────────────────────────────────────────▼───────────┐
+  │  PgVectorStore ─► pg.Pool ─► Supabase Postgres                     │
+  │     agents.chunks (heap) · HNSW index · WAL · fsync   DURABLE      │
+  │     agents.{documents,conversations,messages,profiles}            │
+  └───────────────────────────────────────────────────────────────────┘
+        ▲ durability boundary lives exactly at the pg.Pool hop
 ```
-
----
-
-## Implementation in codebase
-
-**Use cases.** Every time you click "Run" then "Save" in Studio, the write
-path fires. Every time the replay shell lists prior runs, or `npm run
-eval:replays` scores the directory, the read path fires. When you decide a
-run is correct and want it as a deterministic test baseline, you run the
-commit path. Validation rides along the read and commit paths.
-
-**The read path, line by line** — `packages/evals/src/replay-runner.ts:31-44`:
-
-```
-  export async function listReplayArtifacts(dir) {
-    let entries;
-    try {
-      entries = await readdir(dir, { withFileTypes: true }); ← the "table scan":
-                                                               list the directory
-    } catch (error) {
-      if (isNodeError(error) && error.code === 'ENOENT') return [];
-                                          ← missing dir = empty table, not an error
-      throw error;
-    }
-    return entries
-      .filter((entry) => entry.isFile() && extname(entry.name) === '.json')
-                                          ← WHERE extension = '.json'
-      .map((entry) => join(dir, entry.name))
-      .sort();                            ← the ONLY index: lexicographic
-                                            filename order (see file 03)
-  }
-       │
-       └─ no index file, no metadata table — the directory IS the index,
-          and .sort() on filenames IS the ORDER BY. Remove the timestamp
-          prefix from filenames and this silently returns wrong order.
-```
-
-**The write path** — `apps/studio/vite.config.ts:364-383`:
-
-```
-  server.middlewares.use('/api/replay/save', async (req, res) => {
-    ...
-    const artifact = normalizeReplayArtifact(body.artifact); ← partial write-time
-                                                                integrity check
-    const outDir = resolve(workspaceRoot(), 'artifacts/replays');
-    await mkdir(outDir, { recursive: true });                ← create "table" lazily
-    const path = join(outDir,
-      `${formatTimestamp(new Date(artifact.createdAt))}-${slugify(...)}-studio.json`);
-                                          ← the filename IS the primary key + index
-    await writeFile(path, `${JSON.stringify(artifact, null, 2)}\n`, 'utf8');
-                                          ← the entire durability story: one write,
-                                            no fsync, no temp-and-rename
-    sendJson(res, { path: relativeFromWorkspace(path) });
-  });
-```
-
----
 
 ## Elaborate
 
-This shape — file-per-record in a directory, listed and sorted to query — is
-the oldest database there is. Maildir email storage, `git`'s loose-object
-store, and log-structured systems all start here. The reason it works for
-AptKit is the access pattern: write-rarely (a human clicks save),
-read-occasionally (list a handful of runs), small N (8 artifacts today). A
-real engine earns its complexity only when N grows, writes contend, or
-queries need anything beyond "list and sort by time." File `09` names the
-exact thresholds.
-
-The data *shapes* flowing through these paths — the artifact schema, the
-`CapabilityEvent` union — are owned by `study-data-modeling`. The *choice*
-of filesystem over a database, and how it scales, is owned by
-`study-system-design`. This file owns only the mechanism.
-
----
+The repository pattern is decades old; the modern twist is RAG: the "store" is a vector index, and the contract has to be narrow enough that an in-memory toy and a production pgvector instance both satisfy it. buffr's `agents` schema lives in a *shared* `reindb` database — `documents`, `chunks`, `conversations`, `messages`, `profiles`, all `app_id`-keyed (default `'laptop'`) so multiple apps can share one database, partitioned by a column rather than by separate databases. RLS (row-level security) would normally enforce that partition at the engine; here it's a plain `where app_id = $2` in application SQL (`buffr/src/pg-vector-store.ts:74`), with RLS deferred. Read next: 02 for how a chunk row physically lays out, 07 for what "durable" actually buys.
 
 ## Interview defense
 
-**Q: "Your app saves data but has no database. Walk me through how a write
-becomes durable and how you read it back."**
-
-> There are four paths and no engine. A write is a `writeFile` of a whole
-> JSON artifact into `artifacts/replays/`, named with an ISO timestamp prefix
-> so the directory self-sorts. A read is `readdir` plus a `.sort()` on
-> filenames — a full scan, no index. There's no transaction and no fsync, so
-> "durable" means "writeFile resolved." The filename does triple duty: it's
-> the primary key, the only index, and the uniqueness guard.
+**Q: You have two implementations of one store. What's the cost of that abstraction?**
 
 ```
-  write: build → name(ts-prefix) → writeFile   (no fsync)
-  read:  readdir → filter .json → sort names → parse → validate
-                                       ▲
-                          the filename is PK + index + uniqueness
+  contract narrow enough for both  →  features that don't fit get dropped
+        InMemory (Map)  ───┐
+                           ├──► VectorStore: upsert(CHUNKS), no doc concept
+        Postgres (pgvector)┘                  │
+                                              ▼
+                              FK chunks→documents had to be DROPPED
 ```
 
-**Anchor:** "The filename is the index — `replay-runner.ts:43` is the whole
-query planner."
+Answer: "The contract takes chunks, not documents — so a chunk can reference a document_id with no matching row. Postgres would reject that with a foreign key, so buffr dropped the FK (`001_agents_schema.sql:16-27`) to keep drop-in parity. The cost is real: no engine-enforced referential integrity between chunks and documents. We pay it because the same pipeline code has to run over both a Map and Postgres unchanged." Anchor: *the dropped FK is the price of the seam.*
 
----
+**Q: Where is the durability boundary?**
 
-## Validate
-
-1. **Reconstruct:** From memory, name the four query paths and the one file
-   each lives in.
-2. **Explain:** Why does the read path in `replay-runner.ts:31-44` not need
-   an index file?
-3. **Apply:** A teammate renames artifacts to drop the timestamp prefix and
-   use a random UUID. What breaks, and in which function
-   (`replay-runner.ts:43` or `vite.config.ts:983`)?
-4. **Defend:** Argue why filesystem-as-store was the right call for AptKit
-   today, and name the one access-pattern change that would flip the
-   decision.
-
----
+Answer: "Exactly at the `pg.Pool` hop in `PgVectorStore`. Above it, everything is process memory — `InMemoryVectorStore` is a `Map` that dies on exit. Below it, rows are on disk with a WAL. aptkit has no boundary because it has no disk; buffr's is the one line where data starts surviving restarts." Anchor: *one line, the Pool hop.*
 
 ## See also
 
-- `02-records-pages-and-storage-layout.md` — the file-as-record cost model
-- `03-btree-hash-and-secondary-indexes.md` — why the filename sort is the index
-- `04-query-planning-and-execution.md` — the scan-filter-parse "plan" and its N+1
-- `07-wal-durability-and-recovery.md` — the durability boundary in depth
-- `study-system-design` → the filesystem-vs-database choice
-- `study-data-modeling` → the artifact and event schemas
+- `00-overview.md` — the two-store map and ranked findings.
+- `02-records-pages-and-storage-layout.md` — how a chunk row is physically stored.
+- `07-wal-durability-and-recovery.md` — what crossing the boundary buys.
+- study-data-modeling — the schema *shape* and the dropped FK as a modeling call.
+- study-system-design — *why* Supabase, and the local-first/cloud split.

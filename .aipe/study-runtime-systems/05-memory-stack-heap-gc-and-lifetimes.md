@@ -1,226 +1,193 @@
-# 05 — Memory: Stack, Heap, GC, and Lifetimes
+# Memory, Stack, Heap, GC, and Lifetimes — what lives, what grows, what gets collected
 
-**Industry name:** memory model / allocation + garbage collection · *Industry standard*
+**Industry name(s):** heap allocation / GC · object lifetime · memory pressure · buffer-everything vs streaming · **Type:** Industry standard (V8 GC)
 
 ## Zoom out, then zoom in
 
-Where does the memory a run touches live, how long does it live, and what bounds its growth? This concept sits at the runtime layer, under every allocation the agent loop makes.
+aptkit allocates almost everything on the heap, keeps it for the duration of one operation, and lets V8's garbage collector reclaim it. The interesting decisions are the *buffer-everything* choices — places that hold the whole thing in memory rather than streaming it — because those are where memory grows with input size.
 
 ```
-  Zoom out — where a run's memory lives
+  Zoom out — where aptkit's memory lives
 
-  ┌─ Application layer ──────────────────────────────────────────┐
-  │  runAgentLoop allocates: messages[], toolCalls[], strings     │
-  └──────────────────────────┬───────────────────────────────────┘
-  ┌─ Runtime layer (V8) ─────▼───────────────────────────────────┐
-  │  ★ stack (call frames) + heap (objects) + GC ★               │ ← we are here
-  │     no manual free; lifetimes = reachability                 │
-  └──────────────────────────┬───────────────────────────────────┘
-  ┌─ Bounds layer ───────────▼───────────────────────────────────┐
-  │  MAX_TOOL_RESULT_CHARS, maxTokens, maxTurns cap the growth   │
-  └───────────────────────────────────────────────────────────────┘
+  ┌─ Stack (call frames) ─────────────────────────────────────────────┐
+  │   shallow: runAgentLoop's for-loop, cosine's inner loop. No deep   │
+  │   recursion anywhere. Stack depth is bounded and small.            │
+  └──────────────────────────────────┬─────────────────────────────────┘
+  ┌─ Heap (the interesting part) ─────▼─────────────────────────────────┐
+  │   ★ messages[] growing per turn (run-agent-loop.ts:94)            ★ │ ← we are here
+  │   ★ InMemoryVectorStore.chunks Map of 768-float arrays (:12)      ★ │
+  │   ★ NDJSON line buffer (ndjson-stream.ts:108)                     ★ │
+  │   replay artifacts read whole into memory (fs.promises, buffered)  │
+  └──────────────────────────────────┬─────────────────────────────────┘
+  ┌─ GC (V8, automatic) ──────────────▼─────────────────────────────────┐
+  │   generational mark-sweep. aptkit pins nothing, frees nothing       │
+  │   manually. lifetimes are scoped to one operation.                  │
+  └──────────────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: in a manual-memory language you ask "who frees this?" In V8 you ask a different question — "what keeps this *reachable*?" Memory lives as long as something references it; when the last reference drops, GC reclaims it on its own schedule. For AptKit the interesting question isn't *whether* memory is freed (it always is, eventually) but *how big the live set gets during a run* — and that's governed by the same budgets that bound the loop. Memory pressure here is the `messages` array growing each turn, capped by `maxTurns` and `MAX_TOOL_RESULT_CHARS`.
+**Zoom in.** Memory in a GC runtime is about *lifetimes*: when is an object reachable, and when does it become garbage? For aptkit almost every object's lifetime is "one agent run" or "one request" — born at the start, unreachable at the end, collected shortly after. The two exceptions that outlive a single operation are the vector corpus (`Map`) and the per-conversation counters, both of which grow with use. This file walks where memory scales with input and where it doesn't.
 
 ## Structure pass
 
-**Layers.** Application allocations → V8 stack/heap → the budgets that bound them.
-
-**Axis — "what determines this memory's lifetime?"**
+Trace the **lifecycle** axis on memory — how long does each allocation stay reachable?
 
 ```
-  One question down the layers: "when is this reclaimed?"
+  Axis: "how long does this live?" — by allocation site
 
-  ┌─ stack (call frames) ───────┐  when the function returns
-  │  turn, response, toolUses   │  (or the await resumes past it)
-  └──────────────┬───────────────┘
-       ┌─────────▼──────────────────┐ when no longer reachable —
-       │  heap (messages[], strings) │ i.e. when the run completes
-       └─────────┬──────────────────┘ and the closure is dropped
-           ┌─────▼────────────────────┐ never auto-grows past the
-           │  bounded by budgets       │ budget: maxTurns × capped tool result
-           └──────────────────────────┘
+  ┌──────────────────────────────────────────────────────────┐
+  │ messages[] in runAgentLoop (run-agent-loop.ts:94)          │  → one agent run
+  │   grows by 2 entries per turn, freed when the call returns │     (bounded by maxTurns)
+  └───────────────────┬────────────────────────────────────────┘
+      ┌───────────────▼────────────────────────────────────────┐
+      │ NDJSON buffer (ndjson-stream.ts:108)                     │  → one line at a time
+      │   sliced down as lines are yielded                       │     (bounded, streaming-ish)
+      └───────────────┬────────────────────────────────────────┘
+          ┌───────────▼────────────────────────────────────────┐
+          │ InMemoryVectorStore.chunks Map (:12)                 │  → process lifetime,
+          │   one 768-float array per chunk, never evicted        │     GROWS unbounded
+          └────────────────────────────────────────────────────┘
 ```
 
-The lifetime answer sharpens as you descend: stack frames die at return, heap objects die at unreachability, and the *total* a run can hold is capped by budgets. That last point is the one that matters — without the caps, a runaway agent could grow `messages` without bound.
-
-**Seams.** The seam is the `await` inside a long-lived loop: across an `await`, the function's locals (and the closure holding `messages`) stay alive on the heap because the suspended continuation references them. A run that's parked at `await model.complete()` is holding its entire `messages` history live. The bound on that history is the load-bearing detail.
+The seam: **the boundary between per-operation lifetimes and process-lifetime state.** Below it, everything is short-lived and GC reclaims it between operations — memory is flat over time. Above it sits the corpus `Map`, which only ever grows (no eviction, no TTL). At aptkit's scale that's nothing; it's the one allocation whose size is a function of total data indexed rather than a single request.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know that a React component's state lives as long as the component is mounted, and gets GC'd after unmount when nothing references it. A run's `messages` array is the same: it lives as long as the `runAgentLoop` invocation is on the stack (or suspended at an await), and is reclaimed once the function returns and the closure is dropped. Strategy: **reachability-based lifetimes + budget-bounded growth.**
+You know that in JS you never `free()` — you just stop referencing an object and the GC reclaims it. Memory pressure isn't about leaks-by-forgetting-to-free; it's about *holding references too long* or *holding too much at once*. The two questions for any allocation: how long is it reachable, and does its size grow with input?
 
 ```
-  The memory kernel — growth per turn, bounded by budgets
+  Object lifetime — reachable vs garbage
 
-  turn 0:  messages = [user]                          ← small
-  turn 1:  messages = [user, assistant, toolResults]  ← grows
-  turn 2:  messages = [..., assistant, toolResults]   ← grows
-   ...                                                 (each tool result
-  turn N:  capped at maxTurns turns                     truncated to 16KB)
-       │
-       └─ peak live set ≈ maxTurns × (assistant text + Σ capped tool results)
-          GC reclaims it all once runAgentLoop returns
+  function runAgentLoop():
+    messages = []        ← allocated, reachable
+    ... loop runs ...    ← messages grows, stays reachable
+    return result        ← messages goes out of scope
+                              │
+                              ▼ no more references
+                         GC reclaims it (next collection cycle)
+
+  the leak shape to avoid: a long-lived container that keeps
+  appending and never drops references (the corpus Map, by design)
 ```
 
-### Move 2 — walking the mechanism
+The strategy: **scope every allocation to one operation so the GC reclaims it automatically, and accept exactly one growing structure — the corpus — because retrieval needs the whole index resident.**
 
-**The stack holds the call frames; it's shallow here.** `runAgentLoop` → `model.complete` → SDK is a handful of frames deep. There's no deep recursion (the loop is iterative `for`, not recursive). The recovery path (`runRecoveryTurn`) adds one more frame, not a recursive descent. No stack-overflow risk.
+### Move 2 — the allocations that matter
 
-**The heap holds the long-lived objects — chiefly the `messages` array.** Each turn appends an assistant message and a user message of tool results. This array is the dominant allocation and the thing that grows. It lives on the heap, referenced by the running (or suspended) `runAgentLoop` closure.
+**The growing message array.** `run-agent-loop.ts:94` and `:124`, `:189`:
 
-```
-  Heap growth per turn — what gets appended
-
-  messages.push({ role: 'assistant', content: response.content }) ← per turn
-  messages.push({ role: 'user', content: toolResults })           ← per turn
-       │
-       └─ each toolResult.content is truncate(JSON.stringify(result)),
-          capped at MAX_TOOL_RESULT_CHARS = 16_000 chars, so one tool
-          result can't balloon the array with a megabyte payload
+```ts
+const messages: ModelMessage[] = [{ role: 'user', content: userPrompt }];
+// ... each turn:
+messages.push({ role: 'assistant', content: response.content });   // :124
+messages.push({ role: 'user', content: toolResults });             // :189
 ```
 
-**Truncation is the memory bound on a single tool result.** Without `truncate`, a tool returning a 10MB JSON blob would put 10MB into `messages`, then re-send it to the model every subsequent turn (cost *and* memory). The 16KB cap means each tool result contributes at most ~16KB to the live set, and the synchronous `JSON.stringify` that produces it also stays cheap (ties back to `03`: short synchronous spans).
+Per turn, two entries are appended — and the *whole* `messages` array is re-sent to the model each call. So memory and per-call payload both grow linearly with turn count. But it's bounded: `maxTurns` defaults to 8 (`run-agent-loop.ts:87`), and the array is freed when the function returns. There's also a cap on individual tool results — `MAX_TOOL_RESULT_CHARS = 16_000` with `truncate` (`run-agent-loop.ts:52`) — so a single huge tool output can't blow the array up. This is the right shape: growth is bounded by a hard turn limit, and the lifetime is one call.
 
 ```
-  Without vs with the truncation bound
+  messages[] growth — bounded by maxTurns
 
-  no cap:   tool returns 10MB ─► messages holds 10MB ─► resent every turn
-  16KB cap: tool returns 10MB ─► truncate to 16KB ─► messages holds 16KB
-            "...[truncated]" appended so the model knows it was cut
+  turn 0:  [user]                                    1 entry
+  turn 1:  [user, asst, toolResults]                 3 entries
+  turn 2:  [user, asst, tR, asst, tR]                5 entries
+  ...
+  turn N:  2N+1 entries, each tool result ≤ 16KB
+           └── hard ceiling at maxTurns (default 8) ──┘
+           freed when runAgentLoop returns
 ```
 
-**GC reclaims the run's memory when it returns.** Once `runAgentLoop` resolves its `AgentRunResult`, the `messages` array, the `toolCalls` records, and all intermediate strings become unreachable (the caller keeps only the small result). V8's generational GC collects them. There's no manual free, no object pool, no `Buffer` reuse — and at this scale none is needed.
+**The corpus Map — the one unbounded structure.** `in-memory-vector-store.ts:12`:
 
-**The streaming path keeps almost nothing live.** `decodeNdjsonStream` holds only a `buffer` string of the current partial line, not the whole stream. As records are yielded and consumed, prior chunks are GC'd. This is the opposite of buffering the entire response — memory stays flat regardless of stream length.
-
+```ts
+private readonly chunks = new Map<string, VectorChunk>();
 ```
-  Streaming memory — flat, not proportional to stream size
 
-  buffer holds: only the bytes since the last newline
-  yield record ─► consumer uses it ─► record GC'd
-       │
-       └─ a 10,000-event stream never holds 10,000 events in memory at once;
-          peak ≈ one partial line + one record
+Each entry holds a `vector: number[]` of the embedding dimension — 768 floats for nomic-embed, 64 for the Studio fake embedder. A JS `number[]` of 768 doubles is ~6KB of payload plus object overhead. The `Map` never evicts: `upsert` only ever adds (`in-memory-vector-store.ts:18`). So total resident memory is `(chunks indexed) × (~6KB + meta)`. At demo scale (dozens of chunks) that's kilobytes. The honest framing: **this is the only structure whose memory is a function of cumulative data, not per-request work — and it's resident for the whole process.** It's correct for an in-memory dev/test store; the production answer is buffr's `PgVectorStore`, where vectors live in Postgres and aptkit's heap holds only the current query and its top-k hits.
+
+**The NDJSON buffer — streaming-ish, bounded.** `ndjson-stream.ts:108`:
+
+```ts
+let buffer = '';
+for await (const chunk of chunks) {
+  buffer += typeof chunk === 'string' ? chunk : decoder.decode(chunk, { stream: true });
+  // ... slice complete lines out of buffer, yield them, shrink buffer
+  buffer = buffer.slice(newlineIndex + newlineLength);   // :119
+}
 ```
+
+This is the closest aptkit gets to true streaming memory behavior: it holds only the unparsed tail (a partial line) plus whatever the current chunk added, slicing complete lines out as they arrive. Memory is bounded by the longest single line, not the whole stream. Good — it doesn't buffer the entire trace before parsing.
+
+**Buffer-everything elsewhere.** Replay artifacts and fixtures are read whole into memory via `fs.promises.readFile` (in `scripts/*.mjs`, `packages/evals/src/replay-runner.ts`, `apps/studio/vite.config.ts`) — no `createReadStream`. For JSON files of a few KB that's correct; parsing JSON needs the whole document anyway, so streaming wouldn't help. `06` walks the file-handle side.
+
+**Stack: shallow everywhere.** No deep recursion. The agent loop is iterative (`for`), the cosine scan is iterative, tree-walks in the workflow helpers are shallow. Stack depth is small and bounded — no stack-overflow surface.
 
 ### Move 3 — the principle
 
-In a GC runtime, memory management *is* lifetime management: you don't free, you drop references and let growth be bounded by design. The two bounds that keep AptKit's live set small are the same ones from the loop — `maxTurns` caps how many messages accumulate, `MAX_TOOL_RESULT_CHARS` caps how big each one gets — plus the streaming decoder that refuses to hold the whole stream. The discipline isn't "free memory"; it's "bound what stays reachable."
+In a GC runtime, the memory question isn't "did I free it" — it's "what's reachable and for how long." aptkit's discipline is to scope nearly everything to one operation so the GC handles it for free, and to accept exactly one process-lifetime growing structure (the corpus) because retrieval genuinely needs the index resident. The lesson generalizes: a memory problem in a GC language is almost always a *lifetime* problem (something stays reachable too long) or a *bound* problem (something grows with input and has no cap), not a free-the-pointer problem. aptkit has no lifetime problems and exactly one structure without a cap — and that one is deliberately swappable for a database.
 
 ## Primary diagram
 
-```
-  Memory lifetimes — stack, heap, bounds, GC
-
-  ┌─ Stack (shallow, per-frame) ─────────────────────────────────┐
-  │  runAgentLoop → model.complete → SDK  (handful of frames)    │
-  │  locals: turn, response, toolUses — die when frame returns   │
-  └──────────────────────────┬───────────────────────────────────┘
-  ┌─ Heap (the live set) ────▼───────────────────────────────────┐
-  │  messages[]  ── grows per turn, capped by maxTurns           │
-  │  toolCalls[] ── one record per tool call                     │
-  │  strings     ── each tool result capped at 16KB (truncate)   │
-  │  stream buffer ── only current partial line (flat)           │
-  └──────────────────────────┬───────────────────────────────────┘
-  ┌─ Bounds + GC ────────────▼───────────────────────────────────┐
-  │  peak ≈ maxTurns × (text + Σ 16KB results)                   │
-  │  reclaimed when runAgentLoop returns (reachability drops)    │
-  └───────────────────────────────────────────────────────────────┘
-       NO manual free · NO object pool · NO Buffer reuse (none needed)
-```
-
-## Implementation in codebase
-
-**Use cases.** You reason about memory when a long agent run worries you (it can't grow unbounded — `maxTurns` caps it), when a tool might return something huge (it's truncated to 16KB), or when streaming a long trace (the decoder stays flat). The context-window guard (`local`) is the explicit *pre-flight* check that the live message set won't exceed a token budget before even calling the model.
-
-**Code side by side.**
-
-The truncation bound on each tool result:
+The complete memory picture: short-lived per-operation allocations the GC reclaims, one growing corpus, one streaming buffer, shallow stacks.
 
 ```
-  packages/runtime/src/run-agent-loop.ts (lines 52–57, 162)
+  aptkit memory map — complete
 
-  const MAX_TOOL_RESULT_CHARS = 16_000;
-  function truncate(value: string): string {
-    if (value.length <= MAX_TOOL_RESULT_CHARS) return value;
-    return `${value.slice(0, MAX_TOOL_RESULT_CHARS)}\n...[truncated]`; ← marker so model knows
-  }
-  ...
-  resultContent = truncate(JSON.stringify(result)); ← bounds heap + sync stringify cost
-       │
-       └─ without this, a fat tool result lives in messages AND is resent every
-          turn — memory and token cost both blow up
-```
-
-The flat streaming buffer:
-
-```
-  packages/runtime/src/ndjson-stream.ts (lines 107–119)
-
-  let buffer = '';
-  for await (const chunk of chunks) {
-    buffer += decoder.decode(chunk, { stream: true });  ← holds only partial line(s)
-    while (newlineIndex >= 0) {
-      const line = buffer.slice(0, newlineIndex);
-      buffer = buffer.slice(newlineIndex + newlineLength); ← consumed bytes dropped → GC
-      yield decodeNdjsonLine(line, ...);
-    }
-  }
-       │
-       └─ buffer never accumulates the whole stream; peak memory is one partial line
-```
-
-The pre-flight memory/token guard:
-
-```
-  packages/providers/local/src/context-window-guard.ts (lines 57–70)
-
-  async complete(request) {
-    request.signal?.throwIfAborted();
-    const estimate = estimateContextWindow(request, this.options); ← SYNC, before any I/O
-    if (!estimate.ok) {
-      this.options.trace?.emit({ type: 'warning', ... });
-      throw new ContextWindowExceededError(estimate);  ← refuse rather than overflow
-    }
-    return this.provider.complete(request);
-  }
-       │
-       └─ estimates input tokens from message char length (≈ chars/3) and refuses
-          if it exceeds the local model's budget — a synchronous gate on the live set
+  ┌─ Stack: shallow, bounded ────────────────────────────────────────────┐
+  │   iterative loops only, no deep recursion → no overflow surface       │
+  └────────────────────────────────────────────────────────────────────────┘
+  ┌─ Heap: by lifetime ───────────────────────────────────────────────────┐
+  │                                                                        │
+  │  PER-OPERATION (GC reclaims after each call) — memory flat over time   │
+  │    runAgentLoop messages[]  ← grows 2/turn, capped by maxTurns (8)     │
+  │    tool results             ← each truncated to 16KB                   │
+  │    structured-gen attempts[]                                           │
+  │                                                                        │
+  │  STREAMING-BOUNDED                                                      │
+  │    NDJSON buffer ← holds one partial line, sliced down as it yields    │
+  │                                                                        │
+  │  PROCESS-LIFETIME, GROWS WITH DATA (the one to watch)                  │
+  │    InMemoryVectorStore.chunks ← (n chunks) × (768-float array + meta), │
+  │                                  never evicted; swap for PgVectorStore │
+  └────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-GC-managed memory is the default expectation for a TypeScript/Node engineer, so the interesting content here isn't "how does V8 GC work" (generational, mark-sweep) but "what bounds the live set" — and the answer is the budgets, which is why this file leans on `07`. The context-window guard is a neat artifact: it's a *synchronous, pre-flight* estimate (`estimateModelRequestTokens` sums message text and divides by `charsPerToken`) that gates the awaited call — bounding memory/cost *before* spending it. That pattern — estimate cheaply and synchronously, then decide whether to do the expensive async thing — generalizes well. `not yet exercised`: manual memory management, object pooling, arena/slab allocation, `Buffer` reuse, explicit GC tuning (`--max-old-space-size`). None present; the workload's live set is small and short-lived enough that V8 defaults are fine.
+V8's generational GC is tuned for exactly aptkit's allocation pattern: lots of short-lived objects (the "young generation") that die fast and get collected cheaply, plus a small set of long-lived objects (the corpus) that survive into the "old generation" and are collected rarely. Per-operation allocations cost almost nothing to reclaim. The classic Node memory leak — an ever-growing cache or event-listener set on a long-lived object — maps directly onto the corpus `Map` if aptkit ever ran as a long-lived server *and* kept indexing without eviction. It doesn't today (it's a library, runs are short-lived), and in production the corpus moves to Postgres anyway. The general escape hatches when an in-memory index outgrows the heap: a real ANN index with its own memory management, off-heap storage, or — aptkit's actual plan — a database behind the same `VectorStore` contract. See `03` for the CPU cost of scanning that same `Map`, and `study-performance-engineering` for measuring heap pressure.
 
 ## Interview defense
 
-**Q: "Can a long agent run grow memory without bound?"**
+**Q: What's the one structure in aptkit whose memory grows unbounded, and is that a problem?**
 
 ```
-  messages grows per turn ──► bounded by maxTurns (≤ 8, recommendation 6)
-  each tool result        ──► bounded by MAX_TOOL_RESULT_CHARS (16KB)
-  peak live set           ──► maxTurns × (text + Σ 16KB) — finite
-  reclaimed               ──► when runAgentLoop returns
+  InMemoryVectorStore.chunks Map (in-memory-vector-store.ts:12)
+  one 768-float array per chunk, never evicted, process-lifetime
+  grows with TOTAL data indexed, not per-request work
+
+  problem? not at demo/test scale (KBs)
+  it's a dev/test adapter — production swaps PgVectorStore behind the
+  same VectorStore contract, so vectors live in Postgres, not the heap
 ```
 
-Answer: "No. Two independent bounds cap it: `maxTurns` limits how many message rounds accumulate, and `MAX_TOOL_RESULT_CHARS` truncates each tool result to 16KB so one fat payload can't balloon the array. It's reclaimed by GC when the run returns." Anchor: `run-agent-loop.ts:52,87,162`. The part people forget: the same truncation that bounds memory also bounds the *resent* token cost every subsequent turn.
+Anchor: "Everything else is per-operation and GC'd; the corpus `Map` is the one process-lifetime growing structure, and it's deliberately swappable for a database."
 
-**Q: "Does streaming a 10k-event trace hold 10k events in memory?"** No — `decodeNdjsonStream` holds only the current partial line; consumed records are dropped and GC'd. Peak is ~one line. Anchor: `ndjson-stream.ts:108,119`.
+**Q: How does `runAgentLoop` keep memory bounded?**
 
-## Validate
+```
+  messages[] grows 2 entries/turn but:
+    - maxTurns (default 8) caps turn count
+    - each tool result truncated to MAX_TOOL_RESULT_CHARS (16KB)
+    - whole array freed when the call returns (GC)
+  → bounded growth, one-call lifetime
+```
 
-1. **Reconstruct:** Sketch `messages` growth across turns and mark the two bounds (`maxTurns`, 16KB truncate).
-2. **Explain:** Why is the streaming buffer flat regardless of stream length? (Consumed bytes are sliced off and become unreachable — `ndjson-stream.ts:119`.)
-3. **Apply:** A tool returns 5MB of JSON. How much lands in `messages`, and what's the second cost avoided? (~16KB; avoids resending 5MB every turn — `run-agent-loop.ts:162`.)
-4. **Defend:** Explain why the context guard checks token estimate *synchronously before* the await, and what it buys (`context-window-guard.ts:57–68`).
+Anchor: "The message array grows per turn but it's capped by `maxTurns` and 16KB-per-tool-result truncation, then GC'd when the run ends."
 
 ## See also
 
-- `03-event-loop-and-async-io.md` — why a suspended-at-await closure stays live.
-- `07-backpressure-bounded-work-and-cancellation.md` — the budgets that bound the live set.
-- `.aipe/study-performance-engineering/` *(when generated)* — measuring the live set and token cost.
+- `03-event-loop-and-async-io.md` — the CPU cost of scanning the same corpus `Map`
+- `06-filesystem-streams-and-resource-lifecycle.md` — the buffer-everything file reads
+- `07-backpressure-bounded-work-and-cancellation.md` — `maxTurns` as the bound that caps message growth
+- `study-performance-engineering` — measuring heap pressure and the corpus crossover point

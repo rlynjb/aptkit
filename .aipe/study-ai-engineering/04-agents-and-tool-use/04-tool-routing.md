@@ -1,419 +1,275 @@
-# Tool routing and least-privilege allowlists (which tools, locked down how?)
+# Tool routing
 
-**Industry names:** tool selection / routing, least-privilege tool scoping, capability allowlisting · *Industry standard*
+**Subtitle:** Tool selection / routing · least-privilege policy + LLM-within-allowlist · *Industry standard (aptkit's twist: the policy sets the menu)*
 
 ## Zoom out, then zoom in
 
-A workspace exposes dozens of tools. The recommendation agent has no business
-touching the customer-events tools; the anomaly monitor has no business listing
-email campaigns. Tool routing decides which tools each capability gets — and in
-AptKit the answer is enforced *before the provider ever sees the request*. The
-model literally cannot request a tool it wasn't handed.
+Tool routing is the question "given a request, which tool runs?" The textbook split
+is heuristic routing (rules pick the tool) vs LLM routing (the model picks). aptkit's
+real answer is neither pure case: a per-capability **policy** decides the *menu* of
+tools a capability may even see, and the LLM picks *within* that menu. Routing here
+is least-privilege first, model-choice second.
 
 ```
-  Zoom out — where tool routing lives
+  Zoom out — routing is menu (policy) + pick (LLM)
 
-  ┌─ Routing layer (intent + policy) ─────────────────────────────┐
-  │  parseIntent → which capability     ★ ToolPolicy allowlist ★    │ ← we are here
-  │  coverage-gate runnableRequirements → which TASKS can run       │
-  └───────────────────────────────┬────────────────────────────────┘
-                                   │ filterToolsForPolicy(allTools, policy)
-  ┌─ Agent layer ──────────────────▼────────────────────────────────┐
-  │  toolSchemas = ONLY the allowed tools                           │
-  └───────────────────────────────┬────────────────────────────────┘
-                                   │ passed into runAgentLoop
-  ┌─ Provider layer ───────────────▼────────────────────────────────┐
-  │  model.complete({ tools: toolSchemas })  ← sees the subset only │
-  └──────────────────────────────────────────────────────────────────┘
+  ┌─ Capability ───────────────────────────────────────────────┐
+  │  ToolPolicy { capabilityId, allowedTools }                  │
+  │        │ filterToolsForPolicy(allTools, policy)             │
+  │        ▼                                                    │
+  │  ★ the MENU — only the tools this role may see ★            │ ← we are here
+  └───────────────────────────┬─────────────────────────────────┘
+                              │ toolSchemas (the filtered menu)
+  ┌─ Agent loop / model ──────▼─────────────────────────────────┐
+  │  the LLM PICKS one of the allowed tools each turn           │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: routing has two distinct jobs. First, **pick the capability** — is this
-a monitoring, diagnostic, or recommendation request? AptKit does that with a cheap
-heuristic first (`parseIntent`), LLM classification as the fallback. Second,
-**scope the tools** — once you know the capability, hand the model *only* the
-tools that role is allowed to call. That second job is the security-shaped one,
-and it's the heart of this file: least privilege, enforced at the schema boundary.
+Now zoom in. Most "routing" content debates heuristic vs LLM as if you must choose
+one. aptkit shows the production answer: bound the choice with a policy so the model
+*can't* pick a tool outside its role, then let the model route within the allowlist.
+There's also a real heuristic router in the repo — `parseIntent` — that classifies
+intent before/around the LLM. So aptkit teaches both: heuristic-front/LLM-back as the
+general pattern, and its own version as policy-bounded LLM routing.
 
 ## Structure pass
 
-**Layers.** Three: *intent routing* (which capability handles this request),
-*coverage gating* (which tasks can even run against this workspace), and *policy
-filtering* (which tools the chosen capability may see). They run in that order and
-each narrows the input to the next.
+**Layers.** Registry (all tools) → policy filter (the allowlist) → agent loop (offers
+the menu) → model (picks). Plus a side path: an intent classifier that routes the
+request to a capability before any of this.
 
-**Axis — trust / what can the model reach?** Trace it down. At the registry, *all*
-tools exist (full surface). At the policy filter, the surface is cut to the
-allowlist (recommendation 13, query ~49, anomaly 4). At the provider, the model
-sees *only* that subset — it cannot name a tool it never received. The reachable
-surface shrinks monotonically at every layer; nothing widens it back.
+**Axis — who can choose a given tool.** Trace the freedom to call `delete_everything`:
+the registry holds it; `filterToolsForPolicy` (`tool-policy.ts:11`) drops it for any
+capability whose `allowedTools` omits it; so by the time the model sees `toolSchemas`,
+that tool *isn't in the array* and the model literally cannot name it. The axis "is
+this tool callable here?" is decided at the policy filter, not by the model and not
+by a runtime check.
 
-```
-  One question — "what tools can the model reach?"
-
-  ┌─ registry ──────┐  → ALL tools (full catalog)
-  └─────────────────┘
-  ┌─ policy filter ─┐  → ONLY allowedTools (13 / 49 / 4)
-  └─────────────────┘
-  ┌─ provider ──────┐  → exactly the filtered subset — can't request more
-  └─────────────────┘
-```
-
-**Seams.** The load-bearing seam is `filterToolsForPolicy` — the boundary where
-the full catalog becomes the per-capability subset. Trust flips across it: above
-it, every tool is callable; below it, only the allowlist. A second seam is the
-coverage gate, which runs *before* the model spends a single token and removes
-tasks the workspace can't support. Both seams are pre-model — that's what makes
-them cheap and tamper-proof.
+**Seam.** `filterToolsForPolicy(allTools, policy)` (called in every agent, e.g.
+`rag-query-agent.ts:64`, `query-agent.ts:77`). Above it: the full registry. Below it:
+a model that only ever sees its role's tools. That filter is the routing boundary —
+it's *allowlist construction*, run before the model gets a vote.
 
 ## How it works
 
-You already know route handlers and middleware: a request comes in, a router
-picks the handler, and middleware can reject it before the handler runs. Tool
-routing is that, with two twists — the "router" can be a cheap string check or an
-LLM, and the "middleware" is an allowlist that decides which *tools* (not which
-handler) the model gets to see.
-
 ### Move 1 — the mental model
 
-```
-  Routing = two decisions, narrowing the surface
-
-  request ──► (1) WHICH capability?
-              heuristic parseIntent ─ cheap, first try
-                    │ ambiguous?
-                    ▼
-              LLM classifyIntent ─ fallback, costs a call
-                    │
-                    ▼ capability chosen
-              (2) WHICH tools may it see?
-              filterToolsForPolicy(allTools, policy.allowedTools)
-                    │
-                    ▼
-              toolSchemas = the allowed subset ONLY
-                    │
-                    ▼
-              model never sees — never can request — the rest
-```
-
-The mental shift: routing isn't just "pick the handler." It's "pick the handler
-*and* clamp what that handler's model can reach." The clamp is the security
-property.
-
-### Move 2 — the moving parts, one at a time
-
-**Heuristic-first intent routing.** Bridge from a switch statement — before paying
-for an LLM call, AptKit checks the raw query for keywords: contains "monitoring"?
-route to monitoring; "recommendation"? route there; else default to diagnostic.
-It's `parseIntent`, a pure string check, zero cost. Only when you want real
-classification do you call the model (`classifyIntent`), whose output is *also*
-fed through `parseIntent` to normalize it to one of three words. Boundary
-condition: the heuristic is intentionally dumb — it's a fast path, not the final
-word; the LLM classifier exists for the ambiguous cases.
+You know route guards / RBAC from web apps: a middleware decides which endpoints a
+role can hit *before* the handler runs, so an unauthorized request never reaches the
+logic. A tool policy is the same guard for tools. `allowedTools` is the role's
+permission set; `filterToolsForPolicy` is the middleware that strips everything else
+out of the menu. The model is the user clicking a link — it can only click links the
+guard left on the page.
 
 ```
-  Pattern — heuristic before LLM (cost-first routing)
+  Tool policy ≈ an RBAC route guard
 
-  query ──► includes "monitoring"? ──yes──► monitoring
-                │ no
-                ├──► includes "recommendation"? ──yes──► recommendation
-                │ no
-                ├──► includes "diagnostic"? ──yes──► diagnostic
-                │ no
-                └──► default: diagnostic        (zero model calls so far)
-
-  want a real call? classifyIntent → model → parseIntent(its 1 word)
+  all routes (tools)  ──► guard (allowlist filter) ──► only permitted routes shown
+                                                            │
+                                                       user (model) clicks one
 ```
 
-**Least-privilege policy filtering.** Bridge from Unix file permissions — each
-capability owns a `ToolPolicy`: a `capabilityId` and a frozen `allowedTools` list.
-`filterToolsForPolicy` takes the *full* catalog and the policy, builds a `Set` of
-allowed names, and returns only the tools whose name is in the set — re-shaped as
-neutral `ModelTool` schemas. The model is then handed *only* that subset.
-Boundary condition: there is no "allow all" escape hatch and no way for the model
-to request outside the set — an off-list name simply isn't in `toolSchemas`, so
-the model never learns the tool exists.
+### Move 2 — the routing mechanisms
 
-```
-  Layers-and-hops — the catalog shrinks to the allowlist
+**Mechanism 1 — the policy filters the menu (least privilege).** A `ToolPolicy` is a
+capability id plus an allowlist; the filter keeps only matching tools and maps them
+to provider-neutral schemas (`tool-policy.ts:11`):
 
-  ┌─ ToolRegistry ─┐  hop1: listTools() → ALL tools   ┌─ filter ───────┐
-  │  full catalog  │ ─────────────────────────────────►│ allowed = Set( │
-  └────────────────┘                                   │  policy.allowed)│
-                                                        └──────┬─────────┘
-                                            hop2: keep only name ∈ allowed
-                                                               ▼
-                                                    ┌─ toolSchemas ──────┐
-                                                    │ recommendation: 13 │
-                                                    │ query: ~49         │
-                                                    │ anomaly: 4         │
-                                                    └──────┬─────────────┘
-                                            hop3: passed to model.complete({tools})
-                                                           ▼
-                                                    model sees the subset ONLY
+```ts
+export function filterToolsForPolicy(allTools, policy): ModelTool[] {
+  const allowed = new Set(policy.allowedTools);
+  return allTools
+    .filter((tool) => allowed.has(tool.name))     // drop anything not on the allowlist
+    .map((tool) => ({ name: tool.name, description: tool.description ?? '', inputSchema: tool.inputSchema }));
+}
 ```
 
-**Pre-model coverage gating.** Bridge from a feature flag check — before the agent
-spends *any* tokens, the coverage gate asks "can this workspace even run this
-task?" Each task declares the capabilities it `requires` (event names, properties,
-catalogs). `runnableRequirements` filters out any task whose required capabilities
-are absent — the workspace simply lacks the data. The model is never asked to
-attempt work it can't do. Boundary condition: a task with *partial* coverage
-(`limited`) still runs; only `unavailable` tasks are dropped, so the gate is a
-floor, not a perfectionist.
+The model never sees a tool outside its role — not "is told not to call it," but
+*cannot name it*, because it's absent from the array passed to `model.complete`.
 
 ```
-  Pattern — coverage gate filters tasks pre-model
+  Policy filter — the model's menu is pre-trimmed
 
-  for each task requirement:
-    requires ⊆ workspace capabilities?
-        │ no  → 'unavailable' → DROPPED (never sent to the model)
-        │ yes
-        └─ enriches ⊆ capabilities?  no → 'limited' (runs, partial)
-                                     yes → 'full'   (runs, complete)
+  registry: [search, list_*, get_*, execute_*, ... 45 tools]
+       │ filterToolsForPolicy(allTools, policy)
+       ▼
+  toolSchemas: [ only the role's allowed tools ]  ─► model.complete(tools: toolSchemas)
+```
+
+**Mechanism 2 — the menu's *size* is the routing decision.** Compare two capabilities.
+rag-query allows exactly one tool (`rag-query-agent.ts:15`):
+
+```ts
+export const ragQueryToolPolicy: ToolPolicy = {
+  capabilityId: RAG_QUERY_CAPABILITY_ID,
+  allowedTools: [SEARCH_KNOWLEDGE_BASE_TOOL_NAME],   // a one-item menu
+};
+```
+
+With a one-item menu there's nothing to route — the only choice is *whether* to call
+it. The query agent's menu is ~45 read-only `list_*`/`get_*`/`execute_*` tools
+(`query-agent.ts:10`), so the model genuinely routes among them per turn. Same loop,
+same filter; the policy's breadth decides how much routing the model actually does.
+
+```
+  Menu size sets the routing burden
+
+  rag-query  : [search_knowledge_base]                    → no routing (1 choice)
+  query      : [list_dashboards, get_trend, ...~45 tools] → real LLM routing per turn
+```
+
+**Mechanism 3 — heuristic routing up front (`parseIntent`).** Before the LLM picks a
+tool, a keyword heuristic routes the *request type*. `parseIntent`
+(`query/src/intent.ts:4`) keyword-matches a query into one of three intents:
+
+```ts
+export function parseIntent(raw: string): Intent {
+  const text = raw.trim().toLowerCase();
+  if (text.includes('monitoring')) return 'monitoring';
+  if (text.includes('recommendation')) return 'recommendation';
+  if (text.includes('diagnostic')) return 'diagnostic';
+  return 'diagnostic';                                   // default
+}
+```
+
+This is the classic heuristic-front pattern: cheap keyword rules pick the lane, then
+the LLM does the fine-grained work inside it. (There's also `classifyIntent` in the
+same file — an LLM-front variant that asks the model for one word, then runs it
+through the *same* `parseIntent` to normalize. So aptkit has both a pure-heuristic and
+an LLM-then-heuristic router for intent.)
+
+```
+  Heuristic-front / LLM-back routing
+
+  query ─► parseIntent (keyword rules) ─► intent lane (monitoring|diagnostic|recommendation)
+                                              │ feeds the system prompt
+                                              ▼
+                                       LLM routes among the lane's allowed tools
+```
+
+**Mechanism 4 — the two routers compose.** Intent routing (which lane) and policy
+routing (which menu) stack: the intent shapes the prompt/behavior, the policy bounds
+the toolset, and only then does the LLM pick a tool. The result is "policy-bounded LLM
+routing plus an intent heuristic" — not a single router but a small pipeline.
+
+```
+  The full routing pipeline
+
+  request
+    │ parseIntent (heuristic)            ← which lane?
+    ▼
+  intent ─► system prompt
+    │ filterToolsForPolicy (allowlist)   ← which menu?
+    ▼
+  toolSchemas ─► model picks a tool      ← which tool? (LLM, bounded)
 ```
 
 ### Move 3 — the principle
 
-Route by the cheapest signal that works, and scope by least privilege enforced at
-the layer the model can't reach past. Heuristic-first routing means you don't pay
-for an LLM to answer a question a keyword check could. Allowlist filtering means a
-capability — even one driving a model that's been prompt-injected — can only ever
-request the tools its role was granted, because the rest never reach the provider.
-And coverage gating means you never burn tokens on work the data can't support.
-The unifying idea: decide *before* the expensive, untrusted step, not during it.
+Don't let the model route from the universe of tools — route from a role-scoped
+allowlist, and use cheap heuristics for coarse lane selection where keywords suffice.
+The win is twofold: least privilege caps the blast radius of a bad pick (the query
+agent literally cannot mutate anything — its menu is all read-only `list_*`/`get_*`),
+and a smaller menu makes the model's routing more reliable (fewer wrong tools to pick).
+The interview signal is framing routing as *menu construction* before model choice:
+the policy is a security and reliability decision, not a prompt-engineering one.
 
 ## Primary diagram
 
-The full routing path: intent → coverage → policy → bounded subset to the model.
-
 ```
-  Tool routing — full picture
+  Tool routing — policy sets the menu, LLM picks within it
 
-  ROUTING LAYER
-  request ─► parseIntent (heuristic, free) ─┐
-            classifyIntent (LLM, fallback) ─┴─► capability chosen
-                                                     │
-  COVERAGE GATE (pre-model, pre-token)               │
-  runnableRequirements(tasks, workspace.capabilities)│ drop 'unavailable'
-                                                     ▼
-  POLICY FILTER (the trust seam)
-  filterToolsForPolicy(allTools, capability.policy)
-        recommendationToolPolicy → 13 tools
-        queryToolPolicy          → ~49 tools
-        anomalyMonitoringPolicy  → 4 tools
-                                                     │
-  AGENT + RUNTIME                                    ▼
-  runAgentLoop({ toolSchemas: <subset only> })
-                                                     │ model.complete({ tools })
-  PROVIDER                                           ▼
-  model sees ONLY the subset — cannot request anything outside it
-```
-
-## Implementation in codebase
-
-**Use cases.** Three capabilities, three deliberately different blast radii. The
-anomaly monitor is the tightest — 4 tools, all read-only analytics — because a
-scanner needs almost nothing. The recommendation agent gets 13 read-only *discovery*
-tools (list/get scenarios, segments, campaigns) so it can check what already
-exists without duplicating live work. The query agent is the widest — ~49 tools —
-because free-form NL questions can touch almost any read surface. Nobody gets a
-write tool; that's the policy doing its job.
-
-**The policy filter — the trust seam**, `packages/tools/src/tool-policy.ts:11-23`:
-
-```
-  packages/tools/src/tool-policy.ts  (lines 11-23)
-
-  export function filterToolsForPolicy(
-    allTools: readonly ToolDefinition[],
-    policy: ToolPolicy,
-  ): ModelTool[] {
-    const allowed = new Set(policy.allowedTools);   ← the allowlist as a Set
-    return allTools
-      .filter((tool) => allowed.has(tool.name))      ← keep only allowed names
-      .map((tool) => ({ name: tool.name,             ← reshape to neutral schema
-        description: tool.description ?? '',
-        inputSchema: tool.inputSchema }));
-  }
-       │
-       └─ this is the seam. Anything not in `allowed` is gone before the
-          model is called. There is no "all" mode and no model path to
-          request a dropped tool — it isn't in the returned array.
-```
-
-**The per-capability policies** — each agent owns one, declared right next to its
-class:
-
-```
-  recommendation-agent.ts:19-36   13 read-only discovery tools
-  query-agent.ts:10-50            ~49 read-only tools (broadest)
-  monitoring-agent.ts:12-20        4 analytics tools (tightest)
-
-  // monitoring-agent.ts:11 says it plainly:
-  // "Least-privilege tool grant for anomaly scanning.
-  //  Provider adapters only see these tools."
-```
-
-Each `scan()`/`propose()`/`answer()` calls
-`filterToolsForPolicy(allTools, <its policy>)` and passes the result as
-`toolSchemas` (e.g. `monitoring-agent.ts:58-59`,
-`recommendation-agent.ts:69-70`). The model in that run is structurally limited to
-those names.
-
-**Heuristic-first routing**, `packages/agents/query/src/intent.ts:4-29`:
-
-```
-  packages/agents/query/src/intent.ts  (lines 4-10, 12-28)
-
-  export function parseIntent(raw: string): Intent {
-    const text = raw.trim().toLowerCase();
-    if (text.includes('monitoring')) return 'monitoring';     ← free keyword check
-    if (text.includes('recommendation')) return 'recommendation';
-    if (text.includes('diagnostic')) return 'diagnostic';
-    return 'diagnostic';                                       ← safe default
-  }
-
-  export async function classifyIntent(model, query) {        ← the LLM fallback
-    const response = await model.complete({
-      system: 'Classify … as exactly one word …', maxTokens: 16 });
-    return parseIntent(text);   ← LLM output normalized through the SAME heuristic
-  }
-       │
-       └─ parseIntent is free and tried first; classifyIntent costs one
-          16-token call and is reached for only when you want real
-          classification — and its output still passes through parseIntent.
-```
-
-**Coverage gating**, `packages/tools/src/coverage-gate.ts:73-78`:
-
-```
-  packages/tools/src/coverage-gate.ts  (lines 73-78)
-
-  export function runnableRequirements<T extends CoverageRequirement>(
-    requirements: readonly T[],
-    capabilities: ReadonlySet<string>,
-  ): T[] {
-    return requirements.filter(
-      (req) => requirementCoverage(req, capabilities) !== 'unavailable');
-  }
-       │
-       └─ runs before the model. A task whose required event/catalog
-          capabilities are absent is 'unavailable' and dropped, so no
-          tokens are spent asking the model to attempt impossible work.
-          The monitoring agent uses this via runnableCategories()
-          (monitoring-agent.ts:52-54).
+  ┌─ parseIntent (heuristic, intent.ts) ─────────────────────────────────┐
+  │  keyword rules ─► lane (monitoring | diagnostic | recommendation)     │
+  └───────────────┬───────────────────────────────────────────────────────┘
+                  │ shapes the system prompt
+  ┌─ filterToolsForPolicy (allowlist, tool-policy.ts) ───────────────────┐
+  │  registry (all tools) ─► keep only policy.allowedTools                │
+  │   rag-query: [search_knowledge_base]   (1 → no routing)               │
+  │   query:     [~45 read-only list_*/get_*]   (many → real routing)     │
+  └───────────────┬───────────────────────────────────────────────────────┘
+                  │ toolSchemas (the trimmed menu)
+  ┌─ Agent loop / model ─▼───────────────────────────────────────────────┐
+  │  the LLM picks one allowed tool each turn — cannot name a dropped one │
+  └────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-Least privilege is a 1970s security principle (Saltzer & Schroeder): grant a
-component the minimum authority it needs, no more. Applied to LLM agents it's
-suddenly load-bearing again, because the agent's "authority" is the tool set you
-hand it, and the model is an *untrusted* decision-maker — it can be steered by
-data it reads (prompt injection). If a hijacked model can only request read-only
-tools, the worst case is bounded. AptKit's allowlist is exactly this: the policy
-is the capability grant, and `filterToolsForPolicy` is the enforcement point. See
-`../06-production-serving/03-prompt-injection.md` — the allowlist is the *first*
-real injection defense, precisely because it's enforced where the model can't
-reach.
-
-Heuristic-before-LLM routing is the other half: an industry cost pattern (route
-the easy cases with a rule, escalate only the hard ones to the expensive model).
-AptKit's `parseIntent`/`classifyIntent` pair is a small, honest instance of it.
-See `../06-production-serving/02-llm-cost-optimization.md`.
-
-Adjacent concepts: what a tool call physically is (`02-tool-calling.md`), the loop
-that runs the allowed tools (`03-react-pattern.md`), and the injection threat the
-allowlist defends against (`../06-production-serving/03-prompt-injection.md`).
+The field talks about "router" patterns (a model or rules dispatching to handlers)
+and "tool selection" (the model choosing among many tools). aptkit collapses the
+risk in tool selection by making it least-privilege: the allowlist is the same idea
+as a scoped OAuth token or an IAM policy — the agent is granted only the tools its
+job needs. This is also the security story (see `01-llm-foundations` / the security
+study): the smallest credible cause of damage in an agent is a tool it shouldn't have
+been able to call, and the policy filter removes that class entirely. Heuristic
+routing (`parseIntent`) is the cheap front door; when keywords aren't enough,
+`classifyIntent` shows the LLM-as-router variant feeding the same normalizer. Read
+`02-tool-calling.md` for how the picked tool is actually invoked, and
+`06-error-recovery.md` for why least privilege limits the blast radius of a bad call.
 
 ## Project exercises
 
-*Provenance: Phase 4 — Agents and tool use (C4.x). No `aieng-curriculum.md`
-present; IDs are by-phase convention. Case A — routing and policy are
-implemented; these strengthen and test them.*
-
-### Exercise — assert no write tool can ever enter a policy
-
-- **Exercise ID:** `[A4.5]` Phase 4, least-privilege concept
-- **What to build:** A test (or a build-time check) that scans every declared
-  `ToolPolicy.allowedTools` and fails if any name matches a write-shaped prefix
-  (`create_`, `update_`, `delete_`, `execute_` except the read-only EQL one). Pin
-  the read-only invariant the policies currently uphold by convention.
-- **Why it earns its place:** The "all tools are read-only" property is the spine
-  of the injection defense but is enforced only by reviewer discipline today. A
-  test makes it a guarantee.
-- **Files to touch:** `packages/agents/*/src/*-agent.ts` (the policy exports),
-  a new `packages/tools/test/tool-policy.test.ts`.
-- **Done when:** Adding a write tool to any policy turns the suite red.
+### Add a runtime assertion that the model never called a tool outside its policy
+- **Exercise ID:** —  (no curriculum file in repo)
+- **What to build:** in the loop, before `callTool`, assert the chosen tool is in the
+  capability's `allowedTools`; emit a `warning` event and refuse if not (defense in
+  depth behind the menu filter).
+- **Why it earns its place:** the filter trims the menu, but a belt-and-suspenders
+  runtime check is what you'd actually ship for a security-sensitive agent; it shows
+  you don't trust a single layer.
+- **Files to touch:** `packages/runtime/src/run-agent-loop.ts`,
+  `packages/tools/src/tool-policy.ts`, `packages/runtime/test/`.
+- **Done when:** a fixture where the model names a disallowed tool produces a warning
+  and an error observation instead of executing it.
 - **Estimated effort:** `1–4hr`
 
-### Exercise — promote routing from keyword to embedding similarity
-
-- **Exercise ID:** `[B4.6]` Phase 4, intent-routing concept
-- **What to build:** Replace `parseIntent`'s pure keyword check with a small
-  embedding-similarity router: precompute embeddings for the three intent
-  descriptions, embed the query, route to the nearest — still falling back to the
-  LLM `classifyIntent` when similarity is low.
-- **Why it earns its place:** Keyword routing misses "what's gone wrong with
-  checkout?" (no literal keyword). Embedding similarity is the standard cheap-but-
-  smart middle tier between regex and an LLM call — a real cost/quality lever.
-- **Files to touch:** `packages/agents/query/src/intent.ts`, an embedding provider
-  in `packages/providers/*`, `packages/agents/query/test/intent.test.ts`.
-- **Done when:** A keyword-free monitoring question routes to `monitoring` without
-  the LLM fallback firing; a test proves it.
-- **Estimated effort:** `1–2 days`
+### Replace `parseIntent`'s keyword match with a confidence-scored router
+- **Exercise ID:** —  (no curriculum file in repo)
+- **What to build:** when `parseIntent`'s keywords don't match (it currently defaults
+  to `diagnostic`), fall back to `classifyIntent` (the LLM router) instead of the
+  silent default, and record which router decided.
+- **Why it earns its place:** "cheap heuristic first, LLM only on ambiguity" is the
+  production routing pattern; wiring the fallback and the attribution shows you can
+  compose routers by cost.
+- **Files to touch:** `packages/agents/query/src/intent.ts`,
+  `packages/agents/query/src/query-agent.ts`, the query agent's `test/`.
+- **Done when:** a no-keyword query routes via the LLM and the trace records
+  `router: llm`, while a keyword query records `router: heuristic`.
+- **Estimated effort:** `1–4hr`
 
 ## Interview defense
 
-**Q: A prompt-injection attack hijacks your model and tells it to delete data.
-What happens?**
-"Nothing destructive, because of where I enforce the allowlist. I'd draw it:"
+**Q: "How does your agent decide which tool to call — heuristic or LLM?"**
+Both, layered. A `ToolPolicy` filters the registry to the capability's `allowedTools`
+*before* the model gets a vote — `filterToolsForPolicy` builds the menu, so the model
+can only pick tools its role permits (rag-query sees one tool; query sees ~45
+read-only ones). Within that menu the LLM routes per turn. And `parseIntent` is a
+keyword heuristic that picks the request's lane up front. So it's policy-bounded LLM
+routing plus a heuristic intent router — not one or the other.
 
 ```
-  registry: ALL tools
-       │ filterToolsForPolicy(allTools, policy)   ← trust seam
-       ▼
-  toolSchemas: read-only subset only
-       │ model.complete({ tools: subset })
-       ▼
-  model can request ONLY what it was handed — no write tool exists to it
+  parseIntent (heuristic lane) → filterToolsForPolicy (allowlist menu) → LLM picks within menu
 ```
+Anchor: *the policy sets the menu; the LLM only picks from it.*
 
-"Every policy is read-only by design, and `filterToolsForPolicy`
-(`tool-policy.ts:11`) runs *before* the provider sees anything. The model can't
-request a `delete_` tool because it was never told one exists — it isn't in
-`toolSchemas`. The hijack is bounded to read-only requests."
-*Anchor: least privilege enforced at a seam the model can't reach past.*
+**Q: "What stops the model from calling a tool it shouldn't?"**
+It never sees it. `filterToolsForPolicy` drops any tool not in `allowedTools`, so the
+`toolSchemas` array passed to `model.complete` doesn't contain it — the model can't
+name a tool that isn't in its menu. That's least privilege: the query agent's whole
+menu is read-only `list_*`/`get_*`, so it structurally cannot mutate state. It's the
+same idea as a scoped token — grant only what the role needs, and a bad pick can't
+reach a dangerous tool.
 
-**Q: How do you route without paying for an LLM on every request?**
-"Heuristic first. `parseIntent` (`intent.ts:4`) is a free keyword check that
-handles the easy cases; I only call the LLM classifier for ambiguous queries, and
-even its one-word answer gets normalized back through `parseIntent`. Cheap signal
-first, expensive signal only when needed."
-*Anchor: route by the cheapest signal that works; escalate, don't default-escalate.*
-
-## Validate
-
-- **Reconstruct:** From memory, write `filterToolsForPolicy` — Set of allowed
-  names, filter, reshape. Check against `tool-policy.ts:11-23`.
-- **Explain:** Why does the allowlist make a security difference *only because* it
-  runs before `model.complete`? (If it ran after, the model would already have
-  seen — and could have requested — the full surface. Pre-model means the tool
-  never enters the model's reachable set; `tool-policy.ts:11` feeding
-  `monitoring-agent.ts:59`.)
-- **Apply:** A workspace has no `purchase` event. The anomaly monitor has a
-  revenue-drop category requiring `purchase`. What happens? (`runnableRequirements`
-  marks it `unavailable` and drops it pre-model — `coverage-gate.ts:73` via
-  `runnableCategories`, `monitoring-agent.ts:52` — so no tokens are spent on it.)
-- **Defend:** Why does the query agent get ~49 tools but the anomaly monitor only
-  4? (Blast radius matches the job: a scanner needs almost nothing; free-form NL
-  questions can touch many read surfaces. Least privilege per role —
-  `query-agent.ts:10` vs `monitoring-agent.ts:12`.)
+```
+  registry → filter by allowedTools → model's menu excludes the dangerous tool entirely
+```
+Anchor: *least privilege at the menu — a tool that's absent can't be misrouted to.*
 
 ## See also
 
-- [02-tool-calling.md](02-tool-calling.md) — what a tool request physically is
-- [03-react-pattern.md](03-react-pattern.md) — the loop that runs the allowed tools
-- [../06-production-serving/03-prompt-injection.md](../06-production-serving/03-prompt-injection.md) — the allowlist as the first injection defense
-- [../06-production-serving/02-llm-cost-optimization.md](../06-production-serving/02-llm-cost-optimization.md) — heuristic-first routing as a cost lever
-- [.aipe/study-security/](../../study-security/) — trust boundaries and capability scoping
+- `02-tool-calling.md` — how the routed tool is actually invoked
+- `01-agents-vs-chains.md` — the loop the routed tools run inside
+- `06-error-recovery.md` — least privilege limits the blast radius of a bad call
+- `03-react-pattern.md` — the per-turn Action where routing happens
+- `05-agent-memory.md` — `search_memory` as a policy-gated tool

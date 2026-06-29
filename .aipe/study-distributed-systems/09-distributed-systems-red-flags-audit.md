@@ -1,287 +1,164 @@
-# 09 — Distributed-systems red-flags audit
+# 09 — Distributed Systems Red-Flags Audit
 
-**Industry name(s):** coordination risk audit / partial-failure review.
-**Type:** Project-specific.
+**Industry name:** coordination & partial-failure risk audit — *Project-specific.*
 
-This file ranks the actual coordination and partial-failure risks in *this*
-repo, by consequence. The honest headline carries through: AptKit is
-single-process; the only place these risks can bite is at its external-service
-boundaries — cloud APIs and (now) the local Ollama process. The list is short on
-purpose — inventing risks for a system that doesn't have them would be the worst
-kind of distributed-systems theater. The multi-node sync plane that *would* add
-real coordination risk is deferred to `buffr` and out of scope here.
+Ranked by consequence. Each finding names the evidence (`file:line`), the failure it
+causes, and the move. The honest frame first: aptkit is single-process with two real
+network boundaries, so this is a *short* list of *real* risks plus an explicit map of
+what's `not yet exercised`. Nothing here is invented to fill a template.
 
-## Zoom out — where the risks concentrate
-
-Every real risk lives at, or just inside, the one network hop. Above it, failures
-are ordinary in-process exceptions; the risks here are about what happens when
-node B misbehaves and node A has to cope.
+## Zoom out — the risk surface
 
 ```
-  Zoom out — the risk surface is one arrow
+  Where coordination risk concentrates (ranked R1–R5)
 
-  ┌─ Service layer (your process) ──────────────────────────────┐
-  │  bounded loop · re-prompt · ledger — LOW risk (in-process)    │
-  └─────────────────────────────┬────────────────────────────────┘
-                               │ complete()  ◄── ALL real risk here
-  ┌─ Provider boundary ─────────▼────────────────────────────────┐
-  │  no backoff · no timeout override · default shouldFallback     │ ← the findings
-  │  Ollama edges: no SDK, no default timeout · dim one-way door    │
-  └──────────────┬───────────────────────────────┬────────────────┘
-       HTTPS      │  ◄── all real risk here ──►   │ HTTP (localhost)
-  ┌─ Cloud ───────▼───────────┐  ┌─ Ollama process ─▼──────────────┐
-  └────────────────────────────┘  └──────────────────────────────────┘
+  ┌─ aptkit process ────────────────────────────────────────────────────┐
+  │  runAgentLoop (maxTurns ✓, but no per-call deadline)                 │
+  │       │                                                              │
+  │       ▼ complete()                                                   │
+  │  FallbackModelProvider ──► fetch(:11434)  ◄── R1: NO TIMEOUT         │
+  │                                              (hang defeats fallback) │
+  └──────────────────────────────┬───────────────────────────────────────┘
+                                 │ HTTP / TCP
+  ┌─ buffr process ──────────────▼───────────────────────────────────────┐
+  │  indexDocumentRow ──► R3: dual write (orphan on partial commit)       │
+  │  pg.Pool ──────────► R4: no checkout timeout / unbounded wait         │
+  │  SupabaseTraceSink:  R2 (fixed!) ordering ✓ | R5: no backpressure /   │
+  │                      Promise.all-fails-all                            │
+  └─────────────────────────────────────────────────────────────────────┘
 ```
-
-## Structure pass — the axis for ranking
-
-Rank by the **failure axis**: for each finding, how bad is the consequence when
-the provider boundary misbehaves, and how likely is the trigger? A risk that's
-both consequential and easy to hit ranks above a foundational gap that only
-matters if the system grows a second node.
 
 ## Ranked findings
 
-### R1 — `shouldFallback` defaults to "retry everything" (MEDIUM)
+### R1 — Ollama HTTP calls have no per-call timeout (HIGH)
 
-**Evidence:** `packages/providers/fallback/src/fallback-provider.ts:44` —
-`this.shouldFallback = options.shouldFallback ?? (() => true)`.
+**Evidence:** `packages/providers/gemma/src/gemma-provider.ts:201-215`,
+`packages/retrieval/src/ollama-embedding-provider.ts:60-75`. Both call `fetch()` with
+only an optional `AbortSignal` — no `AbortSignal.timeout()`, no deadline.
 
-**The risk:** with the default, a *permanent* error (a 400 for a malformed
-request, an auth failure from a bad API key) triggers a failover to the next
-provider — which will reject it identically. You pay the latency and cost of
-trying every provider for an error that no provider can succeed on. For a
-two-provider chain that's one wasted call; for a longer chain it's N wasted
-calls per request, and it masks the real bug (the malformed request) behind a
-generic `ProviderFallbackError`.
+**Failure it causes:** If the Ollama daemon wedges (model loading, GPU hang, swap
+thrash), `complete()` / `embed()` hangs until the caller aborts or the socket dies.
+Worse, in the `FallbackModelProvider` (`fallback-provider.ts:50-88`) the loop only
+advances *on a thrown error* — a hung provider never throws, so the chain never tries
+the next provider. A *slow* Ollama defeats the entire point of the fallback (surviving
+local-model unavailability), while a *down* Ollama (which throws `ECONNREFUSED`) is
+handled correctly. Slow is the dangerous case and it's unhandled.
 
-**The fix:** inject a `shouldFallback` that classifies — fail over on
-429/503/network errors, rethrow immediately on 4xx-except-429. The hook exists
-(`:73`); it's just not used with real classification by default.
+**The move:** Wrap each transport `fetch` in a per-call deadline —
+`AbortSignal.timeout(ms)` combined with the existing caller `signal`. Turns "infinitely
+slow" into "threw," which every layer above (fallback, `maxTurns`) already handles. One-
+function change per transport; the plumbing is already there. → `02`.
 
-```
-  R1 — the wasted-failover path
+### R2 — Trace ordering under racing inserts (FIXED — keep it that way)
 
-  malformed request → p1: 400 → shouldFallback()=true → p2: 400 → ... → all fail
-                                       │
-                          should have been: 400 → rethrow now (broken everywhere)
-```
+**Evidence:** `buffr/src/supabase-trace-sink.ts:49-93` + `persistMessage:26-30`.
 
-### R2 — no backoff / no same-provider retry (LOW, by design)
+**What was right:** `emit` is sync and queues writes into `pending[]`; `flush()` drains
+with `Promise.all`, so inserts race. The fix: the event's emit-time ISO `timestamp` is
+written into `created_at` (`coalesce($8::timestamptz, now())`), so replay does
+`ORDER BY created_at` and recovers emit order regardless of which insert wins. This is
+the repo's strongest distributed-systems decision — logical position attached to the
+event, not trusted to the transport.
 
-**Evidence:** `fallback-provider.ts:50-86` — the loop moves to the next provider
-with zero delay; there is no retry of the *same* provider and no backoff/jitter.
+**The watch-item:** this guarantee depends on `timestamp()` being single-source
+(`events.ts:30-32`). The day a second machine emits into `agents.messages`, wall-clock
+ordering breaks (clock drift) and you'd need logical clocks. Not a bug; a boundary to
+remember. → `06`, `07`.
 
-**The risk:** low *today* because AptKit fails *over* (switches nodes) rather
-than *back* (retries one), so there's nothing to hammer. The risk is latent: the
-moment anyone adds same-provider retry on a transient 429/503 without backoff,
-they create a thundering-herd / self-DDoS hazard. Flagged so the gap is named
-before someone "helpfully" adds a naive retry.
+### R3 — `indexDocumentRow` dual write, no atomicity across steps (MEDIUM)
 
-**The fix when triggered:** exponential backoff + jitter on same-provider retry.
-See `02`, Step 5.
+**Evidence:** `buffr/src/runtime.ts` (`indexDocumentRow`) — commits the `documents`
+row, then calls `pipeline.index()` (embed via Ollama + chunk upsert) in a *separate*
+transaction.
 
-### R3 — no explicit timeout at AptKit's layer; worse on the Ollama edges (LOW→MEDIUM for local)
+**Failure it causes:** If the embed (R1's hang/fail) throws after the documents row
+commits, you get an orphan — a document with zero chunks: searchable, returns nothing.
+No compensation deletes the orphan; no reconciliation re-indexes it. Acceptable today
+(one local doc, synchronous caller sees the throw).
 
-**Evidence:** `packages/providers/anthropic/src/anthropic-provider.ts:28-39`
-passes `request.signal` to the SDK but sets no `timeout` or `maxRetries` —
-AptKit relies on the provider SDK's defaults. The Ollama edges
-(`packages/providers/gemma/src/gemma-provider.ts:201-215`,
-`packages/retrieval/src/ollama-embedding-provider.ts:60-75`) use a raw `fetch`
-with **no SDK and no default timeout at all** — only the passed `AbortSignal`.
+**The move:** When indexing leaves the request path, use a transactional outbox — write
+the documents row and an "index me" outbox row in *one* transaction; a worker drains
+the outbox, does embed+upsert, retries on failure. At-least-once + the idempotent
+`on conflict (id)` upsert = effectively-once. → `08`, `03`.
 
-**The risk:** for cloud, the effective deadline is whatever the SDK defaults to,
-not something AptKit controls. For the **Ollama edges it's worse**: a local model
-that's cold-loading or wedged will hang the `fetch` indefinitely unless the
-caller supplies an `AbortSignal`. A 9B model's first token after a cold load can
-take many seconds; with no per-call deadline, a RAG run can stall on `embed()`
-or `complete()` with no upper bound but `maxTurns`. Fine for a hand-run CLI; a
-real problem for any unattended or latency-sensitive caller.
+### R4 — Connection pool has no checkout timeout or explicit bound (MEDIUM-LOW)
 
-**The fix when triggered:** pass an explicit `timeout` into the SDK client for
-cloud; wrap the Ollama `fetch` with `AbortSignal.timeout(ms)` (or pass one from
-the caller) so a cold/wedged local model can't hang the run.
+**Evidence:** `buffr/src/db.ts:4-6` — `new pg.Pool({ connectionString })` with no
+`max`, no `connectionTimeoutMillis`.
 
-### R4 — `AbortError` detection is duck-typed by name (LOW)
+**Failure it causes:** Default pool size (10). Under concurrent writes, if all
+connections are checked out, a borrower waits with *no timeout* — the same "no
+deadline" hazard as R1, one layer down. A leaked connection (mitigated by the
+`finally { client.release() }` in `pg-vector-store.ts:62`, which is correct) would
+permanently shrink the pool. Low likelihood at single-user scale.
 
-**Evidence:** `fallback-provider.ts:92-95` and `run-agent-loop.ts:219` detect
-cancellation via `error.name === 'AbortError'` (and `instanceof DOMException`).
+**The move:** Set `connectionTimeoutMillis` so a borrower fails fast instead of
+hanging when the pool is exhausted, and an explicit `max` sized to the workload. The
+`finally release` is already the right defensive line; keep it. → `05`.
 
-**The risk:** correctness of the "cancellation wins over failover" rule (the
-load-bearing detail from `02`/`03`) depends on the error *name* string. A
-provider SDK that throws a cancellation error with a different `name` would
-slip through, get classified as a normal failure, and trigger an *unwanted
-failover* on a request the caller already aborted. Low likelihood (the SDKs use
-standard `AbortError`), but the correctness of the abort path rests on a string
-match.
+### R5 — Trace sink has no backpressure and fails the whole flush on one bad write (LOW)
 
-**The fix when triggered:** check the signal's `aborted` state directly
-(already done partially at `fallback-provider.ts:65` via
-`request.signal?.aborted`) rather than relying solely on the error name.
+**Evidence:** `buffr/src/supabase-trace-sink.ts:87-93` — `pending[]` is unbounded;
+`flush()` uses `Promise.all`.
 
-### R5 — usage-ledger pricing covers only `gpt-4.1-*` (INFORMATIONAL)
+**Failure it causes:** (a) No backpressure — `emit` is sync and never blocks, so if
+Postgres lags, `pending[]` grows unbounded with memory. (b) Poison message — one
+rejected insert rejects the whole `Promise.all`, failing the entire turn's trace
+persistence (throws out of `ask`). Both are inconsequential at one-agent-run scale
+(tiny per-turn buffer).
 
-**Evidence:** `packages/runtime/src/usage-ledger.ts:71-78` —
-`pricingForModel` returns `undefined` for any non-OpenAI provider and any model
-outside the `gpt-4.1` family (including all Anthropic models).
+**The move:** If trace volume grows, switch `Promise.all` → `Promise.allSettled`
+(persist what you can, collect failures) and bound the buffer with periodic flushing
+(flush every N events / T ms). → `06`.
 
-**The risk:** not a coordination risk — a cost-observability gap. The "accounting
-across calls" analog (the closest thing to tracking work across nodes, `03`)
-silently reports `n/a` cost for Anthropic-served turns. Token counts are still
-summed correctly; only the dollar estimate is missing. Flagged because cost
-tracking is fallacy #7 ("transport cost is zero" is false) and the ledger is
-where AptKit answers it — incompletely.
+## Lens inventory — every concept checked
 
-**The fix:** add Anthropic pricing rows to `pricingForModel`.
+| Lens | Verdict | Evidence / note |
+| --- | --- | --- |
+| System map / failure domains | exercised | 4 domains: aptkit, Ollama, buffr, Postgres (`01`) |
+| Timeouts | **gap (R1)** | no per-call deadline on Ollama `fetch` |
+| Retries | exercised | cross-provider fallback chain (`fallback-provider.ts:50-88`) |
+| Failure classification | exercised | `shouldFallback` hook; `isAbortError` re-throw |
+| Backoff / jitter | `not yet exercised` | fallback tries next provider immediately (correct — different endpoint) |
+| Idempotency | exercised | `on conflict (id) do update` (`pg-vector-store.ts:49`) |
+| Idempotency keys (synthetic) | `not yet exercised` | natural keys suffice; no retried HTTP endpoint |
+| Delivery semantics | exercised | chunk=exactly-once; trace=at-least-once (no dedup); memory=at-most-once |
+| Exactly-once delivery | `not yet exercised` | impossible to claim; not built |
+| Consistency / read-your-writes | exercised | holds via single store+writer; breaks on swallowed `remember` (`04`) |
+| Stale replica reads | `not yet exercised` | one Postgres, no replica |
+| Eventual consistency | `not yet exercised` | single copy, nothing to converge |
+| Replication | `not yet exercised` | one node |
+| Partitioning / shard key | partial | `app_id` is a logical partition key, single-node (`05`) |
+| Quorum (R+W>N) | `not yet exercised` | one copy |
+| Connection pool (bounded resource) | **gap (R4)** | no checkout timeout (`db.ts:4-6`) |
+| Queues / streams | exercised | NDJSON trace + `pending[]` write queue (`06`) |
+| Ordering under races | exercised (R2) | `created_at` from emit timestamp |
+| Backpressure | **gap (R5)** | unbounded `pending[]`, sync emit |
+| Poison message handling | **gap (R5)** | `Promise.all` fails whole flush |
+| Wall vs logical clock | exercised | single-source wall time, valid (`07`) |
+| Leader election / lease | `not yet exercised` | one writer |
+| Split-brain | `not yet exercised` | no second would-be leader |
+| Distributed transactions / 2PC | `not yet exercised` | the dual write avoids it (`08`) |
+| Sagas / compensation | partial | `remember` = empty-compensation step; `indexDocumentRow` = uncompensated dual write |
+| Transactional outbox | `not yet exercised` | the fix for R3 if indexing goes async |
+| Reconciliation | `not yet exercised` | no orphan-doc repair job |
 
-### R6 — embedding-dimension mismatch is a corpus-wide one-way door (LOW, handled well)
-
-**Evidence:** `packages/retrieval/src/pipeline.ts:22-29` (`assertWiring`) throws a
-`dimension mismatch` error at pipeline-construction time if the embedder's
-dimension (`OllamaEmbeddingProvider` is fixed at 768,
-`ollama-embedding-provider.ts:40`) disagrees with the store's.
-
-**The risk:** the *consequence* is large but the *handling* is good. A corpus
-indexed at one dimension can only be queried by a same-dimension provider —
-swap the embedding model and every stored vector is unsearchable until you
-re-index. That's a data-migration coordination problem in disguise (it's exactly
-the kind of "schema change forces a backfill" risk that bites replicated stores).
-AptKit defuses it correctly: it checks at *wiring time* and throws loudly, so you
-can never silently index unsearchable vectors. Listed not as a bug but as the
-one place where a model choice is a one-way door over indexed data — and a
-forward-looking flag for when `InMemoryVectorStore` becomes a persistent
-`PgVectorStore` (in `buffr`), where re-indexing isn't a free in-memory rebuild.
-
-**The fix when triggered:** treat re-index as a first-class operation; version
-the corpus by embedding model so a dimension change triggers a backfill rather
-than a silent empty-result regression.
-
-### R7 — memory's id counter is in-process; durable store + restart = id collision (LOW today, INFERENCE)
-
-**Evidence:** `packages/memory/src/conversation-memory.ts:71,78-79` — ids are
-minted from a per-conversation counter `Map` held in process:
-`const n = counters.get(turn.conversationId) ?? 0; ... id = \`${kind}:${turn.conversationId}:${n}\``.
-The counter is rebuilt empty on every process start.
-
-**The risk:** the id-uniqueness invariant rests entirely on a single,
-never-restarted process owning the counter. The store is injected
-(`:18-31,60-61`), and with the durable `PgVectorStore` (in `buffr`,
-`/Users/rein/Public/buffr/src/pg-vector-store.ts`) the rows outlive the process
-while the counter does not. **Inference:** resume the *same* `conversationId`
-after a restart and `remember` mints `memory:<convId>:0` again, and
-`store.upsert` (`:80-86`) **overwrites the persisted turn 0** — the earlier
-exchange is silently lost. This cannot bite in aptkit today: aptkit only wires
-`InMemoryVectorStore` (`conversation-memory.test.ts:27`), where the counter and
-the rows die together, so the id space resets cleanly. It's flagged as a
-forward-looking correctness hazard for the durable wiring in `buffr`.
+## The priority order, one line each
 
 ```
-  R7 — counter resets, durable rows don't (inference)
-
-  before restart:  remember c1 → memory:c1:0, memory:c1:1  (persisted in pg)
-  ── restart ──     counter Map emptied; pg rows survive
-  after restart:   remember c1 → memory:c1:0  → UPSERT overwrites original turn 0
+  R1  add per-call timeouts to Ollama fetch ........ unblocks the fallback chain (do first)
+  R4  add pool checkout timeout .................... same hazard, one layer down
+  R3  outbox for indexDocumentRow .................. only when indexing goes async
+  R5  allSettled + bounded buffer .................. only when trace volume grows
+  R2  keep created_at-ordered replay ............... already right; don't regress
 ```
-
-**The fix when triggered:** don't derive ids from in-process state. Either count
-existing rows for the conversation in the store before assigning `n`, or use a
-content hash / uuid id so the id never depends on a counter that a restart can
-reset. (The narrower contract gap: the `VectorStore`
-contract — `packages/retrieval/src/contracts.ts:33-37` — has no "next sequence"
-primitive, so the engine can't ask the store for a safe `n` today.)
-
-## The non-findings — deliberately absent
-
-These are the risks a checklist would expect that AptKit *correctly* doesn't
-have, because it's single-process. Naming them as non-findings is the honest
-audit:
-
-```
-  Non-findings — risks that DON'T apply (and why)
-
-  split-brain          ── no leader election → impossible
-  stale reads          ── no replicas/cache  → one copy of all state
-  lost messages        ── no queue           → synchronous, no delivery to lose
-  poison messages      ── no durable queue   → no redelivery loop
-  quorum failure       ── no replicas        → nothing to count a majority of
-  clock skew bugs      ── one process clock   → timestamps are a valid total order
-  saga stranded state  ── read-only tools    → no side effect to compensate
-  outbox dual-write    ── no DB + no broker   → no atomic write+publish to bungle
-```
-
-## Ranked summary
-
-```
-  Risk register — by consequence × likelihood
-
-  R1  shouldFallback default = retry-all      MEDIUM   fallback-provider.ts:44
-  R2  no backoff / same-provider retry         LOW*     fallback-provider.ts:50-86
-  R3  no timeout (cloud) / none at all (Ollama) LOW→MED  ollama-embedding-provider.ts:60-75
-  R4  AbortError detected by name string       LOW      fallback-provider.ts:92-95
-  R5  ledger pricing OpenAI-gpt-4.1 only       INFO     usage-ledger.ts:71-78
-  R6  embedding-dim one-way door (handled well) LOW      pipeline.ts:22-29
-  R7  memory id counter ephemeral (durable→collide) LOW† conversation-memory.ts:71
-
-  * LOW today; becomes MEDIUM the instant same-provider retry is added.
-  R3 is LOW for cloud (SDK default) but MEDIUM for the Ollama edges (no timeout).
-  † LOW + inference: harmless with the in-memory store (the only one aptkit
-    wires); becomes a real id-collision bug if a durable PgVectorStore (buffr)
-    resumes the same conversation after a restart.
-```
-
-The verdict: **for a single-process library, the partial-failure handling at the
-external-service boundaries is sound.** The fallback chain, fail-fast guard,
-bounded loop, retry-on-parse, and abort passthrough are the right primitives. R1
-is the one finding worth acting on now (inject real error classification); R3 on
-the Ollama edges (no timeout) is the next. R7 (the memory id counter) is the most
-interesting *new* entry: it's harmless in aptkit but is exactly the kind of
-single-process assumption that breaks when state goes durable — worth fixing
-*before* the `buffr` durable wiring lands, not after. The rest are latent gaps
-whose triggers are clearly named — and most of the distributed-systems checklist
-correctly doesn't apply, because the system is one process talking to external
-services, not a multi-node system. The coordination plane that would change that
-verdict is deferred to `buffr`.
-
-## Interview defense
-
-**Q: "What's the biggest distributed-systems risk in this codebase?"**
-
-"R1 — the fallback chain's `shouldFallback` defaults to retrying on *any* error,
-including permanent ones like a 400. So a malformed request fails over to every
-provider and fails identically, wasting cost and masking the real bug. The fix is
-injecting real error classification — fail over on transient errors, rethrow on
-permanent ones. The hook exists; it's just defaulted to 'retry everything.'"
-
-```
-  default shouldFallback = () => true  →  400 retried on every provider
-  fix: classify — transient → next, permanent → rethrow now
-```
-
-**Q: "What distributed-systems problems does this system NOT have, and why?"**
-
-"Split-brain, stale reads, lost messages, quorum failures — none of them, because
-it's single-process. One copy of all state, one clock, no queue, no replicas, no
-leader. The discipline is to handle the one real edge — the provider call — well,
-and not bolt on machinery for failures that can't occur."
-
-## Validate
-
-1. **Reconstruct:** List the seven findings ranked, with the one that's
-   actionable today — and name which one is an inference that can't bite aptkit
-   as-shipped.
-2. **Explain:** Why is R1 (`fallback-provider.ts:44`) a real cost/latency risk
-   even though the chain "works"?
-3. **Apply:** A teammate adds same-provider retry to handle 429s. Which finding
-   jumps from LOW to MEDIUM, and what must they add alongside it?
-4. **Defend:** Justify why split-brain and stale reads are non-findings here —
-   tie each to a specific design fact about the repo.
 
 ## See also
 
-- `00-overview.md` — the ranked findings in context.
-- `02-partial-failure-timeouts-and-retries.md` — R1–R4 in depth.
-- `03-idempotency-deduplication-and-delivery-semantics.md` — R5 (the ledger) and
-  why retries are safe/unsafe.
-- `04-consistency-models-and-staleness.md` — R7 (the memory id counter) as a
-  durability/consistency seam, in depth.
-- `study-networking` — what timeouts and 5xx mean on the wire (R3).
+- `00-overview.md` — the ranked findings in context
+- `02-partial-failure-timeouts-and-retries.md` — R1 in full
+- `08-sagas-outbox-and-cross-boundary-workflows.md` — R3 in full
+- `06-queues-streams-ordering-and-backpressure.md` — R2/R5 in full
+- **study-debugging-observability** — using the trace to detect these failures in practice
+- **study-system-design** — why the single-node shape was the right scale choice
+```

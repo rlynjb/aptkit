@@ -1,156 +1,232 @@
-# Pass 1 — the system-design audit
+# audit.md — the 8-lens system-design sweep
 
-Eight lenses, walked against real `file:line` evidence. Each lens names what AptKit actually does, or says `not yet exercised` honestly. When a finding is big enough to deserve a full walk, it cross-links to a Pass 2 pattern file rather than restating it.
+Pass 1. Walk aptkit against the 8 system-design lenses. Every lens is checked;
+where the repo doesn't exercise a lens, it says `not yet exercised` plainly rather
+than inventing infrastructure. Significant findings cross-link into the Pass 2
+pattern files.
 
-The honest framing up front: this is a **library monorepo** of 16 internal packages (published as `@rlynjb/aptkit-core` 0.4.1), not a deployed distributed system. Six of the eight lenses have rich findings (boundaries, flow, state, durability, failure, evolution). The caching lens stays mostly `not yet exercised`, and the scale lens now has one real internal bottleneck — the in-memory vector store's linear scan — which is correct for a from-scratch RAG adapter, not a gap to paper over. There's still no traffic, no SQL datastore, no replicas. The default model is now *local*: Gemma + nomic embeddings over Ollama, so the default deployment makes no cloud call at all.
-
-The newest delta is `@aptkit/memory` (the 16th package): episodic conversation memory built by **reusing the existing `EmbeddingProvider` + `VectorStore` retrieval contracts** — a *second* consumer of those seams with zero new infrastructure contracts. It's the strongest evidence in the repo that those contracts were drawn at the right boundary. It also shifts the state lens for the first time: with memory wired (in buffr's `chat` CLI, over a durable `PgVectorStore`), an agent now has state that **persists across runs** — though that durability lives across the repo boundary, in buffr. → see `10-memory-store-topology.md`.
+Scope note: aptkit is the *library*. buffr (`/Users/rein/Public/buffr`) is the one
+known *deployment* that consumes it. Both are in scope because the architectural
+story is the seam between them — but findings stay labelled with which repo they
+live in.
 
 ---
 
 ## 1. system-map-and-boundaries
 
-Every major component, its responsibility, and its trust boundaries. The full picture is in `00-overview.md`; this lens names the boundaries.
+The full map is in `00-overview.md`. The skeleton is four library layers plus one
+deployment consumer:
 
-**Layered dependency boundary (the spine).** `packages/runtime` has zero internal dependencies — it's the foundation everything points at. The dependency arrow always points *toward* runtime: agents depend on runtime + tools + context + prompts; providers depend only on runtime's `ModelProvider` contract; retrieval depends on tools (for the tool contract); core depends on all of them. This is enforced by the build order in `package.json` (`build:core:deps`), which compiles runtime first, then tools/context/prompts/evals/workflows, then the six agents (now including `agent-rag-query`), then `retrieval` + `provider-gemma` + `provider-local`, then core last (`build:core`).
+- **Studio** (`apps/studio`, React/Vite) — dev-only UI. Five analytics agents run
+  behind a shared `AgentReplayShell`; three off-shell pages (`CapabilitiesWorkspace`,
+  `RagQueryWorkspace`, `DocPage`). Studio runs the *real* agent code in-process via
+  Vite middleware (`apps/studio/vite.config.ts:201`) and streams the trace as NDJSON.
+- **agents** (`packages/agents/*`) — six capabilities. Each is a thin assembly:
+  prompt package + tool policy + `runAgentLoop` config + output validator. Not a
+  service each — a function each.
+- **runtime** (`packages/runtime`) — the foundation, zero internal deps. Owns the
+  three load-bearing contracts: `ModelProvider` (`model-provider.ts:54`),
+  `CapabilityEvent`/`CapabilityTraceSink` (`events.ts:1`), and the bounded
+  `runAgentLoop` (`run-agent-loop.ts:76`).
+- **providers** (`packages/providers/*`) — `ModelProvider` adapters: `gemma` (local
+  Ollama, the default), `local` (context-window guard wrapper), `fallback`
+  (sequential chain), plus `anthropic`/`openai` (unbundled cloud adapters).
+- **retrieval + memory** (`packages/retrieval`, `packages/memory`) — the RAG
+  pipeline behind the `EmbeddingProvider`/`VectorStore` contracts (`contracts.ts:22`),
+  and an episodic memory engine that reuses those same two contracts.
 
-**The central seam — `ModelProvider.complete()`** (`packages/runtime/src/model-provider.ts:54-58`). Every model call in the entire system crosses this one interface. No agent, no loop, no eval ever touches a vendor SDK directly. → see `01-provider-abstraction.md`.
+**Trust boundaries.** The hard boundary is the library/deployment seam: aptkit
+ships as `@rlynjb/aptkit-core@0.4.1` to npm (root `private:true`, `packages/core`
+holds `bundledDependencies` for all 16 internal packages). buffr is a *separate*
+repo that imports the published bundle. The other boundary is the local-vs-cloud
+network edge — the default path makes **zero** cloud calls: gemma talks to Ollama
+over plain HTTP `:11434`, no key, no TLS (`gemma-provider.ts:201`). Cloud keys
+(`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`) live in a gitignored `.env` and are only
+read by the unbundled cloud adapters.
 
-**The two retrieval seams — `EmbeddingProvider` and `VectorStore`** (`packages/retrieval/src/contracts.ts:22-37`). The from-scratch RAG capability adds a *second* pair of provider-neutral seams, the same shape as `ModelProvider`: the pipeline turns text→vectors→search without ever naming nomic, OpenAI, pgvector, or in-memory. A `dimension` field on both sides is the safety latch that makes the swap safe. → see `09-retrieval-pipeline-seam.md`.
+**External dependencies.** Ollama (local HTTP) for the default model + embeddings;
+npm registry for distribution; Supabase Postgres — but only on buffr's side.
 
-**The seam now has a second consumer — `@aptkit/memory`** (`packages/memory/src/conversation-memory.ts:1`). Episodic conversation memory imports `EmbeddingProvider`, `VectorStore`, `VectorHit` straight from `@aptkit/retrieval` and speaks *nothing else* — no new contract, no database client, no new control flow. `remember` is the RAG index path and `recall` is the RAG query path, pointed at a corpus of conversation turns instead of documents. That a whole new capability dropped in as a second consumer of an existing seam is the strongest evidence in the repo that the retrieval contracts were drawn at the right boundary. The store is *injected*, so the caller chooses the topology: **shared** with documents (memory mixes into the corpus and surfaces via `search_knowledge_base` — no extra tool) or **dedicated** (isolated, recalled via a `search_memory` tool from `createMemoryTool`). → see `10-memory-store-topology.md`.
-
-**Trust boundaries.** There are two real ones:
-- **The model/embedding HTTP calls** — the only places data leaves the process, over HTTP(S). The bundled default is *local*: `GemmaModelProvider` POSTs to Ollama's `/api/chat` (`packages/providers/gemma/src/gemma-provider.ts`), and `OllamaEmbeddingProvider` POSTs to Ollama's `/api/embed` (`packages/retrieval/src/ollama-embedding-provider.ts:60-75`) — both default to `http://localhost:11434`, so the default deployment never leaves the machine. (Cloud SDK adapters for Anthropic/OpenAI still exist under `packages/providers/` but are no longer in the published bundle's build chain — see lens 8.)
-- **The tool-policy boundary** (`packages/tools/src/tool-policy.ts:11-23`) — each agent can only see the tools on its allowlist. The rag-query agent is the tightest case: its policy grants exactly one tool, `search_knowledge_base` (`packages/agents/rag-query/src/rag-query-agent.ts:15-18`). This is a *capability* boundary, not a security perimeter, but it's a real containment seam. → see `04-capability-as-tool-policy.md`.
-
-**The publish boundary** (`packages/core/package.json` `bundledDependencies`). `bundledDependencies` inlines all 16 internal packages into one tarball (runtime, tools, context, prompts, evals, workflows, retrieval, memory, provider-gemma, provider-local, and the six agents); the must-not-change rule is that app-specific product logic never crosses *into* core. → see `08-monorepo-bundle-boundary.md`.
-
-**External dependencies:** the default surface is the **local Ollama HTTP server** (`gemma2:9b` for reasoning, `nomic-embed-text` 768-dim for embeddings). No database, no cache server, no message broker. Anthropic/OpenAI remain as optional cloud adapters but are not in the default bundle.
-
----
+→ The boundaries are deep enough that three earn their own pattern files:
+`01-provider-neutral-model-seam.md`, `02-retrieval-contracts-as-the-swap-point.md`,
+`03-library-vs-deployment-split.md`.
 
 ## 2. request-response-and-data-flow
 
-The important end-to-end flows.
+Two flows matter.
 
-**The inner flow — one agent run** (`packages/runtime/src/run-agent-loop.ts:98-190`). A capability method seeds a user message, then loops: `model.complete()` → if the response has tool-use blocks, execute them via the registry and feed results back as a user message → repeat until the model stops calling tools or the budget is spent. The loop is bounded and forces a final synthesis turn. → see `02-bounded-agent-loop.md`.
+**Agent answer flow** (the hot path). A question enters an agent's `answer()`,
+which calls `runAgentLoop`. The loop alternates model turns and tool turns until
+the model stops calling tools, a turn budget is hit, or a tool-call budget is hit.
+For the RAG agent (`rag-query-agent.ts:62`): question → `runAgentLoop` (maxTurns 6,
+maxToolCalls 4) → model decides to call `search_knowledge_base` → tool embeds the
+query, searches the store, returns ranked chunks with citations → model synthesizes
+a grounded answer. The model decides *whether* to retrieve — that's agentic
+retrieval, not a fixed pipeline.
 
-**The pipeline flow — monitor → diagnose → recommend** (wired in `apps/studio/vite.config.ts` and `apps/studio/src/agent-runners.ts`). `anomaly-monitoring.scan()` returns `Anomaly[]`; one anomaly feeds `diagnostic-investigation.investigate(anomaly)` → `Diagnosis`; both feed `recommendation.propose(anomaly, diagnosis)` → `Recommendation[]`. The output type of each stage is the input type of the next — a typed handoff. → see `05-multi-agent-pipeline.md`.
+→ Walked in full in `04-bounded-agent-loop.md`.
 
-**The Studio flow — replay over the wire** (`apps/studio/vite.config.ts:887-918` server, `apps/studio/src/api.ts:119-166` client). Click "Replay" → `fetch` POST to a Vite middleware route → the route runs the agent with an `onEvent` callback that writes each `CapabilityEvent` as an NDJSON line → the React client decodes the stream incrementally and accumulates a live trace. → see `07-ndjson-stream-handoff.md`.
+**Index flow.** `indexDocument` (`pipeline.ts:32`): doc → `chunkText` →
+`embedder.embed(texts)` → `store.upsert(chunks)`, each chunk id `<docId>#<i>`, meta
+carrying `docId`/`chunkIndex`/`text` for citations. The query flow is the mirror:
+`queryKnowledgeBase` (`pipeline.ts:50`) embeds the query, searches, returns ranked
+hits. `remember`/`recall` in memory are literally this same index/query pair with a
+`kind:'memory'` tag (`conversation-memory.ts`).
 
-**The eval flow — the testing backbone** (`packages/evals/src/replay-runner.ts`, `scripts/*.mjs`). Live run → write artifact JSON → evaluate → promote to fixture → deterministic replay. → see `06-replay-eval-pipeline.md`.
+**Studio handoff.** Studio's Vite middleware runs the agent and streams each
+`CapabilityEvent` to the browser as `application/x-ndjson`
+(`apps/studio/vite.config.ts:901`), so the UI renders the trajectory live.
 
-**The retrieval flow — RAG's two paths** (`packages/retrieval/src/pipeline.ts:32-59`). Two sequential paths over one validated wiring: the *index* path `doc → chunkText → embedder.embed → store.upsert` builds the corpus offline; the *query* path `query → embedder.embed → store.search → ranked hits` answers online. The query path is reached as a *tool* inside the agent loop — `search_knowledge_base` (`packages/retrieval/src/search-knowledge-base-tool.ts`) wraps `pipeline.query()` so the rag-query agent calls retrieval the same way it would call any other tool. → see `09-retrieval-pipeline-seam.md`.
-
-**The memory flow — remember after, recall before** (`packages/memory/src/conversation-memory.ts:74-106`). Two paths over the same injected store, reusing the retrieval flow shape. The *write* path runs after a turn completes: `{question, answer} → format → embed → upsert(kind=memory)`. The *read* path runs when the past is needed: `query → embed → search(k×4) → filter kind==memory → top k`. In buffr's `chat` session this is wired so `session.ask()` calls `memory.remember(...)` best-effort after every answer (`buffr/src/session.ts:66`), and recall surfaces through the *existing* `search_knowledge_base` tool because memory shares the document store. The `k×4` over-fetch exists because the `VectorStore` contract has no metadata filter — in a shared store, documents can out-rank memory rows, so recall over-fetches then filters by tag. → see `10-memory-store-topology.md`.
-
-No parallel fan-out anywhere — every flow is sequential. The agent loop is sequential by construction (each turn depends on the last), the multi-agent pipeline is sequential by data dependency, the fallback chain is sequential by design, retrieval's two paths run one chunk-batch at a time, and memory's remember/recall are single embed-then-store/search hops.
-
----
+→ The trace handoff is its own pattern: `05-capability-event-trace.md`.
 
 ## 3. state-ownership-and-source-of-truth
 
-Who owns each piece of state and who mutates it.
+aptkit the library is almost entirely **stateless** — its job is to define
+contracts and run pure-ish functions over injected state. The state that exists:
 
-**The agent loop owns conversation state — within one run** (`packages/runtime/src/run-agent-loop.ts:94-96`). The `messages` array, `toolCalls` record, and `finalText` are local to one `runAgentLoop` invocation — born when the loop starts, gone when it returns. The loop itself remains stateless across invocations: nothing in `runAgentLoop` survives between runs. This is the cleanest kind of state ownership inside the loop: there isn't any to leak.
+- **Conversation state** lives in `runAgentLoop`'s local `messages` array
+  (`run-agent-loop.ts:94`) — owned by a single run, discarded when it returns.
+  There is no cross-call history in aptkit; each `answer()` is independent. buffr's
+  `session.ts:24` calls this out explicitly as still-missing sequential history.
+- **Vector corpus state** is owned by whatever `VectorStore` is injected. In
+  aptkit's default that's `InMemoryVectorStore` — a `Map` (`in-memory-vector-store.ts:12`),
+  process-lifetime only. In buffr it's `PgVectorStore` — durable Postgres, the real
+  source of truth.
+- **Memory state** is vector rows in that same store, namespaced `memory:<convId>:<n>`,
+  tagged `kind:'memory'` — a logical partition over a shared collection.
+- **Trace state** is write-only and owned by the sink: in-memory for Studio replay,
+  Postgres `agents.messages` for buffr (`supabase-trace-sink.ts:49`).
 
-**But agent state now persists across runs — through `@aptkit/memory`, not the loop** (`packages/memory/src/conversation-memory.ts:74-87`). This is the first lens-3 delta in the repo's history. With memory wired, an exchange is embedded and `upsert`ed into a `VectorStore` after each turn, and recalled by similarity on a later turn — *across sessions*. Crucially, the loop is **still** stateless; the cross-run state lives entirely in the injected store, owned by whoever supplies it. In buffr's `chat` CLI that's a durable `PgVectorStore` over Supabase Postgres (`buffr/src/session.ts:41,53`), so memory survives the process. The state-ownership boundary is sharp: aptkit owns the *engine* (embed, tag, recall) and never names a database; the *durability* of the persisted memory rows is owned by the consuming repo's store. Memory rows are written **best-effort** — buffr swallows a `remember` failure so it can't lose the answer the user already has (`buffr/src/session.ts:64-69`). → see `10-memory-store-topology.md`. → schema shape of the persisted rows is owned by buffr's `.aipe/study-database-systems/`.
-
-**The trace is append-only, owned by the caller's sink** (`packages/runtime/src/events.ts:26-28`). The loop never holds the trace — it `emit()`s `CapabilityEvent`s to a `CapabilityTraceSink` the caller provides. Studio's sink accumulates into React state (`apps/studio/src/AgentReplayShell.tsx:91-96`); a script's sink pushes to an array. The runtime owns *producing* events; the caller owns *storing* them. Clean separation. → schema shape is owned by `.aipe/study-data-modeling/`.
-
-**The replay artifact is the durable source of truth for "what happened"** (`artifacts/replays/*.json`). Keys: `schemaVersion`, `capabilityId`, `createdAt`, `durationMs`, `provider`, `fixture`, the per-capability output, `trace`, `eval`, `modelTurns`. It's the only thing written to disk during a live run.
-
-**The fixture is the source of truth for "what should happen"** (`packages/agents/*/fixtures/*.json`, `fixtures/promoted/*.json`). A fixture's `modelResponses: ModelResponse[]` is replayed in order by `FixtureModelProvider` (`packages/agents/recommendation/src/fixture-provider.ts:3-18`). Promoted fixtures are correctness baselines — the must-not-change rule (`context.md`) says they're regenerated via `promote:replay`, never hand-edited.
-
-**`WorkspaceDescriptor` is read-only input state** (`packages/context`). It's metadata about a workspace (events, catalogs, totals, data horizon) summarized into prompts — never mutated by an agent.
-
-No URL state, no form state, no client-side persistence beyond React component state in Studio. No server-side session store.
-
----
+The clean answer: aptkit owns *behavior*, the injected store/sink owns *state*. The
+source of truth for durable data is buffr's Postgres, not anything in aptkit.
 
 ## 4. caching-and-invalidation
 
-**Mostly `not yet exercised`.** There is no cache layer, no memoization of model calls, no TTL, no invalidation strategy. Every live `model.complete()` hits the vendor API fresh.
+`not yet exercised` as a deliberate cache layer. There is no read cache, no
+memoized model response, no embedding cache, no TTL/invalidation logic anywhere in
+either repo. The only thing cache-adjacent:
 
-The one thing that *rhymes* with caching is the **fixture-as-recorded-response** mechanism (`FixtureModelProvider`, `packages/agents/*/src/fixture-provider.ts`): a recorded `ModelResponse[]` replayed deterministically instead of calling the model. That's not a cache (no freshness logic, no key-based lookup, no invalidation) — it's a *test double*. But it occupies the architectural slot a response cache would, and it's why eval runs cost zero tokens. → see `06-replay-eval-pipeline.md`.
+- buffr holds **one warm pg pool** per `ChatSession` (`session.ts:39`) — connection
+  reuse, not a data cache.
+- `runAgentLoop` truncates tool results to 16,000 chars before feeding them back
+  (`run-agent-loop.ts:52`) — context-window protection, not caching.
+- Fixtures (recorded `ModelResponse[]`) are *replayed* deterministically, which is
+  cache-like in effect (skip the model), but it's a test artifact, not a runtime
+  cache — see `06-fixture-replay-evals.md`.
 
-If this repo ever needs a real cache (e.g. dedup identical `complete()` calls), the `ModelProvider` seam is exactly where a caching decorator would slot in — same shape as `ContextWindowGuardedProvider` already uses. Worth naming as the natural future seam.
-
-The newer thing that *rhymes* differently is the **`InMemoryVectorStore`** (`packages/retrieval/src/in-memory-vector-store.ts`). It's a process-lifetime store of embeddings — closer to an index than a cache (no TTL, no invalidation; the corpus is rebuilt on each run by re-indexing). It carries a `dimension` and rejects mismatched vectors loudly, which is the analogue of a cache-key contract. → see `09-retrieval-pipeline-seam.md`.
-
----
+If aptkit later cached embeddings or model responses, the invalidation key would be
+(model id + input hash) — but nothing does today.
 
 ## 5. storage-choice-and-durability-boundaries
 
-**No datastore.** Per `context.md`, there is no SQL/relational database. "Data" is file- and stream-shaped:
+Two stores behind one contract — this is the second-most load-bearing thing in the
+repo.
 
-- **NDJSON streams** — `CapabilityEvent`s encoded one-per-line (`packages/runtime/src/ndjson-stream.ts:31-33`). Ephemeral on the wire to Studio; durable when a script writes them into an artifact's `trace`.
-- **JSON files on the filesystem** — replay artifacts (`artifacts/replays/*.json`), fixtures (`packages/agents/*/fixtures/*.json`). Durability is "whatever the filesystem and git give you." Promoted fixtures are committed; replay artifacts are working output.
-- **In-memory embeddings (ephemeral)** — `InMemoryVectorStore` holds the indexed corpus in a process-lifetime `Map` (`packages/retrieval/src/in-memory-vector-store.ts:12`). Zero durability by design: the corpus is re-indexed on each run. The `VectorStore` contract is the seam where a durable store (`PgVectorStore` is the named drop-in) would slot in without touching the pipeline. → see `09-retrieval-pipeline-seam.md`.
-- **Persisted conversation memory (durable — but the durability lives in buffr)** — `@aptkit/memory` writes embedded exchanges through the *same* `VectorStore` seam (`packages/memory/src/conversation-memory.ts:80-86`). In this repo, memory over an `InMemoryVectorStore` is ephemeral like everything else. Durability is unlocked by the *consumer's* store choice: buffr injects a `PgVectorStore`, and memory rows then survive the process and the session. This is the cleanest illustration of the durability boundary in the whole repo — aptkit defines *what* is stored (a tagged vector row) and never *where* it durably lives; the consuming repo owns that. → see `10-memory-store-topology.md`; schema shape lives in buffr's `.aipe/study-database-systems/`.
+- **`InMemoryVectorStore`** (`in-memory-vector-store.ts:10`) — a `Map<id, chunk>`,
+  cosine similarity by linear scan. Zero durability: state dies with the process.
+  Its job is "build the whole RAG pipeline with zero cloud" and to be the test
+  double. It is intentionally O(n) per query — fine at fixture scale, a bottleneck
+  at corpus scale (see lens 7).
+- **`PgVectorStore`** (buffr, `pg-vector-store.ts:19`) — `implements VectorStore`
+  over Supabase pgvector. Durable, transactional upsert (`begin`/`commit`/`rollback`,
+  `pg-vector-store.ts:40`), partitioned by `app_id`, cosine *distance* via the
+  `<=>` operator with `score = 1 - distance` (`pg-vector-store.ts:69`). This is the
+  real durability boundary.
 
-Why no database? Because nothing here needs one. The agents are stateless request-shaped capabilities; the only persistent data is test fixtures and observability records, both of which are git-tracked JSON. Adding Postgres would be architecture for its own sake.
+The dimension is a one-way door: `assertWiring` (`pipeline.ts:22`) and both stores'
+`assertDimension` throw loudly on a mismatch, because a silently mismatched vector
+corrupts ranking rather than erroring.
 
-The durability guarantee that *does* matter: **promoted fixtures are correctness baselines** and must survive unchanged (`context.md` must-not-change constraints). The "boundary" is the `fixtures/promoted/` directory plus the rule that they're only regenerated, never hand-edited. → schema shape lives in `.aipe/study-data-modeling/`.
-
----
+→ Storage *choice as a swap point* is `02-retrieval-contracts-as-the-swap-point.md`.
+Engine internals (HNSW index, pgvector operators, transaction mechanics) belong to
+**`study-database-systems`**; the schema shape (the `agents` tables, `app_id` key,
+the dropped FK for memory rows) belongs to **`study-data-modeling`**.
 
 ## 6. failure-handling-and-reliability
 
-The richest lens after the boundaries lens — failure handling is genuinely designed here, not bolted on.
+Failure containment is real and lives at three levels:
 
-**Bounded work is the primary reliability mechanism** (`packages/runtime/src/run-agent-loop.ts:98-102`). The loop *cannot* run forever: `for (let turn = 0; turn < maxTurns; turn += 1)` plus the `maxToolCalls` budget. A misbehaving model that keeps calling tools hits a hard ceiling and gets forced into a final answer (`forceFinal` at line 102 strips tools so the model *must* synthesize). → see `02-bounded-agent-loop.md`.
+- **Per-tool-call** (`run-agent-loop.ts:158`) — a tool throw is caught, serialized
+  as `{ error }`, and fed back to the model as a `tool_result` with `isError:true`.
+  One tool failing does not abort the run; the model gets to react.
+- **Provider fallback** (`fallback-provider.ts:47`) — try adapters in order, record
+  each failed attempt, emit a `warning` trace event, advance. All-fail throws a
+  `ProviderFallbackError` carrying every attempt. Abort signals are *not* swallowed
+  — they re-throw immediately (`fallback-provider.ts:65`).
+- **Pre-flight guard** (`context-window-guard.ts:57`) — the local guard estimates
+  input tokens and throws `ContextWindowExceededError` *before* calling the model,
+  so an oversized prompt fails fast and (in a fallback chain) hands off to the next
+  provider instead of erroring deep inside Ollama.
 
-**Provider fallback** (`packages/providers/fallback/src/fallback-provider.ts:47-89`). If one provider throws (rate limit, outage, bad key), the chain tries the next. Abort signals are preserved (`isAbortError`), and a customizable `shouldFallback` predicate can stop the chain early. Exhausting the chain throws a `ProviderFallbackError` carrying every attempt. → see `03-fallback-chain.md`.
+**Cancellation** is threaded end-to-end via `AbortSignal`: the loop calls
+`signal?.throwIfAborted()` each turn (`run-agent-loop.ts:99`), passes it to the
+model and tools, and abort errors are distinguished from real failures everywhere.
 
-**Context-window guard** (`packages/providers/local/src/context-window-guard.ts:57-70`). Pre-flight token estimation rejects an over-budget request *before* it's sent — throws `ContextWindowExceededError` and emits a warning rather than letting the vendor reject it. Composed in front of a provider, ahead of or inside the fallback chain. → see `03-fallback-chain.md`.
+**Recovery turn** — when the loop ends without parseable structured output, an
+optional `recoveryPrompt` runs one final no-tools turn to coax the answer
+(`run-agent-loop.ts:204`). A failure there is swallowed into a `warning`, not raised.
 
-**Structured-generation retry** (`packages/runtime/src/structured-generation.ts:62-100`). When a model returns malformed JSON, it retries up to `maxAttempts` (default 2), appending a strict "return ONLY valid JSON" suffix on the retry. Failure emits an error event and returns `{ ok: false }` — degraded, not crashed.
+**buffr durability** — memory writes are best-effort: a `memory.remember` failure is
+caught and swallowed so the user still gets the answer they already have
+(`session.ts:65`). Trace writes are queued and `flush()`ed after the run.
 
-**Loop-level recovery** (`packages/runtime/src/run-agent-loop.ts:192-228`). If `parseResult` returns null after the loop, an optional `recoveryPrompt` triggers one more bare model call to coax a parseable answer. Recovery failures emit warnings but don't propagate.
-
-**Graceful degradation everywhere.** The query agent returns a `FALLBACK_ANSWER` if the loop produces nothing (`packages/agents/query/src/query-agent.ts:101`). Anomaly monitoring returns `[]` rather than failing when no anomaly is found. Memory writes are **best-effort**: `recall` returns `[]` rather than throwing if the embedder yields no vector (`packages/memory/src/conversation-memory.ts:91`), and the consumer treats `remember` as fire-and-forget — buffr wraps it in a try/catch that swallows failures so a memory-write error can't lose the answer the user already received (`buffr/src/session.ts:64-69`). The design call: memory is an *enhancement*, so its failure degrades silently rather than failing the turn.
-
-Partial failure across a *process boundary*? `not yet exercised` — there's only one synchronous external call (the SDK), and its failure is handled by the fallback chain. No two-phase commit, no saga, no distributed retry. → coordination mechanics would belong to study-distributed-systems.
-
----
+Coordination correctness *across processes* is **not yet exercised** — see lens 7
+and **`study-distributed-systems`**.
 
 ## 7. scale-bottlenecks-and-evolution
 
-What breaks first, and what would force a rearchitecture.
+What breaks first, honestly:
 
-**At 10x usage (10x more agent runs):** nothing in *this* repo breaks first — the bottleneck is the **vendor API rate limit and cost**, which is external. The fallback chain (`03-`) already routes around a single provider's limit; the next move would be a response cache at the `ModelProvider` seam (the slot named in lens 4) and request batching. Both slot into the existing seam without touching agents.
+- **`InMemoryVectorStore` is O(n) linear scan** (`in-memory-vector-store.ts:25`) and
+  process-bound. It breaks at any real corpus size. The evolution is already built:
+  swap in `PgVectorStore` (HNSW index, ANN search) — no pipeline change, because
+  both satisfy the same contract. This is the design paying off.
+- **Single process, single conversation.** buffr's `ChatSession` (`session.ts:34`)
+  is one warm pool, one conversation, in-process. There is **no horizontal scale, no
+  queue, no load balancer, no worker pool, no multi-region anything** — `not yet
+  exercised`. The model is "one laptop, one user." At 10x users this needs a request
+  queue and connection-pool tuning; at 100x it needs a different architecture
+  entirely. The honest framing: this is laptop-runtime system design, not
+  large-fleet system design.
+- **No sequential conversation history.** Each `answer()` is independent
+  (`session.ts:24` flags it). Retrieval-based memory gives relevance-based recall but
+  not turn-order context — an aptkit-side change when it lands.
+- **Tool-call emulation tax.** Gemma has no native tool-calling, so the gemma
+  provider renders tools into the system prompt and parses JSON back with up to 2
+  retries (`gemma-provider.ts:62`). That's latency and fragility the cloud adapters
+  don't pay. Swapping to anthropic/openai removes it — the seam is already there.
 
-**At 10x fixtures/replays:** the eval pipeline reads every artifact file synchronously (`packages/evals/src/replay-runner.ts:70-94`, `evaluateReplayArtifactFiles` loops files one at a time). That's fine at tens of fixtures; at thousands it's a linear file-IO scan with no parallelism. Stays stable far longer than you'd think because evals run in CI, not the hot path.
-
-**At 10x corpus (10x more indexed chunks):** `InMemoryVectorStore.search` does an O(n) cosine scan over every chunk per query (`packages/retrieval/src/in-memory-vector-store.ts:25-33`), and the corpus re-indexes on each process start. That's the first retrieval bottleneck — fine for a personal-notes corpus, linear at thousands of chunks. The fix is the `VectorStore` seam: a `PgVectorStore` with an ANN index replaces the scan and adds persistence, with no change to the pipeline, the `search_knowledge_base` tool, or the rag-query agent. → `09-retrieval-pipeline-seam.md`.
-
-**At 10x memory (a long-lived user accumulating exchanges):** in the *shared* topology, every remembered turn adds a row to the same store documents live in, and memory recall is the same O(n) scan plus a `k×4` over-fetch to clear documents off the top (`packages/memory/src/conversation-memory.ts:94`). Two pressures compound: the store grows unbounded (no decay/consolidation — explicitly out of scope, `packages/memory/README.md`), and memory rows increasingly compete with documents for top-k slots. The same `VectorStore`/ANN-index fix handles the scan; the *unbounded growth* would force memory management (summarization, decay) that the package deliberately defers. The dedicated-store topology trades one operated store for clean isolation. → `10-memory-store-topology.md`.
-
-**What stays stable under any growth:** the `ModelProvider` contract, the `EmbeddingProvider` / `VectorStore` retrieval contracts (now proven by *two* consumers — the RAG pipeline and memory), `CapabilityEvent`, `ToolRegistry`, `WorkspaceDescriptor` (the load-bearing interfaces). They're narrow; growth happens behind them.
-
-**What would force a rearchitecture:** moving from "library a host app imports" to "hosted service with traffic." That introduces everything currently `not yet exercised` — an HTTP server, auth, a request queue, a real datastore for traces, horizontal replicas. The current architecture has *no server* (Studio's Vite middleware is a dev convenience, not production). That's the cliff. Everything up to it is incremental.
-
----
+What stays stable under all of the above: the four contracts. That's the point of
+the design — scale changes the implementation behind a seam, never the seam.
 
 ## 8. system-design-red-flags-audit
 
-Ranked architectural risks, each grounded in real evidence. These are honest observations, not alarms — most are "fine for a library, would bite as a service."
+Ranked architectural risks, each grounded:
 
-1. **The pipeline orchestration lives in Studio, not in a package** (`apps/studio/vite.config.ts`, `apps/studio/src/agent-runners.ts`). The monitor→diagnose→recommend wiring is in the dev app, not in `packages/`. A host app importing core gets the six agents but has to re-wire the pipeline itself. If the pipeline is a real product capability, it belongs in a package with its own contract. Right now it's only demonstrated, not shipped. → `05-multi-agent-pipeline.md` walks this.
-
-2. **Cost pricing only covers `gpt-4.1-*`** (`usage-ledger.ts`). The usage/cost ledger silently under-reports for any other model. Lower blast radius now that the default reasoning model is *local Gemma* (zero marginal cost) — but if a host app wires a cloud adapter back in, a model the ledger doesn't price reports wrong cost numbers without erroring.
-
-3. **`InMemoryVectorStore.search` is a full linear scan** (`packages/retrieval/src/in-memory-vector-store.ts:25-33`) and the corpus is re-indexed on every run (no persistence). Correct for the from-scratch in-memory adapter and tiny corpora; at thousands of chunks it's O(n) cosine per query with no ANN index. The `VectorStore` contract is exactly the seam where `PgVectorStore` slots in to fix both — named, not yet built. → `09-retrieval-pipeline-seam.md`.
-
-4. **`rubric-improvement` has no `replay:promoted` script wired into the root pipeline** (`context.md`). The other agents with deterministic regression coverage have promoted fixtures; this one doesn't. It can drift under a model update without a test catching it. → `06-replay-eval-pipeline.md` covers what the others get that this one misses.
-
-5. **Token estimation is a `charsPerToken` heuristic** (`packages/providers/local/src/context-window-guard.ts:100-103`, default 3 chars/token). It's a coarse approximation — a request near the budget edge could be wrongly admitted or wrongly rejected. This guard matters *more* now: the bundled default is local Gemma with a ~8k window (`ask.ts:52` sets `maxTokens: 8192`), so the estimate is the thing standing between a too-long prompt and a vendor rejection. Fine as a guard rail; not a precise accountant.
-
-6. **No cache means identical `complete()` calls re-run** (lens 4). Cheaper now that the default model is local (no per-token cost), but still wasted compute at scale. The seam to fix it already exists.
-
-7. **Shared-store memory has no bound and pollutes document recall** (`packages/memory/src/conversation-memory.ts`, `buffr/src/session.ts:53`). In the topology buffr actually wires, memory rows share the document store and grow unbounded — there's no decay, summarization, or consolidation (deliberately out of scope per `packages/memory/README.md`). Memory rows also rank against documents in `search_knowledge_base`; the `k×4` over-fetch mitigates starvation but the corpora still compete. Correct for a personal single-user runtime; the dedicated-store topology (with a `search_memory` tool) is the named fix and is built but not yet exercised by any consumer. → `10-memory-store-topology.md`.
-
-None of these are "stop the ship." They're the difference between a clean library and a production service — which is exactly the line this repo sits on.
+1. **In-memory store presented as a store, not a demo double.** `InMemoryVectorStore`
+   is the aptkit default and the only bundled `VectorStore`. A consumer who forgets
+   to inject `PgVectorStore` ships a process-lifetime corpus that silently vanishes
+   on restart. Mitigation exists (buffr does inject it) but the default is the
+   dangerous one. Evidence: `in-memory-vector-store.ts:10`, `session.ts:41`.
+2. **No cross-process coordination, but the schema invites it.** buffr's `agents`
+   schema is `app_id`-keyed and durable — it *looks* multi-tenant — yet the runtime
+   is single-process with no locking, no queue, no idempotency on writes. Two
+   concurrent `ChatSession`s on the same `app_id` would interleave trace writes with
+   no ordering guarantee beyond the persisted `created_at`. `not yet exercised` is the
+   honest label; the risk is that the schema's shape implies a concurrency story the
+   runtime doesn't have. Evidence: `supabase-trace-sink.ts:49`, `session.ts:34`.
+3. **Tool-call emulation is a correctness surface, not just latency.** The gemma
+   provider parses free-form model text into tool calls (`gemma-provider.ts:168`).
+   A weak local model can botch the JSON; the retry/nudge + `minTopK` floor
+   (`search-knowledge-base-tool.ts:51`) are real mitigations, but the failure mode
+   (silent wrong-or-no tool call) is subtler than a cloud provider's typed tool API.
+4. **Published-API surface is broad and hand-maintained.** `packages/core/src/index.ts`
+   re-exports 16 packages, some with explicit per-name lists and type aliases
+   (`MonitoringAnomaly`, `DiagnosticAnomaly`). Every one is a semver compatibility
+   commitment (`0.4.x`). Drift between what's exported and what's documented is a
+   real maintenance risk. Evidence: `packages/core/src/index.ts`.
+5. **Fixtures as correctness baselines can rot silently.** Promoted fixtures are the
+   test oracle (`06-fixture-replay-evals.md`). If a fixture is promoted from a buggy
+   run, the bug becomes the baseline. The pipeline assumes the promoter judged the
+   run correct. Evidence: `scripts/promote-replay-to-fixture.mjs`, fixtures under
+   `packages/agents/*/fixtures/promoted/`.

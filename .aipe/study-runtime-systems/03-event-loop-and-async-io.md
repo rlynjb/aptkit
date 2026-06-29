@@ -1,249 +1,193 @@
-# 03 — Event Loop and Async I/O
+# Event Loop and Async I/O — await points, queues, and the one blocking scan
 
-**Industry name:** event loop / microtask queue / non-blocking I/O · *Industry standard*
+**Industry name(s):** event loop / async I/O · microtask vs macrotask queue · event-loop blocking · **Type:** Industry standard
 
 ## Zoom out, then zoom in
 
-The single most important machine in this runtime sits in the runtime layer, beneath every agent and provider.
+Every `await` in aptkit is a handoff to the event loop. This file is about what the loop does between your awaits — and the one place aptkit hands it a CPU job it can't put down.
 
 ```
-  Zoom out — where the loop sits
+  Zoom out — where the event loop sits under aptkit
 
-  ┌─ Application layer ──────────────────────────────────────┐
-  │  runAgentLoop, agents, providers (all express awaits)    │
-  └──────────────────────────┬───────────────────────────────┘
-  ┌─ Runtime layer ──────────▼───────────────────────────────┐
-  │  ★ event loop + microtask queue ★                        │ ← we are here
-  │     pulls ready tasks, runs each to completion           │
-  └──────────────────────────┬───────────────────────────────┘
-  ┌─ Kernel / network layer ─▼───────────────────────────────┐
-  │  epoll/kqueue, socket I/O for the HTTPS provider call    │
-  └───────────────────────────────────────────────────────────┘
+  ┌─ aptkit logic (JS) ───────────────────────────────────────────────┐
+  │   runAgentLoop · generateStructured · cosine scan · JSON.parse     │
+  └──────────────────────────────────┬─────────────────────────────────┘
+                                      │ await (yields the thread)
+  ┌─ ★ Event loop (libuv) ★ ──────────▼─────────────────────────────────┐ ← we are here
+  │   microtask queue (Promises)  ·  macrotask queue (I/O callbacks)    │
+  └──────────────────────────────────┬─────────────────────────────────┘
+                                      │ non-blocking syscalls
+  ┌─ OS / kernel ─────────────────────▼─────────────────────────────────┐
+  │   sockets (HTTP to Ollama/cloud) · timers · fs                      │
+  └──────────────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: the event loop is the scheduler that makes single-threaded code feel concurrent. The question it answers: "while I'm awaiting a model API call that takes two seconds, what is the CPU doing?" Answer: running *other* ready tasks — other requests, queued microtasks — and the instant the network reply lands, it queues your continuation and resumes it. Non-blocking I/O is the trick that turns "wait 2 seconds doing nothing" into "wait 2 seconds doing everything else."
+**Zoom in.** The event loop is the scheduler from `02`, made concrete. It runs your synchronous code to completion, then drains the microtask queue (settled Promises), then picks up the next macrotask (an I/O callback), and repeats. The rule that governs aptkit's responsiveness: **the loop can only switch tasks at an `await` or when your synchronous code returns.** A long synchronous stretch with no `await` freezes everything. aptkit has exactly one such stretch worth knowing.
 
 ## Structure pass
 
-**Layers.** Application awaits → loop schedules → kernel does the actual socket I/O. The contract between application and loop is the Promise; the contract between loop and kernel is the OS readiness API (epoll/kqueue), which you never touch directly.
-
-**Axis — "what blocks the thread at this layer?"**
+Trace the **lifecycle** axis — *when* does each piece of work touch the loop?
 
 ```
-  One question down the layers: "what blocks the one thread?"
+  Axis: "when does this hit the event loop?" — across a single agent run
 
-  ┌─ application ───────────────┐  a synchronous CPU loop blocks
-  │  JSON.parse, .filter, etc.  │  (runs to completion, no yield)
-  └──────────────┬───────────────┘
-       ┌─────────▼─────────────────┐ await NEVER blocks —
-       │  loop: await suspends      │ it yields the thread
-       └─────────┬─────────────────┘
-           ┌─────▼───────────────────┐ kernel I/O is off-thread;
-           │  socket read/write       │ the loop is notified when ready
-           └──────────────────────────┘
+  ┌────────────────────────────────────────────────┐
+  │ await model.complete()   → YIELDS: registers I/O │  loop free, can run other tasks
+  └───────────────────┬──────────────────────────────┘
+      ┌───────────────▼──────────────────────────────┐
+      │ JSON.parse(response) → SYNC: runs to end       │  loop blocked, but tiny
+      └───────────────┬──────────────────────────────┘
+          ┌───────────▼──────────────────────────────┐
+          │ cosine scan over corpus → SYNC: runs to end │  loop BLOCKED for O(n·d)
+          └─────────────────────────────────────────────┘
 ```
 
-The blocking answer flips at the `await`: synchronous app code blocks the thread (and must stay short), but `await` *never* blocks — it suspends and hands the thread back. Kernel-level network I/O happens entirely off the JS thread; the loop just gets a "socket ready" callback. That's why `await model.complete()` is free: the waiting happens in the kernel, not on your thread.
-
-**Seams.** Two queues are the seam between "code that wants to run" and "code that runs next":
-- **microtask queue** — Promise continuations (`.then`, the code after an `await`). Drained *completely* after each task, before any macrotask.
-- **macrotask queue** — timers, I/O callbacks, the next HTTP request. One per loop tick.
-
-The flip across this seam: microtasks always jump the macrotask queue. A flood of resolved Promises can starve a pending timer. AptKit doesn't hit this (no tight Promise loops), but it's the seam where event-loop bugs live.
+The seam: **the boundary between an `async` signature and whether the body actually `await`s.** `InMemoryVectorStore.search` is declared `async` but its body has no `await` (`in-memory-vector-store.ts:25`) — it returns a Promise, but it never yields the loop while computing. That's the trap: the signature *looks* like it cedes control; the execution doesn't. Identifying that flip is the whole point of reading the loop before the mechanics.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know that `fetch()` returns a Promise and your `.then`/`await` runs "later," not now. The loop is what decides *when* "later" is. Strategy: **a queue of ready continuations, drained one at a time, never interrupting one mid-run.**
+You know loading states: a `fetch()` fires, your component shows a spinner, and the UI stays interactive because the browser's event loop keeps running while the request is in flight. Node's loop is the same machine. The danger is also the same: a synchronous loop that runs too long is the server-side equivalent of a `while(true)` freezing your browser tab.
 
 ```
-  The loop kernel — one tick
+  The loop's cycle — and where a sync scan jams it
 
-  ┌──────────────── loop tick ─────────────────┐
-  │ 1. run one macrotask (e.g. an HTTP request) │
-  │ 2. drain ALL microtasks (awaited            │
-  │    continuations) until the queue is empty  │
-  │ 3. I/O poll: any sockets ready? queue their │
-  │    callbacks as macrotasks                  │
-  │ 4. go to 1                                  │
-  └─────────────────────────────────────────────┘
-       run-to-completion: step 1's task finishes
-       fully before step 2 begins
+  ┌──────────────┐   run sync code    ┌──────────────┐
+  │ pick macro-  │ ─────────────────► │ drain micro- │
+  │ task (I/O cb)│                    │ tasks (Promise│
+  └──────▲───────┘                    │ continuations)│
+         │                            └──────┬────────┘
+         │      ◄──────── loop ──────────────┘
+         │
+   if a sync task (cosine scan) runs 200ms here,
+   NOTHING in either queue advances for 200ms
 ```
 
-### Move 2 — walking the mechanism
+The strategy: **keep every synchronous span short so the loop cycles fast, and push all latency into awaited I/O.** aptkit honors this everywhere except the vector scan, which is async-shaped but synchronous-bodied.
 
-**An `await` splits a function into "before" and "after."** Everything up to the `await` runs synchronously now. The `await` registers the continuation (the "after") as a microtask to run when the awaited Promise settles, and *returns control to the loop*. This is the yield point.
+### Move 2 — the await points and the one block
 
-```
-  await splits the function — execution trace
+**Await point: the model call.** `run-agent-loop.ts:103` — `await model.complete(...)`. This is a clean yield. Under the hood it reaches `gemma-provider.ts:204`:
 
-  state before: messages=[user], turn=0
-  ─ runs now ─►  signal.throwIfAborted()   (sync)
-  ─ runs now ─►  build request object      (sync)
-  ─ AWAIT    ─►  model.complete(...)        ← suspend, return to loop
-                 ............ loop runs other tasks ............
-  ─ resumes ─►   response arrives → continuation queued as microtask
-  state after:   messages=[user, assistant], turn still 0 until loop end
-```
-
-**Awaited network I/O is the dominant task in AptKit.** Every `model.complete()` is one `fetch`-like SDK call. While it's in flight, the JS thread is *free*. The kernel watches the socket; when bytes arrive, the loop wakes the continuation. This is why one Node process serves many concurrent Studio replays on one thread — they're all parked at their respective `await model.complete()` simultaneously, and the loop juggles their resumptions.
-
-```
-  Three concurrent requests, one loop, all parked at await
-
-  req1: ──run──► await model ......................► resume ──►
-  req2: ───run──► await model ...........► resume ──►
-  req3: ──run──► await model ....► resume ──►
-              ▲                  ▲       ▲
-              loop free here — it advances whichever
-              request's network reply landed first
+```ts
+const res = await fetch(`${base}/api/chat`, {
+  method: 'POST',
+  headers: { 'content-type': 'application/json' },
+  body: JSON.stringify(payload),
+  ...(signal ? { signal } : {}),
+});
 ```
 
-**Async generators stream I/O lazily.** `decodeNdjsonStream` is an `async function*`: `for await (const chunk of chunks)` pulls one chunk, yields decoded records, and suspends until the consumer asks for more. Each `yield` is a suspension point; each loop iteration begins with a cancellation check. This is the loop applied to a *sequence* of I/O events rather than a single one.
+`fetch` is non-blocking I/O: it registers the socket with libuv and the `await` suspends the agent-loop task. The thread is free until the response macrotask fires. This is aptkit's bread-and-butter — almost all wall-clock time is spent suspended here.
+
+**Await point: the embedding call.** `pipeline.ts:40` — `await wiring.embedder.embed(texts)`. Same shape: an HTTP round-trip to Ollama's embed endpoint, all chunk texts batched into one request body, one yield.
+
+**The block: the cosine scan.** `in-memory-vector-store.ts:25` — the method that *looks* async but never yields:
+
+```ts
+async search(vector: number[], k: number): Promise<VectorHit[]> {
+  this.assertDimension(vector, 'query vector');
+  const hits: VectorHit[] = [];
+  for (const chunk of this.chunks.values()) {          // ← O(n) loop, no await
+    hits.push({ id: chunk.id, score: cosineSimilarity(vector, chunk.vector), meta: chunk.meta });
+  }
+  hits.sort((a, b) => b.score - a.score);              // ← O(n log n) sort, sync
+  return hits.slice(0, Math.max(0, k));
+}
+```
+
+And the inner cost, `in-memory-vector-store.ts:46`:
+
+```ts
+function cosineSimilarity(a: number[], b: number[]): number {
+  let dot = 0, magA = 0, magB = 0;
+  for (let i = 0; i < a.length; i += 1) {              // ← d iterations (768 for nomic)
+    dot += a[i]! * b[i]!;
+    magA += a[i]! * a[i]!;
+    magB += b[i]! * b[i]!;
+  }
+  // ...
+}
+```
 
 ```
-  Async generator — pull-based streaming I/O
+  Cost of one search — pure CPU, on the loop thread
 
-  consumer: for await (record of decodeNdjsonStream(chunks))
-                │ asks for next
-                ▼
-  generator: for await (chunk of chunks)   ← awaits next network chunk
-               buffer += chunk
-               while (newline in buffer):
-                 yield decodeNdjsonLine(...)  ← suspends, hands record to consumer
-               (resumes when consumer asks again)
+  n chunks × d dims =  n × 768 multiply-adds  +  n log n sort
+  ─────────────────────────────────────────────────────────────
+  n = 50    →   ~38K ops      → microseconds, invisible
+  n = 50,000 →  ~38M ops      → tens of ms, the loop is frozen
+                                for that whole span
 ```
 
-**The boundary condition — don't block the loop.** The loop's one rule: synchronous code between awaits must be short, because nothing else runs during it. AptKit's synchronous spans are mostly small (`JSON.parse` of a tool result capped at 16KB, `.filter`/`.map` over a handful of content blocks). The one bounded span to watch is `truncate(JSON.stringify(result))` on a tool result — capped at `MAX_TOOL_RESULT_CHARS` precisely so the synchronous stringify stays cheap.
+At aptkit's actual scale — a handful of docs indexed in tests and the Studio demo — `n` is tiny and this is invisible; running it inline is the right call (no async overhead, dead simple, perfectly traceable). The honest statement is: **this is the one place in the repo where CPU work sits on the loop thread with no yield, and it's the first thing that bites if the corpus ever grows.** The escape hatch is `worker_threads` (move the scan off-thread) or, more likely, swapping in buffr's `PgVectorStore` so the scan happens in Postgres over a network `await` instead of inline. The contract is identical (`VectorStore`), so it's a wiring change, not a rewrite — `pipeline.ts:73` shows the seam.
 
-The new RAG code adds the *first* synchronous span whose cost scales with data, not with a fixed bound: `InMemoryVectorStore.search` walks every stored chunk and runs `cosineSimilarity` — an O(N·dim) dot-product loop — entirely on the JS thread before it returns, then sorts (`in-memory-vector-store.ts:25-33`, `:46-57`). For the 3-doc demo corpus this is microseconds. But there's no `await` inside that scan: index a large corpus and a single `search` call freezes the loop for the whole linear scan. It's unbounded by design — the `dimension` is fixed (768) but the chunk *count* is not. This is the one place in the repo where corpus growth turns a cheap span into a loop-blocking one; the fix is the `PgVectorStore` drop-in the contract already anticipates (the scan moves into Postgres, off the JS thread). See `05`, `08`.
+**Microtasks: the retry loops.** Both the Gemma provider (`gemma-provider.ts:62`) and `generateStructured` (`structured-generation.ts:62`) are `for` loops that `await` a model call each iteration. Each iteration yields the loop at its `await`; the retry itself isn't a busy-wait. So a 2-attempt structured generation is "yield, parse, maybe yield again" — never a tight spin.
 
-`@aptkit/memory`'s `recall` is the same async-I/O-then-sync-filter shape, no new loop. It does `await embedder.embed([query])` then `await store.search(...)` — two yields — followed by a *synchronous* `.filter(kind).slice(k).map(...)` span over the over-fetched hits (`conversation-memory.ts:89-105`). That trailing filter is a third consumer of this pattern (after the RAG query path and the agent loop), and it's bounded the friendly way: the scan is over `fetchK = max(k*4, 20)` hits, not the whole corpus, so unlike the cosine scan above its sync span is fixed-size by construction — the over-fetch caps it. The cancellation half is *not* handled, though: neither `embed` nor `search` here receives a signal (see `07`).
+**No timers in the hot path.** No `setInterval`, `setImmediate`, or `queueMicrotask` anywhere in `packages/` or `scripts/`. The only `setTimeout` is one `window.setTimeout` in a Studio UI component for a transient panel — browser-side, off the runtime path. So aptkit's loop is driven entirely by I/O completion and Promise settling, not by timers.
 
 ### Move 3 — the principle
 
-The event loop converts "waiting on I/O" from a thread-blocking cost into free time, by doing the waiting in the kernel and resuming you via a queue. The single rule that keeps it healthy — never block the thread with long synchronous work — is the one thing you must hold in your head when writing for it. AptKit obeys it by keeping synchronous spans tiny and pushing all the slow work (model calls, tool I/O, file reads) behind `await`.
+The event loop rewards code that yields often and punishes code that doesn't. The async/await syntax hides which is which — an `async` function that never `await`s is a synchronous function wearing a Promise costume, and it blocks the loop exactly as if you'd called it synchronously. The discipline: when you see `async`, ask "does the body actually yield, or just the signature?" In aptkit that question has one interesting answer (the cosine scan) and that single answer tells you precisely where the only event-loop risk lives and exactly how to relieve it — swap the store implementation behind the contract.
 
 ## Primary diagram
 
-```
-  Event loop + async I/O — the whole machine
-
-  ┌─ JS thread (one) ────────────────────────────────────────────┐
-  │                                                              │
-  │  ┌─ macrotask queue ─┐      ┌─ microtask queue ─┐            │
-  │  │ HTTP requests     │      │ awaited continuations         │
-  │  │ I/O callbacks     │      │ (.then, code after await)     │
-  │  │ timers            │      └─────────┬─────────────────────┘ │
-  │  └────────┬──────────┘                │ drained fully each tick│
-  │           │  one per tick             ▼                       │
-  │           ▼                  run continuation to completion   │
-  │      run task ──────────────────────────────────────────────►│
-  └───────────────────────────┬───────────────────────────────────┘
-                              │ await model.complete / tools / file
-                              ▼  (work leaves the thread)
-  ┌─ Kernel / Network ───────────────────────────────────────────┐
-  │  socket I/O for HTTPS provider call — off-thread, non-blocking│
-  │  ready → loop queues the continuation as a macrotask          │
-  └───────────────────────────────────────────────────────────────┘
-```
-
-## Implementation in codebase
-
-**Use cases.** The loop is exercised on every model call (the big yield), every tool call, every NDJSON chunk decoded in the browser, and every file read in a script. You reason about it whenever a replay "hangs" (which await is it parked at?) or when you ask whether one slow request blocks others (it doesn't).
-
-**Code side by side.**
-
-The awaited model call — the dominant yield point:
+The complete loop view: clean yields at I/O, one synchronous block, retry loops that yield each iteration.
 
 ```
-  packages/runtime/src/run-agent-loop.ts (lines 99–109)
+  aptkit on the event loop — complete
 
-  signal?.throwIfAborted();                ← sync, runs now
-  const budgetSpent = ...;                 ← sync
-  const response = await model.complete({  ← SUSPEND: thread freed, kernel waits
-    system: ...,
-    messages,
-    tools: forceFinal ? undefined : toolSchemas,
-    maxTokens,
-    signal,                                ← the only way to wake early
-  });
-       │
-       └─ during this await the loop serves other requests; the continuation
-          (everything after) is queued when the HTTPS reply lands
-```
-
-The native non-blocking I/O at the SDK boundary:
-
-```
-  packages/providers/anthropic/src/anthropic-provider.ts (lines 28–39)
-
-  async complete(request) {
-    const response = await this.client.messages.create(
-      { model, max_tokens, messages, ... },
-      request.signal ? { signal: request.signal } : undefined, ← signal → fetch → kernel
-    );
-       │
-       └─ the SDK uses fetch under the hood; the socket wait is off-thread.
-          the signal lets the kernel-level request be aborted.
-```
-
-The async generator streaming chunks lazily:
-
-```
-  packages/runtime/src/ndjson-stream.ts (lines 103–126)
-
-  export async function* decodeNdjsonStream(chunks, options) {
-    let buffer = '';
-    for await (const chunk of chunks) {           ← await next network chunk (suspend)
-      options.signal?.throwIfAborted();           ← cancel check each chunk
-      buffer += decoder.decode(chunk, { stream: true }); ← partial bytes ok
-      let nl = buffer.search(/\r?\n/);
-      while (nl >= 0) {
-        const line = buffer.slice(0, nl);
-        yield decodeNdjsonLine(line, ...);        ← hand one record to consumer (suspend)
-        nl = buffer.search(/\r?\n/);
-      }
-    }
-       │
-       └─ each yield suspends until the consumer's for-await asks again — pull-based,
-          so a slow consumer naturally slows the generator (the one place with
-          implicit backpressure — see 06)
+  ┌─ JS thread ──────────────────────────────────────────────────────────┐
+  │                                                                        │
+  │  runAgentLoop turn:                                                    │
+  │    await model.complete() ──► fetch ──► [SUSPEND] ◄── response macrotask│
+  │         │ loop free here                                               │
+  │    JSON.parse(result)      ──► sync, tiny block                        │
+  │    InMemoryVectorStore.search() ──► SYNC LOOP, O(n·d)+sort, [BLOCKS]    │
+  │         ▲                                                              │
+  │         └── the one place async signature ≠ actual yield               │
+  │                                                                        │
+  │  retry loops (gemma, generateStructured):                              │
+  │    for attempt: await complete() ──► yields each iteration (no spin)   │
+  │                                                                        │
+  │  queues: microtask (Promise continuations) · macrotask (I/O callbacks) │
+  │  drivers: I/O completion only — no timers in the hot path              │
+  └────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The event loop comes from the same lineage as the browser's — Node took libuv's loop and the same Promise/microtask model the browser uses, so the mental model transfers exactly from frontend work. The microtask-vs-macrotask ordering (microtasks drain fully before the next macrotask) is the subtle part that bites people: a recursive `Promise.resolve().then(...)` can starve I/O. AptKit never builds such a loop, so it stays out of trouble. The deeper context — *how* the kernel does non-blocking socket I/O (epoll/kqueue, TLS handshakes, connection reuse) — is networking's territory; this file stops at the loop's edge. The async generator's pull-based suspension is the one spot where the loop gives you backpressure for free; `06` picks that up.
+The "async function that doesn't await" footgun is one of Node's most common production incidents: a CPU-heavy handler declared `async` gives the false comfort that it's non-blocking, and under load it stalls every concurrent request because they all share the one thread. aptkit's cosine scan is the textbook case, defused only by small `n`. The standard fixes are all available behind the `VectorStore` contract: move to a real ANN index (HNSW, IVF) so search is sub-linear; offload to `worker_threads`; or push it to a database with vector support (pgvector) so the cost becomes a network `await` that yields. aptkit's design — the swappable contract — is precisely what makes that future change cheap. See `study-performance-engineering` for measuring the crossover point, and `05` for the memory side of the same `Map`.
 
 ## Interview defense
 
-**Q: "While `await model.complete()` is in flight, what is the thread doing?"**
+**Q: Is `InMemoryVectorStore.search` blocking the event loop?**
 
 ```
-  thread:  [other req's task][drain microtasks][I/O poll]
-                       ▲
-                       your model call is parked in the kernel;
-                       the thread is NOT waiting on it — it's running
-                       whatever else is ready
+  signature: async  →  looks like it yields
+  body:      for-loop over n chunks, cosine (d=768), full sort
+             ZERO awaits inside
+  verdict:   yes — it blocks the loop for its whole O(n·d + n log n) span
+  safe today because n is tiny (demo/test corpus)
+  fix behind the same contract: worker_threads OR swap to PgVectorStore
 ```
 
-Answer: "Running other ready work. The await suspends the function and returns the thread to the loop; the socket wait happens off-thread in the kernel. When the reply lands, my continuation is queued as a microtask and resumes." Anchor: `run-agent-loop.ts:103`.
+Anchor: "It's `async` in signature but synchronous in body — the one place in the repo CPU work sits on the loop thread with no yield."
 
-**Q: "What would freeze the loop here, and does the code risk it?"** A long *synchronous* span — e.g. stringifying a giant object, or a CPU scan whose length scales with data. The tool-result path is bounded (`MAX_TOOL_RESULT_CHARS = 16_000` before `JSON.stringify`, `run-agent-loop.ts:52,162`), so that span stays tiny. The one unbounded sync span is `InMemoryVectorStore.search`'s cosine scan over every chunk (`in-memory-vector-store.ts:25-33`): harmless at demo corpus size, a loop freeze at scale because no `await` interrupts the linear scan. The move is the `PgVectorStore` drop-in that pushes ranking into Postgres, off the JS thread.
+**Q: What drives aptkit's event loop — timers or I/O?**
 
-## Validate
+```
+  I/O completion (fetch responses) + Promise settling
+  no setInterval / setImmediate / queueMicrotask in the runtime
+  retry loops await each iteration — they yield, they don't spin
+```
 
-1. **Reconstruct:** Draw one loop tick (macrotask → drain microtasks → I/O poll). Mark where an `await` continuation lands.
-2. **Explain:** Why can one Node process serve three Studio replays on one thread? (All three park at `await model.complete()` — `run-agent-loop.ts:103`.)
-3. **Apply:** A reviewer adds a synchronous `JSON.stringify` of an un-truncated 5MB tool result. What happens to other requests? (Loop frozen for the duration; bound it like `truncate` at `:54–57`.) Then: someone indexes a 200k-chunk corpus into `InMemoryVectorStore` and calls `search`. What freezes, and what's the fix? (The synchronous cosine scan over all chunks, `in-memory-vector-store.ts:25-33`; move ranking into `PgVectorStore` so it runs off the JS thread.)
-4. **Defend:** Explain why `decodeNdjsonStream`'s `yield` gives implicit backpressure but `res.write` in the server does not (`06`).
+Anchor: "It's purely I/O-driven — every advance is a settled HTTP Promise, never a timer tick."
 
 ## See also
 
-- `01-runtime-map.md` — the loop's place in the topology.
-- `06-filesystem-streams-and-resource-lifecycle.md` — the streaming half, and where backpressure is/isn't.
-- `07-backpressure-bounded-work-and-cancellation.md` — bounding the synchronous + awaited work, and the memory recall signal gap.
-- `04-shared-state-races-and-synchronization.md` — `@aptkit/memory`'s counter `Map`, the new cross-call mutable state.
-- `.aipe/study-networking/` *(when generated)* — what happens beneath the awaited socket I/O.
+- `02-processes-threads-and-tasks.md` — the single thread the loop runs on
+- `05-memory-stack-heap-gc-and-lifetimes.md` — the `Map` the scan iterates and its memory growth
+- `07-backpressure-bounded-work-and-cancellation.md` — how `signal.throwIfAborted()` interrupts the loop between awaits
+- `study-performance-engineering` — measuring when the inline scan's cost crosses over
