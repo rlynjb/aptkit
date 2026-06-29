@@ -1,277 +1,224 @@
 # 02 — Partial Failure, Timeouts, and Retries
 
-**Industry names:** deadlines · timeouts · retry with backoff and jitter · failure classification (retryable vs terminal) · circuit breaking — *Industry standard.*
+**Industry names:** partial failure · deadlines/timeouts · retries with backoff and jitter · failure classification (retryable vs terminal) · circuit breaker. **Type:** Industry standard.
 
 ## Zoom out, then zoom in
 
-This is the most consequential file in the guide, because it names the biggest gap
-in the repo. The Ollama boundary is where partial failure is real, and the code
-that crosses it has cancellation but **no deadline.**
+This is the most consequential file in the guide. The single biggest distributed-systems gap in the repo lives here: **there is no deadline on the Ollama path.**
 
 ```
-  Zoom out — where timeouts/retries belong vs where they live today
+  Zoom out — where deadlines should live (and don't)
 
-  ┌─ App layer ─────────────────────────────────────────────────────────┐
-  │  runAgentLoop  — has a TURN budget (maxTurns) and a TOOL budget       │
-  │                  (maxToolCalls) ✓  but no per-call wall-clock deadline│
-  └──────────────────────────────┬───────────────────────────────────────┘
-                                 │ provider.complete()
-  ┌─ Provider layer ─────────────▼───────────────────────────────────────┐
-  │  FallbackModelProvider — retries ACROSS providers ✓                   │
-  │  ★ THE GAP: no timeout wraps the call, so a hang never becomes        │
-  │    a failure the fallback can react to ★                              │ ← we are here
-  └──────────────────────────────┬───────────────────────────────────────┘
-                                 │ fetch() — AbortSignal only, no .timeout()
-  ┌─ External ───────────────────▼───────────────────────────────────────┐
-  │  Ollama daemon — can return 500 (→ throws ✓) OR hang (→ nothing ✗)    │
-  └─────────────────────────────────────────────────────────────────────┘
+  ┌─ Orchestration ───────────────────────────────────────────────┐
+  │  runAgentLoop  — bounds TURNS (maxTurns=8) but not TIME         │
+  └───────────────────────────────┬────────────────────────────────┘
+  ┌─ Provider port ────────────────▼────────────────────────────────┐
+  │  ★ FallbackModelProvider ★  — advances on THROW only            │ ← we are here
+  └───────────────────────────────┬────────────────────────────────┘
+  ┌─ Transport ────────────────────▼────────────────────────────────┐
+  │  ★ GemmaProvider.fetch() ★  — NO timeout, NO AbortController     │ ← and here
+  └───────────────────────────────┬────────────────────────────────┘
+  ┌─ External node ────────────────▼────────────────────────────────┐
+  │  Ollama daemon :11434  — can be down, slow, or WEDGED            │
+  └──────────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: a **timeout** turns the most dangerous failure mode — "infinitely slow" —
-into the one your code already handles — "threw an error." Without it, *slow is
-indistinguishable from working*, and every downstream protection (fallback,
-turn budget, the user's patience) waits forever on a box that's never coming back.
+Zoom in: **partial failure** is the defining hazard of distributed systems. A local function either returns or throws. A remote call has a *third* outcome: it never comes back. The daemon isn't crashed (you'd get a connection-refused throw) — it's *wedged*: TCP connected, request accepted, no response, ever. A **deadline** is the only tool that converts that third outcome back into a thrown error you can handle. The repo doesn't have one.
 
-## Structure pass
+## Structure pass — layers, one axis, the seams
 
-**Layers.** Turn budget (loop) → cross-provider retry (fallback) → per-call
-guard (adapter) → the wire (fetch).
+**Layers** (the call stack of one model request): `runAgentLoop` → `FallbackModelProvider.complete` → `GemmaProvider.complete` → `fetch` → Ollama.
 
-**Axis — trace `what gives up, and when?` down the layers.**
+**The one axis: *how does each layer bound the work below it?*** Three kinds of bound exist; trace which each layer has:
 
 ```
-  Axis — "what gives up, and on what signal?" — top to bottom
+  "what bounds the work below this layer?"  — traced downward
 
-  ┌─ runAgentLoop ─────────────────────────────┐
-  │  gives up after maxTurns iterations         │  signal: turn COUNT  ✓
-  └────────────────────┬────────────────────────┘
-       ┌───────────────▼─────────────────────────┐
-       │ FallbackModelProvider                    │  signal: a provider THREW ✓
-       └───────────────┬─────────────────────────┘   (but only if it throws!)
-            ┌──────────▼──────────────────────────┐
-            │ GemmaModelProvider / fetch           │  signal: HTTP non-200 ✓
-            │                                      │  signal: WALL-CLOCK   ✗ MISSING
-            └──────────────────────────────────────┘
+  ┌─────────────────────────────────────────────┐
+  │ runAgentLoop     bound = TURN count (≤8)     │  ✓ count, ✗ time
+  └──────────────────┬──────────────────────────┘
+       ┌─────────────▼───────────────────────────┐
+       │ FallbackProvider  bound = list LENGTH    │  ✓ count, ✗ time
+       └─────────────┬───────────────────────────┘   advances only on THROW
+             ┌───────▼─────────────────────────────┐
+             │ GemmaProvider   bound = parse RETRIES │  ✓ count, ✗ time
+             └───────┬─────────────────────────────┘
+                   ┌─▼─────────────────────────────────┐
+                   │ fetch()   bound = NONE             │  ✗ count, ✗ time  ← the hole
+                   └────────────────────────────────────┘
 ```
 
-**Seam — the load-bearing gap.** Two layers give up on a *count* (turns) or an
-*event* (a thrown error). Nobody gives up on the *clock*. The seam where a deadline
-should live — wrapping `fetch` in the adapter — is empty. That's the finding.
+Every layer bounds *count* — turns, list length, parse attempts. **Not one bounds time.** That's the finding in one diagram: the system can't run forever in turns, but it can hang forever on a single turn.
+
+**The seam that matters: the `fetch` boundary** (`gemma-provider.ts:201`). Failure classification flips here — above it, a thrown error is classified (retryable? advance the chain) and a hang is *not even visible*; at the wire, a hang produces no event at all.
 
 ## How it works
 
-### Move 1 — the mental model: a deadline is a budget you spend, not a property of the call
+### Move 1 — the mental model
 
-You already know this shape from the frontend: a `fetch()` with a loading state
-that you cancel if the user navigates away. A deadline is the same idea, but the
-trigger is the *clock* instead of the *user*. You start a timer; if the response
-doesn't arrive before the timer fires, you abort and treat it as a failure.
+You know this from the browser: a bare `fetch()` with no `AbortController` will spin forever if the server holds the socket open. You've hit the loading spinner that never resolves. Same primitive here — the fix is the same too: attach a deadline, and on expiry, abort and throw.
 
 ```
-  The deadline kernel — a race between the response and a timer
+  The deadline kernel — race the work against a clock
 
-      start ─────────────────────────────────────────────► deadline (e.g. 30s)
-        │                                                       │
-        ├─ fetch() in flight ──────────────► response ✓         │  (wins: use it)
-        │                                                       │
-        └─ fetch() in flight ─────────────────────────────────►✗  (timer wins:
-                                                                    abort, throw,
-                                                                    classify as failure)
-        whichever finishes first wins; the timer guarantees one of them always does
+         start request ────────────────►  response (the good path)
+              │
+              ├──── timer (e.g. 30s) ────►  fires first → ABORT → throw TimeoutError
+              │
+         whichever resolves first wins; the loser is cancelled
 ```
 
-That guarantee — *one of them always finishes* — is the whole point. Without the
-timer, the top branch (response) is the *only* way the race ends, and if the daemon
-hangs, it never does.
+The kernel of a timeout: **a clock racing the work, with a cancel on the loser.** Drop the cancel and you have a "timeout" that reports failure but leaves the request running — a leak. Drop the clock and you have what the repo has now: wait forever.
 
 ### Move 2 — walking the mechanism
 
-**The retry budget that DOES exist: maxTurns.** The agent loop will not run
-forever. It caps iterations and forces a final synthesis turn on the last one:
+**Part 1 — the failover chain, and the trap inside it.** The chain (`FallbackModelProvider`) tries providers in order, records each failure, and on exhaustion throws a `ProviderFallbackError` carrying every attempt. Here's the real loop:
 
-```ts
-// packages/runtime/src/run-agent-loop.ts:98-109
-for (let turn = 0; turn < maxTurns; turn += 1) {       // ← hard iteration budget
-  signal?.throwIfAborted();                            // ← cooperative cancellation point
-  const budgetSpent = maxToolCalls !== undefined && toolCalls.length >= maxToolCalls;
-  const forceFinal = turn === maxTurns - 1 || budgetSpent;  // ← last turn: no more tools
-  const response = await model.complete({
-    system: forceFinal && synthesisInstruction ? `${system}\n\n${synthesisInstruction}` : system,
-    messages,
-    tools: forceFinal ? undefined : toolSchemas,
-    maxTokens,
-    signal,                                            // ← cancellation flows down
-  });
-```
-
-This is a *count-based* budget — it stops the loop from spinning forever on a model
-that keeps asking for tools. But it does **not** bound how long any single
-`model.complete()` takes. One hung call inside one turn hangs the whole loop. The
-budget protects against a fast-but-endless conversation, not a single slow call.
-
-**Cross-provider retry: the fallback chain.** This is real, working retry logic —
-across *providers*, not across *attempts to the same provider*:
-
-```ts
-// packages/providers/fallback/src/fallback-provider.ts:64-88
-} catch (error) {
-  if (isAbortError(error) || request.signal?.aborted) throw error;  // ← don't retry a cancel
-  const attempt = { providerId: provider.id, model: provider.defaultModel,
-                    error: error instanceof Error ? error.message : String(error) };
-  attempts.push(attempt);                              // ← record WHY each one failed
-  if (!this.shouldFallback(error, provider)) {
-    throw error;                                       // ← failure CLASSIFICATION hook
-  }
-  if (index < this.providers.length - 1) {
-    this.trace?.emit({ type: 'warning', ... });        // ← observable: a fallback happened
+```typescript
+// packages/providers/fallback/src/fallback-provider.ts:50-86
+for (let index = 0; index < this.providers.length; index += 1) {
+  const provider = this.providers[index];
+  request.signal?.throwIfAborted();               // honors a caller-supplied abort
+  try {
+    const response = await provider.complete(request);   // ← if this HANGS, we hang here
+    this.lastSelectedProvider = { providerId: provider.id, model: ... };
+    return { ...response, model: ... };           // success → return, don't try the rest
+  } catch (error) {                               // ← the chain ONLY advances on a THROW
+    if (isAbortError(error) || request.signal?.aborted) throw error;
+    attempts.push({ providerId: provider.id, error: ... });   // record the failure
+    if (!this.shouldFallback(error, provider)) throw error;    // terminal error → stop
+    // else: emit a warning and loop to the next provider
   }
 }
-// ...all providers exhausted:
-throw new ProviderFallbackError(attempts);             // ← terminal: carries every attempt
+throw new ProviderFallbackError(attempts);        // all failed → aggregate error
 ```
 
-Three things here are textbook-correct. **(1)** Abort errors are re-thrown, not
-retried — you never retry a cancellation, because the caller asked you to stop.
-**(2)** `shouldFallback` is a *failure-classification* hook: it lets the caller say
-"a 400 is my bug, don't try the next provider; a 503 is theirs, do." **(3)**
-`ProviderFallbackError` carries *every* attempt's reason, so the failure is
-debuggable. This is the repo's one genuine failure-handling-across-services pattern,
-and it's well-built.
+The load-bearing line is `await provider.complete(request)`. **The chain advances on a thrown error and on nothing else.** A provider that's *slow* — not failing, just wedged — never throws, so the `await` never resolves, and the chain never reaches the next provider. Your fallback exists precisely to survive a bad provider, and the one failure mode it can't survive is the most common real-world one: a hang. That's the surprising, load-bearing fact about this seam.
 
-**The gap, stated precisely.** The fallback loop only advances *on a thrown error*.
-A provider that hangs never throws. So:
+There's one escape hatch, and it's caller-controlled: `request.signal?.throwIfAborted()` and the `isAbortError` check. If the *caller* passes an `AbortSignal` and trips it, the chain bails. But nothing in the chain *creates* a deadline — it only honors one handed in.
+
+**Part 2 — the transport, where the deadline is missing.** Down at the wire:
+
+```typescript
+// packages/providers/gemma/src/gemma-provider.ts:201-215
+function defaultHttpTransport(host: string): GemmaChatTransport {
+  const base = host.replace(/\/$/, '');
+  return async ({ signal, ...payload }) => {
+    const res = await fetch(`${base}/api/chat`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+      ...(signal ? { signal } : {}),          // ← timeout ONLY if caller passed a signal
+    });
+    if (!res.ok) {
+      throw new Error(`ollama HTTP ${res.status}: ${await res.text()}`);  // a 500 DOES throw
+    }
+    return (await res.json()) as OllamaChatResponse;
+  };
+}
+```
+
+Read the `fetch` options: `method`, `headers`, `body`, and `signal` *only if the caller supplied one*. There is no `AbortController` created here, no `setTimeout` arming one. A non-OK HTTP status throws (good — that propagates to the chain, which advances). But a daemon that accepts the POST and never answers produces no status and no throw. The `await fetch(...)` sits forever.
+
+**Part 3 — failure classification (the part the repo does have).** Not every failure should be retried. The chain distinguishes via `shouldFallback(error, provider)` — a terminal error (e.g. the context-window guard's `ContextWindowExceededError` from `context-window-guard.ts:34`) re-throws immediately instead of advancing, because trying the same oversized prompt on the next provider is pointless. That's real failure classification: *retryable* (advance) vs *terminal* (stop). The missing half is *timeout* as a third class.
 
 ```
-  Layers-and-hops — how a hang defeats the fallback chain
+  Failure taxonomy — what the chain does with each class
 
-  ┌─ FallbackModelProvider ─┐  hop 1: try provider A     ┌─ GemmaProvider A ─┐
-  │  for each provider:     │ ─────────────────────────► │  fetch(:11434)    │
-  │    try complete()       │                            │   ...hangs...     │ ← Ollama wedged
-  │    catch → next         │  hop 2: error? NEVER ARRIVES│                   │
-  │                         │ ◄ - - - - - - - - - - - - - │  (no timeout to   │
-  │  ★ loop is BLOCKED on   │                            │   force a throw)  │
-  │    hop 1 forever ★      │                            └───────────────────┘
-  └─────────────────────────┘
-       provider B (the cloud fallback) is never tried — the chain can't reach it
+  error thrown by provider.complete()
+        │
+        ├─ AbortError / signal aborted   → re-throw (caller cancelled)     ✓ handled
+        ├─ shouldFallback() == false      → re-throw (terminal, e.g. too big) ✓ handled
+        ├─ shouldFallback() == true       → record + advance to next         ✓ handled
+        └─ NO ERROR, just slow            → ∞ hang, no class, no event       ✗ THE GAP
 ```
 
-If provider A is `GemmaModelProvider` against a wedged Ollama, and provider B is a
-cloud Anthropic provider, the *entire point* of the fallback — survive the local
-daemon being down — is defeated by the daemon being *slow* instead of *down*. Down
-throws (`ECONNREFUSED` → caught → B tried). Slow hangs (→ never caught → B never
-tried). A timeout collapses both into "down."
+**Part 4 — what's `not yet exercised`, and where it would attach.**
+
+- **Backoff + jitter** — `not yet exercised`. There is no retry *loop* on the network call to back off; the chain tries each provider exactly once. Backoff/jitter attach the day you add "retry the *same* provider N times before advancing" — and the moment you do, you need jitter so that if many callers hit a recovering daemon at once they don't synchronize into a thundering herd.
+- **Circuit breaker** — `not yet exercised`. The chain *records* attempts (`attempts.push`) but never *trips*: provider #1 can fail on every single call and the chain keeps trying it first, paying the full failure latency each time. A breaker would, after K consecutive failures, skip provider #1 for a cooldown window. Attach point: a per-provider failure counter on `FallbackModelProvider`.
+- **Deadline propagation** — `not yet exercised`. Even with a per-call timeout, the *right* design passes a single deadline down the whole stack (loop budget → split across providers) so the total time is bounded, not just each hop. Attach point: thread a `deadline` through `ModelRequest`.
 
 ### Move 2.5 — current state vs the fix
 
+This concept is built-but-incomplete, so here's the Phase A / Phase B.
+
 ```
-  Phase A: today                          Phase B: with a per-call deadline
-  ──────────────────────────              ──────────────────────────────────
-  fetch(url, { signal })                  const ac = new AbortController()
-    signal = caller's cancel only         const t = setTimeout(() => ac.abort(), 30_000)
-                                          fetch(url, { signal: anySignal(signal, ac.signal) })
-  hang → blocks forever                     .finally(() => clearTimeout(t))
-  down  → throws (caught)
-                                          hang → ac fires at 30s → throws (caught) ✓
-  fallback works for DOWN only            down → throws (caught) ✓
-                                          fallback works for BOTH ✓
+  Phase A (now)                          Phase B (the fix)
+  ─────────────────────────────────────  ────────────────────────────────────
+  fetch(url, { ...maybe signal })         const ac = new AbortController();
+  no timer                                const t = setTimeout(() => ac.abort(),
+  caller MAY pass a signal                              TIMEOUT_MS);
+                                          fetch(url, { signal: ac.signal })
+  wedged daemon → ∞ hang                    .finally(() => clearTimeout(t));
+                                          wedged daemon → abort → throw at TIMEOUT_MS
+                                          → chain catches → advances to next provider
 ```
 
-What *doesn't* change: the fallback loop, the turn budget, the trace, the
-`shouldFallback` classifier — all of them already react correctly to a thrown
-error. The fix is one `AbortController` + `setTimeout` per transport call
-(`gemma-provider.ts:201-215`, `ollama-embedding-provider.ts:60-75`), feeding the
-existing `signal` plumbing. The architecture is ready; the deadline is the missing
-piece. (Note: `AbortSignal.timeout(ms)` does exactly this in one call on modern
-Node.)
+What *doesn't* change: the chain's catch logic already handles a thrown abort correctly (`isAbortError` re-throws a caller abort, but a *self*-armed timeout would be classified as retryable and advance). The fix is local — arm a clock in `defaultHttpTransport` — and the rest of the machinery is already shaped to receive it. That's the good news: the gap is a missing line, not a missing design.
 
 ### Move 3 — the principle
 
-In a distributed system, *the absence of a response is not the absence of work* —
-the far side might be grinding away, or dead, and you cannot tell. A timeout is how
-you make a decision under that uncertainty: "I've waited my budget; I'll treat this
-as failed and act." Retries only help *after* you've decided something failed, and
-you can only decide that if a timeout (or an error) gave you the signal. Timeout
-first, then classify, then retry — in that order, every time.
+A timeout is not an error-handling nicety — it's how you make partial failure *observable*. Without a deadline, "slow" and "dead" are indistinguishable, and "indistinguishable from dead" means "hangs forever." Every remote call gets a deadline; the only question is what value and whether it's propagated. The repo bounds count everywhere and time nowhere, which is exactly backwards for the failure mode that actually occurs.
 
 ## Primary diagram
 
-The complete picture: the three budgets that exist, the one that's missing, and
-where retry happens.
+The full call stack with every bound labelled and the gap marked.
 
 ```
-  Partial-failure handling in aptkit — what bounds what
+  One model request — bounds at every layer
 
-  ┌─ runAgentLoop ─────────────────────────────────────────────────────┐
-  │  BUDGET 1: maxTurns ........... bounds # of model round-trips    ✓   │
-  │  BUDGET 2: maxToolCalls ....... bounds # of tool executions     ✓   │
-  │  cancellation: signal.throwIfAborted() at each turn             ✓   │
-  └───────────────────────────────┬─────────────────────────────────────┘
-                                  │ complete()
-  ┌─ FallbackModelProvider ───────▼─────────────────────────────────────┐
-  │  RETRY: try providers in order; record each FallbackAttempt     ✓   │
-  │  CLASSIFY: shouldFallback(error) — retryable vs terminal        ✓   │
-  │  CANCEL-SAFE: re-throw AbortError, never retry it               ✓   │
-  └───────────────────────────────┬─────────────────────────────────────┘
-                                  │ complete() → fetch()
-  ┌─ GemmaModelProvider / fetch ──▼─────────────────────────────────────┐
-  │  DEADLINE: per-call wall-clock timeout ............ ✗ MISSING        │
-  │  → a hang here blocks every budget above it, defeats the fallback   │
-  └─────────────────────────────────────────────────────────────────────┘
+  ┌─ runAgentLoop ──────────────────────────────────────────────┐
+  │  for turn in 0..maxTurns(8):  ─ bound: COUNT ✓  TIME ✗        │
+  └───────────────────────────┬──────────────────────────────────┘
+                              │ ModelProvider.complete()
+  ┌─ FallbackModelProvider ───▼──────────────────────────────────┐
+  │  for provider in [p0, p1, …]:   ─ bound: LIST LENGTH ✓        │
+  │    try p.complete()  ── success → return                      │
+  │    catch  ── retryable → record + next ;  terminal → throw    │
+  │           ── (no throw on HANG → stuck on this await) ✗       │
+  └───────────────────────────┬──────────────────────────────────┘
+                              │ GemmaProvider.complete()
+  ┌─ GemmaProvider ───────────▼──────────────────────────────────┐
+  │  for attempt in 0..maxAttempts:  ─ bound: PARSE RETRIES ✓     │
+  │    fetch(/api/chat, { signal? })  ── NO TIMER ARMED ✗         │
+  └───────────────────────────┬──────────────────────────────────┘
+                              │ HTTP POST  (no deadline)
+  ┌─ Ollama daemon :11434 ────▼──────────────────────────────────┐
+  │  down → throws (refused) ✓ | wedged → silence → ∞ hang ✗      │
+  └───────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The "retryable vs terminal" distinction the `shouldFallback` hook exposes is the
-single most underrated idea in failure handling. Most retry bugs are *retrying the
-wrong thing* — hammering a server with a request it will reject every time (a 400),
-or retrying a non-idempotent write and double-applying it. The classifier is where
-you encode "this error means try again" vs "this error means stop." aptkit gives you
-the hook but defaults to `() => true` (retry everything), which is the right default
-for *read-only* model calls but would be dangerous if `complete()` had side effects.
+The deadline idea is old and load-bearing: it shows up in every serious RPC framework (gRPC deadlines, the `context.Context` deadline in Go, `AbortSignal.timeout()` in modern fetch). The deepest version is *deadline propagation* — a single budget set at the edge and subtracted as it flows down, so a request that's already spent 28 of its 30 seconds doesn't start a fresh 30-second retry three layers deep. aptkit hasn't needed that yet because the call stack is shallow and single-purpose, but the moment it adds retries, the absence of propagation becomes the next bug.
 
-Backoff and jitter — waiting longer between retries, with randomness so a fleet of
-clients doesn't retry in lockstep and create a thundering herd — are `not yet
-exercised`: the fallback chain tries the next provider *immediately*, with no delay.
-That's correct here because it's trying a *different* provider, not re-hitting the
-same one. Backoff matters when you retry the *same* endpoint; it would attach if you
-added per-provider retry-the-same-one logic.
+The circuit breaker (Nygard, *Release It!*) is the natural follow-on: timeouts stop one call from hanging; a breaker stops you from *paying the timeout* over and over on a node you already know is down. The chain's `attempts` array is the data a breaker would consume — it's recording the signal already, it just doesn't act on it.
 
 ## Interview defense
 
-**Q: "Walk me through how this handles the model provider being down."**
-"Down and slow are different failures and the code handles them differently —
-that's the interesting part. If Ollama is *down*, the `fetch` throws
-`ECONNREFUSED`, the `FallbackModelProvider` catches it, records a `FallbackAttempt`
-with the reason, and tries the next provider. That path is solid. If Ollama is
-*slow* — daemon wedged, model still loading — the `fetch` has no timeout
-(`gemma-provider.ts:201`), so it hangs, never throws, and the fallback loop is stuck
-on it forever. The fix is a per-call deadline via `AbortController` + `setTimeout`,
-which turns 'slow' into 'threw' so the existing fallback logic can react. The
-architecture's ready; it's a one-function change in the transport."
+**Q: "Your fallback chain has three providers. Provider one hangs. What happens?"**
+The honest answer, with the file open: "It hangs the whole call. The chain advances only on a thrown error — `await provider.complete()` at `fallback-provider.ts:55` — and a hung provider never throws. The `fetch` underneath (`gemma-provider.ts:201`) has no timeout of its own; it only honors a caller-supplied `AbortSignal`. So the slow provider defeats the chain whose entire job is to survive a bad provider. The fix is an `AbortController` armed with `setTimeout` in the transport; the chain's catch already treats an abort as advance-able."
 
 ```
-  sketch while answering
+  the trap, sketched
 
-  DOWN:  fetch → ECONNREFUSED → catch → try next provider   ✓ works today
-  SLOW:  fetch → (hang) → never caught → stuck               ✗ needs a deadline
-                          └─ add: AbortSignal.timeout(30_000) → turns into DOWN
+  chain:  try p0 ──await──► ∞   ✗ never advances to p1, p2
+                  (p0 hangs, doesn't throw)
+  fix:    arm timer → abort → throw → catch → try p1
 ```
 
-**Q: "When do you NOT retry?"** — The load-bearing answer people forget:
-"Three cases. (1) The caller cancelled — `isAbortError` is re-thrown, never retried.
-(2) The error is *terminal* — a 400/422 means the request is wrong; retrying just
-burns quota. That's what `shouldFallback` classifies. (3) The operation isn't
-idempotent and the first attempt might have partially applied — retrying could
-double-apply. aptkit's model calls are read-only so that last one doesn't bite, but
-it's why you classify before you retry."
+Anchor: *the chain advances on a throw, so a hang — not a crash — is the failure it can't survive.*
 
-*Anchor:* `maxTurns` bounds the loop, `shouldFallback` classifies, and the missing
-per-call timeout is the one gap that defeats the fallback.
+**Q: "Difference between bounding turns and bounding time?"**
+`maxTurns=8` stops an infinite agent loop — a *logical* runaway. A timeout stops a single hop that won't return — a *temporal* runaway. They're orthogonal: you can have 8 turns that each hang forever. The repo bounds the first and not the second.
+
+Anchor: *count-bounds stop loops; time-bounds stop hangs; you need both.*
 
 ## See also
 
-- `03-idempotency-deduplication-and-delivery-semantics.md` — why retry-safety needs idempotency
-- `09-distributed-systems-red-flags-audit.md` — the timeout gap is finding #1
-- **study-networking** — socket-level timeouts vs application deadlines
-- **study-runtime-systems** — `AbortSignal`, cooperative cancellation, the event loop
-```
+- `01-distributed-system-map.md` — seam 1 in the full map
+- `03-idempotency-deduplication-and-delivery-semantics.md` — why a retry is only safe if the operation is idempotent
+- `09-distributed-systems-red-flags-audit.md` — this is finding #1
+- `study-networking` — socket-level timeouts, `keep-alive`, and what `fetch` does under the hood
+- `study-runtime-systems` — `AbortController`, the event loop, and cancellation

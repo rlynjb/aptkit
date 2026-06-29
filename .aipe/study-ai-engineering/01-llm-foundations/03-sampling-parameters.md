@@ -1,221 +1,144 @@
-# Sampling parameters — the knobs on the next-token guess
+# Sampling parameters
 
-**Subtitle:** temperature / top-p / top-k · shaping the output distribution · *Industry standard*
+Sampling parameters · temperature/top-p/top-k (Industry standard)
+
+The model outputs a probability distribution over the next token, every step. Sampling parameters decide how you pick from that distribution. Temperature flattens or sharpens it; top-p and top-k clip the tail before you draw. aptkit exposes `temperature` and threads it through; it leaves top-p and top-k at provider defaults. For analytics that's the right call — you want the same answer twice.
 
 ## Zoom out, then zoom in
 
-Before you tune anything, see where the "knobs" live: they ride along with the
-request, get passed to the model, and do nothing in your code at all.
+The knobs live on the request, set by capabilities, honored by the model.
 
 ```
-  Zoom out — where sampling knobs travel
-
-  ┌─ Capability ────────────────────────────────────────────────┐
-  │  classifyIntent / rubric judge — wants ONE deterministic ans │
-  └───────────────────────────┬─────────────────────────────────┘
-                              │ ModelRequest { temperature? }
-  ┌─ Runtime contract ────────▼─────────────────────────────────┐
-  │  complete(request) — carries temperature through untouched  │
-  └───────────────────────────┬─────────────────────────────────┘
-                              │ HTTP / SDK
-  ┌─ The model ───────────────▼─────────────────────────────────┐
-  │  ★ sampler ★  reshapes the next-token probability cloud     │
-  └──────────────────────────────────────────────────────────────┘
+aptkit — where sampling is decided
+┌─────────────────────────────────────────────┐
+│ Capability (analytics / RAG)                  │  wants determinism
+├─────────────────────────────────────────────┤
+│ ★ ModelRequest.temperature, maxTokens         │  ← you are here
+├─────────────────────────────────────────────┤
+│ Adapter → vendor API (top_p/top_k = defaults) │  unset, pass-through
+├─────────────────────────────────────────────┤
+│ Model — samples next token from distribution  │
+└─────────────────────────────────────────────┘
 ```
 
-Every time the model picks the next token, it actually produces a *probability
-distribution* over the whole vocabulary — thousands of candidate tokens, each
-with a likelihood. Sampling parameters decide how that cloud gets collapsed into
-one choice. `temperature` flattens or sharpens the cloud; `top-p`/`top-k` chop
-off the unlikely tail before picking. Low temperature → it almost always grabs
-the single most-likely token (near-deterministic). High temperature → it gambles
-on rarer tokens (creative, sometimes wrong).
+The pattern is "tune randomness at the call site." The question: *how much should the model improvise?* For a UI dropdown you don't want random options; for a brainstorm you do. aptkit's analytics agents are the dropdown — they want `temperature: 0`, the most boring, most repeatable pick. Like a `.sort()` with a stable comparator: same input, same order, every time.
 
 ## Structure pass
 
-**Layers.** Capability (decides it needs determinism) → request field
-(`temperature`) → provider adapter (passes it down or ignores it) → sampler
-(inside the model).
+The capability sets the knob, the request carries it, the model samples. Trace the **control** axis — who decides how random the output is.
 
-**Axis — determinism.** Trace how repeatable the output is. The capability wants
-high repeatability for classifiers; it expresses that as a low/zero temperature
-*intent*; the adapter forwards `temperature` only if set; the sampler honors it.
-In aptkit, most call sites **don't set temperature at all** — determinism comes
-from the *task being narrow* plus *fixture replay in tests*, not a hard lock.
+```
+CONTROL axis — who sets randomness?
+Layer                    sets temperature?   sets top_p/top_k?
+──────────────────────────────────────────────────────────────
+Capability               yes (per task)      no
+ModelRequest             carries it          carries nothing ←★ seam
+Adapter / vendor          forwards it         uses vendor DEFAULT
+Model                    samples accordingly
+```
 
-**Seam.** The flip is at the request boundary: above it, "I want one stable
-answer" is a design decision; below it, it's a float the sampler obeys. aptkit
-leaves that float mostly unset and leans on the task shape instead — an honest
-gap, not a feature.
+The seam is `ModelRequest`. Temperature flows through it end to end; top-p/top-k fall off here because aptkit's request type doesn't carry them. So control over the tail-clipping knobs is *not* in your hands — it's whatever the vendor defaults to. That's the honest gap and the exercise target.
 
 ## How it works
 
-### Move 1 — the mental model
-
-Think of `Math.random()` versus a fixed seed. With no constraint, repeated calls
-wander. Sampling is the model's `random()`, and `temperature` is how wide it's
-allowed to wander. Temperature 0 is "always take the top choice" — as close to a
-pure function as the model gets.
+**Mental model.** Picture the next-token distribution as a bar chart of probabilities. Temperature reshapes the bars; top-k keeps the tallest k bars; top-p keeps the smallest set of bars whose probabilities sum to p. Then you sample from what's left.
 
 ```
-  Temperature reshaping the next-token cloud
-
-  low temp (≈0)                 high temp (≈1.0)
-  ┌───────────────┐             ┌───────────────┐
-  │ ▓▓▓▓▓▓▓ "It"  │ ◄ peaked    │ ▓▓▓ "It"      │ ◄ flat
-  │ ▓ "Honestly"  │   pick top  │ ▓▓ "Honestly" │   pick anything-ish
-  │ . "Frankly"   │   always    │ ▓▓ "Frankly"  │
-  └───────────────┘             └───────────────┘
-  repeatable, "boring"          varied, "creative", riskier
+Next-token distribution, "The sky is ___"
+  P │ blue ████████  (0.6)
+    │ grey ███       (0.2)
+    │ clear ██       (0.1)
+    │ falling █      (0.05)  ...long tail
+    └──────────────────────────
+  temperature ↓0  → always "blue" (argmax, deterministic)
+  temperature ↑1  → bars flatten, tail gets a real shot (creative/risky)
+  top_k = 2        → only {blue, grey} survive, sample among them
+  top_p = 0.8      → smallest set summing to 0.8 = {blue, grey}, sample among them
 ```
 
-### Move 2 — the moving parts
-
-**The knob is just an optional field.** aptkit models temperature as one optional
-number on the request. From `packages/runtime/src/model-provider.ts:39`:
+**Temperature is the one knob aptkit actually drives.** It's a plain field on the request, set by whatever capability builds the call.
 
 ```ts
-export type ModelRequest = {
-  system?: string;
-  messages: ModelMessage[];
-  tools?: ModelTool[];
-  maxTokens?: number;
-  temperature?: number;   // ← optional. unset means "provider default", NOT zero
-  signal?: AbortSignal;
-};
+// packages/runtime/src/model-provider.ts:39-46  (ModelRequest)
+maxTokens?:   number;     // output length cap (cost + window)
+temperature?: number;     // 0 = deterministic argmax ... 1 = flat/creative
+// note: no top_p, no top_k here — that's the gap
 ```
 
-```
-  temperature?  →  set: sampler obeys it
-                →  unset: provider's own default (often ~0.7–1.0)
-```
+`temperature: 0` means "always take the tallest bar" — argmax, no dice roll. That's what you want behind a typed JSON contract: re-running the same analytics prompt should give the same JSON. (Caveat worth saying out loud: temp 0 is *near*-deterministic, not a cryptographic guarantee — floating-point ties and batching can still wobble. Close enough for analytics.)
 
-The trap: `temperature?` being optional means "I didn't say" — and "I didn't say"
-is *not* the same as deterministic. The Anthropic adapter, for instance, only
-sends temperature when it's defined (`anthropic-provider.ts:36`).
-
-**The classifier wants one word, not low temperature.** The clearest "I need
-determinism" site in the repo is intent classification — and notice how it gets
-there. From `packages/agents/query/src/intent.ts:12`:
-
-```ts
-const response = await model.complete({
-  system: 'Classify the user query as exactly one word: monitoring …',  // ← narrow task
-  messages: [{ role: 'user', content: query }],
-  maxTokens: 16,                                                         // ← can't ramble
-  signal: options.signal,
-});                                                                      // ← NO temperature set
-return parseIntent(text);                                               // ← forgiving parser anyway
-```
+**maxTokens is the other half of the budget knob.** It caps output length, which is both a cost lever (see `06-token-economics.md`) and a window lever (see `02-tokenization.md` — the guard reserves 768 for output).
 
 ```
-  How aptkit gets near-deterministic WITHOUT a temp lock
-
-  narrow task ─┐
-  maxTokens:16 ─┼─► output space so small that sampling barely matters
-  forgiving    ─┘   + parseIntent() collapses fuzz to one of 3 labels
-  parser
+temperature  → SHAPE of output  (how surprising)
+maxTokens    → AMOUNT of output (how long, hard ceiling)
+              both ride on the same ModelRequest
 ```
 
-Determinism here is *engineered into the task*: a one-word answer cap of 16
-tokens, plus `parseIntent` keyword-matching the result down to one of three
-labels. Even a slightly varied phrasing lands on the same intent. That's robust,
-but it is **not** a temperature lock — and aptkit does not set one.
+**Where top-p/top-k went.** They didn't. aptkit forwards `temperature`, and the adapter passes it to `client.messages.create` (Anthropic) or `chat.completions` (OpenAI), but never sets `top_p`/`top_k`. So those use the vendor's default sampling. For deterministic structured output, temperature 0 dominates anyway — once you're taking argmax, tail-clipping is moot. The gap only bites when you *want* controlled creativity (temp > 0 but bounded tail), which aptkit's analytics surfaces don't ask for. Top-p/top-k pass-through is **not yet exercised**.
 
-**The structured/judge path threads temperature but doesn't force it.**
-`generateStructured` and the rubric judge accept `temperature` and pass it
-through (`structured-generation.ts:72`, `rubric-judge.ts:77`), but it defaults to
-`undefined`. So even the JSON-grading paths rely on task narrowness + retry +
-fixture replay, not a hard determinism setting. `not yet exercised`: explicit
-temperature tuning across call sites.
-
-### Move 3 — the principle
-
-You get reliable output two ways: clamp the *sampler* (temperature 0) or clamp the
-*task* (tiny output space + a forgiving parser). aptkit chose the second. It's
-cheaper to reason about and survives a provider that ignores temperature, but be
-honest in interviews — the determinism is a property of the task and the tests,
-not a config value.
+**The principle.** Match randomness to the task, and default to the most boring setting that works. Determinism is a feature, not a limitation, for anything feeding a typed contract or a cache. You add entropy on purpose, where a human wants variety — never by accident.
 
 ## Primary diagram
 
-```
-  Two routes to a stable answer
+The full path: capability picks a temperature, request carries it, model samples, top-p/top-k ride the vendor default.
 
-  Route A — clamp the sampler          Route B — clamp the task (aptkit)
-  ┌─────────────────────┐              ┌──────────────────────────┐
-  │ temperature: 0      │              │ tiny prompt, maxTokens:16 │
-  │ sampler always tops │              │ + parseIntent() squeeze  │
-  └─────────┬───────────┘              └────────────┬─────────────┘
-            ▼                                       ▼
-   deterministic by config             deterministic by design + fixtures
-   (aptkit: mostly UNSET)              (aptkit: this is what's real)
 ```
+Sampling, end to end
+  Capability: "analytics → temperature: 0"
+        │
+        ▼
+  ModelRequest { temperature: 0, maxTokens: N }   ← top_p/top_k absent
+        │
+        ▼  complete()
+  Adapter → vendor API (forwards temp; top_p/top_k = vendor default)
+        │
+        ▼
+  Model: distribution ── temp 0 ──▶ argmax ──▶ same token every run
+                          (no tail-clip control reaches here from aptkit)
+```
+
+The dashed absence of top-p/top-k is the whole gap: aptkit controls *how flat*, never *how clipped*.
 
 ## Elaborate
 
-Temperature scales the logits before softmax; top-k keeps only the k highest-
-probability tokens; top-p (nucleus) keeps the smallest set whose cumulative
-probability exceeds p. Production classifiers and JSON generators almost always
-run at temperature 0 in the wild. aptkit's choice to lean on task shape + fixture
-replay is pragmatic for a local-first, fixture-tested repo, but a real gap if you
-ship to a vendor that defaults hot. Read `04-structured-outputs.md` next — the
-retry loop there is the safety net that lets aptkit get away with not locking
-temperature.
+These knobs come straight from the decoder's sampling step. Temperature divides the logits before softmax (T→0 sharpens to argmax, T→∞ flattens to uniform). Top-k (Fan et al.) and nucleus/top-p sampling (Holtzman et al.) are tail-truncation strategies that kill the "degenerate long tail" of low-probability garbage. Modern APIs also expose `seed`, `frequency_penalty`, and `presence_penalty` — none wired in aptkit. Read `04-structured-outputs.md` next: temperature 0 is the quiet partner of the validated-JSON retry loop. Then `06-token-economics.md` for how `maxTokens` maps to spend.
 
 ## Project exercises
 
-### Make the classifier explicitly deterministic
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** add `temperature: 0` to the `classifyIntent` request and add
-  a test that runs the same query N times against a fixture provider asserting one
-  stable label.
-- **Why it earns its place:** closes the honest gap — turns "deterministic by luck
-  of task shape" into "deterministic by config," and teaches the difference.
-- **Files to touch:** `packages/agents/query/src/intent.ts`,
-  `packages/agents/query/test/intent.test.ts`.
-- **Done when:** the request carries `temperature:0` and the repeat test passes.
-- **Estimated effort:** `<1hr`
+### Thread top_p and top_k through the request
 
-### Audit every call site for an unset temperature
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a grep-driven note listing each `model.complete` / structured
-  call and whether it sets temperature, then a one-paragraph recommendation.
-- **Why it earns its place:** surfaces the repo-wide reliance on task shape and
-  makes the gap explicit — the kind of audit a staff engineer runs before a vendor
-  swap.
-- **Files to touch:** read across `packages/agents/*/src`, `packages/runtime/src`,
-  `packages/evals/src`; write nothing into code.
-- **Done when:** you can name every deterministic-intent call site and its temp.
-- **Estimated effort:** `<1hr`
+- **Exercise ID:** `EX-LLM-03a`
+- **What to build:** Add optional `topP?` and `topK?` fields to `ModelRequest`, then forward them in the OpenAI and Anthropic adapters (`top_p` / `top_k`), leaving them undefined when unset so vendor defaults still apply.
+- **Why it earns its place:** Phase 1 wants you to own the full sampling surface, not just temperature. You'll learn the adapter discipline — "only send a param when the caller set it" — and why bolting on a knob touches the port type plus every adapter, the cost of a leaky abstraction.
+- **Files to touch:** `packages/runtime/src/model-provider.ts` (39-46, the `ModelRequest` type); `packages/providers/anthropic/src/anthropic-provider.ts` (28-61); `packages/providers/openai/src/openai-provider.ts`.
+- **Done when:** setting `topP: 0.5` on a request reaches the vendor call, leaving it unset sends no `top_p` field, and a unit test pins both behaviors.
+- **Estimated effort:** `1–4hr`
 
 ## Interview defense
 
-**Q: "Does aptkit use temperature 0 for its classifier?"**
-No — and that's the interesting part. It gets near-determinism from a one-word
-task, a 16-token cap, and a forgiving `parseIntent` parser, plus fixture replay in
-tests. There's no temperature lock anywhere in most call sites.
+**Q: Why temperature 0 for the analytics agents?**
 
 ```
-  expected:  temperature:0
-  actual:    maxTokens:16 + narrow prompt + parseIntent() + fixtures
-             (temperature: unset)
+  temp 0  → argmax → same JSON every run → cacheable, testable, contract-safe
+  temp 1  → samples tail → JSON shape might drift → retries, flaky evals
+            └ wrong tool for a typed boundary
 ```
-Anchor: *the determinism is in the task and the tests, not a config float.*
 
-**Q: "When would you reach for low temperature?"**
-Classifiers, structured/JSON output, anything you'll parse or assert on. High
-temperature is for ideation and copy. The rule: if a downstream parser depends on
-it, clamp it.
+Because the output feeds a typed contract and an eval — you need the same input to give the same output. Anchor: *determinism is a feature when a schema is downstream.*
+
+**Q: Does aptkit control top-p and top-k?**
 
 ```
-  parse/assert downstream?  ──► temperature low (clamp the sampler)
-  human reads it for ideas? ──► temperature high (let it wander)
+  ModelRequest:  temperature ✓ ──▶ vendor
+                 top_p / top_k  ✗ ──▶ (vendor default)
+                 └ no field exists to carry them
 ```
-Anchor: *if code reads the output, sample cold.*
+
+No — only temperature and maxTokens are threaded; top-p/top-k fall to vendor defaults because the request type doesn't carry them. With temp 0 that's harmless; for bounded creativity it's the gap. Anchor: *aptkit tunes how flat, not how clipped.*
 
 ## See also
 
-- `04-structured-outputs.md` — the retry net that compensates for hot sampling
-- `07-heuristic-before-llm.md` — `parseIntent`, the forgiving squeeze used here
-- `01-what-an-llm-is.md` — the function these knobs tune
+- [`04-structured-outputs.md`](./04-structured-outputs.md) — temperature 0 as the partner of validated JSON.
+- [`02-tokenization.md`](./02-tokenization.md) — `maxTokens` against the context window.
+- [`06-token-economics.md`](./06-token-economics.md) — `maxTokens` as a cost lever.

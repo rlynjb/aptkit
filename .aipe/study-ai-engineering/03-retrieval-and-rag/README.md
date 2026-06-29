@@ -1,30 +1,27 @@
 # 03 — Retrieval and RAG
 
-> Anchor: LLM application engineering (RAG over a corpus). · Curriculum: Phase 2
-> (no curriculum file in repo; exercises cite real aptkit/buffr paths).
+> Anchor: LLM application engineering (loopd-shaped) — Phase 2A/2B.
+> aptkit retrieves over an indexed document corpus; buffr swaps the durable store.
 
-This is the heart of aptkit. The retrieval pipeline is **built from scratch over
-two contracts** — `EmbeddingProvider` and `VectorStore` — so the vendor (nomic /
-OpenAI / pgvector / in-memory) is incidental. The same two contracts power both
-RAG and episodic memory.
+The from-scratch RAG pipeline, built behind two swappable contracts
+(`EmbeddingProvider`, `VectorStore`, `packages/retrieval/src/contracts.ts`).
+This is the deepest, most defensible sub-section: real index/query paths, a
+real cosine store, a real pgvector drop-in (buffr), and the **signature
+hallucinated-filter bug + fix + the floor that prevents retrieval starvation**.
 
-The signature story lives here: a weak local model passing a hallucinated
-`filter` argument used to wipe every search result. The fix
-(`matchesFilter`, `search-knowledge-base-tool.ts:101`) is the clearest
-"I-built-this-and-hit-a-real-bug" evidence in the repo. Read `04-vector-databases`
-and `11-rag` for the spine, then `04`/`09` for the failure modes.
+## Files
 
-## Files (self-contained per concept)
+- `01-embeddings.md` — text → 768-dim vector; the geometric picture; nomic-embed-text.
+- `02-embedding-model-choice.md` — why nomic, why local, the one-way-door of dimension.
+- `03-chunking-strategies.md` — fixed-size 512-char windows with 64-char overlap; the chunker.
+- `04-vector-databases.md` — InMemoryVectorStore (aptkit) vs PgVectorStore (buffr, pgvector+HNSW).
+- `05-dense-vs-sparse.md` — aptkit is dense-only; sparse is `not yet exercised`.
+- `06-hybrid-retrieval-rrf.md` — `not yet exercised`; the buildable exercise.
+- `07-reranking.md` — `not yet exercised`; gated on measured retrieval quality.
+- `08-query-rewriting-hyde.md` — `not yet exercised`; the exercise.
+- `09-stale-embeddings.md` — aptkit doesn't track staleness; buffr's `embedding_model` column is the slot.
+- `10-incremental-indexing.md` — upsert-by-id is the incremental primitive; full re-index is the fallback.
+- `11-rag.md` — the full pipeline + the `search_knowledge_base` tool, minTopK floor, the hallucinated-filter fix.
+- `12-graphrag.md` — `not yet exercised`; the exercise.
 
-1. `01-embeddings.md` — text → 768-dim vector; cosine as semantic distance
-2. `02-embedding-model-choice.md` — nomic local; the one-way door (re-embed to switch)
-3. `03-chunking-strategies.md` — aptkit's fixed-size 512/64-char chunker; why deterministic
-4. `04-vector-databases.md` — InMemoryVectorStore vs buffr's PgVectorStore; same contract
-5. `05-dense-vs-sparse.md` — aptkit is dense-only; sparse/BM25 `not yet exercised`
-6. `06-hybrid-retrieval-rrf.md` — the pattern; `not yet exercised` (dense-only today)
-7. `07-reranking.md` — two-stage retrieval; `not yet exercised`; the natural next build
-8. `08-query-rewriting-hyde.md` — `not yet exercised`; where it would slot in
-9. `09-stale-embeddings.md` — freshness; buffr's `embedding_model` column; re-embed story
-10. `10-incremental-indexing.md` — buffr's upsert-on-conflict as incremental indexing
-11. `11-rag.md` — the full pipeline; index path + query path; the spine of the repo
-12. `12-graphrag.md` — `not yet exercised`; the pattern and aptkit's flat-corpus reality
+Read `11-rag.md`, `04-vector-databases.md`, and `01-embeddings.md` first.

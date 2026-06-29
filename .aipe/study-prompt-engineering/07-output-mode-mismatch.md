@@ -1,176 +1,237 @@
 # 07 — Output mode mismatch
 
-**Industry name:** output-format contract mismatch — *Project-specific / Language-agnostic*
+**Subtitle:** output-mode mismatch — when one chain's format meets another's
+expectation (Project-specific)
 
 ## Zoom out, then zoom in
 
-This is the bug that ships green and breaks in prod: chain A is tuned to return
-JSON, chain B downstream expects markdown prose, and the parser between them
-explodes on the first real call. Or subtler — an agent declared as "answer in
-plain text" gets a prompt edit that makes it emit a JSON object, and the
-plain-text consumer chokes. **Every chain has exactly one output mode, declared
-in its prompt, and the consumer must agree with that declaration.** When they
-disagree, the seam breaks.
+Every chain declares one output mode — prose or structured. The bug is when
+chain A emits JSON and the consumer of A expects prose, or vice versa, and
+the parser silently breaks. aptkit makes the mode explicit per capability,
+and the tolerant parser is the seam that absorbs the mismatch when a model
+gets it wrong.
 
 ```
-  Zoom out — the three output modes in this repo
+  Zoom out — output mode declared per capability, absorbed at the parse seam
 
-  ┌─ Producers (each declares ONE mode) ──────────────────────┐
-  │  classifyIntent   → MODE: bare text (one word)            │ ← we are here
-  │  query-agent      → MODE: plain prose ("No JSON required")│
-  │  diagnostic-agent → MODE: JSON in a ```json fence         │
-  │  Gemma tool call  → MODE: {"tool":...,"arguments":...}    │
-  └───────────────────────────┬────────────────────────────────┘
-                              │  consumed by ↓
-  ┌─ Consumers (must match the mode) ─▼────────────────────────┐
-  │  parseIntent (string)  ·  parseAgentJson (JSON)  ·          │
-  │  return finalText (prose)  ·  parseToolCall (tool JSON)     │
-  └──────────────────────────────────────────────────────────────┘
+  ┌─ Capability (declares its mode) ────────────────────────────┐
+  │  query agent      → PROSE   ("No JSON shape is required")    │ ← we are here
+  │  intent classifier→ ONE WORD (substring-parsed)              │
+  │  diagnostic/recs  → STRUCTURED (validator-gated JSON)        │
+  └───────────────────────────┬──────────────────────────────────┘
+                              │ output text
+  ┌─ ★ Parse seam ★ ──────────▼───────────────────────────────────┐
+  │  prose → trim & use as-is   |   structured → parseAgentJson    │
+  └────────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: the failure is always at the producer→consumer seam, and the fix is
-always the same — make the prompt's declared mode and the parser's expectation
-the same thing, and spot the divergence in code review.
+Zooming in: output mode is the contract on a chain's *return shape*. Declare
+it once, in the schema or the prompt's Output section, and make sure every
+consumer reads it the same way. The mismatch is a contract violation between
+producer and consumer — exactly the kind of bug that doesn't throw, it just
+produces garbage downstream.
 
-## The structure pass
+## Structure pass
 
-**Layers:** the prompt's output contract (declared mode) → the model's emission →
-the consumer's parser (expected mode).
+**Layers.** Producer capability (emits in its mode) → parse seam (interprets
+the text) → consumer (uses the parsed value).
 
-**Axis — what shape does this layer expect?** When the answer flips across the
-seam without anyone noticing, that's the bug:
+**Axis — does the consumer interpret the output the way the producer emitted
+it?** Trace it:
 
 ```
-  Axis: "what output shape?" — must hold across the seam
+  Axis: "do producer and consumer agree on the output mode?"
 
-  ┌─ Producer (prompt) ─┐   seam    ┌─ Consumer (parser) ─┐
-  │ declares: prose     │ ══╪══════► │ expects: prose      │  ✓ match
-  │ declares: JSON fence│ ══╪══════► │ expects: JSON        │  ✓ match
-  │ declares: prose     │ ══╪══════► │ expects: JSON  ⚠     │  ✗ MISMATCH
-  └─────────────────────┘            └──────────────────────┘
-   the mode must NOT flip across the seam — if it does, parser breaks
+  query agent → prose,  consumer reads prose      → MATCH   ✓
+  intent      → one word, parseIntent substring   → MATCH   ✓
+  diagnostic  → JSON,   consumer JSON.parse        → MATCH   ✓
+  diagnostic  → JSON in fence, naive JSON.parse    → MISMATCH ✗ (fence!)
+                                  └─ parseAgentJson absorbs it
 ```
 
-**Seam:** the parse call right after generation. `parseIntent` (`intent.ts:4`)
-expects a bare word; `parseAgentJson` (`json-output.ts:7`) expects JSON;
-`RagQueryAgent.answer` returns `finalText.trim()` (`rag-query-agent.ts:82`) and
-expects prose. **What breaks if the producer's mode flips:** add "return your
-reasoning as JSON" to the query agent's prompt and `finalText` is now a JSON
-blob handed to a prose consumer — no error, just garbage rendered to the user.
+**Seam.** The parse seam is load-bearing precisely because it's where a
+mismatch surfaces — or gets silently swallowed. A naive parser turns a mode
+mismatch into a crash or a wrong value. A tolerant parser absorbs the common
+mismatches (the courteous fence) but cannot fix a genuine prose-vs-JSON
+disagreement.
 
 ## How it works
 
-### Move 1 — the mental model
+You know the bug where one function returns `{ data }` and the caller
+destructures `{ items }` — no type error if it's `any`, just `undefined`
+flowing downstream. Output-mode mismatch is that, across a model call. Let's
+walk how aptkit declares modes and where mismatches live.
 
-You already enforce this with TypeScript: a function declares its return type and
-the caller relies on it; change the return type without changing the caller and
-the compiler screams. An LLM chain has the same contract *except there's no
-compiler* — the "return type" is a sentence in the prompt and the "caller" is a
-parser, and nothing forces them to agree. You enforce it by convention and by
-review.
+### Step 1 — prose mode, declared explicitly
+
+The query agent declares prose, in words, in its Output section:
+
+```ts
+// packages/prompts/src/query.ts:50
+## Output
+Give a clear, concise answer in plain prose. A few sentences or short
+markdown bullets are fine. ... No JSON shape is required - just the answer text.
+```
+
+The consumer matches: `QueryAgent.answer` returns `finalText.trim()`
+(`query-agent.ts:101`) — it reads the text as-is, no parse. Producer says
+prose, consumer reads prose. Match.
+
+### Step 2 — structured mode, declared in the prompt and enforced by a validator
+
+The recommendation agent declares JSON, precisely:
+
+```ts
+// packages/prompts/src/recommendation.ts:54
+## Output
+Return ONLY a JSON array in a json fenced block of at most 3 objects.
+Each object must have:
+- title: string
+- bloomreachFeature: scenario | segment | campaign | voucher | experiment
+- ...
+```
+
+The consumer matches by running the text through `parseAgentJson` and a
+validator. Producer says JSON (in a fence!), consumer parses tolerantly.
+Match — and note the prompt *asks* for a fenced block, anticipating the
+courteous-fence behavior rather than fighting it.
+
+### Step 3 — the mismatch, and where it bites
+
+Here's the bug in motion. Suppose a prompt edit "to make it more readable"
+adds "explain your reasoning first" to a chain whose consumer does
+`JSON.parse(text)`. Now the model emits a paragraph of prose, *then* the
+JSON. Naive parse:
 
 ```
-  Pattern — output mode as an untyped contract
+  Comparison — naive parse vs tolerant parse on a mode drift
 
-  PROMPT says: "<mode>"  ───(no compiler)───►  PARSER assumes: "<mode>"
-                                              │
-  if these two strings disagree, the failure is silent until runtime
+  model output: "Based on the data, here are the recommendations:
+                 ```json
+                 [ {...} ]
+                 ```"
+
+  naive JSON.parse(output)        → THROWS (prose prefix + fence)   ✗
+  parseAgentJson(output)          → strips fence, finds [...], parses ✓
+    json-output.ts:7 — fence match, then substring scan for [ ... ]
 ```
 
-### Move 2 — walking the modes
+The tolerant parser (`parseAgentJson`) absorbs *this* mismatch — the
+courteous prose-and-fence wrapper — because it strips the fence and scans
+for the outermost array. That's the seam doing its job. But it cannot
+rescue a genuine disagreement: if the consumer wants prose and the producer
+emits JSON, `parseAgentJson` succeeds and hands a JSON value to a consumer
+that wanted a sentence. No error, wrong shape, garbage downstream.
 
-**Mode A — bare text.** The intent classifier's prompt: *"Reply with ONLY the one
-word"* (`intent.ts:19`). Its consumer `parseIntent` (`intent.ts:4`) lowercases
-and substring-matches `monitoring`/`recommendation`/`diagnostic`, defaulting to
-`diagnostic`. The mode is "a short string"; the parser is forgiving of
-surrounding text. **The boundary done right:** the parser tolerates the model
-saying "diagnostic." with a period — it `includes`-matches rather than
-equality-checks.
+### Step 4 — how to spot mismatches in code review
 
-**Mode B — JSON in a fence.** The diagnostic prompt: *"Return ONLY a JSON object
-in a ```json fenced block with this shape"* (`diagnostic.ts:28`). The consumer is
-`parseAgentJson` (`json-output.ts:7`), which strips the fence and parses. Producer
-and consumer agree: one declares the fence, the other strips it. **What breaks if
-they disagree:** if the prompt said "return JSON" without "fence" and the model
-fenced it anyway, a naive `JSON.parse` would fail — which is exactly why
-`parseAgentJson` defends both cases (concept 02).
+The review heuristic, concrete for this repo:
 
-**Mode C — plain prose.** The query agent: *"No JSON shape is required - just the
-answer text"* (`query.ts:48`). Its consumer takes `finalText` directly. There's
-*intentionally* no parser. **The mismatch risk:** this is the most fragile,
-because a prompt edit that nudges the model toward structure has no parser to
-fail loudly — it just degrades the rendered output.
+```
+  Spotting a mode mismatch in review
 
-**Mode D — emulated tool call.** Gemma's `buildSystemText` declares
-*"respond with ONLY a single JSON object: {"tool": ..., "arguments": ...}"*
-(`gemma-provider.ts:157`); `parseToolCall` (`:168`) expects exactly that shape
-and tolerates `tool`/`name`/`tool_name` and `arguments`/`input`/`args` aliases.
-The mode is a *specific* JSON contract, and the parser is built to its
-declaration.
+  1. find the producer's Output section  (prompt: "Return ONLY JSON" / "prose")
+  2. find the consumer's read            (parseAgentJson? or finalText.trim()?)
+  3. do they agree?
+       prose ↔ trim()            → ok
+       JSON  ↔ parseAgentJson    → ok
+       JSON  ↔ trim()            → MISMATCH (JSON leaks as a string)
+       prose ↔ parseAgentJson    → MISMATCH (parse throws or mis-parses)
+```
 
-**How to spot a mismatch in review.** Two things must line up in the same PR:
-the prompt's output sentence (`## Output` section) and the parser at the call
-site. If a diff touches one without the other, that's the smell. The repo's
-defense-in-depth is `parseAgentJson` being tolerant — but tolerance hides
-mismatches, so it's not a substitute for the contract being right.
+The structured chains validate, which makes a mismatch *loud* — the
+validator rejects a prose answer. The prose chains don't validate, which
+makes a mismatch *silent* — a JSON string flows through `trim()` and the UI
+renders raw braces. So the dangerous direction is structured-output leaking
+into a prose consumer: there's no validator to catch it.
 
-### Move 3 — the principle
+### The principle
 
-**An output mode is a contract with no compiler — so the discipline is to keep
-the declaration and the parser in the same line of sight.** The bug is never that
-the model "got it wrong"; it's that two humans changed the prompt and the parser
-independently. Treat a prompt's `## Output` section as the function signature and
-review it against the consumer every time either moves.
+**Every chain has exactly one output mode; the bug is a contract violation
+between producer and consumer, and a tolerant parser absorbs format noise
+but not a genuine mode disagreement.** Declare the mode in the prompt's
+Output section, match it at the consumer, and lean on the validator to make
+structured-mode mismatches loud. The silent direction — structured leaking
+into prose — is the one to hunt for in review.
 
 ## Primary diagram
 
+Producer modes, the parse seam, consumer reads, and where mismatches hide.
+
 ```
-  Output mode mismatch — producer/consumer agreement table
+  Output mode mismatch — aptkit
 
-  PRODUCER (prompt declares)          CONSUMER (parser expects)     match?
-  ─────────────────────────────────   ───────────────────────────   ──────
-  intent: "ONLY one word"             parseIntent (substring)        ✓
-  diagnostic: "JSON in ```json fence" parseAgentJson (fence-strip)   ✓
-  query: "plain prose, no JSON"        finalText (no parse)          ✓
-  gemma: '{"tool":...,"arguments":}'  parseToolCall (shape+aliases)  ✓
-
-  a prompt edit that flips a PRODUCER mode without updating the
-  CONSUMER turns a ✓ into a silent ✗
+  ┌─ Producers (each one mode) ─────────────────────────────────┐
+  │  query agent       → PROSE                                   │
+  │  recommendation    → JSON array in a fence                   │
+  │  intent classifier → ONE WORD                                │
+  └────────────────────────────┬──────────────────────────────────┘
+                              │ output text
+  ┌─ Parse seam ──────────────▼───────────────────────────────────┐
+  │  parseAgentJson: strip fence → parse → scan {}/[]             │
+  │     absorbs: courteous fence, prose-prefix-then-JSON          │
+  │     CANNOT fix: prose-vs-JSON genuine disagreement            │
+  └────────────────────────────┬──────────────────────────────────┘
+                              │
+  ┌─ Consumers ───────────────▼───────────────────────────────────┐
+  │  prose  → finalText.trim()        (no validator → silent miss) │
+  │  JSON   → validator-gated         (mismatch is LOUD)           │
+  └────────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-This is the operational sibling of concept 02 (structured outputs) and concept 07
-of the broader "contracts at the LLM boundary" idea. The reason it deserves its
-own concept: structured-output tooling solves the *enforcement* of a mode, but
-mode *mismatch* is a coordination failure between two parts of your system, which
-no single tool catches. The mitigation in mature codebases is to type the handoff
-(concept 06's typed handoffs) so the consumer's expectation is a real type, not a
-parser convention — this repo does that for the agent handoffs (`{diagnosis}` is
-a validated shape) but the prose modes (query agent) remain convention-only,
-which is the honest fragile spot.
+Output-mode mismatch is a specialization of the structured-output discipline
+(concept 2) applied across a chain boundary. The reason it earns its own
+concept is the *silent* direction: structured-output tooling makes
+JSON-mode failures loud, but nobody validates prose, so a structured value
+leaking into a prose consumer passes every check and corrupts the UI. The
+defense is the same one that makes single-purpose chains safe (concept 6):
+the seam between stages is a typed contract, and the producer's declared mode
+is part of that contract.
+
+The repo's design quietly anticipates the most common real mismatch — the
+courteous fence — by *asking* for a fenced block in the recommendation
+prompt and stripping it in `parseAgentJson`. That's the production move:
+don't fight the model's politeness, parse around it.
 
 ## Interview defense
 
-**Q: A chain that worked starts producing garbage downstream — where do you
-look?** The output-mode seam: did the producer's prompt change its declared
-format (prose ↔ JSON ↔ tool call) without the consuming parser changing to
-match? It ships green because there's no compiler on the prompt's "return type."
+**Q: What's an output-mode mismatch and how do you catch it?**
+
+Each chain declares one output mode — prose or structured. The mismatch is
+when a consumer reads the producer's output in the wrong mode: a `JSON.parse`
+on prose throws, a `trim()` on JSON leaks raw braces downstream. Catch it in
+review by checking the producer's Output section against the consumer's read,
+and make structured outputs loud with a validator. The dangerous case is
+structured leaking into a prose consumer, because there's no validator there.
 
 ```
-  prompt ## Output  ──must equal──  parser expectation
-  flip one in a PR, not the other → silent mismatch
+  JSON producer ↔ prose consumer (trim) → silent garbage  ← hunt this one
+  prose producer ↔ JSON consumer (parse) → loud crash
 ```
-*Anchor: `query.ts:48` (prose) vs `diagnostic.ts:28` (JSON fence) vs
-`parseAgentJson` (`json-output.ts:7`).*
 
-**Q: The part people forget?** The **prose mode has no parser to fail loudly**.
-JSON mismatches at least throw; a prompt that drifts the query agent toward
-structure just renders worse, undetected. The fix is to treat the `## Output`
-section as a signature reviewed against its consumer.
+Anchor: "aptkit declares mode in the prompt — query agent says 'No JSON
+required,' recommendation says 'Return ONLY a JSON array.' `parseAgentJson`
+absorbs the courteous fence but can't fix a real mode disagreement."
+
+**Q: A model that returned clean JSON starts wrapping it in a code fence
+after an upgrade. What breaks and what saves you?**
+
+A naive `JSON.parse` breaks on the backticks. What saves you is a tolerant
+parser that strips the fence before parsing — `parseAgentJson` matches a
+` ```json ` fence, falls back to a substring scan for the outermost braces.
+The deeper save is having declared the mode and tested it, so the regression
+shows up in the eval suite, not in production.
+
+Anchor: "Courteous fence after an upgrade — `parseAgentJson` strips it; the
+eval suite catches the drift."
 
 ## See also
 
-- `02-structured-outputs.md` — enforcing a JSON mode and parsing it tolerantly.
-- `06-single-purpose-chains.md` — typed handoffs make the consumer's expectation a type.
-- `01-anatomy.md` — the `## Output` section is the mode declaration.
+- [02-structured-outputs.md](02-structured-outputs.md) — the tolerant parse
+  and validator this depends on
+- [06-single-purpose-chains.md](06-single-purpose-chains.md) — the typed
+  contract at the stage seam
+- [09-chain-of-thought.md](09-chain-of-thought.md) — putting reasoning in a
+  field so it doesn't pollute the output mode

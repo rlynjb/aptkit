@@ -1,257 +1,262 @@
-# Chapter 02 — The Demo   (1:00–6:00, 5 min)
+# Chapter 2 — The Demo   (1:00–6:00, 5 minutes)
 
 ## Opening hook
 
-This is the chapter that wins or loses the room. You have five minutes, and
-the rule that matters most: **the money shot lands at ~2:30 — inside the first
-third — not at minute five.** A demo that buries its best moment past the
-halfway mark is the most common loss you'll see. You front-load the "oh," then
-spend the rest of the budget earning depth you've already paid for.
+This is the chapter that wins or loses the demo. Five minutes, the
+biggest budget in the slot, and one job: make the room *see the thing
+work* — not hear about it. You already opened on the RAG page running.
+Now you walk it deliberately so the room understands what they just
+saw, then you fire the money shot inside the first third of the whole
+slot, around 3:00.
 
-You have an unusually safe centerpiece. The money shot runs in the browser
-with no backend: a deterministic keyword-hash embedder, an in-memory vector
-store, and recorded model responses (`apps/studio/src/agent-runners.ts`,
-`runRagQueryFixtureReplay`). It cannot hit a flaky network on stage, and it
-produces the same correct, scored result every time. So the choreography is
-simple: get to the score fast, let it sit, then show the room two more beats
-that prove the toolkit is real.
+The money shot here is specific and you should be able to point at it:
+**the eval score reading "Passing / Precision@1 1.00 / Recall@3 1.00"
+sitting directly beside a correct, cited answer.** That side-by-side
+is the "oh" moment. Most demos show an answer and ask you to trust it.
+You show an answer *and a measurement that says it's right*, computed
+live, in the browser. That's the beat the room repeats afterward.
+
+Three real beats, all verified in `apps/studio/src/`:
+
+  1. The RAG Query page — the money shot (1:00–3:30)
+  2. A real agent replay trace — proof the loop is real (3:30–5:00)
+  3. The local `ask` CLI — proof it runs against a real local model
+     (5:00–6:00, the first beat to cut if you're long)
 
 ## The time-budget bar
 
-```
-  ┌──────────────────────────────────────────────────────────┐
-  │ ░░░░░▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ │
-  │ 1:00 ──────────────────── 6:00 ─────────────────────── 10:00 │
-  │     THE DEMO — you own 1:00 to 6:00 (5 min)                 │
-  │     ★ money shot at ~2:30                                   │
-  └──────────────────────────────────────────────────────────┘
-```
+You own five minutes — the centerpiece. The money shot fires by 3:00.
 
-In these five minutes: land the scored cited answer by 2:30 (beat 1), replay a
-real agent trace (beat 2), and — if Ollama is up — show the same stack live in
-the terminal (beat 3).
+```
+  ┌──────────────────────────────────────────────────────┐
+  │ ░░░░░▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░░░░░░░░░░░░░░░░ │
+  │ 1:00 ──────────── 3:00 ★ ──────── 6:00 ──────── 10:00  │
+  │     THE DEMO — you own 1:00 to 6:00 (5 min)            │
+  │            ★ money shot lands ~3:00                     │
+  └──────────────────────────────────────────────────────┘
+```
 
 ## The chapter-opening diagram — the click-path
 
-This is the exact path through the running app. Three beats, front-loaded so
-the strongest moment is the earliest.
+Here is the exact sequence of screens for all three beats. You walk
+it left to right; the star marks the money shot.
 
 ```
-  THE CLICK-PATH — three beats, money shot first
+  CLICK-PATH — three beats, screens in order
 
-  BEAT 1  (1:00–2:45)  ★ money shot ~2:30
-  ┌─ #rag-query ──────────────────────────────────────────────┐
-  │ pick "Two-part question..." → [Run fixture]                │
-  │   → Answer panel fills: grounded text + [work.md][coffee.md]│
-  │   → Retrieved chunks: relevant rows turn GREEN, scores show │
-  │   → Eval: Passing · Precision@1: 1.00 · Recall@3: 1.00  ★   │
-  └────────────────────────────────────────────────────────────┘
-                              │  "this is a real agent loop, recorded"
-                              ▼
-  BEAT 2  (2:45–4:15)
-  ┌─ an analytics agent page (AgentReplayShell) ──────────────┐
-  │ Run a fixture → step / tool_call / model_usage trace plays │
-  │   → same CapabilityEvent trace, from a real recorded run   │
-  └────────────────────────────────────────────────────────────┘
-                              │  "and it runs locally, no cloud"
-                              ▼
-  BEAT 3  (4:15–5:30)  [skip if Ollama is down]
-  ┌─ terminal ────────────────────────────────────────────────┐
-  │ npm run ask -w @aptkit/agent-rag-query -- "..."            │
-  │   → Gemma (local) + real embeddings answer, cited           │
-  └────────────────────────────────────────────────────────────┘
-
-  buffer 5:30–6:00 — breathing room before under-the-hood
+  BEAT 1: RAG Query page (#rag-query)        BEAT 2: replay trace
+  ┌─────────────────────────┐               ┌─────────────────────────┐
+  │ question pre-loaded      │               │ Recommendation / any    │
+  │   ↓ click Run fixture    │               │ AgentReplayShell page   │
+  │ chunks light up          │               │   ↓ click Run fixture   │
+  │ (relevant = highlighted) │               │ trace streams:          │
+  │   ↓                      │               │  step → tool_call_start │
+  │ answer w/ [citations]    │               │  → tool_call_end →      │
+  │   ↓                      │               │  model_usage            │
+  │ ★ EVAL: Passing 1.00 ★   │               │ (a real CapabilityEvent │
+  │   beside the answer      │               │  trace, not a mockup)   │
+  └─────────────────────────┘               └─────────────────────────┘
+            │                                          │
+            └──────────────┬───────────────────────────┘
+                           ▼
+              BEAT 3 (optional): terminal — `npm run ask`
+              ┌─────────────────────────────────────────┐
+              │ Gemma (local, Ollama :11434) + real RAG  │
+              │  → tool: search_knowledge_base(...)       │
+              │  ← retrieved N chunks                     │
+              │  A: grounded answer, no cloud call        │
+              └─────────────────────────────────────────┘
 ```
 
-The shape to hold: beat 1 is the wow and it's safe; beats 2 and 3 are
-credibility — proof the scored result isn't a one-off mock but one instance of
-a real agent loop that also runs against a live local model.
+## Beat 1 — the RAG Query page and the money shot (1:00–3:30)
 
-## The body — the beats in order
-
-### Beat 1 — the money shot (1:00–2:45, the "oh" at ~2:30)
-
-You're already on the RAG Query Agent page from the cold open. Pick the
-two-part question fixture (`Two-part question answered from two different
-notes`) — it's the strongest because the room watches *two* different notes get
-retrieved and *two* citations land. Then click `Run fixture` and let it work.
-The discipline here: **speak value while your hands click. Do not narrate the
-clicks.**
+This is `RagQueryWorkspace` (`apps/studio/src/RagQueryWorkspace.tsx`).
+You may have already run it once in the cold open — that's fine. Now
+you slow down and let the room read each part. If you want a clean
+populate for the room, pick the second fixture from the dropdown
+("What does the author use to run AI models locally?") so they watch
+it fill from empty.
 
 ```
   SHOW (on screen)                   SAY (out loud)
-  ─────────────────────────────      ─────────────────────────────────────
-  question selected: "What does      "Here's a personal-notes corpus — three
-  the author do for work, and how    short notes. I ask one question that
-  do they take their coffee?"        spans two of them."
-  click [Run fixture]                "Watch three things happen at once."
-  Answer panel fills with grounded   "It answers in plain language — and
-  text ending in [work.md]           every claim carries the note it came
-  [coffee.md]                        from. work-dot-md, coffee-dot-md."
-  Retrieved chunks: work.md and      "Underneath, you can see exactly which
-  coffee.md rows turn GREEN with     chunks it pulled — the relevant ones
-  cosine scores; coffee.md is        light up green, scored by similarity."
-  relevant, others dim
-  Eval row: Passing ·                "And here's the part teams fight about
-  Precision@1 1.00 · Recall@3 1.00   in code review — a retrieval-quality
-                                     SCORE. Top result is correct: precision
-                                     one-point-oh. Every relevant note
-                                     retrieved: recall one-point-oh."   ← ★
-  let it sit for a beat. Don't       (silence — let the room read the 1.00)
-  click anything.
+  ─────────────────────────────      ──────────────────────────────
+  the question at the top:           "I'm asking a question across a
+  "What does the author use to        small set of personal notes.
+  run AI models locally?"             The agent decides on its own
+                                       whether it needs to search."
+
+  click Run fixture                  "Watch the retrieval panel."
+
+  Retrieved chunks panel fills;      "It pulled three chunks and
+  stack.md highlighted as relevant,   ranked them. The one it needs —
+  others dimmed; scores shown         my stack note — scores highest
+                                       and lights up as relevant."
+
+  Answer panel fills with text       "Here's the answer — and it
+  ending in [stack.md]                cites the note it came from.
+                                       That bracket is a real citation,
+                                       not decoration."
+
+  Eval panel: Passing /              "And THIS is the part I care
+  Precision@1 1.00 / Recall@3 1.00   about. Right next to the answer,   ★
+  beside the answer                   the eval scored the retrieval:    MONEY
+                                       precision one, recall one.        SHOT
+                                       The system measured that it got
+                                       the right source. Live. No
+                                       backend — this is all running
+                                       in your browser."
 ```
 
-The money-shot line — say it clean, then stop talking for a second:
+The money-shot line, said with the eval panel and the answer both on
+screen:
 
 ```
-  ┃ "There's the whole argument settled in a number: a grounded,
-  ┃  cited answer, scored one-point-oh on precision and recall —
-  ┃  and there's no backend. This ran entirely in your browser."
+┃ "That's the whole point — the answer is cited, and the score
+┃  next to it says the retrieval was actually correct. Most demos
+┃  ask you to trust the answer. This one measures it."
 ```
 
-Then the line that converts the wow into credibility before you move on:
+Then name the honest edge before anyone wonders — owning it reads as
+confidence, not weakness:
 
 ```
-  ┃ "That's a real retrieval pipeline — a real embedder, a real
-  ┃  vector store, a real agent loop — just made deterministic so
-  ┃  it can't lie to you on stage."
+┃ "To be clear: in the browser this uses a deterministic stub
+┃  embedder so the demo can't flake on stage. The real pipeline
+┃  uses local Ollama embeddings — and I'll show you that running
+┃  for real in a second."
 ```
 
-That `precision@1 = 1.00 / recall@3 = 1.00` sitting next to a correct cited
-answer **is the money shot.** It's computed live by `scorePrecisionAtK` /
-`scoreRecallAtK` from `@aptkit/evals` against the chunks the agent actually
-retrieved — not a hardcoded label. Name that, because a judge who builds AI
-will clock the difference.
+That's true: the in-browser embedder is the 64-dimension keyword-hash
+`makeFixtureEmbedder` in `apps/studio/src/agent-runners.ts`, feeding a
+real `InMemoryVectorStore` and the real `scorePrecisionAtK` /
+`scoreRecallAtK` scorers from `@aptkit/evals`. The retrieval and the
+scoring are real; only the embedder is stubbed for determinism.
 
-### Beat 2 — replay a real agent trace (2:45–4:15)
+## Beat 2 — the replay trace, proof the loop is real (3:30–5:00)
 
-Now prove the loop is general, not bespoke to one page. Go Home, open one of
-the analytics agents (recommendation or anomaly-monitoring — they use the
-shared `AgentReplayShell`), and run a fixture. The point isn't the analytics
-output; it's the **trace**.
-
-```
-  SHOW (on screen)                   SAY (out loud)
-  ─────────────────────────────      ─────────────────────────────────────
-  Home → open Recommendation         "That scored RAG agent isn't a special
-  agent → Run fixture                case. It's one instance of a bounded
-                                     agent loop the whole toolkit shares."
-  the trace panel plays:             "This is a different agent replaying a
-  step → tool_call_start →           real recorded run — same trace format:
-  tool_call_end → model_usage        every step, every tool call, every
-                                     token of model usage, captured."
-  point at a tool_call_end           "When something goes wrong in an agent,
-                                     this trace is how you debug it — and how
-                                     the evals catch a regression before it
-                                     ships."
-```
-
-```
-  ┃ "Same loop, same trace, different agent — the score you just
-  ┃  saw is one capability built on plumbing every agent reuses."
-```
-
-### Beat 3 — the local model, live (4:15–5:30) — skip if Ollama is down
-
-If — and only if — Ollama is running with `gemma2:9b` and
-`nomic-embed-text:v1.5` pulled, drop to the terminal and run the same stack for
-real. This is the beat that proves "in-browser deterministic" was a *choice*,
-not a limitation: the identical agent answers a live question against a real
-local model with real embeddings.
+Money shot landed. Now you earn credibility: this isn't a hardcoded
+string, it's a real agent loop emitting a real event trace. Open any
+shared-shell agent page (`AgentReplayShell` — Recommendation,
+Monitoring, Diagnostic, Query) and run a fixture so the room sees the
+trace stream.
 
 ```
   SHOW (on screen)                   SAY (out loud)
-  ─────────────────────────────      ─────────────────────────────────────
-  terminal:                          "What you saw in the browser was a
-  npm run ask -w                     recording. Here's the same agent against
-  @aptkit/agent-rag-query --         a real local model — Gemma, running on
-  "What do I use for embeddings?"    this laptop, no cloud, no API key."
-  "Indexing 3 documents..." then     "Real embeddings, real retrieval, and
-  a grounded, cited answer prints    Gemma reasoning over the chunks — cited
-                                     the same way."
+  ─────────────────────────────      ──────────────────────────────
+  switch to an agent page            "That answer came out of a real
+  (e.g. Recommendation), the          agent loop — not a hardcoded
+  trace panel visible                 string. Here's another agent on
+                                       the same engine."
+
+  click Run fixture; trace            "This is the actual event trace:
+  panel streams events:               the model takes a step, calls a
+  step → tool_call_start →            tool, gets a result, reports its
+  tool_call_end → model_usage         token usage. Every agent in the
+                                       toolkit emits this same trace."
+
+  point at the eval / passing         "And every one is checked by an
+  indicator                           eval too — that's how I know a
+                                       change didn't break it."
 ```
 
 ```
-  ┃ "Browser version's a recording so it can't break on stage —
-  ┃  but the model is real, and it's running right here, offline."
+┃ "Same engine, same trace, same eval gate — every capability in
+┃  the toolkit is built the same way."
 ```
 
-This beat is the first thing to cut. It depends on a live local model, which
-is exactly the kind of thing that fails on conference wifi and a cold laptop.
-Treat it as a bonus, never a dependency.
+## Beat 3 — the local `ask` CLI (5:00–6:00, cut first if long)
 
-### The strong-vs-weak demo move
-
-The failure mode this demo most invites — and the move that beats it:
+If you have the minute and a terminal ready, this is the strongest
+"it's real" proof: the same agent running against a **real local
+model** — Gemma via Ollama — with real embeddings, no cloud. This is
+`packages/agents/rag-query/scripts/ask.ts`.
 
 ```
-  WEAK demo move                     STRONG demo move
-  ─────────────────────────────      ─────────────────────────────────────
-  "Now I'm clicking Run. Okay, it's  Hands click Run; mouth says "watch
-  loading. Now you can see the       three things happen at once" then names
-  answer here, and these are the     the VALUE — grounded, cited, scored —
-  chunks, and this number here is    while the screen fills. The score gets
-  the precision..." (narrating       a beat of silence to land, not a label
-  the cursor)                        read aloud.
-  → the room watches a cursor        → the room reacts to a result
+  SHOW (on screen)                   SAY (out loud)
+  ─────────────────────────────      ──────────────────────────────
+  terminal:                          "Same agent, but now against a
+  npm run ask -w                      real local model — Gemma, running
+  @aptkit/agent-rag-query             through Ollama on my machine.
+  -- "what do I use for               No cloud, no API key."
+  embeddings and how's my coffee?"
+
+  output streams:                    "It indexes the notes with real
+  Indexing 3 documents...             local embeddings, the model
+  → tool: search_knowledge_base(…)    decides to search, retrieves the
+  ← retrieved N chunks                chunks, and answers grounded —
+  A: grounded answer                  in my voice, because the profile
+                                       is injected into the prompt."
 ```
 
-Narrating your own clicks is the single most common way a strong demo goes
-flat. The SHOW track is for your hands; the SAY track is for value. Keep them
-separate.
+```
+┃ "This is the same toolkit running entirely on my laptop —
+┃  local model, local embeddings, no network in the loop."
+```
 
-## The IF-IT-BREAKS box
+## IF IT BREAKS
 
 ```
 ╔══════════════════════════════════════════════════════════════════╗
 ║ IF IT BREAKS                                                       ║
-║ Dev server won't start / page is dead → switch to the GitHub      ║
-║ Pages STATIC_DEMO build (base /aptkit/), route #rag-query. It's    ║
-║ the same page, fixture-only, already deployed. Say: "let me run    ║
-║ the deployed build" and click Run fixture there — the score lands  ║
-║ identically.                                                       ║
+║ BEAT 1 (money shot) — the page won't populate:                     ║
+║   → open the static GitHub Pages build (base /aptkit/, #rag-query),║
+║     same fixture-only page, no dev server. Run it there.           ║
+║   → page still blank → money-shot screenshot (slide 2): answer +   ║
+║     eval panel side by side. Say "here's a run from earlier" and   ║
+║     deliver the money-shot line over the screenshot.               ║
 ║                                                                    ║
-║ Pages build is ALSO blank → drop to the saved screenshots of the   ║
-║ passing scored result. Say: "here's the result from a run a few    ║
-║ minutes ago" and walk the answer → green chunks → 1.00 score from  ║
-║ the image. Keep the energy up; never apologize twice.              ║
+║ BEAT 3 (CLI) — Ollama isn't responding / model not pulled:         ║
+║   → DON'T debug on stage. Cut beat 3 entirely. You already showed  ║
+║     real retrieval + the real loop in beats 1–2. Say: "that same   ║
+║     thing runs against a local Gemma model on my laptop — happy    ║
+║     to show it after." Move to the close.                          ║
 ║                                                                    ║
-║ Beat 3 (Ollama) fails → just skip it. It's a bonus, not the spine. ║
+║ Rule: never freeze, never apologize twice, keep the clock moving.  ║
 ╚══════════════════════════════════════════════════════════════════╝
 ```
 
-## The "tighten it" treatment
+## Tighten it
 
-Running long? Cut beat 3 (the live `ask` CLI) entirely — it's a bonus and the
-riskiest beat. If you're still long, compress beat 2 to a single sentence over
-one fixture run ("same loop, different agent, same trace"). **Floor: beat 1
-must run to completion and the room must see precision@1 = 1.00 land next to
-the cited answer.** That's the demo. Everything else is reinforcement.
+Cut beats from the bottom up. **First cut: beat 3 (the CLI).** Beats
+1 and 2 already prove real retrieval, real loop, real eval — the CLI
+is the bonus. **Second cut: beat 2** down to a single sentence
+("every agent runs on this same traced, eval-gated loop") while you
+stay on the RAG page. The floor you must never cut: **beat 1 through
+the money shot** — the room has to see the eval score land next to the
+cited answer. That is the demo. Everything else is supporting evidence.
 
-## The one-page run sheet
+## One-page run sheet — THE DEMO
 
 ```
-  ┌─ THE DEMO — 1:00 to 6:00 ────────────────────────────────────────┐
-  │ ★ MONEY SHOT at ~2:30: precision@1 1.00 + recall@3 1.00 next to  │
-  │   a grounded, cited answer — in-browser, no backend.             │
-  │                                                                   │
-  │ BEAT 1 (1:00–2:45) #rag-query, pick "Two-part question", Run:    │
-  │   • "ask one question spanning two notes — watch three things"   │
-  │   • answer is grounded + cited [work.md][coffee.md]              │
-  │   • relevant chunks light up green, scored                       │
-  │   • Eval Passing, Precision@1 1.00, Recall@3 1.00  ← let it sit  │
-  │ BEAT 2 (2:45–4:15) open Recommendation agent, Run fixture:       │
-  │   • "same loop, different agent" — point at the step/tool trace  │
-  │ BEAT 3 (4:15–5:30) [Ollama up only] terminal: npm run ask:       │
-  │   • "browser was a recording; the model is real and offline"     │
-  │                                                                   │
-  │ NAIL THIS LINE:                                                   │
-  │   "There's the whole argument settled in a number — grounded,     │
-  │    cited, scored one-point-oh, and no backend."                  │
-  │                                                                   │
-  │ DON'T narrate clicks. Hands click; mouth speaks value.            │
-  │ IF IT BREAKS: → Pages build #rag-query → screenshots. Skip beat3.│
-  │ TIGHTEN: cut beat 3, then compress beat 2. Floor: beat 1 + 1.00. │
-  └───────────────────────────────────────────────────────────────────┘
+  ┌──────────────────────────────────────────────────────────────┐
+  │ THE DEMO          1:00–6:00          ★ MONEY SHOT ~3:00        │
+  │                                                                │
+  │ BEAT 1 — RAG page (#rag-query), pick 2nd fixture, Run:         │
+  │  • "Asking a question across personal notes; the agent        │
+  │     decides whether to search."                               │
+  │  • "Watch the retrieval panel — it ranked the chunks; the     │
+  │     one it needs lights up as relevant."                      │
+  │  • "The answer cites its source — real citation."             │
+  │  • ★ "And next to the answer, the eval: precision one, recall │
+  │     one. It MEASURED that it got the right source. Live, in   │
+  │     your browser, no backend."                                 │
+  │  • OWN IT: "browser uses a deterministic stub embedder so it  │
+  │     can't flake; real pipeline uses local Ollama embeddings." │
+  │                                                                │
+  │ BEAT 2 — any AgentReplayShell page, Run fixture:               │
+  │  • "Real agent loop, not a hardcoded string — here's the      │
+  │     event trace: step → tool call → usage. Every agent emits  │
+  │     it, every one is eval-gated."                             │
+  │                                                                │
+  │ BEAT 3 (cut first) — terminal: npm run ask -w …rag-query:      │
+  │  • "Same agent against a real local model — Gemma on Ollama,  │
+  │     real embeddings, no cloud."                               │
+  │                                                                │
+  │ NAIL: money-shot line — "the answer is cited, and the score   │
+  │       says the retrieval was correct. Most demos ask you to   │
+  │       trust it; this one measures it."                        │
+  │ IF IT BREAKS: static Pages #rag-query → screenshot; CLU fails  │
+  │       → cut beat 3, mention it, move on.                      │
+  │ TIGHTEN: cut beat 3, then beat 2; never cut beat 1 money shot. │
+  └──────────────────────────────────────────────────────────────┘
 ```

@@ -1,88 +1,208 @@
-# Debugging & Observability — the 8-lens audit
+# Audit — Debugging & Observability (8 lenses)
 
-Pass 1. One sweep of the codebase against eight observability lenses. Each section names what aptkit actually does (with `file:line` grounding) or says `not yet exercised` and when it would matter. Significant findings cross-link to a Pass 2 pattern file rather than restating it.
-
-The repo under audit: aptkit (a deployment-agnostic agent toolkit) plus its companion runtime buffr (`/Users/rein/Public/buffr`, the laptop body that supplies durable persistence). Where a lens only lights up in buffr, that's named explicitly.
+Pass 1. Each lens is walked against the live repo. Findings are grounded in
+`file:line`; where a lens finds nothing, it says `not yet exercised` and names
+when it would matter. Significant mechanisms cross-link to their Pass 2 file.
 
 ---
 
 ## 1. observability-map — what can be observed at each boundary
 
-The evidence map is unusually clean because there's exactly one source of truth: the **CapabilityEvent trace**. Every boundary that matters emits onto it.
+The evidence is concentrated in one place: the structured event log (the
+`CapabilityEvent` trace). Every important boundary of an agent run emits an
+event into it.
 
 ```
-  Where evidence is emitted — boundary by boundary
+  What each boundary can be observed emitting
 
-  ┌─ boundary ───────────────┬─ event emitted ─────────┬─ file:line ──────────┐
-  │ model turn completes     │ model_usage             │ run-agent-loop.ts:112│
-  │ assistant produces text  │ step                    │ run-agent-loop.ts:128│
-  │ tool invocation begins   │ tool_call_start (+args) │ run-agent-loop.ts:147│
-  │ tool invocation ends     │ tool_call_end (+ms,err) │ run-agent-loop.ts:171│
-  │ recovery turn fails       │ warning                 │ run-agent-loop.ts:220│
-  │ provider fallback fires  │ warning (in provider)   │ rendered in TracePanel│
-  └──────────────────────────┴─────────────────────────┴──────────────────────┘
+  boundary                     event emitted              where
+  ──────────────────────────   ─────────────────────────  ───────────────────────
+  model turn completes      →  model_usage (tokens)       run-agent-loop.ts:111-122
+  assistant produces text   →  step (role, content)       run-agent-loop.ts:127-129
+  tool invocation begins    →  tool_call_start (args)     run-agent-loop.ts:147-153
+  tool invocation ends      →  tool_call_end (result,     run-agent-loop.ts:171-179
+                                  error, durationMs)
+  recovery turn fails       →  warning (message)          run-agent-loop.ts:220-225
+  (zero-hit retrieval)      →  ⌀ NOTHING — silent          see lens 8
 ```
 
-What you CAN observe: every model decision, every tool call with its exact arguments and result, per-tool latency, token usage per turn. What you CANNOT observe: anything *inside* a tool handler (no sub-spans), anything across processes (no `traceId`), and — the load-bearing gap — **a retrieval that returned zero hits emits nothing** (`search-knowledge-base-tool.ts:89-91` returns silently). → `01-capability-event-trace.md` for the spine; `04-silent-empty-result-blind-spot.md` for the gap.
+The boundaries that emit nothing are as important as the ones that do. A
+retrieval that returns zero hits passes through `search_knowledge_base`
+(`packages/retrieval/src/search-knowledge-base-tool.ts:92-95`) and produces a
+`tool_call_end` with an empty `results` array — observable only if you read the
+result payload, never surfaced as a `warning`. That gap is lens 8's headline.
+
+The map has three reading surfaces hung off the one emitter — Studio (visual),
+the usage ledger (cost), and buffr's Postgres sink (durable). →
+`01-capability-event-trace.md` for the spine; `02-trace-fan-out-three-consumers.md`
+for the three readers.
 
 ## 2. reproduction-and-evidence — minimal repro, hypotheses, controlled experiments
 
-This is a strength. The fixture/replay system turns any live run into a deterministic, offline reproduction. A recorded `ModelResponse[]` (`packages/agents/*/fixtures/*.json`) is replayed by `FixtureModelProvider`, so a bug that only appeared against live Gemma can be re-run in a `node --test` unit with no network. The retrieval war-story bug is reproduced exactly this way — `search-knowledge-base-tool.test.ts:105-117` is a controlled experiment: seed a corpus, fire a hallucinated `{textContains:'moon'}` filter, assert results are non-empty. → `05-deterministic-replay-reproduction.md`.
+Reproduction is the repo's strongest debugging asset. The whole evaluation
+backbone is built on **deterministic replay**: a recorded `ModelResponse[]` is
+fed back through `FixtureModelProvider` so a run reproduces byte-for-byte
+without touching a live model
+(`packages/agents/recommendation/src/fixture-provider.ts`, replayed by
+`scripts/replay-promoted-fixtures.mjs`). A bug found in a live run can be frozen
+into a fixture and re-run on demand — the controlled experiment is free.
 
-## 3. structured-logs-and-correlation — events, levels, context, correlation IDs, redaction
+The evidence collected per run is the trace plus the replay artifact
+(`artifacts/replays/*.json`), which carries `capabilityId`, `durationMs`,
+`provider`, `fixture`, the output, the full `trace`, the `eval`, and
+`modelTurns`. That artifact is both the evidence and the reproduction seed. →
+`05-deterministic-replay-reproduction.md`.
 
-Partly exercised, with sharp edges.
+## 3. structured-logs-and-correlation — events, levels, context, redaction, searchable fields
 
-- **Structured events: yes.** `CapabilityEvent` is a typed discriminated union (`events.ts:1-24`), serialized as NDJSON (`ndjson-stream.ts:36`). Far better than freetext logs — every record is queryable by `type`.
-- **Levels: minimal.** Only `warning` and `error` carry severity; everything else is untyped signal. There's no debug/info/trace gradation.
-- **Correlation ID: partial.** Every event carries a `capabilityId` (`events.ts`), which correlates events *within one capability's run*. There is **no** cross-run or cross-process `traceId`/`spanId`. Single-process, single-run — nothing to correlate across yet. `traceId` is `not yet exercised`.
-- **Redaction: none in the trace itself.** The loop truncates tool results to 16k chars (`run-agent-loop.ts:52-57`) but does not redact secrets. buffr's persistence stringifies args/results verbatim into `agents.messages` (`supabase-trace-sink.ts:62-71`). `.env` keys never enter the trace (the gemma provider is keyless), so the live exposure is low, but per-field redaction is `not yet exercised`.
+The trace *is* the structured log — there is no separate logging system, and
+that's the right call here. Each `CapabilityEvent` is a typed record with a
+discriminant (`type`), a `capabilityId` for context, and an ISO `timestamp`
+(`packages/runtime/src/events.ts:1-24`). When streamed, events serialize as
+NDJSON — one JSON object per line — via `encodeCapabilityEvent`
+(`packages/runtime/src/ndjson-stream.ts`), the searchable line-oriented format.
 
-→ `01-capability-event-trace.md`.
+Correlation: within a run, every event carries the same `capabilityId`, so a
+single run's events group cleanly. In buffr, the durable rows additionally
+carry a `conversation_id` (`/Users/rein/Public/buffr/src/supabase-trace-sink.ts:27-36`),
+which is the cross-run correlation key — all messages for one conversation
+share it.
 
-## 3a. NDJSON decode robustness — a quieter strength worth naming
+**Levels:** there is no `debug`/`info`/`warn`/`error` severity ladder. The
+closest is the event *type* — `warning` and `error` are distinct variants. Fine
+for now; a real level system matters only when log volume forces filtering.
 
-The stream decoder treats a malformed line as a *bounded warning*, never a throw: `decodeNdjsonLine` returns a `{ok:false, warning}` shape (`ndjson-stream.ts:65-82`), warnings are capped at 25 (`DEFAULT_MAX_WARNINGS`, `:28`), and partial lines are preserved across chunk boundaries (`:103-135`). One corrupt trace line can't crash the replay that's reading it. This is defensive observability plumbing — the channel that carries evidence is itself fault-tolerant.
+**Redaction:** `not yet exercised` as an explicit mechanism. There is no field
+redaction in the trace path — tool args and results are persisted verbatim
+(`supabase-trace-sink.ts:62-71`). The repo's discipline is upstream: `.env`
+holds provider keys and is gitignored, and the project notes warn never to echo
+secrets into artifacts. But if a tool ever received PII in its args, the trace
+would persist it unredacted. Relevant the moment a tool handles user-identifying
+input. → `02-trace-fan-out-three-consumers.md` for the NDJSON serialization.
 
-## 4. metrics-slis-slos-and-alerts — signals, SLIs, SLOs, thresholds
+## 4. metrics-slis-slos-and-alerts — signals, indicators, objectives, thresholds
 
-`not yet exercised`. There is no metrics system — no counters, gauges, or histograms, no Prometheus/OpenTelemetry/StatsD/Datadog (a repo-wide grep for these returns nothing). The closest thing is `summarizeUsage()` (`usage-ledger.ts:25-42`), which *folds* a trace into token totals and a turn count *after* the run — a derived summary, not a live metric, and not aggregated across runs. No SLIs, no SLOs, no alert thresholds, no paging. This becomes relevant the moment buffr runs as a long-lived multi-user service instead of a single laptop session. → the summary mechanism itself is taught in `06-model-usage-accounting.md`.
+`not yet exercised` as a metrics system. There is **no** Prometheus,
+OpenTelemetry, StatsD, Datadog, or counter/gauge/histogram instrumentation in
+either repo (grep confirms zero hits). No SLIs, no SLOs, no alert thresholds,
+no paging.
+
+What exists instead are two per-run *signals* derived from the trace, not
+aggregated metrics:
+
+- **Token usage** — `summarizeUsage(trace)` folds all `model_usage` events into
+  one `{ inputTokens, outputTokens, totalTokens, turns }` row
+  (`packages/runtime/src/usage-ledger.ts:25-42`). This is the SLI-shaped signal
+  closest to existing: tokens-per-run.
+- **Cost** — `estimateCost` turns that into USD, but only for `gpt-4.1*` models
+  (`usage-ledger.ts:71-78`); every other provider returns `undefined`. A
+  partial signal.
+- **Latency** — `durationMs` per tool call (`tool_call_end`) and `durationMs`
+  per whole run (replay artifact). Per-run, not aggregated.
+
+These are diagnostic evidence, not monitoring. The measurement-and-budget
+treatment of these same signals belongs to `study-performance-engineering`; this
+guide only notes they exist as evidence. A metrics system becomes relevant when
+the toolkit runs as a service with aggregate behavior worth watching.
 
 ## 5. traces-and-request-lifecycles — request lifecycles, spans, causal chains, latency attribution
 
-Partly exercised — and this is where the vocabulary collides with the codebase, so be precise.
+There is a **trace** in the event-log sense (the `CapabilityEvent` stream), but
+**no distributed tracing**: no spans, no parent/child span relationships, no
+`traceId` propagation across services (grep confirms). The agent loop is a
+single process; there is no second service to correlate to.
 
-The word "trace" here means the **CapabilityEvent trace**: an ordered event log of one agent run's lifecycle (turn → tool call → turn → final answer). That lifecycle is fully captured and causally readable — you can follow *why* the agent did each thing by reading the events in order. Latency is attributed at one granularity: `tool_call_end.durationMs` (`run-agent-loop.ts:171-178`) measures each tool call.
+The causal chain *is* recoverable from the event log, and this is the
+load-bearing diagnostic capability. The events are ordered, and the loop emits
+them in a fixed lifecycle per turn: `model_usage` → `step` → (`tool_call_start`
+→ `tool_call_end`)\* → next turn (`run-agent-loop.ts:98-190`). Reading that
+order forward gives you the request lifecycle; reading it *backward* gives you
+root-cause analysis (lens 7). Latency attribution exists at the tool granularity
+via `durationMs` per `tool_call_end` — you can see which tool call was slow, not
+why. → `01-capability-event-trace.md` for the lifecycle shape.
 
-What is **not** here is **distributed tracing** in the OpenTelemetry sense: no spans with parent/child links, no `spanId`, no `traceId`, no propagation across services. One process, one run, flat event list. Distributed spans are `not yet exercised` — they'd matter if a single user request fanned out across buffr → aptkit → Ollama → Postgres as separate instrumented services. → `01-capability-event-trace.md` (the lifecycle), `06-model-usage-accounting.md` (latency/token attribution).
+## 6. state-snapshots-and-debugging-boundaries — state inspection, error output, before/after
 
-## 6. state-snapshots-and-debugging-boundaries — state inspection, network traces, error output, before/after
+The replay artifact is a full state snapshot of a run: input fixture, every
+model turn, the complete trace, the output, and the eval result, frozen as JSON
+in `artifacts/replays/` (project context, Data model). That's a complete
+before/after — you can diff two artifacts to see what a code change did to a
+run's trajectory.
 
-Exercised well at the dev boundary, durably at the prod boundary.
-
-- **Dev-time visual snapshot:** Studio's `TracePanel` (`components.tsx:131-182`) renders the full event list as an inspectable timeline — expandable per-event payloads (`tool_call_start` args, `tool_call_end` results/errors via `tracePayload`, `:428-434`), a filter (`all/model/tools/warnings`, `:421-426`), and a summary header (turns/tools/warnings/tokens/elapsed). This *is* the state-inspection debugger. → `02-trace-replay-as-debugger.md`.
-- **Durable snapshot:** buffr's `SupabaseTraceSink` writes every event as a row in `agents.messages` (`supabase-trace-sink.ts:53-85`), ordered by the *event's own* timestamp via `coalesce($8::timestamptz, now())` (`:27-37`) so replay order survives the race between concurrent async inserts. This is a queryable before/after of the entire run. → `03-persisted-trajectory-backward-read.md`.
-- **Error output:** tool errors are caught and recorded as `tool_call_end.error` (`run-agent-loop.ts:163-167`) rather than thrown — the run continues and the failure becomes evidence.
+Studio is the interactive state inspector. `AgentReplayShell`
+(`apps/studio/src/AgentReplayShell.tsx`) accumulates events into a `liveTrace`
+during a streamed run and renders them through `TracePanel`
+(`apps/studio/src/components.tsx`), where each event expands to show its full
+payload — tool args, results, errors, step text. This is the dev-time
+state-inspection boundary: the trace rendered as an explorable tree rather than
+a log to scroll. Error output: tool errors are captured per call into
+`toolCall.error` (`run-agent-loop.ts:163-168`) and ride along in `tool_call_end`,
+so a thrown tool surfaces as a visible event rather than crashing the run. →
+`02-trace-fan-out-three-consumers.md`.
 
 ## 7. incident-analysis-and-prevention — root cause, remediation, regression guards, runbooks
 
-One real incident, handled end-to-end — and it's the most instructive thing in the repo.
+The repo has one documented incident with a clean root-cause-to-prevention arc —
+the signature war story.
 
-- **Symptom:** RAG agent answered "not available" on a corpus that contained the answer.
-- **Evidence:** read the persisted trajectory backward from the final answer; `tool_call_start.args` showed Gemma passed a hallucinated `{textContains: ...}` filter.
-- **Root cause:** the filter was applied as exact-match over chunk metadata; no chunk carried that key, so the post-filter zeroed every hit (`search-knowledge-base-tool.ts:90`).
-- **Remediation:** `matchesFilter` now ignores filter keys absent from a chunk's meta (`search-knowledge-base-tool.ts:101-106`, commit `c5dbf1a`). A sibling fix floored `top_k` so a weak model can't starve its own retrieval (`minTopK`, `:51`, commit `f535e4a`).
-- **Regression guard:** `search-knowledge-base-tool.test.ts:105-117` asserts a hallucinated filter key no longer wipes results.
-- **Runbook:** `not yet exercised` — there's no written incident runbook; the prevention is the test, not a document.
+```
+  The incident arc
 
-→ `03-persisted-trajectory-backward-read.md` for the full arc; `04-silent-empty-result-blind-spot.md` for the contributing condition (the silence).
+  symptom    agent answers "not available" on a good corpus
+     │
+  evidence   read the persisted trajectory BACKWARD:
+     │         answer ← empty tool_result ← tool_call_start args
+     ▼
+  root cause Gemma passed a hallucinated {textContains} filter;
+     │       the exact-match filter zeroed every result
+     ▼
+  fix        matchesFilter() now ignores filter keys absent
+     │       from a chunk's meta (search-knowledge-base-tool.ts:101-106)
+     ▼
+  prevention regression test: hallucinated filter must not wipe
+             results (search-knowledge-base-tool.test.ts:105-117)
+```
+
+The remediation is two-part: the filter hardening (`matchesFilter`) plus a
+`minTopK` floor that stops a weak model starving its own retrieval by passing
+`top_k: 1` (`search-knowledge-base-tool.ts:51,81`; test at lines 77-89). The
+regression guard is real and lives next to the code. There is **no runbook
+document** — the knowledge is in the code comments and the test names, not a
+written incident playbook. → `04-reading-the-trajectory-backward.md` for the
+method, `06-hallucination-tolerant-retrieval-guard.md` for the fix and guard.
 
 ## 8. debugging-observability-red-flags-audit — ranked blind spots
 
-Ranked by how much each one would slow a real diagnosis, most consequential first.
+Ranked by diagnostic consequence — the cost of *not* being able to see
+something when it breaks.
 
-1. **Empty retrieval is silent (highest).** A zero-hit `search_knowledge_base` returns `{results: []}` with no `warning` event (`search-knowledge-base-tool.ts:89-91`). This is the exact condition behind the war story — and the trace gave no signal pointing at it; the diagnosis came from reading the *args*, not from any emitted alarm. The fix is one `trace.emit({type:'warning'})`. → `04-silent-empty-result-blind-spot.md`.
-2. **No timeout as an observable event (high).** The loop honors an `AbortSignal` (`run-agent-loop.ts:99`) but nothing imposes a deadline or records a timeout as a distinct failure. A hung Ollama call would surface as "slow," not as a typed `timeout` event. `not yet exercised`.
-3. **Trace carries unredacted payloads (medium).** Args/results persist verbatim into Postgres (`supabase-trace-sink.ts:62-71`). Low risk today (keyless local model, no PII in the demo corpus), but a real corpus with user data would leak into `agents.messages` unredacted. `not yet exercised`.
-4. **No severity gradation (low).** Only `warning`/`error` carry level; a noisy run can't be filtered by importance beyond those two buckets.
-5. **Cost accounting is OpenAI-only (low).** `pricingForModel` returns `undefined` for any non-OpenAI provider (`usage-ledger.ts:71-77`), so Anthropic and Gemma runs show tokens but `$n/a`. Honest (estimation refuses to guess) but a blind spot for cost observability on the default provider. → `06-model-usage-accounting.md`.
+**1. Empty retrieval is silent (highest consequence).** A zero-hit
+`search_knowledge_base` call emits no `warning`; it returns an empty array that
+looks identical to any other result in the trace
+(`search-knowledge-base-tool.ts:92-95`). Evidence: there is no `warning`/`error`
+emission anywhere in `packages/retrieval/src` (grep confirms). This is the exact
+blind spot the war story exposed — the incident was findable only *after* a user
+complaint, by reading the trajectory backward. The unbuilt fix is a one-line
+zero-hit `warning` event that would surface the failure the instant it happens.
+→ `06-hallucination-tolerant-retrieval-guard.md`.
+
+**2. Cost signal is partial.** `estimateCost` returns `undefined` for every
+provider except OpenAI's `gpt-4.1*` (`usage-ledger.ts:71-78`). The default
+runtime provider is local Gemma and a common cloud provider is Anthropic —
+neither is priced. A run can look "free" in the cost display when it wasn't.
+
+**3. No redaction on the persist path.** Tool args and results are written
+verbatim to `agents.messages` (`supabase-trace-sink.ts:62-71`). Today the tools
+are read-only analytics tools, so the exposure is low — but the *mechanism* to
+redact a sensitive field before persistence does not exist. A blind spot that
+activates the moment a tool touches user-identifying data.
+
+**4. Latency attribution stops at the tool boundary.** `durationMs` tells you
+*which* tool call was slow, never *why* (no spans inside a tool, no provider
+round-trip timing as its own event). Acceptable at this scale; a real limit once
+a single tool fans out internally.
+
+**5. No timeout-as-event.** The loop can be aborted via `AbortSignal`
+(`run-agent-loop.ts:99`) but a slow-then-aborted call doesn't emit a
+distinguishable "timed out" event. A hang and a normal slow call read the same
+in the trace.

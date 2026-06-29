@@ -1,105 +1,118 @@
 # DSA Foundations — aptkit
 
-The reusable data-structures-and-algorithms vocabulary behind aptkit — and the foundations the repo deliberately does *not* exercise yet.
+The reusable data-structures-and-algorithms vocabulary behind aptkit, grounded in real files — plus the foundations the repo doesn't exercise yet, named honestly so you know what to drill.
 
-You've shipped a DSA portfolio already: `Graph.ts`, `BinaryHeap.ts`, `PriorityQueue.ts`, `BinarySearchTree.ts`, five animated sorters, BFS over a river-crossing state graph. This guide is **not** here to re-teach you BFS. It does two things instead:
+This is a **curriculum-style** guide, not an audit. The concept order is fixed (complexity → arrays/maps → stacks/queues/heaps → trees → graphs → sorting/searching → recursion/DP → practice map). Each file teaches one family of structures, anchors the ones aptkit actually runs to a real `file:line`, and labels the rest `not yet exercised` rather than inventing a use for them.
 
-1. Names which of those fundamentals aptkit actually *reaches for* in production code — and which it pointedly doesn't.
-2. Calibrates the gap: aptkit is a RAG/agent toolkit, so it lives almost entirely in the **array + map + linear-scan + ranking** corner of DSA. The graph/tree/heap/DP machinery you've built from scratch is, in this repo, `not yet exercised`.
-
----
-
-## The repo-grounded map — what DSA aptkit actually runs
+## The through-line
 
 ```
-  aptkit through the DSA lens — which structures light up
-
-  ┌─ Service layer (agents) ───────────────────────────────────┐
-  │  runAgentLoop  →  bounded for-loop + state machine          │
-  │  (packages/runtime/src/run-agent-loop.ts)                   │
-  │     control: a counted loop with a forced-final escape      │
-  └───────────────────────────┬─────────────────────────────────┘
-                              │ calls tools
-  ┌─ Tool layer ──────────────▼─────────────────────────────────┐
-  │  filterToolsForPolicy  →  Set membership (allowlist)        │
-  │  (packages/tools/src/tool-policy.ts)                        │
-  │  parseAgentJson        →  bounded substring scan / tolerant │
-  │  (packages/runtime/src/json-output.ts)     parse            │
-  └───────────────────────────┬─────────────────────────────────┘
-                              │ search_knowledge_base
-  ┌─ Retrieval layer ─────────▼─────────────────────────────────┐
-  │  chunkText      →  sliding window over a string             │
-  │  InMemoryVectorStore.search → linear scan + cosine + sort   │
-  │                              + top-k slice  ★ the core DSA ★ │
-  │  recall()       →  Map<id,counter> + over-fetch + filter    │
-  │  (packages/retrieval/*, packages/memory/*)                  │
-  └───────────────────────────┬─────────────────────────────────┘
-                              │ scored by
-  ┌─ Eval layer ──────────────▼─────────────────────────────────┐
-  │  scorePrecisionAtK / scoreRecallAtK → Set ∩ over top-k      │
-  │  (packages/evals/src/precision-at-k.ts)                     │
-  └──────────────────────────────────────────────────────────────┘
-                              │ production drop-in (companion repo)
-  ┌─ buffr / Provider layer ──▼─────────────────────────────────┐
-  │  PgVectorStore → HNSW graph index (ANN)                     │
-  │  (buffr/sql/001_agents_schema.sql, vector_cosine_ops)       │
-  │  THE one real graph algorithm in the whole system —         │
-  │  and it lives in the companion repo, not aptkit.            │
-  └──────────────────────────────────────────────────────────────┘
+  the question this guide answers
+  ─────────────────────────────────────────────────────────
+  which reusable structures and algorithms explain aptkit,
+  and which foundational gaps should you deliberately practice?
 ```
 
-The whole system is, structurally, **one ranking problem wrapped in one bounded loop**. Everything load-bearing reduces to: turn text into a vector, scan an array, sort by score, take the top-k. That's the spine. The graph appears exactly once — as the HNSW index in buffr — and it's the production substitute for aptkit's linear scan.
+You have a strong DSA portfolio already — graphs (BFS/DFS/Dijkstra), heaps, BSTs, sorting, recursion, all built from scratch in `reincodes`. This guide does **not** re-teach those. It does two things instead: (1) shows you where the *applied* structures live inside a production-shaped AI toolkit (mostly in the retrieval layer), and (2) draws a sharp line between "exercised here" and "you've built it elsewhere but aptkit doesn't run it."
 
----
+## Where aptkit actually lives on the DSA map
 
-## Ranked findings — what to look at first
-
-**1. The single most consequential algorithm is a linear scan, and that's a deliberate `O(n)`-per-query tradeoff, not an oversight.** `InMemoryVectorStore.search` (`packages/retrieval/src/in-memory-vector-store.ts:25-33`) walks *every* chunk, computes cosine similarity against each, sorts the full hit list, and slices the top-k. For a from-scratch teaching pipeline with a few docs, that's the right call — it's deterministic, dependency-free, and trivially correct. The cost it accepts: linear in corpus size on every single query. The production answer is buffr's HNSW index (an approximate-nearest-neighbor *graph*), which trades exactness for sub-linear lookup. This swap — array linear-scan → ANN graph — is *the* DSA story of this repo. Read **02** and **05**.
-
-**2. The agent loop is a bounded state machine whose load-bearing part is the part people forget — the forced-final turn.** `runAgentLoop` (`packages/runtime/src/run-agent-loop.ts:98-190`) is a `for (turn = 0; turn < maxTurns; …)` loop. The kernel isn't the iteration — it's `forceFinal = turn === maxTurns - 1 || budgetSpent` (line 102), which strips the tools on the last turn and forces synthesis. Drop that and the loop can spin to the cap producing no answer. Read **01** (cost models / amortized) and the loop walk in **07**.
-
-**3. aptkit is array-and-map shaped; your graph/tree/heap portfolio is `not yet exercised` here.** No tree, no heap, no graph traversal, no DP runs anywhere in aptkit's source. The top-k selection in `search` *could* use a heap (your `BinaryHeap.ts`) instead of a full sort — and at corpus scale it would — but the in-memory store sorts the whole array because `n` is tiny. This is the honest gap: the repo doesn't punish you for not knowing graphs; it simply doesn't use them. The curriculum files (**03**, **04**, **05**, **07**) teach those foundations and say plainly where they *would* enter if aptkit grew.
-
----
-
-## Reading order
+aptkit is an AI-agent toolkit. Its DSA surface is small and concentrated — almost all of it is in `packages/retrieval` and `packages/runtime`. There is no graph, no tree, no heap in the running code. That's not a weakness; it's what a RAG-plus-agent-loop system is made of.
 
 ```
-  01  complexity-and-cost-models          ← the lens for every file below
-  02  arrays-strings-and-hash-maps        ← REPO-GROUNDED: the spine
-  03  stacks-queues-deques-and-heaps      ← curriculum + top-k heap seam
-  04  trees-tries-and-balanced-indexes    ← curriculum + the HNSW seam
-  05  graphs-and-traversals               ← curriculum + the ONE real graph (HNSW)
-  06  sorting-searching-and-selection     ← REPO-GROUNDED: the ranking sort + top-k
-  07  recursion-backtracking-and-dp       ← partial: bounded loop, no DP/backtracking
-  08  dsa-foundations-practice-map        ← ranked plan: exercised first, gaps second
+  aptkit's DSA surface — the structures that actually run
+  (UI / Service / Storage bands)
+
+  ┌─ Service layer — packages/runtime, packages/agents ───────────┐
+  │  bounded agent loop      → state machine, fixed iteration cap  │
+  │    run-agent-loop.ts     │ for-loop + break on terminal state  │
+  │  tolerant JSON parse     → string scan, bracket-balance        │
+  │    json-output.ts        │ fenced-block regex + substring scan │
+  │  tool policy              → Set membership (allowlist)         │
+  │    tool-policy.ts        │ O(1) `allowed.has(name)`            │
+  └───────────────────────────────┬───────────────────────────────┘
+                                   │ retrieval reaches agents AS A TOOL
+  ┌─ Storage layer — packages/retrieval, packages/memory ─────────┐
+  │  ★ cosine-similarity rank + top-k  ★  ← the load-bearing one   │
+  │    in-memory-vector-store.ts │ linear scan + sort + slice      │
+  │  overlapping-window chunker  → sliding window over a string    │
+  │    chunker.ts                │ fixed step = size - overlap     │
+  │  memory id-counter           → Map<convId, n>                  │
+  │    conversation-memory.ts    │ monotonic counter per key       │
+  │  precision@k / recall@k      → Set intersection over top-k     │
+  │    precision-at-k.ts         │ distinct-hit count in a window  │
+  └───────────────────────────────────────────────────────────────┘
+
+  ┌─ Storage layer — buffr (companion repo, the production path) ──┐
+  │  pgvector HNSW index → approximate-nearest-neighbor graph      │
+  │    sql/001_agents_schema.sql:28  using hnsw (vector_cosine_ops)│
+  │  the ONE graph in the whole story — and it's not in aptkit     │
+  └───────────────────────────────────────────────────────────────┘
 ```
 
-Read **01** first — it's the cost lens you hold over every other file. Then **02** and **06** are the dense repo-grounded core. **03–05** and **07** are mostly curriculum, each with one honest seam back into aptkit.
+The single most important thing to internalize: **aptkit's `InMemoryVectorStore` does an exact linear scan; buffr's `PgVectorStore` does an approximate graph walk (HNSW).** Same `VectorStore` contract, two completely different algorithms underneath. That seam — exact O(n) brute force vs approximate-nearest-neighbor (ANN) graph traversal — is the richest DSA lesson in the whole codebase, and it's covered across files 02, 05, and 06.
 
----
+## Ranked findings
+
+```
+  rank   finding                                          where
+  ────────────────────────────────────────────────────────────────────
+  1      cosine rank + top-k is the load-bearing          in-memory-
+         algorithm — linear scan, full sort, slice(k).    vector-store.ts:25
+         The whole system's retrieval quality and cost
+         ride on this one function. It is also the
+         clearest exact-vs-approximate seam in the repo
+         (vs buffr's HNSW). → 06, 02
+  2      the agent loop is a bounded state machine —       run-agent-loop.ts:98
+         a for-loop with a hard iteration cap and a
+         forced-final turn. The cap is the load-bearing
+         part: drop it and a tool-calling model can spin
+         forever. → 07 (iteration as a state space)
+  3      Set/Map membership carries three quiet jobs —     tool-policy.ts:16,
+         tool allowlist (O(1) gate), memory id-counter    conversation-memory.ts:71,
+         (collision-free ids), and distinct-hit counting  precision-at-k.ts:29
+         for precision@k. None are flashy; all are the
+         right primitive. → 02
+```
 
 ## Repo-grounded vs curriculum-only
 
 ```
-  topic                              status in aptkit
-  ─────────────────────────────────  ───────────────────────────────────
-  arrays / strings / hash-maps       REPO-GROUNDED — the whole spine
-  sorting / searching / selection    REPO-GROUNDED — ranking sort + top-k slice
-  complexity / cost models           REPO-GROUNDED — analyzes the above
-  bounded iteration / state machine  REPO-GROUNDED — runAgentLoop
-  set / map membership               REPO-GROUNDED — tool policy, id counters, p@k
-  heaps / priority queues            NOT YET EXERCISED — would replace the top-k sort
-  trees / tries / balanced indexes   NOT YET EXERCISED — HNSW (a graph) is in buffr
-  graphs / BFS / DFS / shortest path NOT YET EXERCISED in aptkit; ONE graph in buffr (HNSW)
-  recursion / backtracking           NOT YET EXERCISED — the loop is flat, not recursive
-  dynamic programming                NOT YET EXERCISED — no overlapping-subproblem code
+  REPO-GROUNDED (aptkit runs these — anchored to real files)
+  ──────────────────────────────────────────────────────────
+  complexity / cost models   the O(n·d) scan, the cap, slice(k)   → 01
+  arrays · strings · maps     vectors, chunker, Set/Map membership → 02
+  sorting · searching · top-k cosine sort + slice, linear scan     → 06
+  recursion (bounded iter)    agent loop, parseAgentJson           → 07
+
+  CURRICULUM-ONLY (you've built these in reincodes; aptkit does NOT run them)
+  ──────────────────────────────────────────────────────────────────────────
+  stacks · queues · deques    not yet exercised in aptkit          → 03
+    └ priority queue / heap    not in aptkit (you built BinaryHeap) → 03
+  trees · tries · balanced    not yet exercised in aptkit          → 04
+    └ HNSW (a graph index)     IS exercised — but in BUFFR, not    → 04, 05
+       aptkit. Labeled cross-repo.
+  graphs · BFS · DFS · paths  not in aptkit's running code; the    → 05
+    only live graph is buffr's HNSW (ANN). State-space
+    BFS appears in YOUR reincodes (PG.ts), not here.
+  dynamic programming         not yet exercised anywhere in        → 07
+    aptkit or buffr.
 ```
 
----
+## Reading order
 
-## See also — cross-guide seams
+```
+  01 ─► 02 ─► 03 ─► 04 ─► 05 ─► 06 ─► 07 ─► 08
+  cost   maps  queues trees graphs sort  recur  practice
+         ★      gap    gap   ★HNSW  ★     ★      map
+  ★ = has real aptkit code; others are curriculum-only / cross-repo
+```
 
-- **`study-ai-engineering`** owns the *retrieval pipeline as an AI system* — embeddings, RAG, agentic retrieval. This guide owns the *data structures and algorithms* underneath it (the array scan, the cosine math, the top-k). When you want "why RAG," go there; when you want "what's the cost of `search`," stay here.
-- **`study-database-systems`** owns buffr's pgvector storage engine, the HNSW index build, and query execution. This guide names HNSW as the ANN *graph structure* (file **05**); the storage-engine mechanics live there.
-- **`study-performance-engineering`** owns the measurement and budgets (the latency of the linear scan, the token budget of the loop). This guide names the *asymptotic* cost; that guide measures the *wall-clock* cost.
+Read 01, 02, 06, 07 for the parts aptkit runs. Read 03, 04, 05 for the foundations you should keep sharp even though aptkit doesn't reach for them — file 08 ranks the whole thing into a practice plan.
+
+## Cross-links to neighboring guides
+
+- **study-ai-engineering** — owns the RAG pipeline as an *AI* concern (embeddings, retrieval quality, evals). This guide owns the *data structures* underneath it. When you want "why cosine, why 768-dim," go there; "what's the time complexity of the scan," stay here.
+- **study-database-systems** — owns pgvector, HNSW build parameters, and the storage engine beneath buffr's index. This guide explains HNSW *as a graph*; that guide explains it *as a database index*.
+- **study-performance-engineering** — owns the measurement and budget of the O(n·d) scan (when it stops being fine, how to profile it). This guide explains the cost *model*; that guide explains how to *measure and act* on it.
+- **study-system-design** — owns the `VectorStore` contract as an architectural seam. This guide explains what's algorithmically different across that seam (exact scan vs ANN graph).

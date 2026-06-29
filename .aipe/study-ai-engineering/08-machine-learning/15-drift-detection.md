@@ -1,381 +1,194 @@
-# Drift detection
+# Drift Detection
 
-**Subtitle:** when production stops looking like training · *Industry standard*
+> data/concept drift detection · monitoring
+
+Blunt first: **aptkit trains no model and monitors no feature distribution.** There's nothing in `packages/` doing drift detection — this is new ground, an exercise you'll build into buffr. Anchor it to contrl: you ship the pose-landmark rep counter, it works great on the phones you tested. Six months later a new flagship phone with a wider-FOV front camera ships, or people start filming in dimmer rooms, and the *distribution of landmark coordinates your model sees in production drifts away from the distribution it was trained on*. Accuracy quietly rots. Nothing crashes. No error fires. That silent rot is what drift detection catches.
 
 ## Zoom out, then zoom in
 
-aptkit has no trained model, so the layers below are the *generic* supervised
-pipeline again — the same stack as file 01. The new thing in this file is the
-band marked ★: a monitoring loop sitting over the serving layer, watching what
-flows through it and feeding signals *back* to the data layer. Drift lives in
-that band.
+Drift detection isn't a training-time stage — it's a *post-deploy monitor* that compares live input distributions against the training baseline. Here it is on the pipeline.
 
 ```
-  Zoom out — the monitoring band over a deployed pipeline
-
-  ┌─ Data layer ───────────────────────────────────────────────────┐
-  │  raw rows + LABELS (the distribution you trained on)           │◄─┐
-  └───────────────────────────┬─────────────────────────────────────┘  │
-                              │ featurize                              │
-  ┌─ Feature layer ───────────▼─────────────────────────────────────┐  │
-  │  fixed-width numeric vectors X                                  │  │
-  └───────────────────────────┬─────────────────────────────────────┘  │
-                              │ fit (frozen at ship time)              │
-  ┌─ Model layer ─────────────▼─────────────────────────────────────┐  │
-  │  fitted model: f(X) → ŷ   (snapshot of the world at training)   │  │
-  └───────────────────────────┬─────────────────────────────────────┘  │
-                              │ ship                                   │
-  ┌─ Serving layer ───────────▼─────────────────────────────────────┐  │
-  │ ┌── ★ MONITORING BAND ★ ──────────────────────────────────────┐ │  │ retrain
-  │ │  watch P(X) · P(ŷ) · the metric, prod-vs-train over TIME    │ │  │ signal
-  │ │  drift? ──► alert ──► investigate ─────────────────────────────┼──┘
-  │ └──────────────────────────────────────────────────────────────┘ │
-  └──────────────────────────────────────────────────────────────────┘
+Where drift detection lives
+┌──────────────────────────────────────────────────────────────────────┐
+│  DATA ──→ FEATURES ──→ TRAIN/VAL/TEST ──→ MODEL ──→ DEPLOY ──★         │
+│   │          │                                        │      │         │
+│   │ baseline │ baseline                               │  live │        │
+│   │ dist.    │ feature dist. (TRAIN snapshot)         │  feature       │
+│   ▼          ▼                                         ▼  dist.         │
+│  ┌──────────────────────────┐          ┌──────────────────────────┐    │
+│  │  TRAIN distribution       │  ◄─PSI─► │  PROD distribution        │    │
+│  │  (frozen at train time)   │ compare  │  (rolling window, live)   │    │
+│  └──────────────────────────┘          └──────────────────────────┘    │
+│                            ★ drift monitor sits OFF the model path      │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-Now zoom in. A fitted model is a *snapshot*. It froze the relationship between
-inputs and answers as it stood on training day. The world keeps moving; the
-snapshot does not. Drift is the slow divergence between the world the model
-remembers and the world it now serves. The monitoring band's whole job is to
-notice that divergence *before* the metric craters — and ideally before any
-labels arrive, because in production labels are late, expensive, or absent.
+The monitor lives downstream of deploy and reads two snapshots: the *frozen training distribution* of a feature and a *rolling production window* of the same feature. It never touches the model itself. Its only output is a number that says "these distributions have moved apart by this much."
 
 ## Structure pass
 
-**Layers.** The drift you can measure is layered by *how much you need to know*.
-Input drift you can see with zero labels (just compare distributions). Prediction
-drift you see from the model's own outputs (still no labels). Performance drift
-you can only confirm once labels arrive. Cheapest-to-watch on top, truest-signal
-on the bottom.
+One axis: **how far has the production input distribution moved from training, and is that far enough to act?** Two seams sit on this axis, and conflating them is the classic mistake:
 
-**Axis — what shifted: the input, the relationship, or the metric?** This is the
-whole taxonomy.
+- **Data drift** — the input distribution `P(X)` shifts. The features themselves look different now. (New camera FOV → landmark coordinates cluster differently.) The model is unchanged, the world feeding it changed.
+- **Concept drift** — the relationship `P(y | X)` shifts. The same input now means a different label. (Same landmark pattern that used to be "rep complete" now isn't, because users changed their exercise form.) Far nastier — your features can look identical while the truth underneath moved.
 
-- **Data / covariate drift** — `P(X)` moved. New kinds of inputs, new value
-  ranges. The model still encodes the old `P(y|X)`, but it is now being asked
-  about regions of input space it saw rarely or never.
-- **Prediction / label drift** — `P(ŷ)` moved. The mix of outputs the model
-  emits changed (suddenly 80% "class A" where it used to be 50%). Often a
-  *downstream symptom* of covariate drift.
-- **Concept drift** — `P(y|X)` moved. The *relationship itself* changed: the
-  same input now deserves a different answer. The input distribution can look
-  identical and the model still rots, because the rule it learned is now wrong.
-- **Performance drift** — the metric dropped. The honest, final signal — but it
-  needs ground-truth labels, which is exactly what you usually lack in prod.
-
-**Seam.** The load-bearing boundary is the **training reference distribution** —
-the saved record of what `X`, `ŷ`, and the metric looked like at ship time.
-Drift is *always* prod-vs-reference. With no frozen reference you cannot measure
-drift at all; you can only measure the present, which tells you nothing about
-movement. Save the reference at the same moment you freeze the model.
+PSI detects **data drift** directly — it only looks at `X`. Concept drift needs labels and usually shows up as a performance drop, not a distribution shift. Know which one your metric can and can't see.
 
 ## How it works
 
-### Move 1 — the mental model
+### Move 1 — Mental model
 
-You already have a drift detector in this repo, and it watches performance drift.
-`scorePrecisionAtK` / `scoreRecallAtK` (`packages/evals/src/precision-at-k.ts`)
-grade retrieval against a *fixed* eval set. Run that fixed set today, get 0.82.
-Run the same fixed set next month against the same corpus and embedding stack,
-get 0.71. The eval set did not change — so a falling curve is the world (or your
-index, or your embedding model) drifting out from under a frozen expectation.
-That drop *is* performance drift, measured with the metric you already trust.
+PSI (Population Stability Index) asks one question: **bin a feature; did the proportion of values landing in each bin change from train to prod?** It's a weighted sum of per-bin disagreement.
 
 ```
-  Pattern — drift is movement against a frozen reference
-
-      training day                      months later
-   ┌───────────────┐                 ┌───────────────┐
-   │ reference:    │   compare over  │ production:    │
-   │ P(X), P(ŷ),   │ ◄────TIME─────► │ P(X), P(ŷ),    │
-   │ metric=0.82   │                 │ metric=0.71    │
-   └───────────────┘                 └───────────────┘
-          ▲ frozen at ship             ▲ recomputed on a schedule
-   drift = the gap, and especially the gap's TREND
+PSI mental model — per-bin proportion disagreement
+ feature value range, binned:
+   bin1   bin2   bin3   bin4   bin5
+  ┌────┬──────┬──────┬──────┬────┐
+TRAIN%  10  │  25  │  30  │  25  │ 10 │   ← frozen baseline
+PROD %  05  │  15  │  25  │  35  │ 20 │   ← live window
+  └────┴──────┴──────┴──────┴────┘
+            │
+            ▼  per bin: (prod% - train%) * ln(prod% / train%)
+            ▼  sum across bins  =  PSI
 ```
 
-The single most important word above is **frozen**. One measurement is a point.
-Drift is a *slope*. You need the reference and a schedule.
+The `ln(prod/train)` term makes it *signed-magnitude weighted*: a bin that doubled and a bin that halved both contribute, and bigger moves contribute more. Sum the bins, get one PSI number.
 
-### Move 2 — the four drifts, then how to measure the cheap one
+### Move 2 — Step by step
 
-**The drift taxonomy, by what moved.** Walk an example. A learned reranker over
-buffr retrieval takes a query, produces relevant doc ids. Here is how each drift
-shows up at the seam.
+**Part A: Bin the feature and compute proportions**
 
-```
-  What moved                   What you observe              Need labels?
-  ┌──────────────────────┐
-  │ covariate  P(X) moved │ ─► new query shapes hit search   ── no
-  ├──────────────────────┤     (PgVectorStore.search inputs)
-  │ prediction P(ŷ) moved │ ─► output mix shifts              ── no
-  ├──────────────────────┤
-  │ concept  P(y|X) moved │ ─► same query, "right" doc        ── yes
-  │                       │     changed (corpus re-meaning)      (to confirm)
-  ├──────────────────────┤
-  │ performance metric ↓  │ ─► precision@k falls               ── yes
-  └──────────────────────┘
-```
-
-The query distribution `P(X)` here is literally the stream of vectors handed to
-`PgVectorStore.search(vector, k) → Hit[]` (`/Users/rein/Public/buffr/src/pg-vector-store.ts`).
-Watching covariate drift means watching how those inputs shift, no labels
-required — which is why it is the workhorse signal in production.
-
-**PSI — the standard covariate-drift measure.** Population Stability Index
-compares the *shape* of one feature, training vs production. Bin the feature,
-take the proportion of mass in each bin for each population, and sum a
-per-bin divergence term. It is symmetric-ish, bounded in practice, and has
-rules of thumb everyone in industry shares.
+Fix the bin edges from the *training* data and reuse them for prod — otherwise you're comparing apples to differently-sliced apples.
 
 ```
-  Two histograms of one feature: cosine_similarity of the top hit
-
-  TRAIN (reference)                 PROD (this week)
-  bin        %                      bin        %
-  [0.0,0.2)  05 ██                  [0.0,0.2)  20 ████████
-  [0.2,0.4)  10 ████                [0.2,0.4)  25 ██████████
-  [0.4,0.6)  35 ██████████████      [0.4,0.6)  30 ████████████
-  [0.6,0.8)  35 ██████████████      [0.6,0.8)  15 ██████
-  [0.8,1.0)  15 ██████              [0.8,1.0)  10 ████
-                                    ▲ mass slid LEFT: hits got worse-matched
+Step A — fixed bins, two proportion vectors
+TRAIN sample ──► bin with edges E ──► train_pct[] = [.10 .25 .30 .25 .10]
+PROD  sample ──► bin with SAME E  ──► prod_pct[]  = [.05 .15 .25 .35 .20]
+                                       (edges E frozen from train)
 ```
 
-The mass slid toward low-similarity bins — prod queries are matching the corpus
-worse than training queries did. PSI puts a number on that slide:
+**Part B: Sum the per-bin PSI contributions**
 
 ```
-  PSI = Σ over bins  (prod% − train%) · ln(prod% / train%)
+Step B — the PSI sum
+        n_bins
+ PSI  =   Σ    (prod_pct[i] - train_pct[i]) * ln(prod_pct[i] / train_pct[i])
+        i = 1
 ```
-
-Annotated pseudocode (NOT aptkit code — study ground):
 
 ```python
-# psi(reference, production, bins) -> float
-# reference, production: raw values of ONE feature
-def psi(reference, production, n_bins=10):
-    # 1. Freeze bin edges from the REFERENCE (quantiles is common).
-    #    Same edges for both populations — comparing shape, not range.
-    edges = quantile_edges(reference, n_bins)
+# not yet exercised in aptkit — no feature monitoring exists in packages/
+EPS = 1e-6  # guard log(0) / divide-by-zero on empty bins
 
-    # 2. Proportion of each population's mass per bin.
-    train_pct = histogram(reference,  edges, normalize=True)   # sums to 1
-    prod_pct  = histogram(production, edges, normalize=True)   # sums to 1
-
+def psi(train_pct, prod_pct):
     total = 0.0
     for t, p in zip(train_pct, prod_pct):
-        # 3. Floor empty bins so ln() and division stay finite.
-        #    An empty prod bin (p≈0) or empty train bin would blow up.
-        t = max(t, 1e-6)
-        p = max(p, 1e-6)
-        # 4. Per-bin term: signed mass change × log mass ratio.
+        t = max(t, EPS)
+        p = max(p, EPS)
         total += (p - t) * math.log(p / t)
-    return total            # this is the PSI
+    return total
 ```
 
-Worked numbers on the histograms above (percentages as fractions):
+The `EPS` guard matters: an empty prod bin gives `ln(0)` = `-inf` and tanks the whole score. Real PSI implementations all clamp.
+
+**Part C: Apply the threshold rule**
+
+PSI is meaningless without an action mapping. This table *is* the decision.
 
 ```
-  bin        train(t)  prod(p)   (p−t)    ln(p/t)    term
-  [0.0,0.2)   0.05      0.20      0.15     1.386      0.2079
-  [0.2,0.4)   0.10      0.25      0.15     0.916      0.1374
-  [0.4,0.6)   0.35      0.30     -0.05    -0.154      0.0077
-  [0.6,0.8)   0.35      0.15     -0.20    -0.847      0.1695
-  [0.8,1.0)   0.15      0.10     -0.05    -0.405      0.0203
-                                                     ──────
-                                            PSI  =    0.543
+PSI threshold rule (industry-standard bands)
+┌──────────────┬───────────────────────┬──────────────────────────┐
+│ PSI value    │ interpretation         │ action                   │
+├──────────────┼───────────────────────┼──────────────────────────┤
+│ PSI < 0.10   │ stable                 │ no action                │
+│ 0.10 – 0.20  │ moderate shift         │ investigate, watch       │
+│ PSI > 0.20   │ significant shift      │ retrain (→ 16-retraining)│
+└──────────────┴───────────────────────┴──────────────────────────┘
 ```
 
-**Reading PSI — the industry rules of thumb.**
-
-```
-  PSI < 0.10   ── stable.        No meaningful shift; do nothing.
-  0.10 – 0.25  ── moderate.      Watch it; investigate the cause.
-  PSI > 0.25   ── significant.   The input has moved. Investigate, likely retrain.
-       │
-   0.543 here ──► well past 0.25 ──► this feature has significantly drifted
+```python
+# not yet exercised in aptkit
+def psi_action(value):
+    if value < 0.10: return "stable"
+    if value < 0.20: return "investigate"
+    return "retrain"   # hands off to 16-retraining-pipelines.md
 ```
 
-PSI 0.543 is a loud alarm: the similarity distribution your reranker was tuned on
-no longer describes production. The model is now being asked questions from a
-region of input space it under-saw.
+**`not yet exercised in aptkit`** — there is no feature store, no prod feature window, and no monitor in the repo. This is something you'd add to buffr, not something I'm describing in shipped code.
 
-**KS-test aside.** PSI bins, so it is sensitive to bin choice. The
-Kolmogorov–Smirnov test is the bin-free alternative for a continuous feature: it
-takes the maximum vertical gap between the two cumulative distributions (the KS
-statistic `D`) and gives a p-value for "same distribution." Use KS when you want
-a hypothesis test on one continuous feature; use PSI when you want a single
-monitorable number per feature with shared thresholds across a team. They answer
-the same question — "did `P(X)` move?" — with different machinery.
+### Move 3 — Principle
 
-**The cleanest signal, when you have labels.** All of PSI and KS are proxies for
-the thing you actually care about: did the model get worse? If labels arrive,
-skip the proxies and *watch the metric directly*. A falling precision@k on a
-fixed eval set is unambiguous performance drift — no binning, no thresholds, no
-inference about cause. Proxies exist only because labels are usually late.
-
-**The monitor → alert → investigate → maybe retrain loop.** Drift detection is
-not a one-shot; it is a running loop, and the last step is deliberately
-*maybe*.
-
-```
-  ┌─────────┐   schedule   ┌─────────┐  threshold  ┌────────────┐
-  │ MONITOR │ ───────────► │  ALERT  │ ──crossed──► │ INVESTIGATE│
-  │ PSI/KS/ │              │ PSI>.25 │              │  why moved?│
-  │ metric  │              │ p@k drop│              └─────┬──────┘
-  └─────────┘              └─────────┘                    │
-       ▲                                          ┌───────┴────────┐
-       │                                          ▼                ▼
-       │                                   real concept       upstream bug
-       │                                   drift?              (data pipe,
-       │                                      │                 bad join)?
-       └──────── back to monitoring ──────────┴──► RETRAIN (file 16) or FIX
-```
-
-You investigate before retraining because a PSI spike is just as often a broken
-upstream join, a units change, or a logging bug as it is genuine concept drift.
-Retraining on a *pipeline bug* bakes the bug into the new model. Confirm the
-cause, then act.
-
-**Move 2.5 — the aptkit reality.** Not yet exercised in aptkit — aptkit runs
-pre-trained LLMs, not trained models. The pattern is taught here as study
-ground.
-
-### Move 3 — the principle
-
-Drift detection is *measuring movement against a frozen reference, cheapest
-signal first*. Watch the inputs when you have no labels (PSI/KS over `P(X)`);
-watch the metric when you do (precision@k on a fixed set); never trust a single
-measurement — drift is a trend, not a point. And always investigate the cause
-before retraining, because half of all "drift" is an upstream bug wearing a
-costume.
+**Models fail silently; only their inputs warn you in advance.** A live metric drop tells you you're *already* losing — by then users felt it. PSI on inputs is a leading indicator: distributions move before labels confirm the damage. Monitor `P(X)` so you act before `P(y|X)` punishes you.
 
 ## Primary diagram
 
-The two faces of the signal: a covariate-drift detector that needs no labels,
-and a performance-drift curve that confirms the damage once labels exist.
-
 ```
-  COVARIATE (no labels)                 PERFORMANCE (needs labels)
-  PSI over a feature, per week          precision@k on a FIXED eval set
-
-  PSI                                   p@k
-  0.6 │              ●  ◄ >0.25 alert   0.85│●
-  0.5 │           ●                     0.80│  ●─●
-  0.4 │        ●                        0.75│       ●
-  0.3 │─────●──────────── 0.25 line     0.70│          ●─●
-  0.2 │  ●                              0.65│              ●  ◄ falling = drift
-  0.1 │●                                0.60│
-      └──┬──┬──┬──┬──┬──► week              └──┬──┬──┬──┬──┬──► run
-        w1 w2 w3 w4 w5 w6                     r1 r2 r3 r4 r5 r6
-   input shape moving away from ref       same eval, dropping score
-   ◄──────── leads in time ────────────►  ◄──── confirms later ────►
+Drift monitor, end to end
+┌─────────────────────────────────────────────────────────────────────┐
+│                                                                       │
+│  TRAIN TIME                          PROD TIME (rolling)              │
+│  ┌──────────────┐                    ┌──────────────────┐            │
+│  │ training set  │                    │ last N days of    │            │
+│  │ feature col X │                    │ live feature X    │            │
+│  └──────┬───────┘                    └─────────┬─────────┘            │
+│         │ bin (edges E)                         │ bin (SAME edges E)   │
+│         ▼                                        ▼                     │
+│  train_pct[] ───────────┐          ┌──────── prod_pct[]               │
+│                         ▼          ▼                                  │
+│                   ┌──────────────────────┐                            │
+│                   │  PSI = Σ (p−t)·ln(p/t)│                            │
+│                   └──────────┬───────────┘                            │
+│                              ▼                                        │
+│              ┌───────────────┴────────────────┐                       │
+│              ▼               ▼                 ▼                       │
+│         PSI < .10        .10–.20          PSI > .20                    │
+│         no action       investigate      RETRAIN ──► 16-retraining    │
+│                                                                       │
+│  Caveat: PSI sees DATA drift P(X). CONCEPT drift P(y|X) hides here.   │
+└───────────────────────────────────────────────────────────────────────┘
 ```
 
-The left curve usually moves *first* — inputs shift before the metric visibly
-suffers — which is exactly why covariate monitoring buys you lead time.
+Before the monitor, a drifting input population is invisible until accuracy complaints arrive. After, the new-camera-FOV shift in contrl's landmark distribution registers as a PSI spike on the affected coordinate features, days before the rep-count accuracy visibly degrades.
 
 ## Elaborate
 
-The hard-won lesson is that the cheapest signal and the truest signal are
-different signals, and you need both. Performance drift (the metric) is the
-truth, but it is *lagging*: you only see it after labels arrive, by which time
-users already ate the bad predictions. Covariate drift (PSI/KS) is *leading* but
-*circumstantial*: `P(X)` can move without hurting the metric (the model
-generalizes fine to the new region), and `P(y|X)` can move while `P(X)` sits
-perfectly still — pure concept drift, invisible to PSI. So the mature setup runs
-PSI per feature for early warning *and* re-runs a labeled eval set for ground
-truth, and treats disagreement between them as information. The most dangerous
-case is concept drift with stable inputs: every distribution looks fine, the
-relationship has silently inverted, and only the labeled metric catches it.
-
-This is distinct from **domain gap** (file 06). Domain gap is a *mismatch present
-at deploy time* — you trained on one population and shipped to another, and the
-model was wrong from minute one. Drift is a *mismatch that grows over time* in a
-deployment that started healthy. Same symptom (prod ≠ train), different clock:
-domain gap is a step at `t=0`; drift is a slope after `t=0`. The fix differs too
-— domain gap wants a better training set or domain adaptation; drift wants a
-monitoring loop and a retraining cadence (file 16).
+- **Bin edges come from train, always.** Re-deriving edges from prod data hides the very shift you're hunting. Freeze edges at training, store them next to the model.
+- **PSI per feature, not global.** Compute one PSI per monitored feature. A global number averages away the one coordinate that's drifting hard. For contrl you'd track PSI on each landmark axis separately — the FOV change hits the outer landmarks first.
+- **Rolling window size is a tuning knob.** Too short → noisy PSI that false-alarms on a quiet weekend. Too long → slow to notice real drift. Match it to your traffic volume.
+- **PSI is blind to concept drift — say so out loud.** This is the trap. The same `X` distribution with a flipped `P(y|X)` shows PSI ≈ 0 while the model is failing. Concept drift surfaces as a *performance* drop (cross-ref the performance-triggered path in `16-retraining-pipelines.md`), and is itself a flavor of the domain-gap problem (cross-ref `06-domain-gap.md`): train and serve distributions diverging.
+- **Domain gap is drift's static cousin.** `06-domain-gap.md` is the gap that exists *at launch* (you trained on one population, deploy to another). Drift is that gap *opening over time* on a population that started matched. Same math (distribution distance), different clock.
 
 ## Project exercises
 
-### Case B 1 — a PSI monitor over a retrieval feature
+### EX-ML-15a — PSI scorer over two feature snapshots
 
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a script that computes PSI for one retrieval feature — the
-  top-hit cosine similarity from `PgVectorStore.search` — comparing a saved
-  *reference* window of values against a recent *production* window, and prints
-  the PSI plus its band (stable / moderate / significant).
-- **Why it earns its place:** PSI is the single most-asked drift question in ML
-  interviews, and building it once over a real feature makes the binning,
-  flooring, and threshold reading concrete instead of memorized.
-- **Files to touch:** new `/Users/rein/Public/buffr/eval/psi-monitor.ts`, reading
-  similarity values produced via
-  `/Users/rein/Public/buffr/src/pg-vector-store.ts`; reference window saved as a
-  small JSON alongside it.
-- **Done when:** the script emits a PSI number and the correct band for a
-  hand-constructed shifted distribution (verify against the worked example: a
-  left-slid histogram yields PSI > 0.25).
+- **Exercise ID:** `EX-ML-15a` (Phase 3 — the ML-evals layer; PSI is a monitoring eval that runs against snapshots, not a training step)
+- **What to build:** A `psi(trainSnapshot, prodSnapshot, binEdges)` function that bins both snapshots with shared edges, computes per-feature PSI with an epsilon guard, and maps each score to `stable` / `investigate` / `retrain` via the threshold table. Take the two snapshots as plain arrays of feature values; emit `{ feature, psi, band }` per feature.
+- **Why it earns its place:** It's the leading-indicator monitor the retraining pipeline's drift trigger depends on — `16` literally calls "PSI > 0.20" as a trigger condition. Building the scorer first means the retraining policy has something real to react to. It also makes the data-vs-concept-drift distinction concrete: you'll *see* PSI stay flat under a synthetic label flip.
+- **Files to touch:** `Case B (new)` — `/Users/rein/Public/buffr/src/ml/drift/psi.ts` (new scorer); `/Users/rein/Public/buffr/src/ml/drift/psi.test.ts` (new test with a known hand-computed PSI fixture).
+- **Done when:** The scorer reproduces a hand-computed PSI (e.g. the `[.10 .25 .30 .25 .10]` vs `[.05 .15 .25 .35 .20]` example) within float tolerance; an empty prod bin does not produce `NaN`/`Infinity`; and a feature with identical train/prod proportions scores `0.0 → stable`.
 - **Estimated effort:** `1–4hr`
-
-### Case B 2 — a performance-drift curve from replay artifacts
-
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a job that re-runs aptkit's fixed eval set, computes
-  precision@k via `scorePrecisionAtK`, and plots the score over time keyed by the
-  timestamps in the replay artifacts at
-  `/Users/rein/Public/aptkit/artifacts/replays/*.json` — turning a pile of runs
-  into a time series.
-- **Why it earns its place:** it builds the *truest* drift signal (the metric on
-  a frozen eval set) and proves you can assemble a time series from logged
-  artifacts — the substrate every real drift dashboard is built on.
-- **Files to touch:** new under
-  `/Users/rein/Public/aptkit/packages/evals/` (e.g. a `drift-curve` script),
-  using `packages/evals/src/precision-at-k.ts` and reading
-  `/Users/rein/Public/aptkit/artifacts/replays/`.
-- **Done when:** the job outputs an ordered series of `(timestamp, precision@k)`
-  points across the replay artifacts, and a falling sequence is visibly distinct
-  from a flat one.
-- **Estimated effort:** `1–2 days`
 
 ## Interview defense
 
-**Q: "How do you detect drift when you have no labels in production?"**
-Watch the input distribution against a frozen training reference. Bin each
-feature, compute PSI = Σ (prod% − train%)·ln(prod%/train%) per feature on a
-schedule, and alert when PSI crosses 0.25 (KS-test if you want a bin-free
-hypothesis test on a continuous feature). It is a *leading* proxy — `P(X)` moving
-is circumstantial, so you investigate before retraining — but it is the only
-signal available before labels arrive.
+**Q: PSI is 0.04 but your model's accuracy dropped 15%. What happened?**
 
 ```
-  ref P(X) ──frozen──┐
-                     ▼
-  prod P(X) ──► PSI per feature ──► >0.25? ──► alert ──► investigate
-   (no labels needed; this is the early-warning line)
+P(X) unchanged  ─────►  PSI ≈ 0.04  (stable, no input drift)
+P(y|X) flipped  ─────►  accuracy ↓ 15%   ← PSI is BLIND to this
+                        = CONCEPT DRIFT, not data drift
 ```
-*Anchor: PSI compares prod-vs-train per binned feature; >0.25 is significant.*
 
-**Q: "What's the difference between domain gap and drift?"**
-Same symptom — production doesn't match training — different clock. Domain gap is
-a mismatch present at `t=0`: wrong from the first request because you trained on
-one population and served another. Drift is a mismatch that *grows* after `t=0`
-in a deployment that started healthy. Domain gap is a step; drift is a slope.
-Fixes differ: better/adapted training data for gap, a monitoring-and-retraining
-loop for drift.
+PSI only watches inputs. The relationship between input and label moved — concept drift — and you only catch that with a *performance* signal, not a distribution one. One-line anchor: *PSI sees the world change; it can't see the meaning of the world change.*
 
-```
-  metric                domain gap            drift
-        │  ●●●●●●●●●●     low & flat      │ ●●●●●____      starts high,
-        │                from minute one  │         ●●●●   slopes down
-        └──────────► t                    └──────────► t
-            (mismatch @ t=0)                  (mismatch grows)
-```
-*Anchor: domain gap = mismatch at deploy time; drift = mismatch that grows over time.*
+**Q: Why bin from training edges instead of recomputing edges on prod?**
+
+If you re-derive edges from prod, you reshape the bins to fit the new data, which absorbs and hides the shift. Frozen edges are the fixed yardstick. One-line anchor: *you can't measure movement against a ruler that moves with the thing you're measuring.*
 
 ## See also
 
-- `06-domain-gap.md` — the mismatch present at deploy time (drift's static cousin)
-- `16-retraining-pipelines.md` — what the "maybe retrain" branch of the loop runs
-- `01-supervised-pipeline.md` — the pipeline this monitoring band sits over
-- `packages/evals/src/precision-at-k.ts` — the metric that makes performance drift measurable
+- [`06-domain-gap.md`](./06-domain-gap.md) — the static train/serve gap that drift is the time-evolving version of
+- [`16-retraining-pipelines.md`](./16-retraining-pipelines.md) — what a PSI > 0.20 spike triggers
+- [`14-training-run-logging.md`](./14-training-run-logging.md) — the prod-model run a drift spike implicates

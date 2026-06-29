@@ -1,55 +1,78 @@
-# Overview — the trust map of aptkit + buffr
+# Overview — the security posture, ranked
 
-One page to orient before the audit. Here's the whole security picture in a single frame, then the verdict: the single worst exposure, ranked first.
+One page. The verdict first, then the rank.
 
-## The whole thing, one diagram
+**The verdict:** aptkit treats the *model* as the attacker and defends
+accordingly — least-privilege tool allowlists, a hard loop budget, a
+defensive output parser, a hallucination-tolerant retrieval filter. Those
+controls are real and they hold. What it does *not* defend is everything
+upstream of authentication and everything around prompt injection: there
+is no authn, no authz, no rate limiting, and retrieved/user content flows
+into the prompt raw. buffr adds the only persistent storage, and that's
+where the two genuine exposures live — tenancy without Row-Level Security,
+and full-trajectory persistence to a PII table.
 
 ```
-  aptkit (toolkit) + buffr (runtime) — the trust boundaries
+  Where the trust controls sit — and where the holes are
 
-  ┌─ UNTRUSTED ─────────────────────────────────────────────────────┐
-  │  Human question string                                          │
-  │  Indexed documents (could contain adversarial text)             │
-  └──────────────────────────────┬───────────────────────────────────┘
-                                 │  no sanitization beyond JSON parse
-                                 ▼
-  ┌─ SEMI-TRUSTED: the model ────────────────────────────────────────┐
-  │  Gemma (local) / Anthropic / OpenAI via ModelProvider.complete() │
-  │  decides: which tool, what args, when to stop                    │
-  │                                                                   │
-  │  CONTROLS that box it:                                            │
-  │   filterToolsForPolicy  — sees only allowed tools (01)           │
-  │   maxTurns / maxToolCalls — bounded work (02)                    │
-  │   minTopK + matchesFilter — bad args can't starve/wipe (03)      │
-  │   parseAgentJson         — tolerant, never eval()s output        │
-  └──────────────────────────────┬───────────────────────────────────┘
-                                 │  tool call → handler
-                                 ▼
-  ┌─ TRUSTED: storage (lives in buffr) ──────────────────────────────┐
-  │  PgVectorStore   — pg `$1..$8` params, `where app_id = $2` (04)  │
-  │  SupabaseTraceSink — persists FULL trajectory to agents.messages │
-  │  agents schema   — app_id column, NO row-level security          │
-  └──────────────────────────────────────────────────────────────────┘
-                                 ▲
-  ┌─ SECRETS ───────────────────┴────────────────────────────────────┐
-  │  .env (both repos, gitignored): ANTHROPIC_API_KEY, OPENAI_API_KEY,│
-  │  DATABASE_URL (with password). Never in source, never in bundle. │
-  └──────────────────────────────────────────────────────────────────┘
+  ┌─ DEFENDED (the model is the threat) ───────────────────────┐
+  │  ✓ tool allowlist          filterToolsForPolicy            │
+  │  ✓ bounded loop            maxTurns / maxToolCalls         │
+  │  ✓ defensive parse         parseAgentJson                  │
+  │  ✓ filter-arg tolerance    matchesFilter / minTopK         │
+  │  ✓ parameterized SQL       $1..$8 everywhere (buffr)       │
+  │  ✓ markdown render         react-markdown, no raw HTML     │
+  │  ✓ path containment        resolveReplayPath               │
+  └─────────────────────────────────────────────────────────────┘
 
-  ┌─ DEV-ONLY side surface: Studio Vite middleware ──────────────────┐
-  │  ~14 /api/* routes, no auth (localhost dev server)               │
-  │  resolveReplayPath gates file writes to artifacts/replays/ (05)  │
-  └──────────────────────────────────────────────────────────────────┘
+  ┌─ UNDEFENDED / NOT YET EXERCISED ───────────────────────────┐
+  │  ✗ tenancy isolation       app_id in code, NO RLS    ← #1  │
+  │  ✗ PII minimization        full trajectory persisted ← #2  │
+  │  ✗ prompt injection        retrieved/user text raw   ← #3  │
+  │  · authentication          none (library + CLI)            │
+  │  · authorization           none                            │
+  │  · rate limiting           none                            │
+  └─────────────────────────────────────────────────────────────┘
 ```
 
-## The verdict — what to worry about, in order
+## The three findings that matter, ranked
 
-This repo is a young AI toolkit, not a production multi-tenant service. The honest framing: the LLM/agent-security controls are real and deliberate, while the classic web controls (authn, authz, rate limiting, input sanitization) are mostly **not yet exercised** because there's no public HTTP surface that needs them yet. Rank the exposures by what an attacker could actually reach:
+**#1 — Cross-tenant isolation is app-code-only; there is no RLS.**
+Every row in buffr's `agents` schema carries an `app_id`
+(`sql/001_agents_schema.sql:6,19,34,54`), and every query passes it as a
+parameter (`where app_id = $2` in `src/pg-vector-store.ts:74`). But the
+schema declares no `CREATE POLICY` and no `ENABLE ROW LEVEL SECURITY` — a
+grep over `sql/` finds neither. The trust assumption is *"every query
+remembers to filter by `app_id`."* One forgotten clause in a future query
+returns another tenant's rows, and the database does nothing to stop it.
+The deep walk and the fix are in `04-app-code-tenancy-without-rls.md`.
 
-1. **app_id tenancy with no RLS — the worst latent exposure.** `agents.chunks` / `conversations` / `messages` / `profiles` all carry an `app_id` column (`buffr/sql/001_agents_schema.sql`), and `PgVectorStore.search` filters `where app_id = $2` (`buffr/src/pg-vector-store.ts:74`). But that filter lives in *application code only*. The database has no row-level security. The day a second tenant shares this Postgres and any query path forgets the `app_id` predicate — or `appId` is ever taken from caller input instead of the trusted config — one tenant reads another's conversations. Today buffr hardcodes `appId: 'laptop'`, so it's latent, not live. **See `04-app-id-tenancy-without-rls.md`.**
+**#2 — The full agent trajectory is persisted to a PII table.**
+buffr's trace sink (the `SupabaseTraceSink`, `src/supabase-trace-sink.ts`)
+writes *every* event to `agents.messages`: assistant text, the user's
+question, tool-call args, tool results and errors, token counts. That's by
+design — it makes runs replayable — but `content`, `tool_calls`, and
+`tool_results` are unredacted plaintext/JSONB. Anything a user types or a
+document contains is now durable. The walk is in
+`05-trajectory-persistence-pii.md`.
 
-2. **Full conversation trajectories persisted as a PII surface.** `SupabaseTraceSink` writes *every* event — user questions, assistant text, tool args, tool results, token counts — into `agents.messages` (`buffr/src/supabase-trace-sink.ts:53-85`). That table is the richest data in the system and has no field-level access control and no redaction. Whatever a user types, and whatever the retrieval surfaces, lands in durable storage. Combined with finding 1, it's the highest-value target.
+**#3 — Prompt injection is undefended.**
+`renderPromptTemplate` (`packages/prompts/src/types.ts:24`) substitutes
+`{var}` placeholders with no escaping; `injectProfile`
+(`packages/context/src/profile-injector.ts`) concatenates profile text
+with no delimiter; retrieved chunks reach the model as raw tool results.
+A document or a user question carrying "ignore previous instructions" has
+a clear path into the system prompt. This is the honest `not yet
+exercised` of the LLM-security lens — see lens 7 in `audit.md`.
 
-3. **The model is untrusted input that flows into a prompt unsanitized.** A user question goes straight into `agent.answer(question)` and into the prompt; indexed documents (which the model retrieves and reads) could carry adversarial instructions. There is no prompt-injection defense — the mitigations that *do* exist (tool allowlist, bounded loop) limit the *blast radius* of a hijacked model rather than preventing the hijack. This is `not yet exercised` as a defended threat, and it's the right next thing to build.
+## What's genuinely solid
 
-The good news, and why this repo reads as security-literate despite the gaps: the controls that *are* here are the right ones for an agent system. Least-privilege tool policy (01), a bounded loop (02), and hallucination-tolerant tool args (03) are exactly the three things that keep a semi-trusted model from becoming a fully-trusted one. Read those three first — they're the load-bearing positives — then the two gaps (04, 05) and the full lens walk in `audit.md`.
+The model-as-attacker controls are the strength. The rag-query agent gets
+a one-tool allowlist (`01`). The loop can't run away — `maxTurns` defaults
+to 8 and the last turn strips the tools (`02`). Bad JSON from a weak local
+model is parsed defensively (`03`). A hallucinated filter arg can't wipe
+the result set (`03`). buffr's SQL is fully parameterized. Studio renders
+docs through react-markdown (no raw-HTML XSS sink) and contains replay
+paths under `artifacts/replays/`.
+
+Read `audit.md` next for the full lens-by-lens walk.

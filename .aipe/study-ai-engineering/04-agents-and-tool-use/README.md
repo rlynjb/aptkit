@@ -1,23 +1,21 @@
 # 04 — Agents and tool use
 
-> Anchor: LLM application engineering (agentic retrieval + analytics agents). ·
-> Curriculum: Phase 4 (no curriculum file in repo; exercises cite real paths).
+> Anchor: LLM application engineering (loopd-shaped) — Phase 4.
+> aptkit's bounded agent loop orchestrates a Gemma LLM (no native tool API)
+> over read-only analytics/retrieval tools.
 
-The other heart of aptkit. Six capabilities run the same bounded agent loop, and
-the standout engineering is that the **default model has no native tool-calling**:
-Gemma can't take a `tools` array, so the provider renders tools into the system
-prompt and parses a JSON tool call back out, with a bounded retry nudge and a
-graceful text fallback. That's the most distinctive thing in the repo, and it
-lives in `02-tool-calling.md`.
+The bounded agent loop (`runAgentLoop`, `packages/runtime/src/run-agent-loop.ts`)
+and the **emulated tool calling** on Gemma are the headline here — a model
+with no tool API made to call tools by rendering schemas into the system
+prompt and parsing JSON back, with a retry nudge and graceful text fallback.
 
-The signature retrieval bug — a hallucinated `filter` argument wiping every result
-— is an agent error-recovery story; it lives in `06-error-recovery.md`.
+## Files
 
-## Files (self-contained per concept)
+- `01-agents-vs-chains.md` — the loop vs the linear pipeline; aptkit has both.
+- `02-tool-calling.md` — emulated tool calling on Gemma (the crown jewel); native on Anthropic/OpenAI.
+- `03-react-pattern.md` — the Thought-Action-Observation loop as `runAgentLoop` runs it.
+- `04-tool-routing.md` — the tool-policy allowlist + coverage gate as deterministic routing.
+- `05-agent-memory.md` — episodic memory over the retrieval contracts; short-term vs long-term.
+- `06-error-recovery.md` — the loop's failure handling: forceFinal, maxToolCalls, parse-retry, hard stop.
 
-1. `01-agents-vs-chains.md` — the loop vs the line; aptkit has both
-2. `02-tool-calling.md` — Gemma's emulated tool-calling; the most distinctive file
-3. `03-react-pattern.md` — thought/action/observation in the agent loop
-4. `04-tool-routing.md` — least-privilege tool policies; heuristic vs LLM routing
-5. `05-agent-memory.md` — episodic memory reusing the retrieval contracts (zero new infra)
-6. `06-error-recovery.md` — bounded turns, forced synthesis, the hallucinated-filter bug + fix
+Read `02-tool-calling.md` and `03-react-pattern.md` first.

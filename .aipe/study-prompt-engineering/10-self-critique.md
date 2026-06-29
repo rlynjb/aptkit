@@ -1,199 +1,261 @@
 # 10 — Self-critique and self-consistency
 
-**Industry name:** self-critique / self-consistency / reflexion — *Industry standard*
+**Subtitle:** self-critique / self-consistency — spend tokens to buy
+reliability (Industry standard)
 
 ## Zoom out, then zoom in
 
-Two reliability techniques that cost 2–5x tokens for one extra step of trust:
-*self-critique* (ask the model to evaluate its own output, then revise) and
-*self-consistency* (run the same prompt N times, vote on the answer). They earn
-their cost on high-stakes outputs you can't cheaply review by hand. The honest
-truth I've learned: a model critiquing its own output has the same blind spots
-that produced the output, so self-critique has real diminishing returns — and in
-this repo, **neither is wired into any agent.** What the repo *does* have is the
-adjacent, stronger pattern: an *independent* judge (a different model) scoring
-output.
+Two reliability patterns that trade tokens for confidence. Self-critique:
+ask the model to evaluate its own output and revise. Self-consistency: run
+the same prompt N times and vote. Both cost 2–5x the token budget for one
+extra step of reliability. aptkit has the *judge half* of self-critique
+built — but as a separate eval model, not an in-loop self-review. The in-loop
+revise step is a curriculum target.
 
 ```
-  Zoom out — self-critique vs the judge that exists
+  Zoom out — the critique machinery exists, but as an external judge
 
-  ┌─ Self-critique / self-consistency (NOT in repo) ──────────┐
-  │  generate → SAME model critiques → revise                 │ ← we are here
-  │  OR generate N times → vote                                │   (not yet exercised)
-  └───────────────────────────┬────────────────────────────────┘
-  ┌─ What IS shipped: independent judge ─▼─────────────────────┐
-  │  evals/rubric-judge.ts — a DIFFERENT model (Claude)        │
-  │     scores another model's output against a rubric         │
-  │  generateStructured retry — a weak form of self-correction │
-  └──────────────────────────────────────────────────────────────┘
+  ┌─ Generation ────────────────────────────────────────────────┐
+  │  agent loop → output (one pass, no in-loop self-review)      │
+  └───────────────────────────┬──────────────────────────────────┘
+                              │ output → artifact
+  ┌─ ★ Critique (external, eval-time) ★ ─────────────────────────┐
+  │  ★ RubricJudge: Claude critiques Gemma's output ★            │ ← we are here
+  │     scores + ONE highest-leverage fix                        │
+  │  in-loop "revise based on the critique" → NOT YET EXERCISED  │
+  └────────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: the rubric judge is the cross-model cousin of self-critique, and it's
-better precisely *because* the judge isn't the author — it doesn't share the
-author's blind spots. The retry loop in `generateStructured` is the one place a
-model is given a chance to "fix itself," but only against a schema, not a quality
-judgment.
+Zooming in: self-critique is a two-step prompt — generate, then grade your
+own work and fix it. Self-consistency is sampling the same question multiple
+times and taking the majority answer. The honest aptkit status: it has the
+critique *prompt* (the rubric judge produces a verdict and a fix), but the
+loop doesn't yet feed that fix back for a revision, and there's no
+N-sample voting. The pieces are there; the self-improving loop is the build
+target.
 
-## The structure pass
+## Structure pass
 
-**Layers:** the generator (produces output) → the critic (evaluates) → the
-reviser/voter (acts on the critique).
+**Layers.** Generation (produces output) → critique (grades it) → revision
+(applies the fix — the missing rung).
 
-**Axis — is the critic the *same* model as the author?** This axis is the whole
-lesson:
+**Axis — does the critique feed back into the output?** Trace it:
 
 ```
-  Axis: "does the critic share the author's blind spots?"
+  Axis: "is the critique's fix applied to produce a better answer?"
 
-  ┌─ Self-critique (same model) ─┐  seam  ┌─ Independent judge (diff model) ─┐
-  │ author critiques itself      │ ══╪══► │ Claude judges Gemma's output     │
-  │ → SAME blind spots ⚠         │ flips  │ → DIFFERENT blind spots ✓        │
-  │ → diminishing returns        │        │ → rubric-judge.ts (SHIPPED)      │
-  └──────────────────────────────┘        └───────────────────────────────────┘
+  RubricJudge produces a "fix"   → YES, it emits one              ✓
+  the agent loop consumes it     → NO  (eval-time only)           ✗
+  N-sample self-consistency vote → NO  (single pass)              ✗
+  the structured-gen RETRY       → a cousin: re-prompt on FAILURE ◐
 ```
 
-**Seam:** the critic/author identity boundary. When the critic is the author
-(self-critique), the seam is weak — the model that missed an error is unlikely to
-catch it on review. When the critic is a different model (the rubric judge), the
-seam is load-bearing — the judge sees what the author missed. **This is why the
-repo invested in the judge and not in self-critique.**
+**Seam.** The load-bearing boundary is between *critique* and *revision*.
+aptkit builds right up to it — the judge emits a `fix` string — but the loop
+back from fix to a revised generation is not wired. That open seam is exactly
+where the curriculum exercise lands.
 
 ## How it works
 
-### Move 1 — the mental model
+You know how a good code review ends with one actionable comment, and the
+author then revises and re-submits? Self-critique is that loop run by the
+model on itself. aptkit has the reviewer; it's missing the
+revise-and-resubmit. Let's walk what exists and what's the build.
 
-You already know the value of a second reviewer on a PR: the author is blind to
-their own mistakes, so a *different* person catches them. Self-critique is asking
-the author to review their own PR — better than nothing, but it misses what they
-already missed. Self-consistency is rolling the dice N times and taking the
-majority — it averages out the unlucky single roll. An independent judge is the
-real second reviewer.
+### Step 1 — the critique exists, and it's disciplined
 
-```
-  Pattern — three reliability strategies
+The rubric judge is a critique engine. Its prompt is built to produce *one*
+actionable fix, not a vague vibe:
 
-  self-critique:   gen ──► critique(SAME model) ──► revise     (weak: shared blind spots)
-  self-consistency: gen×N ──► vote ──► answer                  (costly: N× tokens)
-  independent judge: gen ──► judge(DIFFERENT model) ──► score  (strong: SHIPPED here)
-```
-
-### Move 2 — walking what exists and what doesn't
-
-**What's shipped — the independent judge.** `RubricJudge.judge`
-(`rubric-judge.ts:89`) takes a *subject* (some other model's output) and scores
-it against a rubric using `generateStructured`. The judging instruction
-(`:146`): *"Score meaning and evidence, not style preferences"* and *"Return one
-highest-leverage fix, not a list."* This is critique done by a separate model —
-the strong form. **Why it beats self-critique:** Claude judging Gemma doesn't
-inherit Gemma's failure modes.
-
-**What's shipped — the schema retry (weak self-correction).** `generateStructured`
-(`structured-generation.ts:62`) gives the model a second attempt with a stricter
-nudge on parse/validation failure. This is *self-correction*, but only against an
-objective contract (valid JSON), not a subjective quality judgment. The model
-isn't asked "is this good?" — it's told "that wasn't valid, try again." That
-narrow scope is exactly why it works: there's no shared-blind-spot problem when
-the failure is mechanically checkable.
-
-**What's NOT shipped — self-critique and self-consistency.** No agent in this
-repo runs a "critique your own answer and revise" turn, and none runs the same
-prompt N times to vote. The recommendation agent — which the spec flags as a
-high-stakes candidate (edits/actions a human acts on) — currently relies on the
-prompt's hard rules and the validator, not a critique pass. This is `not yet
-exercised`. **Where it would go:** a high-stakes generation chain
-(recommendations) is the textbook place — generate, have an independent judge
-score it (the rubric judge already exists), and gate or revise on a low score.
-
-### Move 2.5 — current state vs future state
-
-```
-  Comparison — reliability passes: shipped vs gap
-
-  NOW (shipped)                        │  GAP (not yet exercised)
-  ───────────────────────────────────  │  ──────────────────────────────────
-  rubric-judge: independent judge      │  no self-critique turn in any agent
-    (Claude scores Gemma) — eval-time  │  no self-consistency (N-sample vote)
-  generateStructured: schema retry     │  no inline critique→revise loop
-    (objective self-correction only)   │  judge runs at EVAL time, not
-                                       │    inline as a runtime gate
+```ts
+// packages/evals/src/rubric-judge.ts:147
+'Score the subject against the rubric. Score meaning and evidence, not style ...',
+'Never rewrite the subject. Return one highest-leverage fix, not a list.',
 ```
 
-The takeaway: the strong primitive (independent judge) already exists and runs at
-eval time. Promoting it to a *runtime* gate on a high-stakes chain is a
-composition of existing parts — wire `RubricJudge` into the recommendation
-agent's output path — not new infrastructure. That's the cheap path to
-reliability here, and it sidesteps the diminishing-returns problem of true
-self-critique by using a different model as the critic.
+```ts
+// packages/evals/src/rubric-judge.ts:46
+export type RubricJudgment = {
+  dimensions: Record<string, RubricDimensionScore>;
+  verdict: string;
+  fix: string;          // ← the actionable critique, exactly one
+  reasoning?: string;
+};
+```
 
-### Move 3 — the principle
+"One highest-leverage fix, not a list" is the production discipline — a
+critique that returns ten fixes is noise; one prioritized fix is something a
+revision step can act on. This is self-critique's first half done well.
 
-**The value of a critique is proportional to how different the critic's blind
-spots are from the author's.** Self-critique is cheap but shares blind spots;
-self-consistency averages out variance at N× cost; an independent judge is the
-strongest because it doesn't inherit the author's failure modes. This repo bet on
-the judge — correctly — and the open move is to run it inline on the outputs that
-are too expensive to get wrong.
+### Step 2 — the missing rung: feeding the fix back
+
+What's `not yet exercised`: a loop that takes `judgment.fix`, appends it to
+the prompt, and regenerates. The closest existing mechanism is the
+structured-generation retry — but it re-prompts on a *parse/validation
+failure*, not on a *quality critique*:
+
+```ts
+// packages/runtime/src/structured-generation.ts:64
+const messages = attempt === 1 ? baseMessages
+  : appendStrictSuffix(baseMessages, strictSuffix);  // ← retry on FAILURE, not critique
+```
+
+```
+  Pattern — what's built vs the self-critique loop
+
+  BUILT (failure-retry):
+    generate → parse fails → re-prompt "ONLY valid JSON" → regenerate
+
+  SELF-CRITIQUE LOOP (not yet exercised):
+    generate → JUDGE scores + fix → append fix → regenerate → re-judge
+                                                   └─ until verdict=pass
+```
+
+The skeleton parts that would make it a real self-critique loop, named by
+what breaks without each:
+
+- **The critique step.** Already built (the judge). Without it there's
+  nothing to revise toward.
+- **The fix-feedback.** Missing. Without it the critique is observation, not
+  improvement.
+- **The termination bound.** Critical and missing. Without a hard cap, a
+  model that can't satisfy its own critique loops forever (the same
+  bounded-loop discipline as `maxTurns` in `run-agent-loop.ts:87`).
+- **A different critic.** The blind-spot guard (step 4) — without it the
+  critique shares the generator's blind spots.
+
+### Step 3 — self-consistency: also not built
+
+Self-consistency — sample the same prompt N times, vote on the answer — has
+no implementation here. Every capability runs a single pass. The pattern:
+
+```
+  Self-consistency (not yet exercised in aptkit)
+
+  prompt ──┬─► sample 1 → answer A
+           ├─► sample 2 → answer A
+           ├─► sample 3 → answer B
+           └─► sample 4 → answer A
+                          └─► majority vote → A   (3x token cost)
+```
+
+This would fit a low-trust classifier — run the intent classifier 3x and
+vote — but at 3x the cost, which is why it's a deliberate choice, not a
+default.
+
+### Step 4 — the diminishing-returns trap
+
+The honest caveat that keeps this from being a silver bullet: a model
+critiquing its *own* output has the same blind spots that produced the
+output. If the generator misread the question, the self-critic likely
+misreads it too. That's precisely why aptkit's critique is a *different*
+model — Claude judging Gemma — rather than Gemma judging itself. Crossing the
+model boundary is what gives the critique independent blind spots. A
+true self-critique loop on a single model buys less than it looks like it
+should.
+
+### Step 5 — when the extra cost is worth it
+
+```
+  Comparison — is 2-5x token cost worth it?
+
+  high-stakes output (edits to a user's data) → YES, critique before commit
+  low-trust classifier                        → MAYBE, self-consistency vote
+  content hard to manually review at scale    → YES, automated critique gate
+  cheap routine classification                → NO, single pass + eval suite
+```
+
+For aptkit, the natural place is the recommendation or diagnostic agent — the
+outputs a human acts on — where a critique-then-revise pass before surfacing
+the answer would catch a weak recommendation. That's the build target the
+curriculum points at.
+
+### The principle
+
+**Self-critique and self-consistency buy reliability with tokens, but a model
+critiquing itself shares its own blind spots — so cross a model boundary for
+the critique, and always bound the revise loop.** aptkit has the critique
+half (a disciplined judge that emits one fix) and crosses the model boundary
+(Claude judges Gemma), which is the *right* design. The missing rung is
+feeding the fix back into a bounded revision loop — the highest-leverage
+unbuilt reliability feature here.
 
 ## Primary diagram
 
-```
-  Self-critique landscape — what this repo has and lacks
+The built critique, the missing revision loop, the blind-spot guard.
 
-  GENERATE (any agent, e.g. recommendation)
-        │
-        ├─► schema retry (structured-generation.ts:62)   [SHIPPED]
-        │     objective: "not valid JSON, try again"
-        │     no shared-blind-spot problem (mechanical check)
-        │
-        ├─► independent judge (rubric-judge.ts:89)        [SHIPPED, eval-time]
-        │     Claude scores Gemma's output, calibrated rubric
-        │     strong: different model, different blind spots
-        │
-        ├─► self-critique turn (same model revises)       [not yet exercised]
-        │     weak: shared blind spots, diminishing returns
-        │
-        └─► self-consistency (N samples → vote)           [not yet exercised]
-              costly: N× tokens, averages variance
+```
+  Self-critique in aptkit — built, missing, and the guard
+
+  ┌─ Generation ────────────────────────────────────────────────┐
+  │  Gemma agent → output                                        │
+  └────────────────────────────┬──────────────────────────────────┘
+                              │ output
+  ┌─ Critique (BUILT, cross-model) ▼──────────────────────────────┐
+  │  RubricJudge = Claude → { verdict, fix, reasoning }           │
+  │  "one highest-leverage fix, not a list"                       │
+  └────────────────────────────┬──────────────────────────────────┘
+            fix ╎ NOT YET EXERCISED ╎ append fix, regenerate, re-judge
+                ▼                    (bounded by a hard cap)
+  ┌─ Revision ─────────────────────────────────────────────────┐
+  │  (the missing rung — curriculum build target)                │
+  └──────────────────────────────────────────────────────────────┘
+   blind-spot guard: the critic is a DIFFERENT model than the generator
 ```
 
 ## Elaborate
 
-The techniques: *self-consistency* (Wang et al.) samples multiple reasoning paths
-and takes the majority answer — it helps most when the task has a single
-verifiable answer and the model's errors are uncorrelated across samples.
-*Reflexion / self-critique* (Shinn et al., Madaan et al.) has the model critique
-and revise — the documented caveat is exactly the shared-blind-spot problem: gains
-are real but bounded, and they collapse when the model's critique is as wrong as
-its answer. The production reconciliation, which this repo half-implements, is to
-make the critic a *different* model (LLM-as-judge, concept 05) so the critique
-adds genuinely new information. The cost discipline: every one of these multiplies
-your token spend (concept 04), so reserve them for outputs where a wrong answer is
-expensive and hard to catch by hand.
+Self-consistency (Wang et al.) and self-refine / self-critique (Madaan et
+al.) are the canonical sources. The production reality both communities
+converged on matches aptkit's instinct: self-critique with the *same* model
+has limited headroom because the blind spots correlate, so a stronger or
+different critic model is the reliable version. aptkit's Claude-judges-Gemma
+setup is that pattern used at eval time; promoting it into the serving loop
+is the natural extension.
+
+The connection to evals (concept 5) is tight — the rubric judge is the same
+machinery whether it runs as an offline eval or an inline critique. The
+connection to bounded loops (study-agent-architecture, `runAgentLoop`'s
+`maxTurns`) is the termination guard: any revise loop needs the same hard cap
+the agent loop already has, or it spins.
 
 ## Interview defense
 
-**Q: When is self-critique worth the cost, and what's its weakness?** Worth it on
-high-stakes outputs too expensive to review by hand — but its weakness is that
-the model critiquing itself shares the blind spots that produced the error, so
-returns diminish. The stronger move is an *independent* judge (a different model),
-which this repo ships as the rubric judge; self-critique itself is not yet wired.
+**Q: What's the catch with self-critique?**
+
+A model critiquing its own output has the same blind spots that produced the
+output — if it misread the prompt, it misreads it again when reviewing. So
+self-critique on a single model has limited headroom. The reliable version
+crosses a model boundary: a different (often stronger) model critiques. And
+any revise-loop needs a hard termination bound, or a model that can't satisfy
+its own critique spins forever.
 
 ```
-  same-model critique → shared blind spots (weak)
-  different-model judge → new information (strong) ← rubric-judge.ts
+  same-model self-critique → correlated blind spots → low headroom
+  cross-model critique (Claude→Gemma) → independent blind spots → real gain
 ```
-*Anchor: `RubricJudge.judge` (`rubric-judge.ts:89`); schema retry as objective
-self-correction (`structured-generation.ts:62`).*
 
-**Q: The part people forget?** That **self-critique and an independent judge are
-not the same technique**. People say "add a critique step" and reach for the same
-model, getting little. The leverage is in the critic being *different* — and the
-cheap path here is promoting the existing rubric judge from eval-time to a
-runtime gate on the recommendation chain.
+Anchor: "aptkit's `RubricJudge` is Claude critiquing Gemma — cross-model on
+purpose — and it emits 'one highest-leverage fix.' The missing rung is
+feeding that fix back into a bounded revision loop."
+
+**Q: When is the 2–5x token cost of self-consistency worth it?**
+
+High-stakes outputs a human acts on, low-trust classifiers where a vote
+beats a single sample, and content too voluminous to review by hand. Not for
+cheap routine work — there a single pass plus an offline eval suite is
+cheaper and catches regressions. aptkit doesn't implement voting yet; the
+single-pass-plus-eval path is its current bet.
+
+Anchor: "Worth it for high-stakes or low-trust; aptkit currently does
+single-pass + the replay eval suite instead of N-sample voting."
 
 ## See also
 
-- `05-eval-driven-iteration.md` — the rubric judge as an eval-time scorer.
-- `02-structured-outputs.md` — the schema retry as objective self-correction.
-- `04-token-budgeting.md` — every reliability pass multiplies token cost.
-- `06-single-purpose-chains.md` — the recommendation chain is the high-stakes candidate.
+- [05-eval-driven-iteration.md](05-eval-driven-iteration.md) — the rubric
+  judge as an offline eval
+- [09-chain-of-thought.md](09-chain-of-thought.md) — reasoning as the input
+  a critique evaluates
+- [02-structured-outputs.md](02-structured-outputs.md) — the failure-retry
+  that's a cousin of critique-retry
+- study-agent-architecture — the bounded-loop discipline a revise loop needs

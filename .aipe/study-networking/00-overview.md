@@ -1,79 +1,80 @@
 # Study — Networking · Overview
 
-The whole networking surface of aptkit in one page: what crosses a wire, where it can fail, and which protocol semantics the code leans on. This is a curriculum guide — it teaches the transport fundamentals, then anchors each one to the real bytes this repo moves (or honestly marks `not yet exercised` where the repo never touches the wire).
+The question this guide answers: **what actually happens on the wire in aptkit, where can it fail, and which protocol semantics does the code rely on?**
 
-## The honest verdict first
+Verdict first: aptkit is a TypeScript monorepo whose entire network surface is **one HTTP verb against one local origin** — `POST http://localhost:11434/api/*` to a local Ollama daemon — plus a **dev-only HTTP middleware** in Studio and a **static-asset fetch** from GitHub Pages. The cloud SDKs (Anthropic, OpenAI) carry their own HTTP stacks but aren't reached by the local default path. The durable database wire (`pg` over TCP to Supabase) lives in the companion repo **buffr**, not here. There is no TLS in the hot path, no DNS worth resolving (it's `localhost`), no realtime transport, and — the headline risk — **no per-call timeout on any outbound `fetch`**.
 
-aptkit barely touches the network on purpose. The whole monorepo is built around an **injectable transport seam**: every place that *could* hit the wire takes a function you can swap for a recorded response, so the tests run with zero sockets open. The one place the repo *does* open a socket itself is a plain HTTP `POST` to a local Ollama daemon on `localhost:11434` — no TLS, no DNS, no auth, no proxy. The cloud providers (Anthropic, OpenAI) hand the wire entirely to a vendor SDK, so the repo's own networking code never sees those bytes. The durable database lives in the companion repo **buffr**, which opens a `pg.Pool` to Supabase Postgres.
+## The whole network surface in one diagram
 
-So the networking story is small and sharp. That is the lesson, not a gap: a system that pushes the wire to the edges and injects it everywhere else is *testable*, and you'll see that pattern repeated in every file here.
+Every byte aptkit puts on a wire, and where it goes.
 
 ```
-  aptkit's entire on-the-wire surface — one frame
+  aptkit network surface — every origin it talks to
 
-  ┌─ aptkit (this repo) ──────────────────────────────────────┐
-  │                                                            │
-  │  GemmaModelProvider ─── fetch POST ──► localhost:11434     │ ← plain HTTP
-  │  OllamaEmbeddingProvider ─ fetch POST ─► localhost:11434   │   loopback
-  │                                                            │
-  │  AnthropicModelProvider ─► @anthropic-ai/sdk ─► (the wire) │ ← SDK owns it
-  │  OpenAIModelProvider ────► openai sdk ───────► (the wire)  │   (HTTPS, not us)
-  │                                                            │
-  │  Studio dev server (vite middleware) ── HTTP+NDJSON ──► browser
-  │  Studio static build ──────────────────► GitHub Pages (HTTPS, static)
-  └────────────────────────────────────────────────────────────┘
-                              │ buffr consumes @rlynjb/aptkit-core
-                              ▼
-  ┌─ buffr (companion repo) ──────────────────────────────────┐
-  │  pg.Pool ──── TCP (pg wire protocol) ──► Supabase Postgres │ ← long-lived
-  └────────────────────────────────────────────────────────────┘   pool
+  ┌─ Process: Node (agent / CLI / Studio dev server) ──────────────┐
+  │                                                                 │
+  │  GemmaModelProvider ───────┐                                    │
+  │  OllamaEmbeddingProvider ──┤                                    │
+  │       (the client)         │ HTTP POST  (plain, no TLS)         │
+  │                            ▼                                    │
+  └────────────────────────────┼───────────────────────────────────┘
+                               │  loopback only
+                  ┌────────────▼────────────┐
+                  │  Ollama daemon            │  ← origin: localhost:11434
+                  │  /api/chat  /api/embed    │     (same machine)
+                  └───────────────────────────┘
+
+  ┌─ Provider SDKs (NOT on the local default path) ────────────────┐
+  │  AnthropicModelProvider → api.anthropic.com   (SDK owns wire)  │
+  │  OpenAIModelProvider    → api.openai.com      (SDK owns wire)  │
+  └─────────────────────────────────────────────────────────────────┘
+
+  ┌─ Studio (apps/studio) ─────────────────────────────────────────┐
+  │  dev server: vite middleware  /api/model-status, /api/stream/* │
+  │              (HTTP/1.1 on 127.0.0.1:4187, NDJSON streaming)    │
+  │  prod build: static assets fetched from GitHub Pages over HTTPS │
+  └─────────────────────────────────────────────────────────────────┘
+
+  ┌─ buffr (companion repo, NOT this codebase) ────────────────────┐
+  │  pg Pool → Supabase Postgres over TCP (the durable wire)       │
+  └─────────────────────────────────────────────────────────────────┘
 ```
 
-## Ranked findings — what to look at first
+## Ranked findings
 
-1. **No per-call timeout on the Ollama `fetch` (highest consequence).** Both `GemmaModelProvider`'s `defaultHttpTransport` (`packages/providers/gemma/src/gemma-provider.ts:201-215`) and `OllamaEmbeddingProvider`'s (`packages/retrieval/src/ollama-embedding-provider.ts:60-75`) call `fetch` with no `AbortSignal.timeout`. A wedged Ollama daemon — model still loading, GPU stuck — makes the agent loop hang indefinitely. The only escape is a caller-supplied `request.signal`, which nothing in-repo supplies a deadline for. → `07-timeouts-retries-pooling-and-backpressure.md`, `08-networking-red-flags-audit.md`.
+1. **No per-call timeout on the Ollama `fetch` — a wedged daemon hangs the agent forever.** Both `defaultHttpTransport` in `packages/providers/gemma/src/gemma-provider.ts:201-215` and `packages/retrieval/src/ollama-embedding-provider.ts:60-75` call `fetch` with only an optional `AbortSignal` and no `AbortController` timeout. The signal threads from `run-agent-loop.ts:91` but nothing ever *fires* it on a deadline. If Ollama accepts the TCP connection and then stalls (model loading, OOM, swap), the `await fetch` never resolves. This is the single highest-consequence network gap. → `07-timeouts-retries-pooling-and-backpressure.md`, `08-networking-red-flags-audit.md`.
 
-2. **The injectable transport seam is the load-bearing design choice.** `GemmaChatTransport` and `EmbedTransport` are function types the constructor accepts; the real `fetch` is the *default*, not the only path. This is why the entire test suite runs offline and why swapping Ollama for a remote inference server is a one-arg change. It's also the seam where control flips from "in-process pure function" to "bytes on a socket." → `01-network-map.md`, `03-tcp-udp-connections-and-sockets.md`.
+2. **The transport is a clean seam (`GemmaChatTransport` / `EmbedTransport`) — network is fully injectable, so tests never touch a socket.** `gemma-provider.ts:19-25` and `ollama-embedding-provider.ts:18-22` define a function-type port; the real `fetch` is just the default adapter. This is the strongest design choice on the network axis: the HTTP boundary is mockable without a server. → `01-network-map.md`, `03-tcp-udp-connections-and-sockets.md`.
 
-3. **The repo offloads all hard networking to dependencies.** TLS, DNS, HTTP/2, connection pooling to cloud APIs, retry/backoff — none of it is in aptkit's code, because the Anthropic/OpenAI SDKs and `pg` own it. That's the right call for a toolkit (don't reimplement an HTTP client), but it means the repo can't *demonstrate* those mechanisms. The files below teach them anyway and label the boundary plainly. → `04-tls-and-trust-establishment.md`, `02-dns-routing-and-addressing.md`.
+3. **One verb, one shape, fail-loud on non-2xx — no retries, no backoff, no idempotency handling.** Every transport is `POST` + `content-type: application/json` + `stream:false`, and `if (!res.ok) throw`. A transient 503 from Ollama is a hard error, not a retry. That's the right call for a single-user local daemon, but it's the first thing that breaks under any flakiness. → `05-http-semantics-caching-and-cors.md`, `07-timeouts-retries-pooling-and-backpressure.md`.
 
 ## Reading order
 
 ```
-  foundations            00-overview            (you are here)
-       ↓
-  the map                01-network-map         every boundary, one diagram
-       ↓
-  addressing             02-dns-routing-and-addressing
-       ↓
-  transport              03-tcp-udp-connections-and-sockets
-       ↓
-  encryption             04-tls-and-trust-establishment
-       ↓
-  application            05-http-semantics-caching-and-cors
-       ↓
-  realtime               06-websockets-sse-streaming-and-realtime
-       ↓
-  resilience             07-timeouts-retries-pooling-and-backpressure
-       ↓
-  the audit              08-networking-red-flags-audit   ranked risks
+  00  overview            ← you are here
+  01  network-map         the full on-the-wire path, every boundary
+  02  dns-routing         names & addressing (mostly `not yet exercised`)
+  03  tcp-udp-sockets     connections, loopback, the fetch socket lifecycle
+  04  tls-trust           encryption in transit (`not yet exercised` locally)
+  05  http-semantics      methods, status, headers, CORS, caching
+  06  websockets-sse      realtime & streaming (NDJSON, not websockets)
+  07  timeouts-retries    the timeout gap, pooling, backpressure
+  08  red-flags-audit     ranked network-failure risks
 ```
-
-Read top to bottom the first time. After that, `08` is the file you reopen — it's the ranked risk list with evidence.
 
 ## `not yet exercised` in this repo
 
-The repo never touches these. Each file below teaches the concept and says exactly when it would become relevant here.
-
-- **DNS resolution** — every endpoint is `localhost` (loopback, no lookup) or hidden inside a vendor SDK / `DATABASE_URL`. → `02`.
-- **TLS handshake / certificates / termination** — the only socket aptkit opens is plain HTTP to loopback. TLS exists only inside the SDKs and the `pg` connection in buffr. → `04`.
-- **HTTP/2, HTTP/3, connection reuse, keep-alive at the app layer** — aptkit's `fetch` calls are single-shot; reuse is the SDK's job. → `03`, `07`.
-- **WebSockets / SSE** — no long-lived bidirectional transport anywhere. Studio's "streaming" is NDJSON over a single HTTP response body, which is a different mechanism (one-way chunked transfer). → `06`.
-- **Retries, backoff, jitter, request collapsing, circuit breakers at the HTTP layer** — `FallbackModelProvider` retries across *providers*, not across *network attempts*; there is no transport-level retry. → `07`.
-- **Proxies, CDNs, edge/origin split, load balancing** — GitHub Pages serves the static Studio build behind its own CDN, but that's infrastructure the repo configures via a workflow, not code it runs. → `02`.
+- **DNS resolution** — every outbound call targets `localhost`/`127.0.0.1`; no hostname is ever resolved by aptkit code. (`02`)
+- **TLS / certificate trust** — the local Ollama wire is plain HTTP; no `https:` origin, no cert pinning, no termination point in aptkit. Cloud SDK TLS is owned by the vendor SDKs. (`04`)
+- **HTTP/2, connection multiplexing, keep-alive tuning** — never configured; left to the Node `fetch` (undici) defaults. (`03`)
+- **WebSockets, Server-Sent Events** — no long-lived bidirectional transport. Streaming is one-shot NDJSON over a plain HTTP response in Studio dev, and `stream:false` to Ollama. (`06`)
+- **Retries, backoff, jitter, request collapsing, circuit breakers** — none in aptkit's HTTP layer. The `FallbackModelProvider` switches *providers* on error but does not retry a *call*. (`07`)
+- **Connection pooling on the HTTP side** — no `Agent`/pool tuning. (Pooling exists only in buffr's `pg.Pool`, a different repo and a different protocol.) (`07`)
+- **CORS** — the Studio dev middleware is same-origin; no `Access-Control-*` headers are set. (`05`)
 
 ## Cross-links to neighboring guides
 
-- **`study-distributed-systems`** — partial failure, the fallback chain as a coordination pattern, idempotency of the Ollama call. Networking owns *what happens on the wire*; distributed-systems owns *correctness when the wire fails mid-coordination*.
-- **`study-performance-engineering`** — latency budgets, the cost of a synchronous round-trip per agent turn, why the missing timeout is also a tail-latency problem.
-- **`study-debugging-observability`** — the trace events (`CapabilityEvent`) and NDJSON stream are how you'd *see* a network failure; that guide owns the evidence trail, this one owns the failure mechanism.
+- **study-distributed-systems** — partial failure when the Ollama daemon or Supabase is unreachable; the `FallbackModelProvider` chain as a coordination pattern.
+- **study-performance-engineering** — latency of the synchronous `await fetch`, the cost of no connection reuse, NDJSON streaming as a time-to-first-byte lever.
+- **study-debugging-observability** — the `if (!res.ok) throw` error text is the only network-failure signal; NDJSON trace events as the on-the-wire observability record.
+- **study-security** — *whether* the loopback boundary and the (gitignored) API keys are safe; this guide only covers *what's on the wire*.

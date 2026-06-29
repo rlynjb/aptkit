@@ -1,260 +1,212 @@
 # LLM cost optimization
 
-**Subtitle:** Measure tokens, price them, route the cheap thing first · the usage ledger · *Industry standard*
+*LLM cost optimization · model routing (Industry standard)*
+
+Here's the thing aptkit gets right that most teams don't: it *measures* cost. The usage ledger (`estimateCost`) is real, it works, it's wired into the trace. What aptkit doesn't do yet is *act* on the measurement. The fallback chain looks like routing — it tries one provider, then another — but it routes on *failure*, not on *cost or quality*. That distinction is the whole file. You have the speedometer; you don't have the gear-shift.
 
 ## Zoom out, then zoom in
 
-Before any tactic: you can't optimize a cost you don't measure. Here's where the
-measuring instrument sits in aptkit — and where the pricing it feeds quietly
-runs out of data.
+Cost optimization has two halves, and aptkit owns exactly one of them. ★ Measurement (what did this call cost?) is shipped. Routing (which model *should* this call go to?) is `not yet exercised`.
 
 ```
-  Zoom out — where cost gets measured in aptkit
-
-  ┌─ Agent run ─────────────────────────────────────────────────┐
-  │  every model turn emits a `model_usage` trace event          │
-  │  (run-agent-loop.ts:111, structured-generation.ts:131)       │
-  └───────────────────────────┬─────────────────────────────────┘
-                              │ trace events
-  ┌─ Usage ledger ────────────▼─────────────────────────────────┐
-  │  ★ summarizeUsage  → sum tokens across turns                │ ← the instrument
-  │  ★ estimateCost    → tokens × price                          │
-  └───────────────────────────┬─────────────────────────────────┘
-                              │ pricingForModel(provider, model)
-  ┌─ Price table ─────────────▼─────────────────────────────────┐
-  │  OpenAI gpt-4.1 family ONLY · Gemma=$0 · Anthropic=undefined │ ← the gap
-  └──────────────────────────────────────────────────────────────┘
+Cost optimization: measure → decide → route
+┌──────────────────────────────────────────────────────────────────────┐
+│  MEASURE  (SHIPPED)                                                    │
+│  ┌──────────────────────────────────────────────────────────────┐    │
+│  │ usage-ledger.ts: summarizeUsage → estimateCost → formatCost    │    │
+│  │   tokens in/out  ──pricingForModel──▶  $ per call              │    │
+│  └────────────────────────────┬───────────────────────────────────┘  │
+│                                ▼ feeds                                 │
+│  DECIDE  (NOT YET EXERCISED)                                           │
+│  ┌──────────────────────────────────────────────────────────────┐    │
+│  │ "is the cheap model good enough for THIS request?"             │    │
+│  └────────────────────────────┬───────────────────────────────────┘  │
+│                                ▼ drives                                │
+│  ROUTE  (NOT YET EXERCISED — and NOT what the fallback chain does)     │
+│  ┌──────────────────────────────────────────────────────────────┐    │
+│  │ cheap model (Gemma, $0) ──good?──▶ done                        │    │
+│  │                          ──not good?──▶ escalate (Sonnet, $$)  │    │
+│  └──────────────────────────────────────────────────────────────┘    │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-Now zoom in. aptkit *measures* tokens well — every turn emits a `model_usage`
-event and `summarizeUsage` sums them. What it can't fully *price* is anything
-outside the OpenAI gpt-4.1 family. Gemma is free because it's local, so $0 is
-correct. Anthropic pricing is `undefined` — a real gap, not a free lunch. And
-the famous "route cheap models first" tactic? aptkit has a fallback chain that
-looks like it but optimizes *availability*, not cost.
+The fallback chain (`FallbackModelProvider`) lives in the ROUTE box's *shape* but not its *trigger*. It escalates on **exception**, never on **"the cheap answer wasn't good enough."**
 
 ## Structure pass
 
-**Layers.** Run → ledger → price table. The ledger is provider-neutral (it sums
-whatever turns happened); the price table is provider-*specific* (it only knows
-OpenAI).
+One axis: **failure-based vs quality/cost-based routing**.
 
-**Axis — cost.** Trace a dollar. Tokens are counted at the model boundary
-(`response.usage`), summed by `summarizeUsage`, then multiplied by a per-million
-rate in `pricingForModel`. The dollar amount is only as good as that last
-multiply — and for Gemma it's $0 (local), for Anthropic it's `undefined`
-(unpriced).
+- **Failure-based (shipped — `FallbackModelProvider`).** Try provider A; if `complete()` *throws*, try provider B. The trigger is an error. A working-but-bad answer from A never triggers a fallback — the chain considers it a success and returns it.
+- **Quality/cost-based (the gap — a router).** Try the *cheap* model; inspect the result; escalate to the expensive model only if the cheap result fails a quality gate. The trigger is a *validation verdict*, not an exception.
+- **The seam they share.** Both are `ModelProvider`s composed of an ordered list of providers. The router is the fallback chain with the gate moved from `catch` to `if (!validate(result))`.
 
-**Seam.** The load-bearing boundary is `pricingForModel(provider, modelName)`
-(`packages/runtime/src/usage-ledger.ts:71`). Above it, token counts are real and
-provider-neutral. Below it, the answer depends entirely on whether the table has
-a row. The axis "do we know what this cost?" flips here: known for OpenAI,
-$0-and-correct for Gemma, `undefined`-and-blind for Anthropic.
+That's the precise distinction to hold: **same composition, different trigger.**
 
 ## How it works
 
-### Move 1 — the mental model
-
-You know how a phone bill separates *metered usage* (minutes used) from the *rate
-plan* (cents per minute)? The ledger is that exact split. `summarizeUsage` reads
-the meter; `pricingForModel` is the rate plan. Swap the model and the meter
-keeps reading — but if the rate plan has no row for that model, the bill comes
-back blank.
+**Move 1 — the mental model: routing is a fallback whose trigger is quality, not failure.**
 
 ```
-  Meter vs. rate plan — two separate jobs
-
-  meter (provider-neutral)            rate plan (provider-specific)
-  ┌────────────────────────┐         ┌─────────────────────────────┐
-  │ summarizeUsage:        │  tokens │ pricingForModel:            │
-  │  sum inputTokens       │ ──────► │  gpt-4.1     $2 / $8 per M   │
-  │  sum outputTokens      │         │  gpt-4.1-mini $0.4 / $1.6    │
-  │  count turns           │         │  gpt-4.1-nano $0.1 / $0.4    │
-  └────────────────────────┘         │  everything else → undefined │
-                                      └─────────────────────────────┘
-   meter always works · bill only prints if the plan has a row
+Two triggers, one composition
+                 ┌─────────────────────────────────────────────┐
+  FALLBACK CHAIN │ for provider in [A, B, C]:                   │
+  (shipped)      │   try:    return await provider.complete()   │
+                 │   catch:  continue   ← trigger = EXCEPTION    │
+                 └─────────────────────────────────────────────┘
+                 ┌─────────────────────────────────────────────┐
+  QUALITY ROUTER │ for model in [cheap, expensive]:             │
+  (the gap)      │   res = await model.complete()               │
+                 │   if validate(res): return res               │
+                 │   else: continue     ← trigger = BAD RESULT   │
+                 └─────────────────────────────────────────────┘
 ```
 
-### Move 2 — the instrument, the pricing, and the routing it doesn't do
+**Move 2 — step by step.**
 
-**The meter — `summarizeUsage`.** It folds every `model_usage` event into one
-row, ignoring everything else. `packages/runtime/src/usage-ledger.ts:25`:
+**Part A — what's shipped: the cost meter.** The ledger turns trace events into a dollar figure. It's honest about scope — only OpenAI gpt-4.1 tiers are priced, and `provider !== 'openai'` returns `undefined`, which is exactly correct for local Gemma:
 
 ```ts
-export function summarizeUsage(trace: readonly CapabilityEvent[]): TokenUsageSummary {
-  return trace.reduce<TokenUsageSummary>(
-    (summary, event) => {
-      if (event.type !== 'model_usage') return summary;   // only count model turns
-      const inputTokens = event.inputTokens ?? 0;
-      const outputTokens = event.outputTokens ?? 0;
-      return {
-        inputTokens: summary.inputTokens + inputTokens,    // accumulate in
-        outputTokens: summary.outputTokens + outputTokens, // accumulate out
-        totalTokens: summary.totalTokens + inputTokens + outputTokens,
-        modelName: event.model || summary.modelName,
-        turns: summary.turns + 1,                          // one turn = one call
-        estimated: summary.estimated || event.estimated === true,
-      };
-    },
-    { inputTokens: 0, outputTokens: 0, totalTokens: 0, modelName: '', turns: 0, estimated: false },
-  );
-}
-```
-
-Provider-neutral by design — it never asks *which* model, only sums what the
-turns reported.
-
-**The rate plan — `pricingForModel`.** This is where provider-neutrality ends
-hard. `packages/runtime/src/usage-ledger.ts:71`:
-
-```ts
+// packages/runtime/src/usage-ledger.ts:70-78
 export function pricingForModel(provider: string, modelName: string): UsagePricing | undefined {
-  if (provider !== 'openai') return undefined;            // ← Gemma, Anthropic: no row
+  if (provider !== 'openai') return undefined;           // ← Gemma / local: no per-call price
   const normalized = modelName.toLowerCase();
   if (normalized.startsWith('gpt-4.1-nano')) return { inputUsdPerMillion: 0.1, outputUsdPerMillion: 0.4 };
   if (normalized.startsWith('gpt-4.1-mini')) return { inputUsdPerMillion: 0.4, outputUsdPerMillion: 1.6 };
-  if (normalized.startsWith('gpt-4.1'))      return { inputUsdPerMillion: 2,   outputUsdPerMillion: 8   };
-  return undefined;                                       // any other openai model: blind
+  if (normalized.startsWith('gpt-4.1'))      return { inputUsdPerMillion: 2,   outputUsdPerMillion: 8 };
+  return undefined;
 }
 ```
 
-Read the first line carefully: `if (provider !== 'openai') return undefined`.
-Gemma returns `undefined` and that's *correct* — local Gemma costs $0, so
-`estimateCost` returning nothing is the truth. Anthropic also returns `undefined`
-and that's a *gap* — a paid model with no row prices as blank, not as $0. Same
-return value, opposite meaning. Know the difference cold.
+`estimateCost` (`usage-ledger.ts:49-68`) divides token counts by a million and multiplies by these rates. The local-first consequence is structural: **when the model is Gemma, every call costs $0**, so the only optimization left is *don't call the expensive model unless you have to* — which is routing.
 
-**The routing aptkit doesn't do.** The classic cost tactic is "send the easy
-prompt to the cheap model, escalate only hard ones." aptkit has a chain that
-*looks* like it — `FallbackModelProvider` tries providers in order. But read why
-it iterates: it falls to the next provider on *error*, not on cost or quality.
-`packages/providers/fallback/src/fallback-provider.ts:47`:
+**Part B — what's shipped that *looks* like routing but isn't: the fallback chain.** The loop tries each provider in order; the trigger to move on is a *caught exception*:
 
 ```ts
-async complete(request: ModelRequest): Promise<ModelResponse> {
-  const attempts: FallbackAttempt[] = [];
-  for (let index = 0; index < this.providers.length; index += 1) {
-    const provider = this.providers[index];
-    try {
-      const response = await provider.complete(request);   // try this provider
-      this.lastSelectedProvider = { providerId: provider.id, model: response.model ?? provider.defaultModel };
-      return { ...response, model: response.model ?? provider.defaultModel };
-    } catch (error) {                                       // ← only errors advance the chain
-      // ...record attempt, maybe fall through to next provider...
-    }
+// packages/providers/fallback/src/fallback-provider.ts:50-86
+for (let index = 0; index < this.providers.length; index += 1) {
+  const provider = this.providers[index];
+  try {
+    const response = await provider.complete(request);
+    this.lastSelectedProvider = { providerId: provider.id, /* ... */ };
+    return { ...response, model: response.model ?? provider.defaultModel }; // ← ANY success returns
+  } catch (error) {                                                          // ← only an ERROR continues
+    if (isAbortError(error) || request.signal?.aborted) throw error;
+    attempts.push(/* ... */);
+    if (!this.shouldFallback(error, provider)) throw error;                  // ← gate is on the error
+    // ... continue to next provider ...
   }
-  throw new ProviderFallbackError(attempts);
 }
 ```
 
-The chain advances on a `catch`, never on "this model was good enough cheaper."
-That makes it failover-by-*availability* (try local Gemma first, fall to cloud if
-it dies), which *incidentally* favors the free model — but cost-aware quality
-routing is `not yet exercised`.
+Read line 54: *any* successful `complete()` returns immediately. A cheap model that returns garbage-but-valid prose is a "success" here. The chain never escalates for quality — only for crashes. That's the gap in one sentence: **`shouldFallback(error, provider)` gates on an error; a quality router would gate on `validate(response)`.**
 
-### Move 3 — the principle
+**Part C — the gap, drawn: a quality-gated router.** Here's current-state-vs-future-state:
 
-Split the meter from the rate plan so token-counting stays universal while
-pricing stays a swappable table. aptkit nailed the meter and left the rate plan
-half-populated on purpose: it only prices what it has actually run on the cloud
-(OpenAI), and it tells the truth elsewhere — $0 for free-local Gemma, `undefined`
-for unrun-but-paid Anthropic. The discipline isn't "price everything," it's
-"never invent a number you can't back."
+```
+Move 2.5 — fallback chain (shipped) vs quality router (the gap)
+CURRENT: FallbackModelProvider              FUTURE: QualityRoutedProvider
+┌────────────────────────────────┐         ┌────────────────────────────────────┐
+│ for p in providers:            │         │ for m in [gemma, sonnet]:          │
+│   try:                         │         │   res = await m.complete(req)      │
+│     return p.complete(req)     │ ──────▶ │   if validate(res): return res     │
+│   catch e:                     │         │   // valid? cheap won. done at $0  │
+│     if shouldFallback(e):      │         │   // invalid? escalate to $$       │
+│       continue                 │         │ throw RoutingExhausted(...)        │
+│ throw ProviderFallbackError    │         │                                    │
+│                                │         │ trigger = QUALITY, not exception   │
+│ trigger = EXCEPTION            │         │                                    │
+└────────────────────────────────┘         └────────────────────────────────────┘
+```
+
+The router reuses the structured-generation validators (`generateStructured`'s `validate`) as the quality gate. Gemma produces a structured answer; if it parses and validates, you spent $0 and you're done. Only on a validation miss do you pay for Sonnet.
+
+**Move 3 — the principle.** Measure first, route second, and never confuse failover with routing. Failover protects *availability* (the provider is down). Routing protects *cost* (the cheap model is good enough). They share a loop but answer different questions. aptkit has the meter and the failover loop; the missing piece is moving the gate from `catch` to `if (!valid)`.
 
 ## Primary diagram
 
 ```
-  The cost path, end to end — and where it goes blind
-
-  every model turn
-        │ emits model_usage { inputTokens, outputTokens, model }
-        ▼
-  ┌─ summarizeUsage ─────────┐   provider-neutral, always works
-  │ Σ in · Σ out · turns     │
-  └────────────┬─────────────┘
-               │ (provider, model, tokens)
-               ▼
-  ┌─ estimateCost → pricingForModel ───────────────────────────┐
-  │  openai gpt-4.1*  →  real $ ($2/$8, mini $0.4/$1.6, nano…)  │
-  │  gemma (local)    →  undefined  = correct $0                │
-  │  anthropic        →  undefined  = GAP (paid, but unpriced)  │
-  └──────────────────────────────────────────────────────────────┘
+Where each piece lives — and the one-line move that closes the gap
+┌─────────────────────┬──────────────────────────┬───────────────────────────┐
+│ Piece               │ Status                   │ Trigger                   │
+├─────────────────────┼──────────────────────────┼───────────────────────────┤
+│ Cost ledger         │ SHIPPED                  │ — (passive measurement)   │
+│ Fallback chain      │ SHIPPED                  │ exception (availability)  │
+│ Quality router      │ NOT YET EXERCISED        │ validation miss (cost)    │
+└─────────────────────┴──────────────────────────┴───────────────────────────┘
+              THE MOVE: gate on  if (!validate(res))  instead of  catch(error)
 ```
 
 ## Elaborate
 
-The whole reason cost optimization is mostly unbuilt here is the Gemma economics:
-local inference has no per-token bill, so the headline tactics (cheap-model
-routing, caching, batching) have no dollar payoff and aptkit didn't chase them.
-The instrument is still worth its weight — the moment a paid provider enters the
-fallback chain, `summarizeUsage` already counts the tokens and the only work left
-is adding a pricing row. The clean next step is to fill in Anthropic pricing so
-`undefined` stops meaning two different things. Read `01-llm-caching.md` for the
-sibling lever (skip the call entirely) and `05-retry-circuit-breaker.md` for the
-fallback chain's other job.
+- **The cost ledger only prices OpenAI on purpose.** `pricingForModel` returns `undefined` for everything non-OpenAI — that's not a bug, it's the local-first stance. Gemma has no per-call price, so `estimateCost` correctly returns `undefined` and the formatter shows `$0.00` / `n/a`. If you add Anthropic to the price table, do it deliberately and cite real rates (read `claude-api`).
+- **Routing's payoff scales with the cheap model's hit rate.** If Gemma is good enough 80% of the time, you pay Sonnet on 20% of requests — an 80% cost cut on a cloud-only baseline. If Gemma is good enough 10% of the time, routing just adds a wasted Gemma call before every Sonnet call. Measure the gate's pass rate before you trust the router.
+- **Don't route on a vibe — route on a validator.** The quality gate has to be programmatic (the same JSON validators `generateStructured` uses), not a second LLM judging the first. An LLM judge in the hot path is *more* cost, not less.
 
 ## Project exercises
 
-### Add Anthropic pricing rows to the rate plan
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** extend `pricingForModel` so `provider === 'anthropic'` with
-  known Claude model ids returns real per-million rates, leaving Gemma's $0/local
-  case untouched.
-- **Why it earns its place:** closes the `undefined`-means-two-things gap and
-  forces you to reason about why $0 (free) and `undefined` (unpriced) must stay
-  distinct.
-- **Files to touch:** `packages/runtime/src/usage-ledger.ts` (the
-  `pricingForModel` branch at `:71`).
-- **Done when:** a test asserts an Anthropic model yields a non-`undefined`
-  `CostEstimate` while a Gemma model still yields `undefined`.
+Phase 5. Case B — measurement exists, the router doesn't.
+
+### Quality-gated model router
+
+- **Exercise ID:** `EX-SERVE-02a` — quality-gated-router
+- **What to build:** A `QualityRoutedProvider` that takes an ordered `[cheap, expensive]` provider list and a `validate` predicate. It calls the cheap model, runs `validate` on the response, returns on pass, and escalates to the next model on a validation miss. Distinct from `FallbackModelProvider` because the trigger is the validator, not an exception.
+- **Why it earns its place:** It closes the exact gap this file is about and forces you to articulate failover-vs-routing in code.
+- **Files to touch:** new `packages/providers/fallback/src/quality-router.ts` (sibling to `fallback-provider.ts`), reuse a `JsonValidator` from `packages/runtime/src/json-output.ts`.
+- **Done when:** a passing cheap result never calls the expensive provider (spy assertion), and a failing one does; emits a trace event on escalation.
+- **Estimated effort:** `1–4hr`
+
+### Anthropic pricing in the ledger
+
+- **Exercise ID:** `EX-SERVE-02b` — anthropic-pricing-tiers
+- **What to build:** Extend `pricingForModel` with current Anthropic per-million rates so `estimateCost` can price a cloud-fallback call. Read `claude-api` for the exact model ids and rates — do not guess.
+- **Why it earns its place:** Routing without a price table is half-blind; this makes the router's cost claim auditable.
+- **Files to touch:** `packages/runtime/src/usage-ledger.ts:70-78`.
+- **Done when:** an Anthropic model id returns a defined `UsagePricing`, with a test asserting the dollar math, and rates sourced from the skill (not memory).
 - **Estimated effort:** `<1hr`
 
-### (Case B) Make the fallback chain cost-aware
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a design note + skeleton that orders the fallback providers
-  cheapest-first using `pricingForModel`, distinguishing "advance on error"
-  (today) from "advance on cost/quality" (the goal).
-- **Why it earns its place:** the interview cliché is cheap-model routing;
-  building it on top of the *availability* chain shows you know the two are
-  different axes.
-- **Files to touch:** new
-  `packages/providers/fallback/src/cost-aware-fallback.ts` (skeleton),
-  reference `packages/providers/fallback/src/fallback-provider.ts:47` and
-  `packages/runtime/src/usage-ledger.ts:71`.
-- **Done when:** a written note states why ordering by price is a different
-  decision than failover, and where each belongs.
+### Route-decision trace event
+
+- **Exercise ID:** `EX-SERVE-02c` — route-decision-observability
+- **What to build:** Emit a structured trace event from the router recording which model was selected and why (cheap-passed vs escalated), so Studio can show the routing decision and aggregate the gate pass rate.
+- **Why it earns its place:** A router you can't observe is a router you can't tune — the pass rate is the metric that justifies the whole thing.
+- **Files to touch:** `packages/providers/fallback/src/quality-router.ts`, the event types in `packages/runtime/src/events.ts`.
+- **Done when:** every routed call emits one decision event with `{selectedModel, escalated, gatePassed}`, visible in a replay.
 - **Estimated effort:** `1–4hr`
 
 ## Interview defense
 
-**Q: "Why does Gemma show $0 and Anthropic show nothing — isn't that the same?"**
-No — they're opposite truths sharing one return value. Gemma runs locally, so $0
-is the correct cost. Anthropic returns `undefined` because there's no pricing
-row, so the system is *blind*, not free. The fix is adding a row, not treating
-`undefined` as zero.
+**Q: aptkit has a fallback chain. Isn't that model routing?**
 
 ```
-  pricingForModel returns undefined for BOTH:
-   gemma     → local, no bill        → undefined == correct $0
-   anthropic → paid, no row in table → undefined == GAP (unpriced)
+fallback:  A throws ──▶ try B          (trigger = AVAILABILITY)
+routing:   A's answer fails gate ──▶ try B   (trigger = QUALITY/COST)
+            └── same loop, the gate moved from catch{} to if(!valid){}
 ```
-Anchor: *`usage-ledger.ts:72` — `if (provider !== 'openai') return undefined`.*
 
-**Q: "Doesn't the fallback chain already do cheap-model routing?"**
-It looks like it but it doesn't. The chain advances only inside a `catch` — it
-falls to the next provider on *failure*, not because a cheaper one was good
-enough. Trying free-local Gemma first incidentally favors cost, but quality-aware
-cost routing is unbuilt.
+Anchor: failover answers "is the provider up?"; routing answers "is the cheap model good enough?" — same composition, different trigger.
+
+**Q: How do you decide *when* to escalate to the expensive model without a human?**
 
 ```
-  fallback chain:   try A → on ERROR → try B → on ERROR → fail
-  cost routing:     classify prompt → easy? cheap model : hard? big model
-   different trigger (error vs. difficulty) → different decision
+cheap model ──▶ structured response ──▶ validate(res)
+                                          pass → done ($0)
+                                          fail → escalate ($$)
+        the validator is the SAME one generateStructured already uses
 ```
-Anchor: *`fallback-provider.ts:64` — the chain only moves on `catch`.*
+
+Anchor: the quality gate has to be a programmatic validator, not a second LLM — an LLM judge in the hot path adds cost instead of cutting it.
+
+**Q: Local-first means $0 per call. Why optimize cost at all?**
+
+```
+Gemma = $0  ──so optimization = "avoid the cloud call unless needed"
+            ──router earns out the moment a paid provider joins the list
+```
+
+Anchor: local-first makes cost optimization *unforced today* and *pre-built for the day you add a cloud model* — which is exactly when an unmeasured router would surprise you.
 
 ## See also
 
-- `01-llm-caching.md` — the other dollar lever: skip the call entirely
-- `05-retry-circuit-breaker.md` — the fallback chain's availability job
-- `01-llm-foundations/06-token-economics.md` — where `usage` originates
+- [`01-llm-caching.md`](./01-llm-caching.md) — the other way to cut cost: don't make the call at all.
+- [`05-retry-circuit-breaker.md`](./05-retry-circuit-breaker.md) — the fallback chain's other role: availability, not cost.
+- [`../05-evals-and-observability/README.md`](../05-evals-and-observability/README.md) — where the validators that gate the router come from.

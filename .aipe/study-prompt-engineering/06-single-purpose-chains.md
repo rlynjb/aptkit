@@ -1,169 +1,236 @@
 # 06 — Single-purpose chains
 
-**Industry name:** prompt chaining / pipeline decomposition — *Industry standard*
+**Subtitle:** single-purpose chains — one capability, one job, composed
+(Language-agnostic)
 
 ## Zoom out, then zoom in
 
-The multi-purpose prompt — "classify the intent AND answer the question AND
-suggest next steps" — is the prompt that's impossible to debug. When it fails you
-can't tell *which* job failed, and when you fix one job you regress another.
-**One chain, one job, composed into longer flows.** That's the pattern, and
-aptkit is built almost entirely out of it: each agent is one capability with one
-job, one prompt package, one tool policy.
+One chain, one job. aptkit's organizing unit is the *capability* — a prompt
+package + tool policy + loop config + validator, each owning exactly one
+job: classify intent, answer a query, monitor anomalies, diagnose, recommend,
+RAG-answer. Compose them into longer flows, but never load two jobs into one
+prompt.
 
 ```
-  Zoom out — the agents as single-purpose chains
+  Zoom out — capabilities as single-job units
 
-  ┌─ Capability layer (each = one job) ───────────────────────┐
-  │  classifyIntent   → one word: monitoring/diagnostic/rec   │ ← we are here
-  │  monitoring-agent → detect anomalies (no diagnosis)       │
-  │  diagnostic-agent → one anomaly → cause (no remediation)  │
-  │  recommendation-agent → diagnosis → ≤3 actions            │
-  │  rag-query-agent  → question → grounded answer            │
-  └───────────────────────────┬────────────────────────────────┘
-                              │  each composes ↓
-  ┌─ Shared runtime ──────────▼────────────────────────────────┐
-  │  runAgentLoop + tool policy + validator                     │
-  └──────────────────────────────────────────────────────────────┘
+  ┌─ Capability registry (each = ONE job) ──────────────────────┐
+  │  ★ intent classifier   → one word out                        │ ← we are here
+  │  ★ query agent         → prose answer over read-only tools    │
+  │  ★ anomaly-monitoring  → severity-sorted anomalies            │
+  │  ★ diagnostic          → one tested Diagnosis                 │
+  │  ★ recommendation      → ≤3 grounded recommendations          │
+  │  ★ rag-query           → cited answer from the knowledge base  │
+  └───────────────────────────┬──────────────────────────────────┘
+                              │ composed
+  ┌─ Flow ────────────────────▼───────────────────────────────────┐
+  │  classify intent → query agent (framed by that intent)        │
+  └────────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: the strongest evidence is the *pipeline* — monitoring → diagnostic →
-recommendation is three single-purpose agents chained, and each one's prompt
-refuses to do the next one's job ("Do not diagnose causes. Do not propose
-actions." — `monitoring.ts`).
+Zooming in: a single-purpose chain is the pipeline pattern — each stage does
+one transformation, and stages compose. The payoff is debuggability (you
+know exactly which stage failed), model-routing (a tiny model for the
+classifier, a bigger one for generation), and cheap iteration (you tune one
+prompt without disturbing the others).
 
-## The structure pass
+## Structure pass
 
-**Layers:** the pipeline (fixed order of chains) → each chain (one prompt, one
-job) → the loop (the chain's internal tool calls).
+**Layers.** Capability (one job) → flow (capabilities composed) →
+observability (each stage's events tagged with its own capabilityId).
 
-**Axis — what is this chain's single job?** Trace it and the boundaries pop:
+**Axis — when a flow produces a bad answer, which stage do you blame?**
+Trace it:
 
 ```
-  Axis: "what is the one job?" — across the pipeline
+  Axis: "where did this failure originate?"
 
-  ┌──────────────────────────────┐
-  │ monitoring-agent             │  → DETECT (and only detect)
-  └──────────────────────────────┘
-      ┌──────────────────────────┐
-      │ diagnostic-agent         │  → EXPLAIN one anomaly (no fix)
-      └──────────────────────────┘
-          ┌──────────────────────┐
-          │ recommendation-agent │  → PROPOSE actions (read-only)
-          └──────────────────────┘
-
-  each chain refuses the next chain's job — that refusal IS the boundary
+  one mega-prompt doing 3 jobs → UNKNOWN (could be any of the 3)   ✗
+  classify intent (one job)    → check the one-word output         ✓
+  query agent (one job)        → check the tool calls + final text  ✓
+  each stage = its own capId   → trace events pinpoint the stage    ✓
 ```
 
-**Seam:** the typed handoff between chains. The diagnostic agent takes an
-`{anomaly}` (`diagnostic.ts:14`); the recommendation agent takes a `{diagnosis}`
-(`recommendation.ts:38`). The output of one chain is the typed input of the next.
-**What breaks if a chain does two jobs:** the seam disappears, the handoff is
-implicit, and a failure anywhere in the blob is unattributable.
+**Seam.** The boundary between stages is the load-bearing one. Because each
+stage has its own `capabilityId`, its own tool policy, and its own
+validator, the seam between them is a clean contract — one stage's output is
+the next stage's input, and a failure is localized to one side of the seam.
 
 ## How it works
 
-### Move 1 — the mental model
+You already build pipelines this way in a frontend: a `.map().filter().reduce()`
+chain where each step does one transform, and when the result is wrong you
+know which step to inspect. A single-purpose chain is that, with each step a
+model call. Let's walk it.
 
-You already build pipelines this way in code: small pure functions composed, not
-one 500-line function. Each function has one responsibility; you test them
-independently; when the pipeline breaks you know which function. A single-purpose
-chain is that, with a model in each box.
+### Step 1 — the smallest possible job: the intent classifier
+
+The cleanest example in the repo does exactly one thing — turn a query into
+one of three words:
+
+```ts
+// packages/agents/query/src/intent.ts:17
+const response = await model.complete({
+  system: 'Classify the user query as exactly one word: monitoring ... ' +
+          'diagnostic ... or recommendation ... Reply with ONLY the one word.',
+  messages: [{ role: 'user', content: query }],
+  maxTokens: 16,                          // ← one job, tiny budget
+  signal: options.signal,
+});
+return parseIntent(text);                 // ← robust parse: substring match
+```
+
+One job, 16-token budget, a forgiving parser (`parseIntent` substring-matches
+and defaults to `diagnostic`). This is a chain you can hand to the smallest,
+cheapest model you have — it doesn't need a frontier model to pick one of
+three words. That's the model-routing payoff in one function.
+
+### Step 2 — compose: classifier feeds the query agent
+
+The classifier's output frames the next stage. The query agent takes the
+intent and threads it into its prompt:
+
+```ts
+// packages/agents/query/src/query-agent.ts:78
+const intent = runOptions.intent ?? 'diagnostic';   // from the classifier
+const system = renderPromptTemplate(this.prompt, { schema, project_id, intent });
+```
 
 ```
-  Pattern — the chain pipeline
+  Pattern — two single-purpose stages composed
 
-  query ──► [classifyIntent] ──► intent
-                                   │
-  question + intent ──► [query-agent] ──► answer
-
-  anomaly ──► [diagnostic] ──► diagnosis ──► [recommendation] ──► actions
-            one job          typed handoff   one job
+  ┌─ stage 1: classify ──┐  one word   ┌─ stage 2: answer ────────┐
+  │ tiny model           │ ──────────► │ bigger model + tools      │
+  │ system: "one word"   │  "diagnostic"│ system framed by intent  │
+  │ maxTokens: 16        │             │ maxTurns: 8, maxToolCalls:6│
+  └──────────────────────┘             └───────────────────────────┘
+   each stage: own prompt, own budget, own failure surface
 ```
 
-### Move 2 — walking the chains
+The query agent's prompt even says what to do with the framing: "Use that
+classification to frame your answer, but answer the actual question"
+(`query.ts:26`). One job per stage; the seam between them is a single typed
+value (the `Intent`).
 
-**The classifier is the purest single-purpose chain.** `classifyIntent`
-(`query/src/intent.ts:12`) does exactly one thing: map a query to one of three
-words. Its entire system prompt is *"Classify the user query as exactly one word…
-Reply with ONLY the one word"* and `maxTokens: 16` (`:22`). **What breaks if you
-fold this into the query agent:** you can no longer route on intent before
-answering, and you can't swap a cheap model in for just the classification.
+### Step 3 — each capability carries its own least-privilege policy
 
-**Each agent declares its job in its prompt and refuses the others.** The
-diagnostic prompt: *"You do not propose remediation"* (`diagnostic.ts:5`). The
-monitoring prompt: *"Do not diagnose causes. Do not propose actions."* The
-recommendation prompt: *"You are read-only: you do NOT execute anything"*
-(`recommendation.ts:3`). These refusals are the chain boundaries written into the
-prompt itself.
+Single-purpose isn't just about the prompt — it's about the *grant*. The
+RAG-query agent may only search the knowledge base:
 
-**Model routing falls out for free.** Because the classifier is its own chain,
-you can run it on a small/cheap model (it returns one word) and reserve a larger
-model for generation. The provider seam (`ModelProvider`) makes this a per-chain
-choice. **The debugging benefit:** when the pipeline produces a bad recommendation,
-you replay the diagnostic artifact in isolation and know immediately whether the
-fault was detection, diagnosis, or recommendation.
+```ts
+// packages/agents/rag-query/src/rag-query-agent.ts:15
+export const ragQueryToolPolicy: ToolPolicy = {
+  capabilityId: RAG_QUERY_CAPABILITY_ID,
+  allowedTools: [SEARCH_KNOWLEDGE_BASE_TOOL_NAME],   // ← exactly one tool
+};
+```
 
-### Move 3 — the principle
+The query agent gets a broad read-only allowlist (`query-agent.ts:10`); the
+RAG agent gets one tool. The tool policy *is* the job boundary expressed as a
+capability grant. A stage can't reach outside its job because it has no tool
+to do so. That's the debugging-and-blast-radius payoff: a stage that
+misbehaves can only misbehave within its grant.
 
-**A chain that does one job can be tested, replayed, routed, and debugged in
-isolation; a chain that does three cannot.** The cost of a multi-purpose prompt
-isn't paid at write time — it's paid every time it fails and you can't tell which
-of its jobs broke. Decompose until each chain has a name you could put on a
-function.
+### Step 4 — the failure mode of multi-purpose chains
+
+What you're avoiding: the mega-prompt that classifies *and* queries *and*
+recommends in one call. Three problems, each concrete:
+
+- **Brittleness.** One instruction added for the recommend job perturbs the
+  classify job — the "add one more instruction" drift from concept 1, now
+  three-way entangled.
+- **Expensive failures.** When the combined output is wrong, you re-run the
+  whole expensive call to debug, and you can't tell which job failed.
+- **Harder iteration.** You can't tune the classifier without risking the
+  recommender — there's no seam to isolate against.
+
+The single-purpose decomposition pays for itself the first time a flow
+breaks and you can point at exactly one stage.
+
+### The principle
+
+**Decompose by job, compose by contract.** Each stage owns one
+transformation, one prompt, one budget, one tool grant — and the seam
+between stages is a typed value, not a tangle. This is the same instinct
+that makes you write small pure functions instead of one 300-line one: the
+failure surface shrinks to one stage, and you can route, test, and iterate
+each independently.
 
 ## Primary diagram
 
+The capability unit and a composed flow, every boundary labelled.
+
 ```
-  Single-purpose chains — the analytics pipeline
+  Single-purpose chains in aptkit
 
-  WORKSPACE
-     │
-     ▼
-  [monitoring-agent]  job: DETECT      → anomalies[]   (no diagnosis)
-     │ pick one anomaly
-     ▼
-  [diagnostic-agent]  job: EXPLAIN     → diagnosis     (no remediation)
-     │ typed handoff {diagnosis}
-     ▼
-  [recommendation-agent] job: PROPOSE  → ≤3 actions    (read-only)
-
-  each box: one PromptPackage + one toolPolicy + one validator + runAgentLoop
+  capability = prompt package + tool policy + loop config + validator
+  ┌──────────────────────────────────────────────────────────────┐
+  │ ONE capability, ONE job:                                       │
+  │   intent classifier  → Intent (one word)   tools: none, mt:16  │
+  │   query agent        → prose answer         tools: read-only   │
+  │   rag-query          → cited answer         tools: search only │
+  │   diagnostic         → Diagnosis            validator-gated    │
+  │   recommendation     → ≤3 recs              validator-gated    │
+  └────────────────────────────┬──────────────────────────────────┘
+        composed by typed contract │
+  ┌─ Flow ────────────────────▼───────────────────────────────────┐
+  │  classifyIntent(q) ──Intent──► QueryAgent.answer(q, {intent})  │
+  │  each stage: own capabilityId on every trace event            │
+  └────────────────────────────────────────────────────────────────┘
+   failure localizes to ONE stage; each stage routes to its own model
 ```
 
 ## Elaborate
 
-Prompt chaining is the oldest production-LLM pattern (it predates tool calling)
-and survives because of debuggability, not capability. The Anthropic prompt guide
-calls it "prompt chaining" and recommends it for exactly the reason here: smaller
-prompts are more reliable and individually testable. The model-routing payoff
-(cheap model for classification, expensive for generation) is the cost lever — in
-this repo enabled by the `ModelProvider` swap seam, though the cost-optimal
-per-chain model assignment is a config choice the agents leave to the host.
+The pipeline-of-single-purpose-stages pattern is the spine of LangChain's
+"chain" abstraction and every production agent system that survived past a
+demo. The transferable lesson is the same one from microservices and from
+Unix pipes: a component that does one thing is testable, replaceable, and
+debuggable; a component that does five is none of those.
+
+aptkit's specific encoding — capability = prompt + policy + loop + validator
+— ties the single-purpose principle to least-privilege security (concept 12,
+and study-security). The tool policy is the job boundary *and* the trust
+boundary at once. The model-routing payoff connects to token budgeting
+(concept 4): a one-word classifier on a tiny local model costs almost
+nothing, freeing budget for the generation stage that needs it.
 
 ## Interview defense
 
-**Q: Why chain single-purpose prompts instead of one capable prompt?** Debuggability
-and routing. When a single-purpose chain fails you know which job failed and can
-replay it in isolation; you can also route a cheap model to the cheap job. A
-multi-purpose prompt makes failures unattributable and forces one model on every
-job.
+**Q: Why decompose an agent into single-purpose chains instead of one
+prompt?**
+
+Three concrete payoffs. Debuggability: when a flow fails you know which stage
+failed, because each stage has its own capabilityId, prompt, and validator.
+Model-routing: a tiny model classifies, a big model generates — you don't pay
+frontier prices for picking one of three words. Iteration: you tune one
+prompt without perturbing the others, because the seam between stages is a
+typed value, not a tangled mega-prompt.
 
 ```
-  [detect] → [explain] → [propose]   each refuses the next's job
-   replay any box alone · route a model per box
+  mega-prompt: 3 jobs → fail → which job? unknown → re-run all
+  3 chains:    fail → that stage's capId in the trace → fix one
 ```
-*Anchor: `classifyIntent` (`intent.ts:12`); the "do not diagnose/propose"
-refusals in `monitoring.ts` / `diagnostic.ts:5`.*
 
-**Q: The part people forget?** The **typed handoff** between chains. The chain
-boundary is only real if the output of one is the validated input of the next
-(`{anomaly}` → `{diagnosis}`). Without it you've split the prompt but kept the
-implicit coupling.
+Anchor: "aptkit's unit is capability = prompt + tool policy + loop +
+validator. The intent classifier is one word out, 16-token budget,
+tiny-model-routable; the query agent it feeds is a separate capability."
+
+**Q: What's the failure mode you're avoiding?**
+
+The multi-purpose chain: brittle (one job's instruction perturbs another),
+expensive to debug (re-run the whole call, can't localize the failure), and
+hard to iterate (can't tune one job without risking the rest). The fix is
+one job per capability with a typed contract at the seam.
+
+Anchor: "Add-one-instruction drift, three-way entangled — the seam between
+stages is what you give up by merging them."
 
 ## See also
 
-- `01-anatomy.md` — each chain's prompt has the same four-section anatomy.
-- `07-output-mode-mismatch.md` — the typed handoff is where mode mismatches bite.
-- `04-token-budgeting.md` — small models for classifier chains save tokens.
-- `../study-agent-architecture/` — multi-agent orchestration at depth.
+- [01-anatomy.md](01-anatomy.md) — the add-one-instruction drift, now
+  multiplied across jobs
+- [03-prompts-as-code.md](03-prompts-as-code.md) — the capability unit
+- [07-output-mode-mismatch.md](07-output-mode-mismatch.md) — the contract at
+  the seam between stages
+- study-agent-architecture — multi-agent orchestration of these capabilities

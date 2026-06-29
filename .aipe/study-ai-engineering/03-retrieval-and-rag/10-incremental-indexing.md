@@ -1,235 +1,194 @@
-# Incremental indexing — upsert-by-id
+# Incremental indexing
+> Delta upsert vs full rebuild · Industry standard
 
-**Subtitle:** Incremental indexing · re-index one doc without rebuilding the corpus · *Industry standard*
+Your corpus isn't frozen — docs get added, edited, deleted. You've got two ways to keep the index current: rebuild the whole thing from scratch (simple, correct, expensive) or update only what changed (cheap, fast, needs a stable identity for "what changed"). aptkit already has the primitive for the cheap path baked into its chunk id scheme: `${doc.id}#${i}` plus an upsert means re-indexing a doc *overwrites* its chunks instead of duplicating them. So delta-updating one doc is already free. What's missing is the layer that *decides* which docs changed so you don't re-index the unchanged ones. This is partially exercised — the primitive exists, the change-detection layer doesn't.
 
 ## Zoom out, then zoom in
 
-Incremental indexing is the difference between "edit one note and re-process
-everything" and "edit one note, touch only its chunks." It lives at the store's
-write path, and aptkit gets it almost for free: indexing is per-document and upsert
-is keyed by chunk id, so re-indexing one doc leaves the rest of the corpus
-untouched.
+Incremental indexing is a property of the *write* path — it lives in how `indexDocument` and `upsert` assign identity.
 
 ```
-  Zoom out — the write path is per-document
-
-  ┌─ indexDocument(doc) (pipeline.ts:32) ───────────────────────┐
-  │  chunk ─► embed ─► ★ store.upsert(chunks) ★                  │ ← we are here
-  └───────────────────────────┬─────────────────────────────────┘
-               upsert by id    │
-  ┌─ VectorStore ──────────────▼────────────────────────────────┐
-  │  doc#0, doc#1 overwrite in place; other docs UNTOUCHED       │
-  └──────────────────────────────────────────────────────────────┘
+the two write strategies over the same store
+┌──────────────────────────────────────────────────────────┐
+│  corpus changes (add / edit / delete docs)                  │
+└───────────────┬────────────────────────────────────────────┘
+        ┌────────┴────────┐
+        ▼                  ▼
+┌────────────────┐  ┌──────────────────────────────────┐
+│ FULL REBUILD    │  │ ★ INCREMENTAL (delta upsert) ★     │
+│ re-index every  │  │ re-index only changed docs;        │
+│ doc             │  │ id `${doc.id}#${i}` overwrites      │
+│ simple, costly  │  │ in place — primitive EXISTS ✓      │
+└────────────────┘  │ change-detection layer: ✗ MISSING  │
+                     └──────────────────────────────────┘
 ```
 
-Now zoom in. You know the difference between `INSERT … ON CONFLICT DO UPDATE`
-(upsert) and `TRUNCATE; INSERT` (full rebuild). The first changes one row's worth of
-data; the second throws away everything and rewrites it. aptkit's index path is the
-upsert kind, at *document* granularity: `indexDocument` re-chunks and re-upserts one
-doc, and because chunk ids are stable, the new chunks land exactly on the old ones.
-That's incremental indexing — no special machinery, just stable ids plus upsert.
+The store doesn't care which strategy you use — `upsert` is the same call either way. The difference is *what you feed it*: every doc (rebuild) or just the changed ones (incremental). aptkit's id scheme already makes a single-doc re-index correct and non-duplicating; the gap is the bookkeeping that knows a doc changed at all.
 
 ## Structure pass
 
-**Layers.** Granularity (per-document — `indexDocument`) → key (stable chunk id
-`${docId}#${i}`) → mechanism (upsert: `Map.set` / `on conflict do update`).
+Pick the **cost** axis: what does keeping the index fresh cost under each strategy?
 
-**Axis — cost.** Trace the cost of editing one doc out of N. Full rebuild: re-embed
-and re-upsert all N docs — O(corpus). Incremental: re-embed and re-upsert one doc's
-chunks — O(one doc), the other N-1 docs never move. The axis "how much work per
-edit?" flips from corpus-sized to doc-sized, and aptkit sits on the cheap side by
-construction.
+```
+cost of one corpus update
+  FULL REBUILD                       INCREMENTAL
+  ┌──────────────────────┐          ┌──────────────────────────┐
+  │ embed ALL N docs       │          │ embed only CHANGED docs   │
+  │ cost ∝ corpus size     │          │ cost ∝ change size        │
+  │ 1 doc edit → re-embed  │          │ 1 doc edit → re-embed 1   │
+  │   the whole corpus     │          │   doc's chunks            │
+  └──────────────────────┘          └──────────────────────────┘
+        ▲ seam: change-detection is what flips you from O(corpus) to O(delta) ▲
+```
 
-**Seam.** The chunk id `${docId}#${i}` (`pipeline.ts:42`) plus the by-id upsert
-(`in-memory-vector-store.ts:21`, `pg-vector-store.ts:50`). The id is the join between
-"a new index run" and "the existing chunk it replaces." That deterministic id is the
-entire mechanism — lose it and incremental indexing breaks into duplicate or orphan
-chunks.
+The seam is change detection. Without it, you either rebuild everything (O(corpus) per update — fine for 50 docs, painful for 50k) or you manually track what changed (error-prone). With it, an update costs only the embed of what actually changed. aptkit sits *one step* before that seam: the overwrite primitive is there, so a single-doc re-index is already a clean delta — you just have to know *which* doc to re-index.
 
 ## How it works
 
-### Move 1 — the mental model
-
-You know `Map.set(key, value)`: same key overwrites, new key inserts, and every
-*other* entry is untouched. SQL's `INSERT … ON CONFLICT (id) DO UPDATE` is the same
-contract for a table. Incremental indexing is just choosing a *stable* key so that
-re-processing the same source maps onto the same entries. The corpus is a `Map<id,
-chunk>`; re-indexing a doc is a handful of `set` calls on that doc's keys.
+**Move 1 — upsert-by-stable-id is the whole trick.** Incremental indexing reduces to "assign a deterministic id, then overwrite":
 
 ```
-  Upsert by stable id — same key overwrites, rest untouched
-
-  corpus: { "noteA#0": v, "noteA#1": v, "noteB#0": v }
-  re-index noteA ─► set "noteA#0", set "noteA#1"   (noteB#0 never touched)
-   stable id = same key each run = clean overwrite, not duplicate
+why ${doc.id}#${i} makes delta-update free
+   first index of doc "guide" (3 chunks):
+      guide#0, guide#1, guide#2   ──upsert──► 3 rows
+   edit doc, re-index "guide" (still 3 chunks):
+      guide#0, guide#1, guide#2   ──upsert──► OVERWRITES the same 3 rows
+                  ▲ same ids → same rows → no duplicates, no stale leftovers
 ```
-
-### Move 2 — the mechanism, and the one gap
-
-**Per-document granularity.** The unit of indexing is one document
-(`pipeline.ts:32`): `indexDocument(doc, wiring)` chunks *that* doc, embeds *its*
-chunks, and upserts *them*. There is no "re-index the corpus" call — re-indexing is
-always one doc at a time, so it's incremental at doc granularity by default.
-
-```
-  indexDocument — the per-doc write unit (pipeline.ts:32)
-
-  doc {id, text} ─► chunkText ─► embed(batch) ─► store.upsert(chunks)
-   scope = ONE doc's chunks; the rest of the corpus is out of scope
-```
-
-**Stable ids make upsert land on the old chunks.** Each chunk's id is
-`${doc.id}#${i}` (`pipeline.ts:42`), deterministic from the doc id and chunk index.
-Re-index the same doc and chunk 0 gets id `doc#0` again — mapping onto the existing
-`doc#0`. In-memory overwrites via `Map.set` (`in-memory-vector-store.ts:21`); buffr
-overwrites via `on conflict (id) do update` (`/Users/rein/Public/buffr/src/pg-vector-store.ts:50`):
 
 ```ts
-// in-memory (in-memory-vector-store.ts:18)
+// packages/retrieval/src/pipeline.ts:41-46
+const chunks = texts.map((text, i) => ({
+  id: `${doc.id}#${i}`,          // ← deterministic: same doc + same chunk index = same id
+  vector: vectors[i]!,
+  meta: { ...(doc.meta ?? {}), docId: doc.id, chunkIndex: i, text },
+}));
+await wiring.store.upsert(chunks); // upsert = insert-or-overwrite by id
+```
+
+The id is `docId#chunkIndex`, not a random UUID or a content hash. That determinism is what makes re-indexing idempotent: index "guide" twice and you get three rows, not six. The store's `upsert` does the rest.
+
+**The store's upsert semantics.** In-memory it's a `Map.set` (last write wins by key); in buffr it's `ON CONFLICT DO UPDATE`:
+
+```ts
+// packages/retrieval/src/in-memory-vector-store.ts:18-23
 async upsert(chunks: VectorChunk[]): Promise<void> {
   for (const chunk of chunks) {
     this.assertDimension(chunk.vector, `chunk "${chunk.id}"`);
-    this.chunks.set(chunk.id, chunk);     // same id ─► in-place overwrite
+    this.chunks.set(chunk.id, chunk);   // ← Map.set: same id overwrites
   }
 }
 ```
 
 ```sql
--- buffr (pg-vector-store.ts:48) — same semantics in SQL
-insert into agents.chunks (id, …, embedding, …)
-values ($1, …, $6::vector, …)
-on conflict (id) do update set
-  embedding = excluded.embedding, content = excluded.content, …
+-- buffr/src/pg-vector-store.ts:48-54  (same semantics, durable)
+insert into agents.chunks (id, document_id, app_id, chunk_index, content, embedding, embedding_model, meta)
+values ($1, $2, $3, $4, $5, $6::vector, $7, $8)
+on conflict (id) do update set                 -- ← same id → overwrite the row
+  document_id = excluded.document_id, ...,
+  embedding = excluded.embedding, ..., meta = excluded.meta
 ```
 
-That `on conflict (id) do update` *is* incremental indexing in one statement: only
-the named doc's rows are written; the HNSW index updates just those vectors; every
-other row is undisturbed.
+Both stores honor the same contract: upsert by id is insert-or-overwrite. So the incremental primitive works identically whether you're on the prototype store or Postgres — that's the drop-in property (file 04) paying off again.
+
+**The one sharp edge — shrinking docs.** Overwrite is clean only when chunk *count* stays the same or grows. If an edit makes a doc shorter (5 chunks → 3), the overwrite updates `#0..#2` but leaves `#3, #4` as orphans:
 
 ```
-  Re-index one doc — only its chunks move
-
-  edit noteA ─► indexDocument(noteA)
-       │ upsert noteA#0..2
-       ▼
-  agents.chunks:  noteA#0 ✎  noteA#1 ✎  noteA#2 ✎   noteB#* untouched   noteC#* untouched
+the orphan-chunk gotcha
+   doc "guide" v1: guide#0..#4  (5 chunks stored)
+   doc "guide" v2 (shorter): re-index → upsert guide#0..#2
+      guide#0,1,2 → OVERWRITTEN ✓
+      guide#3,4   → NOT touched → STALE ORPHANS still in the store ✗
+   fix: delete all `${doc.id}#*` before re-indexing, or upsert-then-delete-extra
 ```
 
-**The one gap: orphan chunks when a doc shrinks.** The id is `docId#i` by chunk
-*index*. If a doc had 5 chunks (`doc#0..4`) and an edit shrinks it to 3
-(`doc#0..2`), re-indexing upserts `doc#0..2` but never touches `doc#3` and `doc#4` —
-they linger as orphans, still matchable, still pointing at deleted text. Deleting
-the now-absent high-index chunks is `not yet exercised`.
+`indexDocument` upserts but never deletes, so a shrinking doc leaves orphan chunks that still match queries. Real incremental indexing needs a "delete chunks for this doc beyond the new count" step — a gap in the current primitive worth knowing.
+
+**Move 2 — the missing change-detection layer.** `not yet exercised`. The decision layer above `indexDocument`:
 
 ```
-  Orphan chunks on shrink (not yet exercised)
-
-  before: doc#0 doc#1 doc#2 doc#3 doc#4
-  edit shrinks doc to 3 chunks ─► re-index upserts doc#0 doc#1 doc#2
-  after:  doc#0 doc#1 doc#2 [doc#3 doc#4]  ← ORPHANS: stale, never overwritten
-   fix: delete chunks where docId = $d and chunkIndex >= newCount  (not built)
+change-detection layer (pseudocode — DOES NOT EXIST)
+function reindexCorpus(docs, store):
+    for doc in docs:
+        h = hash(doc.text)
+        if store.lastHash(doc.id) == h:    # unchanged → skip entirely (no embed)
+            continue
+        indexDocument(doc, wiring)          # changed → delta-update its chunks
+        store.recordHash(doc.id, h)
+    for docId in store.knownDocs() - {docs.id}:  # doc removed from source
+        store.deleteDoc(docId)              # delete its chunks
 ```
 
-### Move 2.5 — current state vs future state
+This is what turns "re-index everything" into "re-index the delta." It needs a stored hash per doc (connects to file 09's content-addressing) and a delete path for removed docs.
 
-```
-  Phase A (aptkit, now)             Phase B (full incremental — not yet exercised)
-  ┌────────────────────────┐        ┌──────────────────────────────────┐
-  │ per-doc upsert by id    │        │ upsert + delete orphan chunks      │
-  │ growing/same-size docs ✓│  add   │ where docId=$d and chunkIndex>=N   │
-  │ shrinking docs ─► orphans│ delete │ shrink leaves no stale chunks      │
-  │ no full rebuild needed   │ step   │ true per-doc consistency           │
-  └────────────────────────┘        └──────────────────────────────────┘
-   incremental WRITE exists; incremental DELETE (on shrink) does not
-```
-
-### Move 3 — the principle
-
-Choose a deterministic key derived from the source, and incremental indexing falls
-out of plain upsert — no separate rebuild path, no diffing engine. The cost of an
-edit drops from corpus-sized to doc-sized for free. The catch is the *delete* side:
-a key by position (`#index`) only overwrites positions that still exist, so shrinking
-a source orphans its tail. Pair the upsert with a "delete chunks beyond the new
-count" step and the per-document write becomes a true per-document *replace*.
+**Move 3 — the principle.** Incremental indexing is identity discipline: give every chunk a deterministic, doc-scoped id and let upsert overwrite. aptkit already does that, so single-doc updates are free and idempotent. The full rebuild is always available as the correct, expensive fallback — and you keep it for cases where you can't trust your change detection. What completes the picture is the layer that detects changes (a per-doc hash) plus deletes for shrunk/removed docs, so the index tracks the source without ever touching what didn't change.
 
 ## Primary diagram
 
 ```
-  Incremental indexing in aptkit terms
-
-  edit one doc
-     │ indexDocument(doc) — per-doc scope (pipeline.ts:32)
-     ▼
-  re-chunk ─► re-embed ─► upsert chunks  id = `${docId}#${i}` (pipeline.ts:42)
-     │
-     ├─ in-memory: Map.set by id (in-memory-vector-store.ts:21)
-     └─ pg: on conflict (id) do update (pg-vector-store.ts:50)
-     ▼
-  doc#0..k overwritten   |   all OTHER docs untouched   |   O(one doc), not O(corpus)
-     └─ shrink case: doc#k+1.. become ORPHANS (delete step not yet exercised)
+incremental vs full, over the same upsert
+   source docs ──► change detection (MISSING) ──┐
+                       │ changed                  │ unchanged → SKIP
+                       ▼                           ▼
+                  indexDocument(doc)            (no embed, no write)
+                       │ chunk ids `${doc.id}#${i}`
+                       ▼
+                  store.upsert ── same id → OVERWRITE ──► in-place delta
+                       │
+                       ⚠ shrunk doc → orphan chunks #3,#4 (need delete)
+   ───────────────────────────────────────────────────────────────────
+   FULL REBUILD = run indexDocument over EVERY doc (correct, O(corpus))
 ```
+
+The overwrite primitive exists; change detection (skip unchanged) and delete (orphans/removed docs) are the gaps that complete the incremental path.
 
 ## Elaborate
 
-The elegance is that aptkit never *built* incremental indexing — it got it as a side
-effect of two ordinary choices: index per document, and key chunks by a stable
-`docId#index`. That's the lesson — incremental behavior is usually a consequence of
-good keys, not a dedicated subsystem. The honest gap is symmetry: upsert handles
-"chunk still exists" perfectly and "chunk no longer exists" not at all, so a
-shrinking doc leaks orphans that behave exactly like stale embeddings
-(`09-stale-embeddings.md`) — confident matches on deleted text. Closing it is a
-small delete-by-prefix. Read `09-stale-embeddings.md` for why orphans are dangerous
-and `04-vector-databases.md` for the upsert implementations on both stores.
+This is the same delta-vs-full tension as database materialized views (incremental refresh vs full refresh) and build systems (incremental compile vs clean build) — same tradeoff, same answer: incremental when you can trust your change detection, full rebuild as the trustworthy fallback. Adjacent: **content-addressed chunk ids** (key by hash so unchanged chunks are no-ops — file 09's `EX-RAG-09b`), **soft deletes / tombstones** (mark removed instead of deleting, for audit), and **CDC** (change-data-capture — derive the delta from the source's write log instead of diffing). buffr's `agents.documents` table (`sql/001_agents_schema.sql:4-12`) is the natural home for a per-doc content hash. Read next: `09-stale-embeddings.md` (the content-hash that powers change detection) and `03-chunking-strategies.md` (where the `#i` ids are minted).
 
 ## Project exercises
 
-### Delete orphan chunks when a re-indexed document shrinks
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** after upserting a doc's chunks, delete any existing chunks for
-  that `docId` whose `chunkIndex >= newChunkCount` — in-memory by scanning the Map,
-  in pg by a `delete … where document_id = $d and chunk_index >= $n`.
-- **Why it earns its place:** turns per-doc upsert into per-doc *replace* and kills
-  the orphan-chunk staleness leak; it proves you saw the asymmetry between insert and
-  delete in an upsert-only design.
-- **Files to touch:** `packages/retrieval/src/pipeline.ts` (pass the new count),
-  `packages/retrieval/src/in-memory-vector-store.ts` (add a prune),
-  `/Users/rein/Public/buffr/src/pg-vector-store.ts` (delete-by-prefix), a new test in
-  `packages/retrieval/test/`.
-- **Done when:** a test indexes a 5-chunk doc, re-indexes a 3-chunk version, and
-  asserts chunks `doc#3`/`doc#4` are gone.
+### Add a change-detection layer (only re-index changed docs)
+
+- **Exercise ID:** `EX-RAG-10a`
+- **What to build:** A `reindexCorpus(docs)` that stores a per-doc content hash, skips docs whose hash is unchanged, delta-updates changed docs via `indexDocument`, and deletes chunks for docs removed from the source.
+- **Why it earns its place:** It completes the incremental path — turning aptkit's existing overwrite primitive into a real O(delta) re-index, and fixing the orphan-chunk and removed-doc gaps. Phase 2A: the next step on a primitive that already half-exists.
+- **Files to touch:** new `packages/retrieval/src/reindex.ts`; uses `indexDocument` (`packages/retrieval/src/pipeline.ts:32-47`); needs a hash store (per-doc) — `agents.documents` (`buffr/sql/001_agents_schema.sql:4-12`) for the buffr path.
+- **Done when:** re-running over a corpus with one edited doc, one removed doc, and N unchanged docs issues embeds only for the edited doc, deletes the removed doc's chunks, and leaves no orphans — proven by counting embed calls and asserting store contents.
+- **Estimated effort:** `1–2 days`
+
+### Fix the shrinking-doc orphan bug
+
+- **Exercise ID:** `EX-RAG-10b`
+- **What to build:** Make `indexDocument` (or the store) delete chunks for a doc beyond the new chunk count before/after upsert, so a doc that shrinks from 5 to 3 chunks ends with exactly 3.
+- **Why it earns its place:** It's a real correctness bug in the existing primitive — shrunk docs leave stale orphans that still match queries. Small, sharp, high-value.
+- **Files to touch:** `packages/retrieval/src/pipeline.ts:32-47`; add a `deleteByDocPrefix` to the `VectorStore` contract (`packages/retrieval/src/contracts.ts:33-37`) and both stores.
+- **Done when:** re-indexing a doc from 5 chunks to 3 leaves exactly 3 chunks in the store, with a test asserting `#3`/`#4` are gone.
 - **Estimated effort:** `1–4hr`
 
 ## Interview defense
 
-**Q: "How do you re-index without rebuilding the whole corpus?"**
-Per-document upsert keyed by a stable chunk id. `indexDocument` (`pipeline.ts:32`)
-scopes work to one doc; each chunk's id is `${docId}#${i}` (`pipeline.ts:42`), so
-re-indexing maps new chunks onto their old ids and overwrites in place — `Map.set`
-in-memory (`in-memory-vector-store.ts:21`), `on conflict (id) do update` in pg
-(`pg-vector-store.ts:50`). Editing one doc is O(one doc); every other doc is
-untouched. No rebuild path exists because none is needed.
+**Q: How does aptkit avoid duplicating chunks when you re-index a doc?**
 
 ```
-  stable id + upsert ─► re-index one doc ─► its chunks overwrite, corpus untouched
+chunk id = `${doc.id}#${i}`  (deterministic, not random)
+   re-index "guide" → same ids guide#0,#1,#2 → upsert OVERWRITES same rows
+   random/UUID ids would → new rows every time → duplicates
 ```
-Anchor: *incremental indexing is a stable key plus upsert — not a separate subsystem.*
 
-**Q: "What breaks when an indexed document gets shorter?"**
-Orphan chunks. Ids are by chunk index, so a doc that shrinks from 5 chunks to 3
-re-upserts `doc#0..2` but leaves `doc#3` and `doc#4` behind — stale chunks pointing
-at deleted text that still match queries. Upsert handles "still exists" but not "no
-longer exists." The fix is a delete step: remove chunks for the doc with
-`chunkIndex >= newCount`. It's `not yet exercised`.
+Anchor: deterministic doc-scoped ids make re-indexing idempotent — upsert overwrites by id, so the same doc never duplicates its chunks.
+
+**Q: A doc was edited to be shorter and old content keeps showing up in results. Why?**
 
 ```
-  shrink 5→3 ─► upsert doc#0..2 ─► doc#3,doc#4 orphaned (stale, still matchable)
+v1: guide#0..#4 (5 chunks)   →   v2 upserts guide#0..#2 (3 chunks)
+   #0,1,2 overwritten ✓   |   #3,#4 untouched → ORPHANS still match queries
 ```
-Anchor: *upsert-by-index replaces what exists; shrinking a doc needs an explicit delete.*
+
+Anchor: upsert overwrites but never deletes — a shrinking doc leaves orphan chunks; incremental indexing needs an explicit delete-beyond-new-count step.
 
 ## See also
 
-- `09-stale-embeddings.md` — orphans are a staleness leak; the freshness primitive
-- `04-vector-databases.md` — the upsert implementations on both stores
-- `11-rag.md` — `indexDocument` and the `${docId}#${i}` id scheme
-- `03-chunking-strategies.md` — why chunk count changes when a doc is edited
-- `04-agents-and-tool-use/05-agent-memory.md` — memory reuses the same upsert path
+- [09-stale-embeddings.md](09-stale-embeddings.md) — content hashing for change detection
+- [03-chunking-strategies.md](03-chunking-strategies.md) — where `${doc.id}#${i}` is minted
+- [04-vector-databases.md](04-vector-databases.md) — upsert/on-conflict in both stores

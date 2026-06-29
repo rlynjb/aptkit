@@ -1,285 +1,180 @@
-# The context window is a fixed budget
+# Context window
 
-**Subtitle:** The window as a token budget · guard, don't truncate · *Industry standard, aptkit-specific guard*
+> The finite container (Industry standard)
+
+The context window is a fixed-size box. System prompt, conversation history, retrieved documents, tool schemas, *and* the room reserved for the model's reply all share it. Add anything and something else has to give. Most failures here are silent — the model quietly truncates, or you blow the limit and get a cryptic provider error mid-generation. aptkit refuses to be silent: the context-window guard (`ContextWindowGuardedProvider`) estimates the input size *before* the call and throws a typed `ContextWindowExceededError` if it won't fit. It fails loud. It does not summarize or truncate — and that's the honest boundary.
 
 ## Zoom out, then zoom in
 
-Before any token math, here's where the budget lives in aptkit. The guard is one
-box wrapped around the provider — everything above it builds a request, the guard
-weighs that request, and only then does the model see it.
+The window is one container with competing tenants. The guard sits as a decorator *in front of* the real provider: it measures everything that's about to be sent, subtracts a reserve for the output, and either delegates or throws.
 
 ```
-  Zoom out — where the budget check sits
+The finite container + the guard in front of it (LAYERS)
 
-  ┌─ Capability layer ──────────────────────────────────────────┐
-  │  agent loop assembles system + messages + tool schemas       │
-  └───────────────────────────┬─────────────────────────────────┘
-                              │ ModelRequest
-  ┌─ Guard layer ─────────────▼─────────────────────────────────┐
-  │  ★ ContextWindowGuardedProvider ★  estimate → ok? → pass     │ ← we are here
-  │  not ok → THROW ContextWindowExceededError                   │
-  └───────────────────────────┬─────────────────────────────────┘
-                              │ only if it fits
-  ┌─ Provider / model ────────▼─────────────────────────────────┐
-  │  local Gemma — has a HARD finite input slot                  │
-  └──────────────────────────────────────────────────────────────┘
+  ┌─────────────────────── context window (maxTokens) ───────────────────────┐
+  │ system prompt │ messages (history) │ tool schemas │  RESERVED for output  │
+  │   competes    │      competes      │   competes   │   (outputReserve=768) │
+  └───────────────────────────────────────────────────────────────────────────┘
+        ▲
+        │ measured by
+  ┌─────┴───────────────────────────────────────────────┐
+  │ ★ ContextWindowGuardedProvider (decorator)            │
+  │   estimate input tokens → fits? delegate : THROW      │
+  │   availableInput = maxTokens − outputReserve          │
+  └───────────────────────────────────────────────────────┘
 ```
 
-Now zoom in. The context window is the total number of tokens the model can read
-in one call — system prompt, every message, every tool schema, all of it, summed.
-It is not "memory" and it is not elastic. When you overflow it, a cloud model
-errors and a local model silently produces garbage. aptkit's answer is unusual
-and worth internalizing: it does not try to manage eviction or compress history.
-It *weighs the request before sending it* and refuses to send one that won't fit.
+Everything left of the reserve competes for the same finite space; the guard is the bouncer that checks the total before anyone gets in.
 
 ## Structure pass
 
-**Layers.** Capability assembles the request → guard estimates and gates →
-provider runs the model. The guard is a decorator: same `ModelProvider`
-interface, wrapped around the real one.
+One axis: **the order of operations on every request — measure, decide, act**.
 
-**Axis — what happens when input is too big?** Trace it. Most systems would
-*truncate* (drop old messages) or *summarize* (compress history). aptkit does
-neither at this layer. It *throws*. The estimate runs first
-(`context-window-guard.ts:59`), and if `estimate.ok` is false the call never
-reaches the model (`:60-68`). The request is rejected whole, not trimmed.
+- **Measure** — `estimateModelRequestTokens` concatenates the system prompt, every message, and every tool schema into one string and divides by a char-per-token ratio. Char-count estimation, not a real tokenizer.
+- **Decide** — `availableInputTokens = maxTokens − outputReserve` (default reserve 768). If the estimate exceeds that, the request doesn't fit.
+- **Act** — fits → delegate to the wrapped provider unchanged. Doesn't fit → throw `ContextWindowExceededError` carrying the full estimate. No truncation, no summarization, no silent drop.
 
-**Seam.** The load-bearing boundary is `complete()` on the guard
-(`context-window-guard.ts:57`). Above it: a request that might be too big. Below
-it: a request that provably fits, or no call at all. The axis "is this within
-budget?" flips exactly here — above, unknown; below, guaranteed.
+The seam: it's a `ModelProvider` decorator. It wraps *any* provider and presents the same `complete()` interface, so the guard is transparent to everything downstream — you compose it, you don't rewire for it.
 
 ## How it works
 
-### Move 1 — the mental model
-
-You know a fixed-size buffer — a ring buffer, or a `<div style="height:400px">`
-with `overflow: hidden`. There's a hard ceiling, and content past it is either
-clipped or it errors. The context window is that buffer, measured in tokens. The
-twist: aptkit doesn't clip silently. It's a buffer that *refuses the write* when
-the write wouldn't fit — closer to a bounded queue that throws on overflow than a
-scrollable div that hides what spills.
+**Move 1 — the mental model.** The guard is a luggage scale at the gate. Before the bag goes on the plane it gets weighed; over the limit and you're turned away *at the gate*, not after the door closes mid-flight. The weight is estimated by length (char count), and a fixed amount of cargo space is always held back for the return payload (the model's output).
 
 ```
-  The window as a token budget
+Guard decision on every complete() (PATTERN)
 
-  maxTokens ┌─────────────────────────────────────────────┐
-            │ system prompt        ▓▓▓▓                    │
-            │ messages (history)   ▓▓▓▓▓▓▓▓▓▓▓▓▓            │
-            │ tool schemas         ▓▓▓                      │  ← input tokens
-            ├─────────────────────────────────────────────┤
-            │ outputReserve (768)  ░░░░  reserved for reply │  ← can't be used by input
-            └─────────────────────────────────────────────┘
-   availableInputTokens = maxTokens − outputReserve
-   if estimatedInput > availableInput → THROW, never send
+  request (system + messages + tools)
+        │
+        ▼  estimateModelRequestTokens   text.length / charsPerToken  (ceil)
+   estimatedInputTokens
+        │
+        ▼  compare
+   estimatedInputTokens ≤ (maxTokens − outputReserve) ?
+        │                                   │
+       yes                                 no
+        ▼                                   ▼
+  delegate to wrapped provider        throw ContextWindowExceededError
+  (request passes through)            (carries the estimate; emits a warning)
 ```
 
-### Move 2 — the guard, step by step
+**Move 2 — walk the pieces.**
 
-**Estimating the input.** aptkit can't tokenize without the model, so it
-approximates: characters divided by a fixed `charsPerToken` of 3. It sums every
-part of the request — system, each message, and each tool's name + description +
-JSON schema. From `context-window-guard.ts:91-98`:
-
-```ts
-export function estimateModelRequestTokens(request: ModelRequest, charsPerToken = 3): number {
-  const text = [
-    request.system ?? '',
-    ...request.messages.map(messageText),
-    ...(request.tools ?? []).map((tool) => `${tool.name} ${tool.description ?? ''} ${JSON.stringify(tool.inputSchema)}`),
-  ].join('\n');
-  return estimateTextTokens(text, charsPerToken);   // Math.ceil(text.length / 3)
-}
-```
-
-The lesson hiding here: tool schemas count against your budget. A model with ten
-verbose tool definitions burns window before the conversation even starts.
+**The decorator wraps any provider and guards its `complete()`.** It adds the check and otherwise gets out of the way.
 
 ```
-  estimateModelRequestTokens — what gets weighed
-
-  ┌─ system ─┐  ┌─ messages[] ─┐  ┌─ tools[] (name+desc+schema) ─┐
-  │  text    │  │  text per    │  │  JSON.stringify(inputSchema) │
-  └────┬─────┘  └──────┬───────┘  └──────────────┬───────────────┘
-       └───────────────┴──── join('\n') ─────────┘
-                            │
-                   length / 3, ceil
-                            ▼
-                   estimatedInputTokens
+context-window-guard.ts (57-69)              the measure→decide→act on each call
+  async complete(request) {
+    request.signal?.throwIfAborted();
+    const estimate =
+      estimateContextWindow(request, opts);  ─ MEASURE (59)
+    if (!estimate.ok) {
+      trace?.emit({ type:'warning', ... });  ─ observable: warn before failing (61-66)
+      throw new ContextWindowExceededError(   ─ ACT-reject: loud, typed (67)
+        estimate);
+    }
+    return this.provider.complete(request);   ─ ACT-accept: delegate unchanged (69)
+  }
 ```
 
-**Computing the budget and gating.** The available slot is `maxTokens` minus a
-reserve set aside for the model's own reply (default 768). If the estimate
-exceeds that, `ok` is false. From `context-window-guard.ts:80-88`:
+`packages/providers/local/src/context-window-guard.ts:57-69`. Notice it emits a `warning` trace event *before* throwing (61-66) — so the failure shows up in observability, not just as an exception. And it delegates the *unmodified* request when it fits (69): the guard never touches the payload, it only gates it.
 
-```ts
-const estimatedInputTokens = estimateModelRequestTokens(request, charsPerToken);
-const availableInputTokens = Math.max(0, maxTokens - outputReserve);   // reserve room for the reply
-return { /* ... */ ok: estimatedInputTokens <= availableInputTokens };
-```
+**The budget is maxTokens minus a fixed output reserve.** You must leave room for the reply, or a request that "fits" still fails when the model tries to answer.
 
 ```
-  The gate
-
-   estimatedInput ──► [ <= availableInput ? ] ──► yes ──► provider.complete()
-                              │
-                              └──── no ──► emit warning ──► throw
+context-window-guard.ts (73-89)              the budget arithmetic
+  estimateContextWindow(request, opts):
+    outputReserve = opts.outputReserve ?? 768 ─ hold back room for the reply (78)
+    estimatedInputTokens =
+      estimateModelRequestTokens(req, cpt)     ─ measure the input (80)
+    availableInputTokens =
+      max(0, maxTokens − outputReserve)        ─ what's left for input (81)
+    ok = estimatedInputTokens
+         ≤ availableInputTokens                ─ the verdict (87)
 ```
 
-**Refusing, not truncating.** This is the whole point. When it doesn't fit, the
-guard emits a trace warning and throws — it does not drop messages to make room.
-From `context-window-guard.ts:60-68`:
+`context-window-guard.ts:81` is the subtraction that makes the reserve real — the input budget is *not* the full window, it's the window minus 768 (default).
 
-```ts
-if (!estimate.ok) {
-  this.options.trace?.emit({ type: 'warning', /* ...skipping local provider... */ });
-  throw new ContextWindowExceededError(estimate);   // refuse — let the caller decide
-}
-return this.provider.complete(request);
-```
-
-Why refuse? Because the guard wraps the *local* provider, and aptkit has a
-fallback chain. A throw here is a signal: "this won't fit on Gemma — try the next
-provider." Truncating would silently corrupt the request; throwing keeps the
-decision honest and routes around the limit instead of through it.
-
-**The other half — bounding growth in the loop.** The guard checks one request.
-But a multi-turn agent loop *grows* the message list every turn, and a single
-huge tool result could blow the window in one shot. So the loop caps every tool
-result before appending it. From `run-agent-loop.ts:52-57`:
-
-```ts
-const MAX_TOOL_RESULT_CHARS = 16_000;
-function truncate(value: string): string {
-  if (value.length <= MAX_TOOL_RESULT_CHARS) return value;
-  return `${value.slice(0, MAX_TOOL_RESULT_CHARS)}\n...[truncated]`;
-}
-```
-
-That truncated string is what gets pushed back as a `tool_result` message
-(`run-agent-loop.ts:162,167,189`). So there are two distinct moves: the *loop*
-truncates tool results (to bound growth), and the *guard* refuses the whole
-request (to enforce the ceiling). Different layers, different jobs.
+**Estimation is char-count, deliberately.** No tokenizer dependency; just length over a ratio.
 
 ```
-  Two layers, two strategies
-
-  run-agent-loop          truncate tool result to 16k chars   (bound growth)
-        │ appends bounded messages
-        ▼
-  ContextWindowGuard      estimate whole request, refuse if over  (enforce ceiling)
+context-window-guard.ts (91-103)             cheap, approximate, dependency-free
+  estimateModelRequestTokens(req, cpt=3):
+    text = [ system,                    ─────  everything that goes in...
+             ...messages.map(text),
+             ...tools.map(schema) ].join
+    return ceil(text.length / cpt)      ─────  length ÷ 3 chars/token, rounded up (102)
 ```
 
-### Move 3 — the principle
+`context-window-guard.ts:91-103`. The default is 3 chars per token (51). It's an approximation — a real tokenizer would be exact — but it's cheap, has no dependency, and `ceil` biases it to *over*-estimate, which is the safe direction for a guard.
 
-Treat the window as a hard budget you measure *before* spending, not a buffer you
-overflow and clean up after. aptkit splits the work: bound per-item growth where
-the data enters (the loop's 16k truncation), and gate the total at the boundary
-to the model (the guard's throw). Refusing beats silently truncating, because a
-refusal can be routed — to another provider, a smaller prompt, fewer tools — while
-a silent truncation just degrades the answer with no signal.
+**Move 3 — the principle.** Fail loud at the gate, not silent in the air. A guard that throws a typed error before the call is strictly better than a provider that truncates your context invisibly and gives you a confidently-wrong answer. The cost of that choice, stated honestly: the guard *only* rejects. It has no fallback — no summarize-then-retry, no drop-oldest-message. When it throws, the caller has to handle it. That's a real gap, and the Case B exercise fills it.
 
 ## Primary diagram
 
 ```
-  The full context-budget story in aptkit
+What the guard does — and pointedly does not — do
 
-  agent loop                          guard                        local model
-  ┌──────────────┐  ModelRequest      ┌──────────────────┐         ┌──────────┐
-  │ system       │ ─────────────────► │ estimate tokens  │         │ Gemma    │
-  │ messages[]   │  (each tool result │  (chars / 3)     │         │ finite   │
-  │ tools[]      │   capped at 16k)   │                  │  fits   │ input    │
-  │              │                    │ <= maxTokens     │ ──────► │ slot     │
-  │              │                    │   − reserve(768)?│         │          │
-  └──────────────┘                    └────────┬─────────┘         └──────────┘
-                                               │ over budget
-                                               ▼
-                                  throw ContextWindowExceededError
-                                  → fallback chain picks another provider
-   above: assemble & bound growth   │   at the seam: measure & gate   │   below: run
+  MEASURE input (char/token estimate)      ████  context-window-guard.ts:91-103
+  RESERVE output room (maxTokens−768)       ████  :81
+  REJECT loud (typed error + warning event) ████  :67
+  ─────────────────────────────────────────────
+  TRUNCATE oldest messages                  ░░░░  not implemented
+  SUMMARIZE to fit                          ░░░░  not implemented  ← Case B
+  it gates; it never edits the payload to make it fit
 ```
 
 ## Elaborate
 
-aptkit's guard is deliberately *not* a context-management system. There's no
-sliding window, no summarization, no eviction policy — and that's a design stance,
-not a gap. The reasoning: a local model swap is cheap (the fallback chain exists),
-so when a prompt won't fit, the right move is to route to a model that *can* hold
-it, not to mutilate the prompt. The `charsPerToken: 3` estimate is intentionally
-conservative — it over-counts slightly so a borderline request errs toward "too
-big" rather than overflowing at runtime. The cost is false rejections on
-prose-heavy requests; the benefit is never silently corrupting a request. If you
-wanted true context management (summarize-old-turns, drop-least-relevant), it
-would live as another `ModelProvider` decorator beside this one — `not yet
-exercised` in the repo. Read `02-lost-in-the-middle.md` next: even when content
-*fits* the window, where it sits inside the window changes whether the model uses
-it.
+The over-estimate bias is intentional and correct for a guard. `Math.ceil(text.length / 3)` rounds up, and 3 chars/token is conservative for English (real ratios run ~4). A guard that errs toward over-estimating fails a few borderline-but-fine requests; a guard that under-estimates lets a too-big request through and you get the provider error you were trying to avoid. For a *gate*, false-positive-reject beats false-negative-admit.
+
+The honest limitation worth saying out loud: this is a wall, not a valve. Production context management usually degrades gracefully — summarize old turns, drop the least-relevant retrieved chunk, or compress history — so a slightly-too-big request still succeeds with less context. aptkit's guard does none of that; it throws. That's defensible (loud beats silent) but incomplete, and the fix is a fallback strategy at the call site or in a smarter guard.
 
 ## Project exercises
 
-### Add a "near-budget" warning band to the guard
+### Add a truncation/summarization fallback instead of throwing
 
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** extend `estimateContextWindow` to return a `nearLimit`
-  boolean (e.g. estimated input > 90% of available) and have
-  `ContextWindowGuardedProvider.complete` emit a `warning` trace when `nearLimit`
-  is true but the request still fits — so you see the cliff before you fall off it.
-- **Why it earns its place:** proves you understand the budget is a gradient, not
-  a binary, and that observability belongs at the boundary where the decision is
-  made.
-- **Files to touch:** `packages/providers/local/src/context-window-guard.ts`, and
-  a test under `packages/providers/local/test/` constructing requests at 50% and
-  95% of budget.
-- **Done when:** `node --test` shows a near-limit request passes AND emits exactly
-  one warning, while an in-budget request emits none.
-- **Estimated effort:** `<1hr`
+- **Exercise ID:** `EX-CTX-01a`
+- **What to build:** A variant guard (or an option on the existing one) that, when the estimate is over budget, *reduces* the request to fit — drop-oldest-message and/or summarize history — before delegating, falling back to the throw only when even the reduced request won't fit. This extends the Phase 1 (context) context-window mechanism from "reject" to "degrade gracefully."
+- **Why it earns its place:** It closes the one honest gap — the guard fails loud but never recovers. Graceful degradation is the production-grade behavior interviewers expect once you've shown you understand the finite container.
+- **Files to touch:** `packages/providers/local/src/context-window-guard.ts` (`complete` 57-69; reuse `estimateContextWindow` 73-89).
+- **Done when:** an over-budget request with droppable history succeeds with a reduced payload, and a request that can't be reduced enough still throws `ContextWindowExceededError`.
+- **Estimated effort:** `1–2 days`
 
-### Make tool-result truncation budget-aware instead of fixed
+### Swap char-estimation for a real token count
 
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** thread a `maxToolResultChars` option through
-  `RunAgentLoopOptions` so a caller can shrink the 16k cap when running against a
-  small-window model, defaulting to the current constant.
-- **Why it earns its place:** the fixed 16k is a magic number that assumes a
-  generous window; making it a knob shows you see how per-item bounding and the
-  total budget are coupled.
-- **Files to touch:** `packages/runtime/src/run-agent-loop.ts`, plus a test in
-  `packages/runtime/test/` asserting a small cap truncates a large result.
-- **Done when:** a test passing `maxToolResultChars: 200` produces a `tool_result`
-  ending in `...[truncated]`, and the default is unchanged.
+- **Exercise ID:** `EX-CTX-01b`
+- **What to build:** Make `estimateModelRequestTokens` pluggable so a real tokenizer can replace the `length / 3` heuristic, keeping the char-ratio as the dependency-free default.
+- **Why it earns its place:** It tightens the estimate (fewer false rejects) while preserving the cheap fallback — a clean demonstration of the accuracy-vs-dependency tradeoff.
+- **Files to touch:** `packages/providers/local/src/context-window-guard.ts:91-103`.
+- **Done when:** the guard accepts an injected token-counter and falls back to char-estimation when none is provided.
 - **Estimated effort:** `1–4hr`
 
 ## Interview defense
 
-**Q: "Your prompt is too long for the model. What does aptkit do?"**
-It refuses, it does not trim. The `ContextWindowGuardedProvider` estimates the
-request's tokens (chars / 3) before sending, and if input would exceed
-`maxTokens − outputReserve` it throws `ContextWindowExceededError`. The throw is a
-routing signal for the fallback chain, not a dead end.
+**Q: What does the context-window guard do when a request is too big?**
 
 ```
-  too big ──► guard estimates ──► over budget ──► THROW
-                                                   │
-                                       fallback chain ──► next provider
-   (never silently drops messages)
+  estimate ≤ maxTokens − outputReserve ?  yes → delegate unchanged
+                                          no  → emit warning + THROW ContextWindowExceededError
 ```
-Anchor: *the guard gates `complete()` at `context-window-guard.ts:60` — refuse, then route.*
 
-**Q: "A loop runs many turns. What stops the window from growing unbounded?"**
-Two separate mechanisms. The agent loop truncates every tool result to 16k chars
-before appending it (`run-agent-loop.ts:54`), so no single tool call can blow the
-window. And the guard re-checks the *whole* assembled request on every turn, so
-even accumulated growth gets gated. Per-item bounding plus total gating.
+Anchor: `context-window-guard.ts:67` throws; `:69` delegates. It fails loud at the gate.
+
+**Q: Why subtract `outputReserve` from `maxTokens`?**
+
+Anchor: `:81` — the model needs room to *reply*; a request that fills the whole window leaves no space for output and fails mid-generation.
+
+**Q: Why char-count estimation instead of a tokenizer, and what's the risk?**
 
 ```
-  per turn:  tool result ──► truncate 16k ──► append to messages[]
-  every call: whole request ──► guard estimate ──► gate
+  ceil(text.length / 3) — cheap, no dependency, over-estimates (safe for a gate)
+  risk: rejects a few borderline-fine requests; never admits a too-big one
 ```
-Anchor: *the loop bounds per-item (`MAX_TOOL_RESULT_CHARS`); the guard enforces the ceiling.*
+
+Anchor: `:102` — `Math.ceil(text.length / charsPerToken)`, default 3 (`:51`).
 
 ## See also
 
-- `02-lost-in-the-middle.md` — fitting the window isn't enough; position matters
-- `03-prompt-chaining.md` — splitting one big prompt into cheaper per-step contexts
-- `../01-llm-foundations/02-tokenization.md` — where `charsPerToken` comes from
-- `../01-llm-foundations/08-provider-abstraction.md` — the fallback chain the throw routes into
+- [02-lost-in-the-middle.md](02-lost-in-the-middle.md) — *what* you put in the window matters too, not just how much.
+- [03-prompt-chaining.md](03-prompt-chaining.md) — splitting work across calls keeps each request inside the window.
+- [../05-evals-and-observability/04-llm-observability.md](../05-evals-and-observability/04-llm-observability.md) — the `warning` event the guard emits.

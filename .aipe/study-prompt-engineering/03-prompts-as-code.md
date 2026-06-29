@@ -1,235 +1,273 @@
 # 03 — Prompts as code: versioning and observability
 
-**Industry name:** prompt management / prompt versioning — *Industry standard*
+**Subtitle:** prompts-as-code — version-controlled prompt packages with
+provenance (Industry standard)
 
 ## Zoom out, then zoom in
 
-The Friday I learned this lesson: the underlying model got upgraded over the
-weekend, 30% of my eval set regressed Monday, and I couldn't answer the only
-question that mattered — *which prompt, on which model, produced the outputs that
-used to pass?* I had prompts as strings scattered across handlers and no version
-on any of them. Never again. **Prompts are source code: one file per prompt,
-version-controlled, reviewed in PRs, and stamped with provenance so you can pair
-a prompt version with a model version.**
-
-aptkit gets this right structurally. Here's the shape.
+A prompt is source code. It gets reviewed, versioned, diffed, and shipped
+through the same pipeline as the rest of your TypeScript. aptkit takes this
+literally: every agent's prompt is a typed `PromptPackage` with an `id`, a
+`version`, and a `capabilityId` — provenance baked into the value. Here's
+where that lives.
 
 ```
-  Zoom out — prompts as versioned code
+  Zoom out — prompts as a versioned source layer
 
-  ┌─ Authoring layer (this concept) ──────────────────────────────┐
-  │  packages/prompts/src/                                         │ ← we are here
-  │    query.ts        → queryPromptPackage {id, version, capId}   │
-  │    diagnostic.ts   → diagnosticPromptPackage                   │
-  │    recommendation.ts, monitoring.ts                            │
-  │  packages/prompts/src/types.ts → PromptPackage type            │
-  └───────────────────────────┬────────────────────────────────────┘
-                              │  rendered + sent
-  ┌─ Runtime ─────────────────▼────────────────────────────────────┐
-  │  agent loop / generateStructured → model.complete               │
-  └───────────────────────────┬────────────────────────────────────┘
-                              │  trace events carry capabilityId
-  ┌─ Observability ───────────▼────────────────────────────────────┐
-  │  CapabilityEvent {capabilityId, model, timestamp} (NDJSON)      │
-  │  replay artifacts {provider, fixture, capabilityId} on disk     │
-  └──────────────────────────────────────────────────────────────────┘
+  ┌─ Source layer (git, reviewed, semver'd) ────────────────────┐
+  │  ★ PromptPackage ★  { id, version, capabilityId, system }    │ ← we are here
+  │  packages/prompts/src/{query,recommendation,monitoring,...}  │
+  └───────────────────────────┬──────────────────────────────────┘
+                              │ imported by the agent
+  ┌─ Capability layer ────────▼───────────────────────────────────┐
+  │  capability = prompt package + tool policy + loop + validator  │
+  └───────────────────────────┬──────────────────────────────────┘
+                              │ run → artifact
+  ┌─ Observability layer ─────▼───────────────────────────────────┐
+  │  replay artifact records capabilityId + provider + trace      │
+  └────────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: the unit is the `PromptPackage` (`packages/prompts/src/types.ts:13`).
-It's not a string — it's a record with `id`, `version`, and `capabilityId`. That
-trio is the provenance that answers the Monday-morning question.
+Zooming in: the concept is *treating the prompt as a first-class artifact*
+rather than a string buried in a function. Two consequences fall out — you
+can pin a prompt to a model version (a prompt that worked on Sonnet 3 can
+break on Sonnet 4), and you can trace which prompt produced which output in
+production.
 
-## The structure pass
+## Structure pass
 
-**Layers:** the prompt *definition* (a typed record in git) → the *render* (vars
-substituted) → the *run* (sent under a `capabilityId`) → the *trace/artifact*
-(what was logged, with model id + timestamp).
+**Layers.** Source (the package literal) → capability (package + policy +
+loop) → observability (the artifact with provenance).
 
-**Axis — can you reconstruct what produced an output?** Trace it:
+**Axis — can you answer "which exact prompt produced this output?"** Trace
+it:
 
 ```
-  Axis: "is this output traceable back to a prompt + model?"
+  Axis: "is the prompt that produced this output identifiable?"
 
-  ┌────────────────────────────────────────────┐
-  │ PromptPackage {id, version, capabilityId}   │  → YES, prompt identified
-  └────────────────────────────────────────────┘
-      ┌──────────────────────────────────────┐
-      │ run under capabilityId               │  → YES, run tagged
-      └──────────────────────────────────────┘
-          ┌──────────────────────────────────┐
-          │ artifact {provider, model, time}  │  → YES, model + when captured
-          └──────────────────────────────────┘
-
-  every layer carries identity → output is fully reconstructable
+  inline string in a function  → NO  (no id, no version, can't diff)
+  PromptPackage { id, version }→ YES (named, semver'd, reviewable)
+  capability binds it to an id → YES (capabilityId on every event)
+  artifact records capabilityId→ YES (provenance survives to disk)
 ```
 
-**Seam:** the `capabilityId` string. It's the join key that threads a prompt
-definition → its run → its trace events → its replay artifact. `query.ts:59` sets
-`capabilityId: 'query-agent'`; the loop stamps every `CapabilityEvent` with that
-same id (`run-agent-loop.ts:116`); the artifact on disk records it too. **What
-breaks if the seam is loose:** you have prompts and you have logs but you can't
-join them, which is exactly the position I was in on that Monday.
-
-**The honest gap:** the *prompt+model pairing* is half-built. The artifact
-records the `provider` and `model`, and the package records the prompt `version`
-— but nothing in the repo *joins them into a single regression key* (e.g. an eval
-matrix indexed by `version × model`). So "which prompt version on which model"
-is reconstructable by hand but `not yet exercised` as automation.
+**Seam.** The boundary that matters is between *the prompt as text* and
+*the prompt as a versioned identity*. Inline strings live below that seam —
+unidentifiable. `PromptPackage` lives above it. Cross that seam and the
+prompt becomes something you can review, pin, and trace.
 
 ## How it works
 
-### Move 1 — the mental model
+You already version your code and pin your dependencies in `package.json`.
+A prompt is a dependency of your agent's behavior, so it gets the same
+treatment: a name, a version, a place in the dependency graph. Let's walk
+how aptkit reifies that.
 
-You already version your API contracts — a `package.json` has a `version`, a
-migration has a number, a published package has a semver. A `PromptPackage` is
-that same instinct applied to the prompt: give it an `id`, a `version`, and a
-stable `capabilityId`, and now a prompt change is a reviewable diff with a
-version bump, not a silent string edit.
+### Step 1 — the prompt is a typed value with provenance
 
-```
-  Pattern — the PromptPackage record (prompts/src/types.ts:13)
+The `PromptPackage` type forces three identity fields:
 
-  PromptPackage {
-    id:           "query-agent.default"   ← stable name (review/audit)
-    version:      "0.1.0"                 ← bump on every behavior change
-    capabilityId: "query-agent"           ← the join key into traces/artifacts
-    system:       "You are an AI analyst..."  ← the prompt body
-    compactSystem?:  "..."                 ← token-budget variant (concept 04)
-    variables:    [{name, description, required}]  ← the {placeholder} contract
-    examples:     [{name, input, expectedContains}] ← eval anchors
-  }
-```
-
-### Move 2 — walking the provenance
-
-**Step 1 — the definition is a typed record in git.** `queryPromptPackage`
-(`query.ts:56`) is a `const` export with the system string, the variable
-contract, and examples. It's reviewed like any other code — a prompt PR shows the
-exact diff of the instruction text. **What breaks without this:** prompt edits
-ship as invisible string changes with no review surface and no version.
-
-**Step 2 — the variable contract is explicit.** `variables[]` (`query.ts:62`)
-declares `schema` (required), `project_id` (required), `intent` (required) with
-descriptions. This is the typed interface to the prompt — it tells a caller what
-must be supplied before `renderPromptTemplate` (`types.ts:24`) runs. **What
-breaks without it:** a caller forgets `{schema}`, the regex leaves the literal
-`{schema}` in the prompt, and the model gets a placeholder instead of data.
-
-**Step 3 — the run is tagged with capabilityId.** When the agent runs the loop,
-it passes `capabilityId` (`rag-query-agent.ts:67`, `RAG_QUERY_CAPABILITY_ID`),
-and the loop stamps it onto every emitted event:
-
-```
-  Inline annotation — run-agent-loop.ts:116 model_usage event
-
-  trace?.emit({
-    type: 'model_usage',
-    capabilityId,                  ← the join key, on every event
-    provider: model.id,            ← which provider answered
-    model: response.model ?? ...,  ← which exact model version
-    inputTokens, outputTokens,     ← cost provenance (concept 04)
-    timestamp: timestamp(),        ← when
-  });
+```ts
+// packages/prompts/src/types.ts:13
+export type PromptPackage = {
+  id: string;          // 'query-agent.default'
+  version: string;     // '0.1.0'  ← semver on the PROMPT
+  capabilityId: string;// 'query-agent'  ← binds to the agent
+  description: string;
+  system: string;      // the actual prompt text
+  compactSystem?: string;  // a token-budget variant (concept 4)
+  variables: PromptVariable[];
+  examples: PromptExample[];
+};
 ```
 
-**Step 4 — the artifact persists it.** A replay artifact
-(`artifacts/replays/*.json`) records `capabilityId`, `provider`, `fixture`, and
-the model turns. That's the durable record: open an artifact months later and you
-know which capability, which provider, and what the model actually emitted. The
-fixture-replay backbone (see `../study-testing/`) turns this into deterministic
-regression tests.
+And every agent's prompt is exported as one of these:
 
-### Move 2.5 — current state vs future state
-
-This concept is built-but-partial. Worth being precise about the line.
-
-```
-  Comparison — prompt provenance: now vs the gap
-
-  NOW (shipped)                      │  GAP (not yet exercised)
-  ─────────────────────────────────  │  ────────────────────────────────
-  PromptPackage has id+version       │  no eval matrix keyed on
-  capabilityId threads run→trace     │    (prompt version × model)
-  artifact records provider+model    │  no automated "this prompt was
-  compactSystem? slot for budget     │    validated against models X,Y,Z"
-  prompts reviewed as code in PRs    │  drift across model upgrades is
-                                     │    caught by re-running evals
-                                     │    manually, not by a gate
+```ts
+// packages/prompts/src/query.ts:56
+export const queryPromptPackage: PromptPackage = {
+  id: 'query-agent.default',
+  version: '0.1.0',
+  capabilityId: 'query-agent',
+  description: 'Free-form workspace question answering ...',
+  system: QUERY_PROMPT,
+  variables: [ /* {schema}, {project_id}, {intent} declared */ ],
+  examples: [ /* eval anchors */ ],
+};
 ```
 
-The takeaway is what *doesn't* have to change: the provenance is already on the
-wire (`capabilityId` + `model` in every event). Closing the gap is a build on top
-of existing data, not a re-architecture — you'd add an eval run keyed on
-`(version, model)`, not new instrumentation.
+The `version` field is the load-bearing one. It says "this exact prompt
+text is 0.1.0." When you change a word, you bump it, and now any artifact
+that recorded `version: 0.1.0` is pinned to the old text. The
+`variables[]` array is self-documenting — it declares which placeholders the
+template expects, so a reviewer sees the contract without reading the regex.
 
-### Move 3 — the principle
+### Step 2 — the capability binds prompt to identity
 
-**A prompt without a version is a liability the moment the model changes.** The
-discipline isn't bureaucracy — it's the only thing that lets you answer "what
-broke and why" after a model upgrade. Treat the prompt as the source it is: name
-it, version it, review the diff, and stamp every run so the output traces back to
-the exact prompt and the exact model that produced it.
+A prompt alone isn't an agent. aptkit's organizing idea is that a
+*capability* = prompt package + tool policy + loop config + validator. The
+agent pulls the package's system text and stamps the capability id onto
+every trace event:
+
+```ts
+// packages/agents/query/src/query-agent.ts:71
+this.prompt = options.prompt ?? queryPromptPackage.system;
+// ...
+const { finalText } = await runAgentLoop({
+  capabilityId: QUERY_CAPABILITY_ID,   // 'query-agent' — stamped on every event
+  ...
+});
+```
+
+```
+  Layers-and-hops — provenance from package to artifact
+
+  ┌─ Source ─────────┐ hop 1: system text  ┌─ Capability ──────────┐
+  │ queryPromptPackage│ ──────────────────► │ QueryAgent            │
+  │ id/version/capId  │ hop 2: capabilityId │ runAgentLoop(capId)   │
+  └───────────────────┘ ──────────────────► └──────────┬────────────┘
+                                                hop 3: every event
+                                                carries capabilityId
+                                                        ▼
+                                             ┌─ Observability ──────┐
+                                             │ CapabilityEvent       │
+                                             │ replay artifact JSON  │
+                                             └───────────────────────┘
+```
+
+### Step 3 — observability: which prompt produced which output
+
+Every event the loop emits carries the `capabilityId`
+(`run-agent-loop.ts:112` — `model_usage`, `step`, `tool_call_*`). Those
+events stream out as NDJSON and land in a replay artifact. The artifact
+records `capabilityId`, `provider`, the full `trace`, and the output. So in
+production you can take any saved artifact and answer: which capability ran,
+against which provider, producing what. That's prompt observability — not
+"we log the prompt string somewhere" but "the prompt's identity is attached
+to its output by construction."
+
+### Step 4 — the prompt + model-version pairing
+
+Here's the operational scar this concept is really about. A prompt is not
+portable across model versions. The Gemma provider defaults to `gemma2:9b`
+(`gemma-provider.ts:47`); the Anthropic default is `claude-sonnet-4-6`. The
+*same* tool-emulation system text that coaxes a clean JSON tool call out of
+one model can fall apart on another that's chattier or formats differently.
+The artifact records `provider` precisely so that when you see a regression,
+you can ask "did the prompt change, or did the model under it change?" —
+the question you cannot answer if the prompt is an anonymous inline string
+and the model is implicit.
+
+```
+  Comparison — inline string vs PromptPackage when the model upgrades
+
+  inline string + implicit model:
+    Sonnet 3 → Sonnet 4 upgrade → outputs change → WHY? unknowable
+    (no prompt version, no recorded provider)
+
+  PromptPackage + recorded provider:
+    artifact A: { version:'0.1.0', provider:'anthropic', model:'sonnet-3' }
+    artifact B: { version:'0.1.0', provider:'anthropic', model:'sonnet-4' }
+    same prompt version, different model → it's the MODEL → pin or re-eval
+```
+
+### Step 5 — the deployment story
+
+Because the prompt is a value in a package, changing it is a code change: a
+diff, a pull request, a review. The `@rlynjb/aptkit-core` bundle is
+published with semver (`0.4.x`), and the prompt packages are re-exported as
+part of that public surface (per the project's compatibility contract). A
+prompt edit ships exactly like an API change — visible, reviewable,
+versioned — not as a silent string swap that nobody notices until the eval
+set regresses.
+
+### The principle
+
+The generalizing idea: **a prompt is a dependency of your system's
+behavior, so it earns a name, a version, and a place in the dependency
+graph.** The moment a prompt is an anonymous inline string, you've lost the
+ability to diff it, pin it to a model, or trace its output. aptkit's
+`PromptPackage` is the minimal reification that buys all three back.
 
 ## Primary diagram
 
-The full provenance thread, definition to artifact.
+The full prompts-as-code path, provenance flowing from source to artifact.
 
 ```
-  Prompts as code — the provenance thread
+  Prompts as code — aptkit
 
-  DEFINITION (git)        prompts/src/query.ts
-  ┌──────────────────────────────────────────────────────┐
-  │ queryPromptPackage { id, version, capabilityId,       │
-  │                      system, variables, examples }    │
-  └───────────────────────────┬────────────────────────────┘
-       renderPromptTemplate({schema, intent, project_id})
-  RUN                         ▼   run under capabilityId
-  ┌──────────────────────────────────────────────────────┐
-  │ runAgentLoop({ capabilityId, model, system })          │
-  └───────────────────────────┬────────────────────────────┘
-       emit CapabilityEvent {capabilityId, provider, model, ts}
-  TRACE / ARTIFACT            ▼
-  ┌──────────────────────────────────────────────────────┐
-  │ artifacts/replays/*.json {capabilityId, provider,      │
-  │                           model, fixture, modelTurns}  │
-  └──────────────────────────────────────────────────────┘
-       join key throughout = capabilityId
+  ┌─ Git / review ──────────────────────────────────────────────┐
+  │  PromptPackage { id:'query-agent.default', version:'0.1.0',  │
+  │                  capabilityId:'query-agent', system, vars }  │
+  │  edited via diff + PR, semver-bumped on change               │
+  └────────────────────────────┬──────────────────────────────────┘
+                              │ imported, system text used
+  ┌─ Capability ──────────────▼───────────────────────────────────┐
+  │  prompt package + tool policy + loop + validator              │
+  │  runAgentLoop(capabilityId) stamps every event                │
+  └────────────────────────────┬──────────────────────────────────┘
+                              │ NDJSON trace
+  ┌─ Artifact (provenance on disk) ▼──────────────────────────────┐
+  │  { capabilityId, provider, model, trace, output }             │
+  │  answers: which prompt + which model → this output            │
+  └────────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The "prompts as code" movement (Hamel Husain, the LangSmith/PromptLayer tooling
-ecosystem) exists because the alternative — prompts as untracked strings — makes
-the model-upgrade regression undebuggable. The `PromptPackage.version` here is
-deliberately semver-shaped so a behavior change is a visible bump. The deeper
-idea this repo nails is that *the prompt and the model are a pair*: a prompt
-tuned on one model is not guaranteed on the next, so the provenance has to carry
-both. aptkit carries both on the wire (`model.id` in every `CapabilityEvent`);
-the missing piece is the gate that re-validates the pair on a model change.
+The "prompts as code" framing is now standard practice — prompt registries,
+versioned prompt stores, and prompt-management tooling all encode the same
+idea. aptkit's version is deliberately lightweight: no external registry,
+just a typed value in a workspace package, versioned by git and semver. That
+fits a toolkit that publishes as one npm bundle.
+
+The deeper connection is to evals (concept 5). Versioning a prompt is only
+useful if you can tell whether a new version is *better*. The
+`PromptPackage.examples` and the replay-eval pipeline are the other half:
+version the prompt, run the golden set, compare scores across versions. And
+the prompt+model pairing connects to token budgeting (concept 4) via
+`compactSystem` — a second, shorter system variant in the same package, for
+when the model or window changes.
 
 ## Interview defense
 
-**Q: How do you manage prompts in production?** As versioned source: one
-`PromptPackage` per prompt with `id`, `version`, `capabilityId`; reviewed in PRs;
-every run stamped with the capabilityId and the model id so outputs trace back.
-The capabilityId is the join key from definition to trace to artifact.
+**Q: What does "prompts as code" actually buy you?**
+
+Three things you lose with an inline string: diffability (review a prompt
+change like a code change), pinning (tie a prompt version to a model
+version, so you can tell a prompt regression from a model regression), and
+observability (attach the prompt's identity to its output by construction).
+aptkit's `PromptPackage` carries `id`/`version`/`capabilityId`, and every
+trace event and artifact records the capability id and provider.
 
 ```
-  PromptPackage {version} ──capabilityId──► trace {model, ts} ──► artifact
-  "which prompt, which model, when" — answerable for every output
+  inline string → unidentifiable output
+  PromptPackage → artifact { capabilityId, version, provider } → traceable
 ```
-*Anchor: `PromptPackage` (`types.ts:13`); `capabilityId` stamped at
-`run-agent-loop.ts:116`.*
 
-**Q: What's the part people forget?** The **prompt+model pairing**. A prompt is
-only valid *for a given model*. People version the prompt and forget the model
-changed underneath it — which is exactly the 30%-regression Monday. The fix is an
-eval gate keyed on `(prompt version × model id)`; in this repo the data for it is
-captured but the gate is `not yet exercised`.
+Anchor: "`types.ts:13` — version on the prompt, capabilityId on every event,
+provider on the artifact. That triple answers 'which prompt + which model
+made this output.'"
+
+**Q: A model upgrade lands Friday and 30% of outputs change. How does
+prompts-as-code help you triage?**
+
+Because the prompt version and the provider/model are both recorded on the
+artifact, you can compare two runs with the *same* prompt version across the
+two models and confirm the change is the model, not your prompt. Without
+that pairing you're guessing. The fix is then scoped: re-eval the prompt
+against the new model and pin or revise — not blindly rewrite.
+
+Anchor: "Recorded `provider` + prompt `version` = the model-vs-prompt
+question becomes answerable instead of a guess."
 
 ## See also
 
-- `01-anatomy.md` — what's inside the `system` field being versioned.
-- `04-token-budgeting.md` — the `compactSystem` slot is a budget variant of the package.
-- `05-eval-driven-iteration.md` — the eval gate that should key on version × model.
-- `../study-testing/` — fixture-replay turns artifacts into regression tests.
+- [01-anatomy.md](01-anatomy.md) — the `PromptPackage` sections this
+  versions
+- [04-token-budgeting.md](04-token-budgeting.md) — `compactSystem` as a
+  budget variant in the same package
+- [05-eval-driven-iteration.md](05-eval-driven-iteration.md) — versioning is
+  only useful with evals to compare versions
+- [06-single-purpose-chains.md](06-single-purpose-chains.md) — the
+  capability = prompt + policy + loop + validator unit

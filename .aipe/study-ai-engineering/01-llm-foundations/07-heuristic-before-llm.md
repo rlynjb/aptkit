@@ -1,226 +1,154 @@
-# Heuristic before LLM — the cheap path first
+# Heuristic-before-LLM
 
-**Subtitle:** keyword shortcut + model fallback · code → maybe model → answer · *Language-agnostic*
+Heuristic-before-LLM · the cheap-path gate (Industry standard)
+
+The cheapest model call is the one you never make. Before aptkit spends a token, a deterministic check rules out work the agent can't possibly do — if a task needs a capability the workspace doesn't have, it's filtered out *before* the model runs. aptkit's real version of this is the coverage gate. It's a `.filter()` over tasks, run by code, not by an LLM.
 
 ## Zoom out, then zoom in
 
-Before you reach for the model, see that aptkit often answers without it — a plain
-keyword check does the work, and the LLM is the fallback, not the default.
+The gate sits in front of the agent loop — a deterministic checkpoint between "here are the tasks" and "spend tokens."
 
 ```
-  Zoom out — where the cheap path sits
-
-  ┌─ Capability (query agent) ──────────────────────────────────┐
-  │  needs an Intent: monitoring / diagnostic / recommendation  │
-  └───────────────────────────┬─────────────────────────────────┘
-                              │ classifyIntent(model, query)
-  ┌─ Routing ─────────────────▼─────────────────────────────────┐
-  │  ★ parseIntent ★  pure keyword check — no model call        │ ← we are here
-  └───────────────────────────┬─────────────────────────────────┘
-                              │ only if needed
-  ┌─ The model ───────────────▼─────────────────────────────────┐
-  │  one-word classification — expensive, slower, stochastic    │
-  └──────────────────────────────────────────────────────────────┘
+aptkit — where the cheap path gates the expensive one
+┌─────────────────────────────────────────────┐
+│ Requested tasks (requirements)                │
+├─────────────────────────────────────────────┤
+│ ★ coverage-gate: runnableRequirements()        │  ← you are here (DETERMINISTIC)
+│    schemaCapabilities → requirementCoverage     │
+├─────────────────────────────────────────────┤
+│ Agent loop + complete()  ── only runnable tasks │  ← EXPENSIVE, model spends here
+├─────────────────────────────────────────────┤
+│ Model                                           │
+└─────────────────────────────────────────────┘
 ```
 
-Every model call costs tokens, latency, and a chance of being wrong. The
-heuristic-before-LLM pattern asks: can a few lines of deterministic code answer
-this? If yes, return immediately. If no, *then* pay for the model. In aptkit the
-cleanest example is intent classification — and the same function `parseIntent`
-plays two roles: the cheap shortcut *and* the parser that interprets the model's
-answer when you do fall through.
+The pattern is "heuristic-before-LLM" — a cheap deterministic filter guarding an expensive probabilistic one. The question: *which of these tasks can we rule out without asking the model?* You've done this exact move on the frontend: validate the form client-side before hitting the API, so you don't burn a round trip on input you already know is invalid. Here the "invalid input" is a task whose required capabilities aren't in the workspace.
 
 ## Structure pass
 
-**Layers.** Cheap heuristic (`parseIntent` keyword check) → model call
-(`classifyIntent`) → the same heuristic again (parsing the model's one-word reply).
+Three steps: read what the workspace can do, score each task, drop the impossible. Trace the **cost** axis.
 
-**Axis — cost.** Trace what each layer spends. The heuristic costs a few string
-`includes` calls — effectively free, fully deterministic. The model costs a
-network round-trip, tokens, and nondeterminism. The pattern's whole job is to keep
-the cheap layer in front so the expensive layer runs only when it must.
+```
+COST axis — what's spent at each step?
+Step                       cost          can rule out work?
+───────────────────────────────────────────────────────────
+schemaCapabilities()       ~free (read)  —
+requirementCoverage()      ~free (compare) scores full/limited/unavailable
+runnableRequirements()     ~free (filter)  drops 'unavailable' ←★ seam
+agent loop + complete()    $$ tokens       runs ONLY survivors
+```
 
-**Seam.** The flip is "do we trust code, or do we ask the model?" Below the seam,
-deterministic and free. Above it, stochastic and metered. `parseIntent` guards
-the seam from *both* sides — as the entry shortcut and as the exit parser.
+The seam is `runnableRequirements`. Everything before it is free CPU work. Everything after it costs tokens. The filter is the gate: an `unavailable` task dies here, for free, instead of dying after the model spent tokens discovering it couldn't be done. The whole point is that the flip from free-to-expensive happens *after* the impossible tasks are gone.
 
 ## How it works
 
-### Move 1 — the mental model
-
-You know a cache check before a fetch: `if (cache.has(k)) return cache.get(k)`
-then fall through to the network? Heuristic-before-LLM is that shape, where the
-"cache" is a rule you can compute and the "network" is the model. Cheap, certain
-answer first; expensive, uncertain answer only on a miss.
+**Mental model.** Match required capabilities against available ones, like a set membership test. The workspace advertises what it can do; each task declares what it needs; coverage is the intersection. No model involved — it's a comparison.
 
 ```
-  cache-before-fetch, but the fetch is a model
-
-  query ─► cheap rule matches? ─yes─► return (free, certain)
-                  │ no
-                  ▼
-            call model ─► parse its answer with the SAME rule
+The gate — set matching, no LLM
+  workspace capabilities:  {A, B, C}
+  task needs A,B → 'full'        ✓ runnable
+  task needs A,X → 'limited'     ~ partial (some missing)
+  task needs X,Y → 'unavailable' ✗ FILTERED OUT before any token
 ```
 
-### Move 2 — the moving parts
-
-**The pure keyword heuristic.** `parseIntent` is just three `includes` checks with
-a default. No model, no I/O, fully deterministic. From
-`packages/agents/query/src/intent.ts:4`:
+**Reading what the workspace can do.** First, derive the capability set from the schema.
 
 ```ts
-export function parseIntent(raw: string): Intent {
-  const text = raw.trim().toLowerCase();
-  if (text.includes('monitoring')) return 'monitoring';        // ← cheap, exact
-  if (text.includes('recommendation')) return 'recommendation';
-  if (text.includes('diagnostic')) return 'diagnostic';
-  return 'diagnostic';                                          // ← safe default on no match
-}
+// packages/tools/src/coverage-gate.ts:23-35  (schemaCapabilities)
+// inspect the workspace/schema → produce the set of capabilities it supports
+// pure derivation: no model, no network
 ```
 
-```
-  parseIntent — the free path
-
-  text.includes('monitoring')     ─► 'monitoring'
-  text.includes('recommendation') ─► 'recommendation'
-  text.includes('diagnostic')     ─► 'diagnostic'
-  none                            ─► 'diagnostic'  (default, never throws)
-```
-
-**The model fallback — and the reuse.** `classifyIntent` calls the model only for
-the hard cases, asks for exactly one word, then funnels that word back through the
-*same* `parseIntent`. From `packages/agents/query/src/intent.ts:12`:
+**Scoring each requirement.** Each task gets graded against that set.
 
 ```ts
-export async function classifyIntent(model, query, options = {}) {
-  const response = await model.complete({
-    system: 'Classify … as exactly one word: monitoring … diagnostic … recommendation …',
-    messages: [{ role: 'user', content: query }],
-    maxTokens: 16,                                             // ← bound the spend
-    signal: options.signal,
-  });
-  const text = /* join text blocks */;
-  return parseIntent(text);                                    // ← SAME heuristic parses the reply
-}
+// packages/tools/src/coverage-gate.ts:38-45  (requirementCoverage)
+// returns 'full' | 'limited' | 'unavailable'
+//   full        = every needed capability present
+//   limited     = some present, some missing
+//   unavailable = none / the critical ones missing
 ```
 
+Three states, not a boolean — because "partially doable" is real (run the task but warn). `coverageReport` (lines 56-70) rolls these into a per-task summary you can show before committing to a run.
+
+**The filter that saves the tokens.** This is the gate itself.
+
+```ts
+// packages/tools/src/coverage-gate.ts:73-78  (runnableRequirements)
+// keep tasks whose coverage is NOT 'unavailable'
+//   → 'full' and 'limited' survive; 'unavailable' is dropped
+//   the agent never sees an unavailable task → never spends a token on it
 ```
-  classifyIntent — the metered path, parsed by the cheap one
 
-  query ─► model.complete (maxTokens:16) ─► "Diagnostic." (one wordish)
-                                                  │
-                                          parseIntent(text)
-                                                  ▼
-                                          'diagnostic'  (fuzz absorbed)
-```
+That one filter is the heuristic-before-LLM in code. An `unavailable` task is provably impossible (the workspace lacks the capability), so there's zero value in asking the model to attempt it — you'd pay tokens to be told "can't." The filter answers deterministically, for free, first.
 
-The elegance: the heuristic is the contract on both ends. The model is told to
-emit a word `parseIntent` already understands, so even a sloppy "Diagnostic." or
-"this is diagnostic" lands correctly. And if the model produces garbage, the
-default branch still returns a valid `Intent` — the system never crashes on a bad
-classification.
-
-**A related guard worth naming.** The search tool applies cheap pre-checks too —
-a `minTopK`/filter guard that bounds what it asks for before trusting model-driven
-retrieval. Same family of idea ("cheap guard before trusting the model"), but
-`parseIntent` is the canonical, clearest instance in the repo.
-
-### Move 3 — the principle
-
-Put a deterministic, free decision in front of every metered, stochastic one, and
-reuse it as the parser for the model's reply so both paths converge on the same
-small output space. The model becomes a fallback that upgrades hard cases, never
-a tax on easy ones — and a forgiving parser means the model's output never has to
-be exact.
+**The principle.** Don't pay the model for work you can rule out deterministically. Any time a cheap, exact check can eliminate a candidate before the expensive probabilistic step, run it first. This generalizes everywhere: a regex pre-filter before an LLM classifier, a cache hit before a generation, a permission check before a tool call. The model is the most expensive tool in the box — gate it.
 
 ## Primary diagram
 
-```
-  Heuristic-before-LLM routing
+The full route from requested tasks to a token spend, with the impossible ones dropped for free.
 
-  query
-    │
-    ▼
-  ┌─────────────────────────┐   match
-  │ parseIntent (keywords)  │ ───────► Intent   (free path, exits here when obvious)
-  └───────────┬─────────────┘
-              │ ambiguous / need the model
-              ▼
-  ┌─────────────────────────┐
-  │ model.complete (16 tok) │ ──► one-word reply
-  └───────────┬─────────────┘
-              ▼
-  ┌─────────────────────────┐
-  │ parseIntent (REUSED)    │ ───────► Intent   (default-safe, never throws)
-  └─────────────────────────┘
-   cheap & certain in front   │   metered & stochastic only on the hard cases
 ```
+Coverage gate — full routing
+  requested tasks ─────────────┐
+                               ▼
+  schemaCapabilities() ──▶ {available caps}
+                               │
+       per task: requirementCoverage(task, caps)
+                               │
+            ┌──────────────────┼──────────────────┐
+          'full'           'limited'          'unavailable'
+            │                  │                    │
+            └── runnableRequirements() keeps ───────┘ drops here (FREE)
+                         │                            ✗ no token spent
+                         ▼
+                  agent loop + complete()   ── $$ tokens spent only here
+```
+
+The expensive box at the bottom only ever sees survivors; the `unavailable` branch is killed before any spend.
 
 ## Elaborate
 
-This is the routing pattern behind every cost-and-latency-conscious AI system:
-classifier-before-generator, cache-before-call, regex-before-LLM. The discipline
-is to keep the heuristic *honest* — it must be either confidently right or
-explicitly defer, never silently wrong. aptkit's `parseIntent` defers safely by
-defaulting to `diagnostic`, the most general intent. Read `03-sampling-
-parameters.md` for why the one-word task is near-deterministic without a
-temperature lock, and `06-token-economics.md` for what each avoided model call
-saves.
+This is the AI-engineering instance of the classic "cheap check before expensive operation" — short-circuit evaluation, a bloom filter before a disk read, client-side validation before a server round trip. In LLM systems it shows up as model routing (small model gates the big one), retrieval gating (no relevant docs → skip generation), and intent classifiers that bail before the expensive agent spins up. aptkit's gate is the capability-coverage flavor. Read `04-structured-outputs.md` (the gate's deterministic-then-probabilistic shape mirrors validate-then-retry) and `06-token-economics.md` (what the gate saves you in dollars).
 
 ## Project exercises
 
-### Add a confident-shortcut path to classifyIntent
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** in `classifyIntent`, run `parseIntent(query)` first and return
-  immediately when the query *itself* contains an unambiguous keyword, only calling
-  the model on a miss — with tests proving the model is never called for an obvious
-  query.
-- **Why it earns its place:** makes the heuristic an actual short-circuit (right
-  now it's only the parser), which is the cost-saving half of the pattern.
-- **Files to touch:** `packages/agents/query/src/intent.ts`,
-  `packages/agents/query/test/intent.test.ts`.
-- **Done when:** a fixture model with a spy proves zero model calls for keyword-
-  obvious queries and one call otherwise.
-- **Estimated effort:** `1–4hr`
+### Surface the coverage report before the run
 
-### Make the default branch observable
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** when `parseIntent` hits the default branch on a *model* reply
-  (i.e. the model said something off-vocabulary), emit a `warning` event so weak
-  classifications are visible in the trace.
-- **Why it earns its place:** a silent default hides model drift; surfacing it is
-  the observability instinct that separates toy code from production.
-- **Files to touch:** `packages/agents/query/src/intent.ts`, matching `test/`.
-- **Done when:** an off-vocabulary model reply produces a warning; a clean reply
-  produces none.
+- **Exercise ID:** `EX-LLM-07a`
+- **What to build:** This gate exists (Case A) — make its savings visible. Emit a trace event from `coverageReport`/`runnableRequirements` that records how many tasks were dropped as `unavailable` and which capabilities they needed, so Studio can show "skipped 3 tasks, saved N model calls" before the agent runs.
+- **Why it earns its place:** Phase 1 wants you to *see* the cheap-path payoff, not just trust it. You'll learn to instrument a deterministic gate and quantify avoided spend, which is exactly the argument you make when defending a heuristic-before-LLM design.
+- **Files to touch:** `packages/tools/src/coverage-gate.ts` (56-70 `coverageReport`, 73-78 `runnableRequirements`); emit via the trace/event path used by `packages/runtime/src/ndjson-stream.ts`.
+- **Done when:** running a workspace missing a capability produces a trace event listing the dropped tasks and the missing capabilities, and the count matches the tasks the agent never received.
 - **Estimated effort:** `1–4hr`
 
 ## Interview defense
 
-**Q: "Why not just always ask the model to classify intent?"**
-Because most queries are answerable by a keyword check that's free, instant, and
-deterministic. The model is the fallback for ambiguity, capped at 16 tokens. You
-don't pay latency, tokens, and nondeterminism for cases a rule already nails.
+**Q: How do you avoid spending tokens on work the agent can't do?**
 
 ```
-  always-model:  every query → round-trip + tokens + maybe wrong
-  heuristic-1st: obvious → free rule;  hard → model (bounded)
+  task needs capability X, workspace lacks X
+  → requirementCoverage = 'unavailable'
+  → runnableRequirements() DROPS it     (free, deterministic)
+  → agent never sees it → 0 tokens
+       └ vs: let the model try, pay, get told "can't"
 ```
-Anchor: *the model is a fallback for hard cases, not a tax on easy ones.*
 
-**Q: "The model replied 'Diagnostic.' with a period — does that break it?"**
-No. The model's reply goes back through the same `parseIntent` that does
-`includes('diagnostic')`, so punctuation and casing are absorbed, and anything
-unrecognized defaults to a valid intent. The heuristic is forgiving by design.
+A deterministic capability check filters out impossible tasks before the agent runs — `runnableRequirements()` drops `unavailable` ones for free. Anchor: *rule it out with code before you pay the model.*
+
+**Q: Why three coverage states instead of runnable/not?**
 
 ```
-  "Diagnostic." ─► toLowerCase + includes('diagnostic') ─► 'diagnostic'
-  garbage       ─► default branch ─► 'diagnostic' (never throws)
+  full        → run it
+  limited     → run it, but warn (some capability missing) ← the nuance
+  unavailable → drop it
 ```
-Anchor: *one forgiving parser guards both the shortcut and the model's reply.*
+
+Because "partially doable" is a real case — a `limited` task still runs but flags missing capabilities, which a boolean would force you to wrongly drop or wrongly trust. Anchor: *partial coverage is a first-class state.*
 
 ## See also
 
-- `03-sampling-parameters.md` — why the one-word classify task is near-deterministic
-- `06-token-economics.md` — the cost each skipped model call avoids
-- `04-structured-outputs.md` — the heavier cousin when the reply must be JSON
+- [`06-token-economics.md`](./06-token-economics.md) — the dollars this gate saves.
+- [`04-structured-outputs.md`](./04-structured-outputs.md) — the deterministic-then-probabilistic shape.
+- [`08-provider-abstraction.md`](./08-provider-abstraction.md) — the expensive step the gate guards.

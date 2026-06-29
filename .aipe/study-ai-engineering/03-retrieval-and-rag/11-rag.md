@@ -1,268 +1,229 @@
-# RAG — Retrieval-Augmented Generation
+# RAG
+> Retrieval-augmented generation · Industry standard
 
-**Subtitle:** RAG · grounded generation over a private corpus · *Industry standard*
+You shipped this exact shape in AdvntrCue: embed the query, cosine-search pgvector, stuff the top chunks into the prompt, let GPT-4 answer with citations. That's RAG — give the model facts it wasn't trained on, at query time, so it answers grounded in *your* corpus instead of hallucinating from its weights. aptkit's version is the same skeleton, built from scratch, with one extra thing AdvntrCue probably didn't have: a `search_knowledge_base` tool that's been hardened against a specific, nasty retrieval-quality bug — a weak local model hallucinating a metadata filter that silently wiped every result. This file walks that bug and the three pieces of the fix in detail, because they're the load-bearing skeleton of robust RAG.
 
 ## Zoom out, then zoom in
 
-RAG is the spine of aptkit. Here's where it sits: the agent asks for a tool, the
-tool runs the retrieval pipeline, the pipeline reaches an embedder and a store,
-and the ranked chunks come back up to ground the model's answer.
+RAG is the whole stack assembled — every prior file is a component, and the `search_knowledge_base` tool is the seam where retrieval meets the agent.
 
 ```
-  Zoom out — RAG across the layers
-
-  ┌─ Capability ──────────────────────────────────────────────┐
-  │  rag-query agent — "answer grounded in the knowledge base" │
-  └───────────────────────────┬────────────────────────────────┘
-                              │ calls tool: search_knowledge_base
-  ┌─ Retrieval pipeline ──────▼────────────────────────────────┐
-  │  ★ index: doc→chunk→embed→upsert ★                          │ ← we are here
-  │  ★ query: query→embed→search→rank ★                         │
-  └──────────────┬───────────────────────────┬─────────────────┘
-                 │ embed()                    │ search()
-  ┌─ Embedder ───▼──────────┐   ┌─ Vector store ▼──────────────┐
-  │ nomic-embed-text, 768d  │   │ InMemory (cosine) / PgVector │
-  └─────────────────────────┘   └──────────────────────────────┘
+the full RAG loop in aptkit
+┌──────────────────────────────────────────────────────────┐
+│  agent (Gemma) decides it needs facts → calls a tool        │
+└───────────────┬────────────────────────────────────────────┘
+                ▼
+┌──────────────────────────────────────────────────────────┐
+│  ★ search_knowledge_base tool ★   the retrieval↔agent seam  │  ← you are here
+│  minTopK floor · 4x over-fetch · hallucination-safe filter  │
+└───────────────┬────────────────────────────────────────────┘
+                ▼  pipeline.query(query, fetchK)
+┌──────────────────────────────────────────────────────────┐
+│  embed query (file 01) → store.search cosine (file 04)      │
+│  over chunks (file 03) embedded by nomic (file 02)          │
+└───────────────┬────────────────────────────────────────────┘
+                ▼  ranked VectorHit[] with citations
+┌──────────────────────────────────────────────────────────┐
+│  agent stuffs chunks into context → generates GROUNDED answer│
+└──────────────────────────────────────────────────────────┘
 ```
 
-Now zoom in. You already shipped RAG once (AdvntrCue: pgvector + GPT-4), so the
-shape is familiar — retrieve, augment, generate. What's worth studying in aptkit
-is that the pipeline is built from scratch over two swappable contracts, and the
-agent reaches it as a *tool* rather than as bespoke control flow. The model
-decides *when* to retrieve; the pipeline decides *what* comes back.
+Everything below the tool you've already studied — embed, chunk, store, search. The tool is where it all becomes *agent-usable*: it turns "ranked vectors" into "cited passages an LLM can quote." And it's where retrieval quality lives or dies, because a tool that returns empty produces an ungrounded answer, and the model never tells you retrieval failed — it just makes something up.
 
 ## Structure pass
 
-**Layers.** Pipeline (index/query) → contracts (embedder, store) → adapters
-(nomic, in-memory/pg). Two paths run through the same wiring: indexing writes,
-querying reads.
+Pick the **failure** axis: how does RAG fail, and where does each failure originate?
 
-**Axis — state.** Who owns the corpus? Trace it: the pipeline owns no state (it's
-pure functions over a wiring); the `VectorStore` owns the vectors; the document
-text lives in `meta.text` on each chunk. The pipeline is stateless glue between a
-stateful store and a stateless embedder.
+```
+failure across the RAG loop
+  embed/search          the TOOL                  generation
+  ┌──────────────┐     ┌──────────────────────┐   ┌──────────────────┐
+  │ wrong chunks  │     │ EMPTY results          │   │ ignores context   │
+  │ retrieved     │     │ (filter wiped them /   │   │ / over-trusts it  │
+  │ (recall)      │     │  topK starved to 1)    │   │                   │
+  └──────────────┘     └───────────┬──────────┘   └──────────────────┘
+                                    ▼
+              ★ seam: empty retrieval → ungrounded answer, SILENTLY ★
+              the model doesn't know retrieval failed; it hallucinates
+```
 
-**Seam.** The load-bearing boundary is the pair of contracts in
-`contracts.ts` — `EmbeddingProvider` (`:22`) and `VectorStore` (`:33`). The axis
-"who knows about the vendor?" flips here: above, the pipeline names no vendor;
-below, nomic and in-memory/pgvector live. A dimension guard (`pipeline.ts:22`)
-makes the seam fail loud if an embedder and store disagree.
+The seam — and the most dangerous failure — is *empty retrieval*. Wrong chunks at least give the model something to push back on; empty results give it nothing, so it falls back to its weights and confabulates with full confidence. The tool's hardening exists entirely to prevent the loop from silently returning empty. That's why the floor, the over-fetch, and the safe filter are the skeleton: each one stops a different path to "empty."
 
 ## How it works
 
-### Move 1 — the mental model
-
-You know how `Array.prototype.filter` + `sort` gives you "the items matching a
-predicate, ranked"? RAG is that, but the predicate is *semantic similarity* and
-the ranking is *cosine score*. Retrieve the few most-similar chunks, paste them
-into the prompt, let the model answer from them instead of from frozen training
-data.
+**Move 1 — the RAG pattern.** Four steps, and the tool owns the middle two:
 
 ```
-  RAG — the kernel
-
-  question ─► embed ─► search store ─► top-k chunks ─► stuff prompt ─► answer
-                                          │                              │
-                                          └── cite these ────────────────┘
-   the model answers FROM the chunks, not from memory — that's the whole trick
+the RAG pattern
+   1. RETRIEVE   embed query → cosine search → top-k chunks
+   2. AUGMENT    format chunks as cited context: "[docId] passage..."
+   3. STUFF      inject context + question into the prompt
+   4. GENERATE   LLM answers, citing the passages
+        │
+        └─ grounding rule: answer FROM the chunks, say "I don't know" if absent
 ```
 
-### Move 2 — the two paths
+aptkit's `search_knowledge_base` tool is steps 1–2: it queries the pipeline and formats each hit into a citation string the agent can quote. Steps 3–4 are the agent's job (sub-section 04).
 
-**Index path: doc → chunk → embed → upsert.** Before you can retrieve, the corpus
-must be embedded and stored. `indexDocument` (`pipeline.ts:32`) is the whole write
-side:
+**The tool seam.** The tool wraps the pipeline's query path and adds the hardening:
 
 ```ts
-export async function indexDocument(doc, wiring) {
-  assertWiring(wiring);                       // fail loud if dims disagree
-  const texts = chunkText(doc.text);          // 512-char windows, 64 overlap
-  if (texts.length === 0) return;
-  const vectors = await wiring.embedder.embed(texts);   // one embed call, batched
-  const chunks = texts.map((text, i) => ({
-    id: `${doc.id}#${i}`,                     // stable id: docId#chunkIndex
-    vector: vectors[i]!,
-    meta: { ...(doc.meta ?? {}), docId: doc.id, chunkIndex: i, text },  // text rides along
-  }));
-  await wiring.store.upsert(chunks);
+// packages/retrieval/src/search-knowledge-base-tool.ts:78-96 (the handler)
+const handler: ToolHandler = async (args) => {
+  const query = typeof args.query === 'string' ? args.query : '';
+  const requestedTopK = typeof args.top_k === 'number' && args.top_k > 0 ? args.top_k : defaultTopK;
+  const topK = Math.max(requestedTopK, minTopK);            // ← FIX 1: the floor (see below)
+  const filter = /* parse args.filter if it's a plain object */;
+  const fetchK = filter ? topK * 4 : topK;                  // ← FIX 2: over-fetch when filtering
+  let hits = await pipeline.query(query, fetchK);
+  if (filter) hits = hits.filter((h) => matchesFilter(h, filter)).slice(0, topK); // ← FIX 3 inside matchesFilter
+  return { query, results: hits.map(toResult) };            // toResult builds the citation
+};
+```
+
+Now the bug. A weak local model (Gemma) gets a tool whose schema allows an optional `filter` object. The model, trying to be helpful on a query like "find the part about kayaking," hallucinates a filter key that *sounds* plausible but no chunk's metadata actually has — say `{ "textContains": "kayaking" }`. A naive filter implementation (`every key must match`) then excludes *every* chunk, because no chunk has a `textContains` key. Retrieval returns empty. The agent, handed nothing, hallucinates an answer. No error anywhere. That's the signature retrieval-quality bug.
+
+**Fix 1 — the minTopK floor.** A weak model can also starve retrieval by asking for `top_k: 1`, then miss everything in a multi-part question:
+
+```ts
+// packages/retrieval/src/search-knowledge-base-tool.ts:51 and :81
+const minTopK = Math.max(1, options.minTopK ?? 1);          // :51 — configurable lower bound
+// ...
+const topK = Math.max(requestedTopK, minTopK);              // :81 — model can't go below the floor
+```
+
+```
+the floor: model asks for 1, floor forces ≥ minTopK
+   model: top_k = 1   ──► Math.max(1, minTopK)   ──► topK = minTopK (e.g. 3)
+   stops a weak model from starving its own retrieval on multi-part questions
+```
+
+*Remove this* and a model that under-asks retrieves one chunk for a three-part question and answers two-thirds wrong. The floor is the guardrail on the model's own bad `top_k`.
+
+**Fix 2 — the 4x over-fetch.** Filtering *after* retrieval shrinks the result set, so you must fetch extra to still return `topK`:
+
+```ts
+// packages/retrieval/src/search-knowledge-base-tool.ts:88
+const fetchK = filter ? topK * 4 : topK;                    // fetch 4x when a filter will trim
+```
+
+```
+over-fetch: post-filter shrinks results, over-fetch refills
+   want topK=5, with filter:
+     fetch 20 ──► filter trims (some don't match) ──► still ≥5 survive ──► slice(5)
+   WITHOUT over-fetch: fetch 5 ──► filter trims to 2 ──► only 2 returned (starved)
+```
+
+*Remove this* and any legitimate filter that excludes some hits leaves you under `topK` — fewer chunks, weaker grounding.
+
+**Fix 3 — the hallucination-tolerant filter.** The core fix: a filter key only excludes hits that *have* that key with a different value; keys absent from a chunk's meta are ignored:
+
+```ts
+// packages/retrieval/src/search-knowledge-base-tool.ts:101-106
+function matchesFilter(hit: VectorHit, filter: Record<string, unknown>): boolean {
+  // A filter key only excludes hits that HAVE that key with a different value.
+  // Keys absent from a chunk's meta are ignored, so a weak model's hallucinated
+  // filter (e.g. {textContains: "x"}) can't silently wipe every result.
+  return Object.entries(filter).every(([key, value]) =>
+    !(key in hit.meta) || hit.meta[key] === value);         // ← absent key ⇒ pass, not fail
 }
 ```
 
-The detail that matters: `text` is stored *in the chunk's meta*. That's what lets
-the search tool build a citation later without a second lookup.
-
 ```
-  Index path — write side
-
-  doc {id,text} ─► chunkText ─► ["…512c…","…512c…"] ─► embed ─► [v0,v1]
-                                                                  │
-                          upsert chunks {id:"doc#0", vector:v0, meta:{…,text}}
-                                                                  ▼
-                                                          ┌─ VectorStore ─┐
-                                                          │  the corpus   │
-                                                          └───────────────┘
+naive filter vs hallucination-tolerant filter
+  query filter: { textContains: "kayaking" }   (no chunk has a textContains key)
+  NAIVE:  every key must match → key absent → FAIL → ALL chunks excluded → EMPTY ✗
+  APTKIT: key absent → IGNORE that key → chunk passes → results survive ✓
+          but: { docId: "guide" } on a chunk WITH docId="other" → correctly excluded ✓
 ```
 
-**Query path: query → embed → search → rank.** The read side is `queryKnowledgeBase`
-(`pipeline.ts:50`):
+The genius is the `!(key in hit.meta) ||` clause. A real filter on a real metadata key (`docId`, `chunkIndex`) still works — it excludes mismatches. But a *hallucinated* key that no chunk carries is simply ignored, so a bad model can't weaponize the filter into wiping retrieval. *Remove this clause* (revert to `every key matches`) and you're back to the original bug: one hallucinated filter key empties the whole result set.
 
-```ts
-export async function queryKnowledgeBase(query, wiring, topK = 5) {
-  assertWiring(wiring);
-  const [vector] = await wiring.embedder.embed([query]);  // embed the query the SAME way
-  if (!vector) return [];
-  return wiring.store.search(vector, topK);               // cosine top-k
-}
-```
-
-The query is embedded by the *same provider* as the corpus — that's why the
-dimension guard matters. `store.search` ranks by cosine and returns the top-k
-`VectorHit`s (`in-memory-vector-store.ts:25`).
-
-```
-  Query path — read side
-
-  "what ORM?" ─► embed ─► qv ─► store.search(qv, 5) ─► [hit,hit,hit] sorted by score
-                                       │
-                              cosine(qv, each chunk.vector), sort desc, slice 5
-```
-
-**Augment + generate.** The retrieved chunks reach the model through the tool
-result. The rag-query agent's system prompt orders the model to call
-`search_knowledge_base` first and ground every answer in the returned chunks,
-citing sources, and to say so plainly when the corpus has nothing
-(`rag-query-agent.ts:20-27`). The "augment" step is just: the tool result becomes
-a `tool_result` message the model reads on its next turn (`run-agent-loop.ts:189`).
-
-```
-  Augment + generate — through the agent loop
-
-  model turn 1: "call search_knowledge_base('ORM')"
-       │
-  tool result: { results: [ "[setup.md] We use Drizzle…", … ] }  ◄─ appended as a message
-       │
-  model turn 2: reads chunks → "You use Drizzle ORM [setup.md]."  ◄─ grounded + cited
-```
-
-### Move 2.5 — current state vs future state
-
-aptkit's RAG runs end to end today on the in-memory store with local nomic + Gemma.
-The only thing that changes for production durability is the store: buffr fills
-`PgVectorStore` (pgvector + HNSW) behind the same `VectorStore` contract. Nothing
-in `indexDocument`/`queryKnowledgeBase`/the agent changes.
-
-```
-  Phase A (aptkit, now)            Phase B (buffr, durable)
-  ┌────────────────────┐          ┌────────────────────────┐
-  │ InMemoryVectorStore│          │ PgVectorStore          │
-  │ cosine over array  │   same   │ pgvector <=>, HNSW idx  │
-  │ forgets on exit    │ contract │ persists across runs    │
-  └────────────────────┘          └────────────────────────┘
-   pipeline + agent: IDENTICAL on both
-```
-
-### Move 3 — the principle
-
-RAG is only as good as retrieval — a great model over bad chunks gives confident
-wrong answers. So the engineering investment goes into the retrieval contracts and
-their failure modes (the hallucinated-filter bug, the `minTopK` floor), not into
-the model. Build the pipeline so the vendor is swappable and the failure modes are
-visible, and the "generation" half mostly takes care of itself.
+**Move 3 — the principle.** RAG's load-bearing failure is silent empty retrieval, because the LLM downstream can't tell "no facts found" from "no facts needed" — it just hallucinates. So the tool seam must *refuse to return empty for the wrong reasons*: floor the model's `top_k` so it can't starve itself, over-fetch so post-filtering doesn't under-deliver, and make the filter ignore keys it doesn't recognize so a weak model's hallucinated constraint can't wipe everything. And the framing rule on top: don't RAG features that work without it — retrieval is for grounding in *your* facts, not a reflex on every query.
 
 ## Primary diagram
 
 ```
-  RAG end to end in aptkit
-
-  ┌─ rag-query agent (capability) ─────────────────────────────────────┐
-  │  system: "always search first, ground answers, cite, refuse if none"│
-  └───────────────┬──────────────────────────────▲─────────────────────┘
-         tool call │                              │ grounded answer
-  ┌─ search_knowledge_base tool ─▼────┐           │
-  │  topK = max(requested, minTopK)   │           │
-  └───────────────┬───────────────────┘           │
-                  │ pipeline.query                 │
-  ┌─ pipeline ────▼────────────────────────────────┴──────────┐
-  │  INDEX  doc→chunk(512/64)→embed(nomic,768)→store.upsert    │
-  │  QUERY  query→embed→store.search(cosine top-k)→VectorHit[] │
-  └───────────────┬───────────────────────────────────────────┘
-                  ▼
-  ┌─ VectorStore ── InMemory (aptkit)  |  PgVector + HNSW (buffr) ─┐
-  └────────────────────────────────────────────────────────────────┘
+RAG end to end, with the three fixes named
+   agent calls search_knowledge_base(query, top_k?, filter?)
+        │
+        ▼ topK = max(requestedTopK, minTopK)        ◄── FIX 1: floor (no self-starvation)
+        ▼ fetchK = filter ? topK*4 : topK           ◄── FIX 2: over-fetch (filter won't starve)
+   pipeline.query(query, fetchK)
+        │ embed(query) → store.search → ranked VectorHit[]
+        ▼
+   if filter: hits.filter(matchesFilter).slice(topK) ◄── FIX 3: absent keys ignored
+        │                                                  (hallucinated filter can't wipe all)
+        ▼ toResult: "[docId] snippet..."  ← citation
+   ranked, cited chunks ──► agent stuffs context ──► GROUNDED answer
+   ─────────────────────────────────────────────────────────────────
+   remove FIX 1 → multi-part questions under-retrieve
+   remove FIX 2 → filtered queries return < topK
+   remove FIX 3 → one hallucinated filter key → EMPTY → ungrounded answer
 ```
+
+Three small guards, each closing a different path to silent empty retrieval — together they're why aptkit's RAG doesn't quietly hallucinate when a weak model misuses the tool.
 
 ## Elaborate
 
-RAG was invented to fix two LLM limits: models don't know your private data, and
-their public knowledge is frozen at training time. Retrieval injects fresh,
-specific knowledge at query time. The "above-threshold" rule still applies — don't
-add RAG to features that work without it; hand-picked retrieval (recency, explicit
-relations) often beats vector search at small scale. aptkit earns RAG because the
-corpus is open-ended (a personal knowledge base). Read `04-vector-databases.md` for
-the storage swap and `04-agents-and-tool-use/03-react-pattern.md` for how the agent
-decides *when* to retrieve.
+RAG is Lewis et al., 2020 (the original "Retrieval-Augmented Generation" paper) — the idea that you don't need to fine-tune facts into a model when you can retrieve them at inference. The frontier moved to **agentic RAG** (the model decides *whether* and *how* to retrieve, iterating — exactly aptkit's tool-call shape, sub-section 04), **RAG vs long-context** (do you retrieve or just stuff the whole corpus into a 1M-token window? — retrieval still wins on cost, freshness, and citation), and **graph RAG** (file 12). The hallucinated-filter bug is a specific instance of a general agent lesson: never trust LLM-generated tool arguments to be well-formed — validate, floor, and degrade gracefully. Bridge: AdvntrCue gave you steps 1–4; aptkit adds the tool-seam hardening that production agentic RAG needs. Read next: `07-reranking.md` (the precision stage) and the agents sub-section (who calls the tool).
 
 ## Project exercises
 
-### Add a "no relevant chunk" threshold to the query path
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a relevance floor in `queryKnowledgeBase` (or the tool) that
-  drops hits below a cosine-score threshold, so the agent gets an empty result
-  rather than three weak chunks, and answers "I couldn't find that" honestly.
-- **Why it earns its place:** "refuse over hallucinate" is the single most-probed
-  RAG behavior in interviews; wiring the threshold proves you control the
-  precision/recall tradeoff at the retrieval seam.
-- **Files to touch:** `packages/retrieval/src/pipeline.ts`,
-  `packages/retrieval/src/search-knowledge-base-tool.ts`, a new test in
-  `packages/retrieval/test/`.
-- **Done when:** a unit test shows a low-similarity query returns `[]` and the
-  rag-query agent emits the fallback answer.
+### Add a relevance-threshold gate (refuse to answer below score X)
+
+- **Exercise ID:** `EX-RAG-11a`
+- **What to build:** A score threshold in the tool: if the top hit's cosine score is below a configurable minimum, return an explicit "no relevant results" signal so the agent says "I don't know" instead of grounding on weak matches.
+- **Why it earns its place:** The current tool always returns *something* — even garbage low-score chunks — and a weak model will dutifully cite them. A threshold turns "force an answer from bad chunks" into "honestly refuse," which is the other half of robust grounding. Phase 2A: the natural next hardening on the tool you just studied.
+- **Files to touch:** `packages/retrieval/src/search-knowledge-base-tool.ts:78-96` (handler) and `:32-41` (options); the score is on `VectorHit` (`packages/retrieval/src/contracts.ts:15-19`).
+- **Done when:** a query with no good match returns an empty/`belowThreshold` result the agent can detect, a query with a strong match returns chunks as before, and a test pins both around the threshold.
 - **Estimated effort:** `1–4hr`
 
-### Run the RAG agent against buffr's PgVectorStore end to end
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** wire the rag-query agent to buffr's `PgVectorStore` and index
-  a handful of docs, proving the contract swap is transparent.
-- **Why it earns its place:** demonstrates the seam works — same agent, durable
-  store, persists across runs.
-- **Files to touch:** `/Users/rein/Public/buffr/src/session.ts`,
-  `/Users/rein/Public/buffr/src/pg-vector-store.ts`,
-  `/Users/rein/Public/buffr/sql/001_agents_schema.sql`.
-- **Done when:** indexing once and querying in a *new* process returns grounded
-  answers without re-indexing.
-- **Estimated effort:** `1–2 days`
+### Regression-test the three hardening fixes
+
+- **Exercise ID:** `EX-RAG-11b`
+- **What to build:** Three tests: (a) a hallucinated filter key returns full results not empty; (b) `top_k: 1` is floored to `minTopK`; (c) a filtered query still returns `topK` thanks to over-fetch.
+- **Why it earns its place:** These three behaviors are subtle and easy to "simplify" away in a refactor — each test pins one path to silent empty retrieval shut. This is the safety net for the signature bug.
+- **Files to touch:** test file alongside `packages/retrieval/src/search-knowledge-base-tool.ts`; exercise lines `:51`, `:81`, `:88`, `:101-106`.
+- **Done when:** all three pass, and reverting `matchesFilter` to a naive `every-key-matches` makes test (a) fail.
+- **Estimated effort:** `1–4hr`
 
 ## Interview defense
 
-**Q: "Walk me through your RAG pipeline."**
-Two paths over two contracts. Index: chunk the doc into 512-char windows, embed
-each with nomic (768-dim), upsert into the store with the text in the chunk's meta.
-Query: embed the question the same way, cosine-search the store for top-k, hand the
-chunks to the model as a tool result, model answers from them and cites. The vendor
-is swappable — in-memory for tests, pgvector+HNSW in buffr.
+**Q: A weak model passed a filter and your RAG returned an empty result and hallucinated. What's the fix?**
 
 ```
-  index: doc→chunk→embed→upsert        query: q→embed→search→rank→stuff→answer
-  the model answers FROM chunks; retrieval quality is the whole ballgame
+{ textContains: "x" } — no chunk HAS a textContains key
+  naive filter: key absent → fail → ALL excluded → empty → hallucination
+  fix: !(key in hit.meta) || hit.meta[key] === value
+       absent key IGNORED → real filters still work, hallucinated ones don't wipe all
 ```
-Anchor: *RAG is only as good as retrieval — a great model over bad chunks is confidently wrong.*
 
-**Q: "What's the load-bearing part people forget?"**
-That the query must be embedded by the *same* provider as the corpus, at the same
-dimension — otherwise cosine ranks garbage. aptkit guards it: `assertWiring`
-(`pipeline.ts:22`) throws at wiring time on a dimension mismatch, and the store
-re-checks every vector. A silent dimension mismatch corrupts ranking with no error.
+Anchor: an LLM's tool arguments are untrusted input — the filter ignores keys no chunk carries, so a hallucinated constraint can't empty the result set while real metadata filters still exclude mismatches.
+
+**Q: Why over-fetch 4x only when filtering, and why floor top_k?**
 
 ```
-  embedder.dimension ≠ store.dimension ─► throw at wiring time (fail loud)
-   the corpus and the query MUST share one embedding space
+filter trims AFTER retrieval → fetch topK*4 so ≥topK survive the trim
+floor: Math.max(requestedTopK, minTopK) → weak model can't ask for top_k:1
+       and starve a multi-part question
 ```
-Anchor: *same embedder, same dimension, or the cosine scores are meaningless.*
+
+Anchor: both guards prevent silent empty/under-retrieval — over-fetch refills what the post-filter removes, the floor stops the model starving itself; the LLM can't tell "no facts" from "few facts," so the tool must not under-deliver.
+
+**Q: When should a feature NOT use RAG?**
+
+```
+retrieval = grounding in YOUR facts the model lacks
+   feature works from the model's own knowledge? → RAG adds latency + a failure mode
+   above-threshold rule: don't RAG what works without it
+```
+
+Anchor: RAG earns its cost only when the answer depends on corpus facts the model can't know — reflexively retrieving on every query adds latency and the empty-retrieval failure mode for no grounding benefit.
 
 ## See also
 
-- `04-vector-databases.md` — the store swap (in-memory vs pgvector)
-- `03-chunking-strategies.md` — the 512/64 chunker
-- `01-embeddings.md` — what the 768-dim vector means
-- `04-agents-and-tool-use/02-tool-calling.md` — how search reaches the model
-- `05-evals-and-observability/01-eval-set-types.md` — how retrieval is graded (precision@k)
+- [01-embeddings.md](01-embeddings.md) — the retrieve step's representation
+- [04-vector-databases.md](04-vector-databases.md) — the store behind `pipeline.query`
+- [07-reranking.md](07-reranking.md) — the precision stage before generation
+- [12-graphrag.md](12-graphrag.md) — RAG over a graph instead of vectors

@@ -1,181 +1,189 @@
 # Timeouts, Retries, Pooling, and Backpressure
 
-**Industry name:** resilience patterns / deadline propagation / connection pooling / flow control · *Industry standard*
+**Deadlines · retry/backoff · connection pools · overload control** — *Industry standard*
 
-## Zoom out, then zoom in
+## Zoom out — where resilience would live
 
-This is the file about what keeps a network call from hanging, retrying forever, or drowning a downstream. It's also the file with the sharpest honest gap in the repo.
-
-```
-  Zoom out — where resilience controls live (and don't)
-
-  ┌─ Service layer ────────────────────────────────────────────┐
-  │  agent loop: maxTurns bound (caps total work)              │
-  │  FallbackModelProvider: retries across PROVIDERS, not hops │
-  └───────────────────────────┬────────────────────────────────┘
-                              │
-  ┌─ Provider layer ─────────▼─────────────────────────────────┐
-  │  Gemma fetch: AbortSignal pass-through ✓ ... but NO timeout │ ← ★ the gap ★
-  │  Ollama embed fetch: same — NO timeout                     │
-  └───────────────────────────┬────────────────────────────────┘
-                              │
-  ┌─ Storage layer (buffr) ──▼─────────────────────────────────┐
-  │  pg.Pool: bounded connections = the system's only real     │
-  │    backpressure (connect() queues when all are busy)        │
-  └────────────────────────────────────────────────────────────┘
-```
-
-**Zoom in.** Verdict first: **the repo has cancellation but no deadline, retries across providers but not across network attempts, and backpressure only in buffr's pool.** The Ollama `fetch` honors a caller's `AbortSignal` but sets no timeout of its own — so a wedged daemon hangs until something else aborts it. The pattern to learn: **resilience is four separate knobs — timeout, retry, pool, backpressure — and a system can have some and not others; naming which is which is the skill.**
-
-## Structure pass
-
-**Layers:** caller (sets deadlines, ideally) → transport (`fetch` / `pg.Pool`) → downstream.
-
-**Axis — "what stops this from waiting forever or overloading the next layer?"** Trace each knob:
+This is the topic where aptkit has the most *absences*, and the absences are the lesson. Timeouts, retries, pooling, and backpressure are the resilience layer wrapped around a network call. aptkit's outbound `fetch` has a cancellation *path* but no deadline that fires it, no retry, and no tuned pool. Here's where that layer sits — mostly empty.
 
 ```
-  Axis — what bounds the work — knob by knob
+  Zoom out — the resilience layer around the fetch
 
-  knob          where it lives                       present?
-  ────────────────────────────────────────────────────────────────
-  cancellation  request.signal → fetch signal        YES (pass-through)
-  timeout       (would be AbortSignal.timeout)        NO  ← the gap
-  retry (net)   none at the HTTP layer                NO
-  retry (logic) tool-call parse-retry in Gemma        YES (app-level)
-  fallback      FallbackModelProvider across providers YES (different mechanism)
-  pool          buffr pg.Pool                          YES (buffr only)
-  backpressure  pg.Pool connection cap (queues)        YES (buffr only)
-  iteration cap agent loop maxTurns                    YES (bounds the loop)
+  ┌─ Caller (agent loop) ──────────────────────────────────────┐
+  │  passes AbortSignal down (mechanism present)               │
+  └──────────────────────────┬─────────────────────────────────┘
+                             │
+  ┌─ Provider transport ──────▼─────────────────────────────────┐
+  │  await fetch(url, {signal?})                                │ ← we are here
+  │  ✗ no timeout  ✗ no retry  ✗ no backoff  ✗ no pool tuning   │
+  └──────────────────────────┬─────────────────────────────────┘
+                             │
+  ┌─ Ollama daemon ───────────▼─────────────────────────────────┐
+  │  may stall (model load / OOM) with the socket open          │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-**Seam:** the seam is `request.signal` — the boundary where a caller's intent to cancel crosses into the transport. It's wired (the signal is forwarded), but nothing upstream ever attaches a *deadline* to that signal, so the wire is there with no current to run through it.
+## Zoom in — the concept
+
+A **timeout** bounds how long you'll wait; a **retry** re-sends a failed request, ideally with **backoff** (increasing delay) and **jitter** (randomized delay, so retries don't synchronize into a thundering herd); a **connection pool** reuses sockets to amortize handshakes; **backpressure** is how a consumer signals "slow down" to a producer. The question: which of these does aptkit have? Verdict — a clean *cancellation mechanism* but no *deadline policy*, no retries at the HTTP layer, and pooling/backpressure left to defaults. The headline is the timeout gap.
+
+## Structure pass — the skeleton
+
+**Layers:** caller deadline → transport timeout → retry policy → pool → backpressure. aptkit has wiring at the caller layer (the signal) and nothing actively bounding the transport.
+
+**Axis traced — "what bounds the wait?"**
+
+```
+  One question down the resilience stack: "what bounds the wait?"
+
+  ┌────────────────────────────────────────────┐
+  │ caller: AbortSignal threaded through         │  → CAN bound, if fired
+  └────────────────────────────────────────────┘
+      ┌────────────────────────────────────────┐
+      │ transport: await fetch(…, {signal?})     │  → nothing fires the signal ✗
+      └────────────────────────────────────────┘
+          ┌────────────────────────────────────┐
+          │ retry policy                          │  → none ✗
+          └────────────────────────────────────┘
+              ┌────────────────────────────────┐
+              │ undici pool                       │  → default, untuned
+              └────────────────────────────────┘
+
+  the mechanism exists at the top; nothing at the transport actually bounds the wait
+```
+
+**Seam — the `AbortSignal` pass-through.** The signal is threaded from `run-agent-loop.ts:91` through `provider.complete()` into `...(signal ? {signal} : {})` (`gemma-provider.ts:73, 208`). That's the seam where a timeout *would* attach — and the gap is that nothing attaches one.
 
 ## How it works
 
-#### Move 1 — the mental model
+### Move 1 — the mental model
 
-Think of a `fetch` with a loading spinner that never stops. The request went out, the server is stuck, and your UI waits forever because nothing told `fetch` "give up after N seconds." That's a missing timeout. The four resilience knobs answer four different "what if" questions:
+You've written `fetch` with `AbortController` + `setTimeout` to bound a slow API. aptkit wired the `AbortController` half (the signal flows everywhere) but never wrote the `setTimeout` half. The shape, with the missing piece marked:
 
 ```
-  The pattern — four independent knobs
+  The bounded-call pattern — aptkit has the wire, not the timer
 
-  timeout   ──► "what if it never answers?"     bound the WAIT
-  retry     ──► "what if it fails transiently?" try AGAIN (with backoff)
-  pool      ──► "what if I call it constantly?" REUSE connections
-  backpressure ► "what if I call faster than    SLOW the caller down
-                  it can serve?"
+   ┌─ present ─────────────────────────────────────────┐
+   │ caller creates signal → passes to complete()       │
+   │ → passes to fetch(…, {signal})                     │
+   │ → if signal.abort() fires, undici kills the socket │
+   └────────────────────────────────────────────────────┘
+   ┌─ MISSING ─────────────────────────────────────────┐
+   │ const c = new AbortController()                     │
+   │ setTimeout(() => c.abort(), DEADLINE)  ← never written
+   │ → so the signal only fires if an OUTER caller aborts│
+   └────────────────────────────────────────────────────┘
 ```
 
-The part people conflate: **a retry without a timeout is useless** — if the first attempt hangs forever, you never reach the retry. And **fallback (try a different provider) is not retry (try the same call again)**. The repo has fallback and app-level parse-retry but no network timeout, which is precisely the dangerous combination.
+### Move 2 — walking what's there and what's not
 
-#### Move 2 — walking the knobs in this repo
-
-**Cancellation is wired; the deadline is missing.** The Gemma transport forwards `request.signal` into `fetch` (`packages/providers/gemma/src/gemma-provider.ts:203-209`):
+**Timeout — the mechanism is plumbed, the policy is absent.** The signal threads cleanly. `runAgentLoop` accepts a `signal` (`run-agent-loop.ts:91`) and calls `signal?.throwIfAborted()` before each turn (`:99`) and passes it to the model call (`:108`). The provider checks it (`gemma-provider.ts:53, 63`) and forwards it to `fetch`. So if *something* aborts the signal, the whole chain unwinds correctly.
 
 ```ts
-return async ({ signal, ...payload }) => {
-  const res = await fetch(`${base}/api/chat`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(payload),
-    ...(signal ? { signal } : {}),   // ✓ if a caller aborts, fetch aborts
-  });                                 // ✗ but nothing sets a timeout-based signal
-  // ...
-};
+// packages/providers/gemma/src/gemma-provider.ts:69-74
+lastResponse = await this.chat({
+  model: this.defaultModel,
+  messages,
+  stream: false,
+  ...(request.signal ? { signal: request.signal } : {}),   // signal forwarded — but who fires it?
+});
 ```
 
-And `complete()` checks the signal between attempts (`gemma-provider.ts:52,63`: `request.signal?.throwIfAborted()`). So cancellation *works* — if a caller passes an `AbortSignal` that fires, the call unwinds cleanly. The gap: **no code in the repo constructs an `AbortSignal.timeout(ms)` and passes it in.** A wedged Ollama (model loading, GPU stuck, daemon hung) leaves the `fetch` pending with no deadline. The embedding transport has the identical shape and identical gap (`packages/retrieval/src/ollama-embedding-provider.ts:62-68`).
+What's missing: nowhere does aptkit create an `AbortController` and `setTimeout(() => controller.abort(), ms)`. So the `await fetch` has no deadline of its own. **Consequence, concretely:** Ollama is loading a 9B model into VRAM, the HTTP connection is accepted but the response is stalled for 40 seconds — `await fetch` simply waits the whole 40s (or forever, if the load wedges), and the agent turn blocks. The only escape is an outer caller aborting, which in the CLI/agent path nothing does. This is finding #1 in the overview and #1 in the red-flags audit.
+
+**Retry — none at the HTTP layer.** `if (!res.ok) throw` (`gemma-provider.ts:210`) is terminal. A transient 503 doesn't retry; it throws. There's no backoff, no jitter, no retry-after handling. The *tool-call* retry loop in the Gemma provider (`gemma-provider.ts:62-89`) is **not** a network retry — it re-prompts the model to fix malformed JSON over the *same kind* of call, not because the HTTP failed. Don't confuse the two: the loop hardens *parsing*, not *transport*.
+
+**Provider fallback ≠ call retry.** The `FallbackModelProvider` tries providers in order and records failed attempts (`fallback/src/...`), switching from, say, Gemma to a cloud provider on error. That's resilience at the *provider* granularity — "this provider failed, try the next one" — not "this call failed, retry it." A single provider's transient blip still surfaces as a failure unless a *different* provider is configured behind it. It's a real failover mechanism, just at a coarser grain than HTTP retry.
 
 ```
-  Layers-and-hops — the missing deadline
+  Two different "retries" — don't conflate them
 
-  ┌─ caller (agent loop) ──────┐   no AbortSignal.timeout attached
-  │  model.complete(request)   │ ─────────────────────────────────┐
-  └────────────────────────────┘                                   │
-                              request.signal (maybe present,        │
-                              but never a timeout)                  ▼
-  ┌─ transport ────────────────────────────────────────────────────┐
-  │  fetch(..., { signal })  ── hangs indefinitely if Ollama wedged │
-  └──────────────────────────┬──────────────────────────────────────┘
-                  hop C: HTTP │ ... no response ...
-                             ▼
-                      ┌─ Ollama (stuck) ─┐
-                      │ never replies     │
-                      └───────────────────┘
+  tool-call loop (gemma-provider.ts:62)   provider fallback (FallbackModelProvider)
+  ┌──────────────────────────────┐        ┌──────────────────────────────┐
+  │ same provider, re-prompt for  │        │ provider A fails → try B      │
+  │ valid JSON tool call          │        │ (coarse-grain failover)       │
+  │ NOT a network retry           │        │ NOT a per-call retry          │
+  └──────────────────────────────┘        └──────────────────────────────┘
+  neither one re-sends a failed HTTP request to the same Ollama endpoint
 ```
 
-**The fix is one line and it's not in the repo.** A `signal: AbortSignal.timeout(30_000)` (or merging a timeout with the caller's signal) in `defaultHttpTransport` would bound the wait. That's the move — named here, not present in the code.
+**Pooling — undici default, untuned.** aptkit talks to one origin (`localhost:11434`), so undici's keep-alive pool likely serves repeated calls from one warm socket. But there's no `http.Agent`, no `maxSockets`, no `keepAlive` config — it's whatever the runtime defaults are. For a single-user local tool that's correct (no concurrency pressure). Real connection-pool tuning exists only in buffr's `pg.Pool` (`buffr/src/db.ts:4-6`) — a different protocol, a different repo, and even there it's `new pg.Pool({connectionString})` with default sizing, no `connectionTimeoutMillis`/`idleTimeoutMillis`/`max`. So pooling is `not yet exercised` as a tuned concern on either side.
 
-**Retry exists, but at the application layer, not the network layer.** Gemma's `complete()` retries the *model call* when the response isn't a valid tool call, appending a corrective nudge (`gemma-provider.ts:57-89`):
+**Backpressure — partial, on the streaming response.** The NDJSON stream writes synchronously with `res.write` (`vite.config.ts:908`) and never checks the return value or waits for `drain`. Node's socket buffers absorb the writes; for a short agent trace that's fine. There's no explicit backpressure handling — if a slow client couldn't keep up with a huge trace, writes would buffer in memory. For the trace sizes here (a handful of events) that's a non-issue, but it's the absent mechanism worth naming. On the read side, `decodeNdjsonStream` is a pull-based async generator, which gives the *consumer* natural backpressure (it pulls when ready).
 
-```ts
-const maxAttempts = wantsTool ? this.maxToolCallAttempts : 1;  // default 2
-for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-  const messages = attempt === 0 ? baseMessages : [...baseMessages, { role: 'user', content: RETRY_NUDGE }];
-  lastResponse = await this.chat({ ... });        // each attempt is a fresh HTTP call
-  const call = parseToolCall(raw);
-  if (call) return ...;                            // good tool call → done
-  if (looksLikeToolAttempt(raw)) continue;         // botched JSON → retry with nudge
-  break;
-}
+### Move 2.5 — current state vs the obvious fix
+
+The timeout gap has a small, contained fix. What's striking is how little has to change, because the mechanism is already plumbed.
+
+```
+  Comparison — timeout today vs the one-function fix
+
+  TODAY                                  FIX (transport-local)
+  ┌──────────────────────────────┐      ┌──────────────────────────────┐
+  │ await fetch(url, {signal?})   │      │ const c = new AbortController()│
+  │ signal only from outer caller │ ───► │ const t = setTimeout(          │
+  │ → wedged Ollama hangs forever │      │   () => c.abort(), DEADLINE)   │
+  │                               │      │ fetch(url, {signal: merge(     │
+  │                               │      │   signal, c.signal)})          │
+  │                               │      │ finally clearTimeout(t)        │
+  └──────────────────────────────┘      └──────────────────────────────┘
+  no contract change — the transport already accepts a signal
 ```
 
-This is a *semantic* retry (the model produced bad JSON), not a *transport* retry (the network failed). There's no backoff, no jitter — and critically, since each attempt is a `fetch` with no timeout, a hang on attempt 1 means the retry never runs.
+Nothing above the transport changes: `complete()`, the agent loop, the caller all stay identical. The deadline lives entirely inside `defaultHttpTransport`. That's the payoff of having plumbed the signal already — the fix is local.
 
-**Fallback is a different resilience mechanism.** `FallbackModelProvider` (used by Studio's live modes, `apps/studio/vite.config.ts:820-829`) tries the primary provider, and on failure moves to the next provider in the chain, emitting trace events. That's resilience against *a whole provider being down*, not against *one network attempt hanging*. It composes over the missing timeout, not in place of it — see `study-distributed-systems` for the fallback chain as a partial-failure pattern.
+### Move 3 — the principle
 
-**The agent loop's `maxTurns` bounds total work.** Each agent runs `runAgentLoop` with a turn cap (recommendation agent: `maxTurns 6`). This bounds how many model round-trips a single capability makes — a different axis of "don't run forever" that caps the *count* of network calls, not the *duration* of any one.
-
-**Pooling and backpressure live only in buffr.** `pg.Pool` (`buffr/src/db.ts:4`) reuses connections (see `03`) and, crucially, provides the system's *only* real backpressure: when every pooled connection is checked out, `pool.connect()` (used by `PgVectorStore.upsert`, `buffr/src/pg-vector-store.ts`) *queues* rather than opening unbounded sockets. That queue is flow control — it slows the caller when Postgres is saturated. aptkit's own HTTP path has no equivalent: nothing limits concurrent in-flight Ollama calls, so a burst of agent turns could fan out unbounded requests at the daemon. `not yet exercised` as a real risk because the agents run sequentially, but the mechanism isn't there.
-
-**Request collapsing / dedup / circuit breakers:** `not yet exercised`. No identical-in-flight-request coalescing, no circuit breaker that trips after N failures, no rate limiter. None are needed for sequential local agents, but all would matter under concurrency.
-
-#### Move 3 — the principle
-
-The principle: **timeout, retry, pool, and backpressure are four independent knobs, and the dangerous failure is having retry/fallback without a timeout — because a hang on the first attempt starves everything downstream of it.** aptkit has cancellation wired (the signal flows) but no deadline set, fallback across providers but no transport retry, and backpressure only where `pg.Pool` happens to provide it. The single highest-leverage fix is a timeout on the Ollama `fetch`; everything else is appropriately scoped to a sequential local toolkit.
+Resilience is a ladder, and you climb it in response to observed failure, not preemptively. aptkit is at the bottom rung deliberately: one local origin, one user, no flakiness pressure — so no retries, no pool tuning, no backpressure machinery. That's defensible for everything *except the timeout*, because a timeout protects against a failure mode that exists even locally: a daemon that accepts a connection and then stalls. A timeout isn't resilience-for-scale; it's correctness-for-liveness. The principle: ship the timeout even when you skip the rest, because "wait forever" is never the right default.
 
 ## Primary diagram
 
-```
-  Resilience recap — what's wired, what's missing
+The full resilience layer: what's present, what's absent, where the gap is.
 
-  CALLER         caller could attach AbortSignal.timeout ... but doesn't
-       │
-       ▼
-  TRANSPORT  fetch(signal) ── cancellation ✓ ── timeout ✗ ──► hang risk
-       │     Gemma parse-retry ✓ (app-level, no backoff/jitter)
-       │     transport-level network retry ✗
-       │
-  PROVIDER   FallbackModelProvider ── try next provider on failure ✓
-       │     (resilience vs provider-down, not vs hang)
-       │
-  LOOP       runAgentLoop maxTurns ── bounds CALL COUNT ✓
-       │
-  STORAGE    buffr pg.Pool ── reuse ✓ ── connect() queues = backpressure ✓
-            (the only flow control in the system)
+```
+  aptkit resilience layer — the timeout gap is the headline
+
+  ┌─ TIMEOUT ──────────────────────────────────────────────────┐
+  │  AbortSignal threaded caller→complete→fetch   ✓ mechanism   │
+  │  AbortController + setTimeout to FIRE it       ✗ MISSING     │ ★ finding #1
+  │  → wedged Ollama → await fetch hangs indefinitely           │
+  └──────────────────────────────────────────────────────────────┘
+  ┌─ RETRY / BACKOFF ──────────────────────────────────────────┐
+  │  HTTP retry            ✗   |  backoff/jitter  ✗             │
+  │  tool-call re-prompt   ✓ (parsing, not network)            │
+  │  provider fallback     ✓ (coarse failover, not per-call)   │
+  └──────────────────────────────────────────────────────────────┘
+  ┌─ POOLING ──────────────────────────────────────────────────┐
+  │  undici default, untuned (one origin)    not yet exercised  │
+  │  buffr pg.Pool: default sizing, no timeouts (other repo)    │
+  └──────────────────────────────────────────────────────────────┘
+  ┌─ BACKPRESSURE ─────────────────────────────────────────────┐
+  │  write: no drain handling (small traces, fine)             │
+  │  read: pull-based async generator → natural backpressure ✓ │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-These patterns come from production RPC stacks (gRPC deadlines, Finagle's circuit breakers, every database client's pool) where the lesson was learned the hard way: an unbounded wait is how one slow dependency takes down a whole service. The repo is small enough that the missing timeout hasn't bitten — local Ollama on a dev laptop rarely wedges — but the *mechanism* is the same one that causes cascading outages at scale. The `AbortSignal` plumbing is already in place, which means the fix is genuinely one line; the absence is an omission, not an architectural problem. See `study-performance-engineering` for why the missing timeout is also a tail-latency issue, and `study-distributed-systems` for the fallback chain under partial failure.
+Timeouts, retries with jittered backoff, and circuit breakers are the canonical resilience kit for any service that calls another service — at scale they're the difference between a blip and a cascading outage. aptkit doesn't operate at that scale, so most of the kit is correctly absent. The timeout is the exception because it guards *liveness*, not throughput: a single hung call with no deadline can wedge an entire interactive session, and that's true at any scale, including one user. The cleanest version of this fix is the merged-signal pattern in Move 2.5 — a controller and a timer inside the transport, merged with the caller's signal so both an outer abort and a deadline can fire. See **study-distributed-systems** for how timeouts compose with the fallback chain under partial failure, and **study-performance-engineering** for how the missing connection-pool tuning and the synchronous `await fetch` shape latency.
 
 ## Interview defense
 
-**Q: "What happens if your model server hangs?"**
-Answer with the honest verdict and the fix: "Right now it hangs — the `fetch` to Ollama forwards a caller's `AbortSignal` so cancellation works, but nothing sets a timeout, so a wedged daemon leaves the call pending indefinitely. The one-line fix is an `AbortSignal.timeout` in the transport. I have fallback across providers and an app-level retry for malformed tool calls, but neither helps if attempt one never returns — which is exactly why the missing timeout is the most consequential gap." That answer shows you can tell the four knobs apart and rank them.
+**Q: What happens if your model server hangs?**
+Today, the call hangs with it — that's the gap. The `AbortSignal` is threaded end-to-end from the agent loop into `fetch`, but nothing fires it on a deadline, so a wedged Ollama (model load, OOM) holds the connection open and `await fetch` never resolves. The fix is local: an `AbortController` plus `setTimeout` inside the transport, merged with the caller's signal. No contract above it changes.
 
 ```
-  sketch: retry without timeout = useless
-
-  attempt 1 ──► HANG (no deadline) ──► retry never reached ✗
-  attempt 1 ──► TIMEOUT after Ns ───► retry runs ✓
-                     ▲ the missing knob
+  signal threaded ✓  →  but no setTimeout to fire it ✗  →  hang
+  fix: controller + timer in defaultHttpTransport, merged with caller signal
 ```
+Anchor: *"I plumbed the cancellation mechanism but not the deadline policy — that's the one resilience piece I'd ship even at one user, because it's liveness, not scale."*
 
-Anchor: *a retry without a timeout never fires — bound the wait first.*
+**Q: Do you retry failed calls?**
+Not at the HTTP layer — `!res.ok` throws, terminal. There are two other "retries" that aren't network retries: the tool-call loop re-prompts the model for valid JSON, and `FallbackModelProvider` fails over to a different provider. Neither re-sends a failed HTTP request. For a local single-user daemon that's fine; a remote or flaky wire would want retry-with-backoff-and-jitter on idempotent calls.
 
 ## See also
 
-- `08-networking-red-flags-audit.md` — the missing timeout ranked as the #1 risk
-- `03-tcp-udp-connections-and-sockets.md` — the pg.Pool that provides the only backpressure
-- `study-distributed-systems` (neighbor guide) — the fallback chain as partial-failure coordination
+- `03-tcp-udp-connections-and-sockets.md` — the socket the timeout would bound
+- `06-websockets-sse-streaming-and-realtime.md` — backpressure on the NDJSON stream
+- `08-networking-red-flags-audit.md` — the timeout gap ranked #1
+- `00-overview.md` — retries/pooling/backpressure under `not yet exercised`

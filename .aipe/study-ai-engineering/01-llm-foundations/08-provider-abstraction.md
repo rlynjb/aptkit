@@ -1,277 +1,215 @@
-# Provider abstraction — the load-bearing seam
+# Provider abstraction
 
-**Subtitle:** ModelProvider · one interface, many vendors · *Industry standard*
+Provider abstraction · the adapter/factory pattern (Industry standard)
+
+This is the crown jewel of LLM foundations. One interface — `ModelProvider` — and everything in aptkit depends on it, never on a vendor SDK. Anthropic, OpenAI, Gemma, a fallback chain, a context guard: all of them are just adapters behind that one `complete()` method. Swap the adapter, the rest of the system doesn't notice. This is dependency inversion applied to the most vendor-locked thing in your stack.
 
 ## Zoom out, then zoom in
 
-This is the seam the whole repo balances on. Before any vendor detail, see that
-every agent talks to a single interface and never names a vendor.
+The port sits at the waist of aptkit; adapters hang below it, all features above depend only on it.
 
 ```
-  Zoom out — the one seam every agent depends on
-
-  ┌─ Capabilities ──────────────────────────────────────────────┐
-  │  query / rag-query / recommendation / evals — vendor-blind  │
-  └───────────────────────────┬─────────────────────────────────┘
-                              │ complete(request): Promise<response>
-  ┌─ The seam ────────────────▼─────────────────────────────────┐
-  │  ★ ModelProvider ★  one interface — id, defaultModel,        │ ← we are here
-  │  complete()                                                 │
-  └──────┬──────────┬──────────┬──────────┬──────────┬──────────┘
-         │          │          │          │          │
-     ┌───▼──┐   ┌───▼──┐   ┌───▼───┐  ┌───▼────┐ ┌───▼─────────┐
-     │Gemma │   │Claude│   │OpenAI │  │Fallback│ │ContextGuard │
-     │(local)│  │      │   │       │  │(wraps) │ │(wraps)      │
-     └──────┘   └──────┘   └───────┘  └────────┘ └─────────────┘
+aptkit — the provider waist
+┌─────────────────────────────────────────────┐
+│ Capabilities, agent loop, generateStructured  │  depend on the PORT only
+├─────────────────────────────────────────────┤
+│ ★ ModelProvider — the PORT (one complete())    │  ← you are here
+├─────────────────────────────────────────────┤
+│ ADAPTERS:                                       │
+│  anthropic · openai · gemma · fallback · local │
+└─────────────────────────────────────────────┘
+   each maps complete() → its vendor's API (or wraps another provider)
 ```
 
-There is no `getModel()` switch statement. Instead, every provider is a *class
-that implements the same interface*, so swapping vendors is swapping which
-instance you construct — agents above the seam never change. This is the single
-most important design decision in aptkit: the model is replaceable because the
-interface is tiny and nobody above it knows the vendor. The proof it's truly a
-seam and not just a type lives in a *different* repo — buffr swaps the storage
-side through the exact same trick.
+The pattern is the **adapter** behind a **port** (hexagonal architecture / dependency inversion). The question: *what changes when you swap providers?* Answer: nothing above the waist. You've shipped this before — a `DataSource` interface with `MySQLAdapter` and `PostgresAdapter` behind it, every repository coded against the interface. Same move, except the "database" is a language model and the adapters include a *local* one with no native tool calling at all.
 
 ## Structure pass
 
-**Layers.** Capability → `ModelProvider` interface → a concrete provider class
-(Gemma/Claude/OpenAI) → optionally wrapped by `FallbackModelProvider` or
-`ContextWindowGuardedProvider` → vendor SDK/HTTP.
+Two adapter shapes here: leaf adapters (map to a vendor) and wrapper adapters (decorate another provider). Trace the **trust** axis — what each adapter assumes about the model below it.
 
-**Axis — vendor knowledge.** Trace "who knows it's Claude?" The capability:
-nothing. The interface: nothing — just `id` and `complete`. The concrete class:
-everything (SDK, model name, auth). The flip is total and clean.
+```
+TRUST axis — what does the adapter assume?
+Adapter        type      trusts the model to...           ←★ seams
+──────────────────────────────────────────────────────────────────
+anthropic      leaf      emit native tool_use blocks       (full trust)
+openai         leaf      emit native tool_calls            (full trust)
+gemma          leaf      NOT support tools → emulate+retry  ←★ trust flips
+fallback       wrapper   one provider may fail → try next   ←★ failure-aware
+local (guard)  wrapper   request may overflow → reject early ←★ size-aware
+```
 
-**Seam.** `ModelProvider` (`packages/runtime/src/model-provider.ts:54`). Above it,
-typed request/response and zero vendor strings. Below it, `@anthropic-ai/sdk`,
-Ollama HTTP, OpenAI client. Wrappers (fallback, context guard) sit *on the seam*:
-they implement `ModelProvider` and also consume one, so they compose without
-anyone noticing.
+Two seams. At **gemma**, trust in native capability flips to zero — it can't do tool calling, so the adapter fakes it. At **fallback/local**, the adapter stops trusting a single call to succeed and adds resilience. Every adapter presents the *same* `complete()`; what differs is how much it had to compensate for the model beneath it.
 
 ## How it works
 
-### Move 1 — the mental model
-
-You know how a React component takes a `fetcher` prop and doesn't care if it's
-`fetch`, Axios, or a mock? `ModelProvider` is that prop for the model. Agents
-receive *a* provider and call `complete()`; whether that's local Gemma or remote
-Claude is decided once, at construction, by whoever wires the app.
+**Mental model.** A port is a contract; adapters are implementations; wrappers are adapters that take another provider as input (decorator pattern). The factory just hands you the right one. Everything upstream holds a `ModelProvider`, never a vendor type.
 
 ```
-  Dependency injection, applied to the model
-
-  agent(provider) {                  provider can be ANY of:
-    provider.complete(req)   ◄────────  Gemma | Claude | OpenAI | Fallback | Guard
-  }                                    agent code is identical for all of them
+The port + adapters
+            ModelProvider (port)
+                  │ complete(request): Promise<ModelResponse>
+   ┌──────┬───────┼────────┬─────────────┐
+ anthropic openai gemma  fallback      local
+  (leaf)  (leaf) (leaf)  (wrapper)     (wrapper)
+                          holds [p1,p2] holds inner provider
 ```
 
-### Move 2 — the moving parts
-
-**The interface — one method.** Every provider satisfies the same three members.
-From `packages/runtime/src/model-provider.ts:54`:
+**Leaf adapter: native tool calling (Anthropic).** Maps the request straight onto the vendor SDK; the model speaks tools natively.
 
 ```ts
-export type ModelProvider = {
-  id: string;                                              // ← 'gemma' | 'anthropic' | 'openai' | 'fallback'
-  defaultModel?: string;
-  complete(request: ModelRequest): Promise<ModelResponse>; // ← the entire contract
-};
+// packages/providers/anthropic/src/anthropic-provider.ts:18-26, 28-61
+id = 'anthropic';
+defaultModel = 'claude-sonnet-4-6';                  // ~:24
+async complete(request) {
+  const res = await client.messages.create({ ... }); // :28-61 map request → vendor
+  // native tool_use blocks; usage input_tokens/output_tokens, estimated:false
+}
 ```
 
-```
-  The whole seam
+`estimated:false` matters — Anthropic returns real token counts, so the usage ledger isn't guessing (contrast `02-tokenization.md`). This is the easy case: the vendor already speaks the contract's dialect.
 
-  id           ─► used by the cost ledger to pick pricing
-  defaultModel ─► the model name a vendor uses by default
-  complete()   ─► everything an agent ever calls
-```
-
-**Each vendor is a class implementing it.** Same shape, different guts. The
-defaults tell the story — local-first by default, cloud when wired:
+**Leaf adapter: emulated tool calling (Gemma) — the hard case.** Local Gemma over Ollama has *no* tool API. The adapter manufactures one with a prompt + parse + retry loop.
 
 ```ts
-class GemmaModelProvider    implements ModelProvider { id='gemma';     defaultModel='gemma2:9b'        } // gemma-provider.ts:39
-class AnthropicModelProvider implements ModelProvider { id='anthropic'; defaultModel='claude-sonnet-4-6'} // anthropic-provider.ts:18
-class OpenAIModelProvider   implements ModelProvider { id='openai';    defaultModel='gpt-4.1'          }
+// packages/providers/gemma/src/gemma-provider.ts:52-92  (complete)
+const maxAttempts = wantsTool ? this.maxToolCallAttempts : 1;   // :57 (default 2)
+for (let attempt = 0; attempt < maxAttempts; attempt += 1) {     // :62
+  // :67 on retry, append RETRY_NUDGE to the system text
+  const raw = await ollamaChat(...);
+  const call = parseToolCall(raw);                               // :78
+  if (call) return toolUseBlock(call);
+  if (looksLikeToolAttempt(raw)) continue;                       // :86 retry
+}
+return textBlock(raw);                                           // :91 fallback to text
 ```
-
-```
-  Same interface, different vendor below the line
-
-  GemmaModelProvider     ─► POST localhost:11434/api/chat   (no key, no TLS)
-  AnthropicModelProvider ─► @anthropic-ai/sdk messages.create (ANTHROPIC_API_KEY)
-  OpenAIModelProvider    ─► OpenAI client
-       ▲ all three return the SAME ModelResponse shape ▲
-```
-
-The default model is **local Gemma** — no API key, no TLS, talking to Ollama on
-localhost. Claude and OpenAI are opt-in by constructing their provider instead.
-
-**Wrappers that are themselves providers.** The real power: `FallbackModelProvider`
-*implements* `ModelProvider` and *holds* a list of them, trying each in order. From
-`packages/providers/fallback/src/fallback-provider.ts:47`:
 
 ```ts
-async complete(request: ModelRequest): Promise<ModelResponse> {
-  for (let index = 0; index < this.providers.length; index += 1) {
-    const provider = this.providers[index];
-    try {
-      const response = await provider.complete(request);     // ← try this vendor
-      this.lastSelectedProvider = { providerId: provider.id, model: response.model ?? provider.defaultModel };
-      return { ...response, model: response.model ?? provider.defaultModel };
-    } catch (error) {
-      if (isAbortError(error) || request.signal?.aborted) throw error;
-      attempts.push({ providerId: provider.id, model: provider.defaultModel, error: String(error) });
-      // emit a warning, then fall through to the next provider
-    }
+// packages/providers/gemma/src/gemma-provider.ts:133-165  (buildSystemText)
+// renders each tool as JSON {name, description, input_schema} into the system prompt,
+// then: "When a tool is needed, respond with ONLY a single JSON object, no prose: ..."
+
+// :168-182 (parseToolCall) — tolerant field mapping
+parsed = parseAgentJson(text);                       // :171 (reuse the JSON extractor)
+const name = obj.tool ?? obj.name ?? obj.tool_name;  // accept any of three spellings
+const args = obj.arguments ?? obj.input ?? obj.args; // ditto
+```
+
+```
+Gemma emulated tool call
+  inject tool schemas into system prompt
+        │
+  attempt 1: model replies ──▶ parseToolCall
+        │                         │
+     valid JSON tool? ─yes─▶ return tool_use block ✓
+        │ no
+  looks like a botched attempt? ─yes─▶ append RETRY_NUDGE, attempt 2
+        │ no
+  return as plain text  (it wasn't trying to call a tool)
+```
+
+The genius is that *from above*, Gemma's `complete()` looks identical to Anthropic's — same `tool_use` block out. The prompt-engineering, the retry, the lenient `tool ?? name ?? tool_name` field mapping all hide behind the port. The local model can't speak tools, so the adapter teaches it to, one nudge at a time.
+
+**Wrapper adapter: the fallback chain.** Holds a list of providers and tries them in order — resilience as composition.
+
+```ts
+// packages/providers/fallback/src/fallback-provider.ts:27-96  (complete 47-89)
+for (const provider of this.providers) {
+  try { return await provider.complete(request); }       // try it
+  catch (error) {
+    if (!shouldFallback(error, provider)) throw error;    // not a fallback-able error → bail
+    emitWarning(...);                                     // :78-84 record the fallback
+    // else loop to next provider
   }
-  throw new ProviderFallbackError(attempts);                 // ← all failed, with the full attempt log
 }
+throw new ProviderFallbackError(...);                     // :88 all exhausted
 ```
 
-```
-  FallbackModelProvider — a provider made of providers
+The `shouldFallback` gate is the discipline — you only fall through on *retryable* errors (rate limit, timeout), not on a bad request, so you don't paper over real bugs. Because `FallbackModelProvider` *is* a `ModelProvider`, it composes: a fallback whose first entry is a context-guarded Gemma whose fallback is Anthropic. Turtles all the way down, one interface.
 
-  complete(req)
-     │
-     ▼
-  [ Gemma ] ──fail──► [ Claude ] ──fail──► [ OpenAI ] ──fail──► ProviderFallbackError(attempts)
-     │ ok                │ ok                 │ ok
-     ▼                   ▼                    ▼
-   return            return               return   (records lastSelectedProvider)
-```
-
-`ContextWindowGuardedProvider` is the same composition idea: it wraps a provider,
-estimates tokens, and throws `ContextWindowExceededError` before calling down if
-the request won't fit (`context-window-guard.ts:38`). Because both wrappers *are*
-providers, you can stack them — guard around a fallback chain around three
-vendors — and agents see one `complete()`.
-
-**The proof the seam is real: buffr.** A type is only a real seam if something
-external can fill it without touching the core. aptkit defines a sibling seam,
-`VectorStore`, and buffr — a separate repo — implements it for Postgres/pgvector,
-importing the contract from the published package. From
-`/Users/rein/Public/buffr/src/pg-vector-store.ts:19`:
+**Wrapper adapter: the context guard (decorator).** Wraps any provider and rejects oversized requests before they hit it (see `02-tokenization.md`).
 
 ```ts
-import type { VectorStore } from '@rlynjb/aptkit-core';        // ← contract from aptkit
-export class PgVectorStore implements VectorStore {            // ← buffr fills it, aptkit unchanged
-  readonly dimension: number;
-  async upsert(chunks: Chunk[]): Promise<void> { /* INSERT … agents.chunks (embedding vector) */ }
-}
+// packages/providers/local/src/context-window-guard.ts:38-71  (complete 57-69)
+estimateContextWindow(request);                  // :59 estimate input tokens
+if (over)  throw new ContextWindowExceededError; // :60-68 reject locally
+return this.inner.complete(request);             // :69 else delegate down
 ```
 
 ```
-  The seam, proven from outside
-
-  aptkit defines:  ModelProvider   +   VectorStore     (just interfaces)
-                        │                   │
-   aptkit fills:   Gemma/Claude/…      (in-memory store)
-   buffr fills:        —               PgVectorStore (Postgres + pgvector)
-        ▲ buffr swaps the STORE, not the model — same seam discipline ▲
+Decorator stack — same interface at every layer
+  guard.complete()  ── too big? throw  : ──▶  inner.complete()
+       │                                          │
+       └ still a ModelProvider ───────────────────┘ still a ModelProvider
 ```
 
-The point: in aptkit the swap point *for the model* is the `ModelProvider` type.
-buffr doesn't swap the model — it proves the pattern by swapping the *store* the
-same way, filling `VectorStore` from a different repo with zero changes to aptkit.
-
-### Move 3 — the principle
-
-Define the smallest interface that captures the dependency, make every
-implementation a class that satisfies it, and let composition (wrappers that are
-also implementations) add fallback, guarding, and policy without leaking upward.
-A seam is proven when an outside party can fill it untouched — `ModelProvider` for
-the model, `VectorStore` for storage, buffr for the receipts.
+**The principle.** Invert the dependency on anything you don't control. Define the interface *you* need, make every vendor conform to it via an adapter, and never let a vendor type leak upward. Then resilience (fallback) and safety (guard) become decorators you stack, not rewrites. The reward shows up the day you swap providers — or run a local model with none of the vendor's features — and nothing above the waist changes.
 
 ## Primary diagram
 
-```
-  Provider abstraction, fully stacked
+The whole abstraction: one port, leaf adapters mapping to vendors, wrapper adapters composing for resilience and safety.
 
-  agent
-    │ complete(req)
-    ▼
-  ┌ ContextWindowGuardedProvider ─────────────────────────────┐
-  │  estimate tokens; fits? else ContextWindowExceededError    │
-  │   │ complete(req)                                          │
-  │   ▼                                                        │
-  │ ┌ FallbackModelProvider ─────────────────────────────────┐│
-  │ │  try in order, record attempts, ProviderFallbackError  ││
-  │ │   ├─► GemmaModelProvider     (gemma2:9b, localhost)     ││
-  │ │   ├─► AnthropicModelProvider (claude-sonnet-4-6)        ││
-  │ │   └─► OpenAIModelProvider    (gpt-4.1)                  ││
-  │ └────────────────────────────────────────────────────────┘│
-  └────────────────────────────────────────────────────────────┘
-   every layer IS a ModelProvider — the agent only ever sees complete()
 ```
+Provider abstraction — full picture
+  Capabilities / agent loop / generateStructured
+        │ (hold a ModelProvider, nothing else)
+        ▼
+  ┌──────────────── ModelProvider port ─────────────────┐
+  │ complete(request): Promise<ModelResponse>            │
+  └──────────────────────────────────────────────────────┘
+        │                │                  │
+   ┌────┴────┐      ┌────┴─────┐       ┌────┴──── wrappers ────────┐
+ anthropic  openai  gemma                fallback           context guard
+ native     native  EMULATE tools:       try p1→p2→p3,      estimate→reject
+ tool_use   calls   prompt+parse+retry    shouldFallback     or delegate
+ est:false                                ProviderFallbackError
+        └─ leaf adapters → vendor API ─┘   └─ wrap other providers ─┘
+```
+
+Read it top-down: features see one box; reality is five adapters and two compositions, all wearing the same interface.
 
 ## Elaborate
 
-The anti-pattern this kills is embedding a vendor SDK in business logic, where a
-model swap becomes a rewrite. By forcing everything through `complete()`, aptkit
-makes the swap a one-line construction change and makes fallback/guarding
-composable. This is the same Ports-and-Adapters / dependency-inversion idea you'd
-apply to a database or a payment gateway — the model is just another external
-dependency behind a port. Read `01-what-an-llm-is.md` for the request/response
-contract, and `06-token-economics.md` for how `provider.id` drives pricing.
+This is hexagonal architecture (Cockburn) / ports-and-adapters, and the dependency inversion principle (the D in SOLID): high-level policy depends on an abstraction, low-level vendor detail conforms to it. The fallback chain is the **chain of responsibility** pattern; the context guard is the **decorator** pattern; the thing that picks an adapter is a **factory**. The Gemma emulation is the standout — it's the same trick LangChain/LlamaIndex use to give tool calling to models that lack it, built here from scratch over Ollama. What aptkit does *not* have: rate limiting, circuit breakers, exponential backoff — only the bounded retry in `generateStructured` and this fallback chain exist; richer resilience is **not yet exercised**. Read `04-structured-outputs.md` (a tool call is a structured output) and `05-streaming.md` (the port returns once, no token stream).
 
 ## Project exercises
 
-### Build a recording provider that wraps any ModelProvider
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a `RecordingModelProvider` implementing `ModelProvider` that
-  wraps another, writes each request/response to disk as a fixture, and delegates
-  `complete()` — usable for capturing replay traces from a live Gemma run.
-- **Why it earns its place:** proves you understand wrappers-as-providers (the
-  fallback/guard pattern) and produces the fixtures the test suite runs on.
-- **Files to touch:** new `packages/providers/recording/src/recording-provider.ts`,
-  matching `test/`.
-- **Done when:** wrapping Gemma and calling `complete()` writes a fixture and
-  returns the unchanged response.
-- **Estimated effort:** `1–4hr`
+### Add a backoff-and-retry decorator provider
 
-### Add a shouldFallback policy that only retries on transient errors
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** pass a `shouldFallback` to `FallbackModelProvider` that
-  returns false for auth/4xx errors (don't waste the next provider on a config bug)
-  and true for timeouts/5xx, with tests for both branches.
-- **Why it earns its place:** naive "fall back on any error" masks misconfiguration;
-  classifying errors is the production-grade version of the pattern.
-- **Files to touch:** `packages/providers/fallback/src/fallback-provider.ts`
-  (already supports the hook), `packages/providers/fallback/test/`.
-- **Done when:** an auth error throws immediately; a timeout advances to the next
-  provider.
-- **Estimated effort:** `1–4hr`
+- **Exercise ID:** `EX-LLM-08a`
+- **What to build:** This abstraction is the foundation (Case A) — extend it with a missing resilience layer. Build a `RetryingModelProvider` wrapper (decorator, same shape as the context guard) that catches retryable errors (rate limit, 5xx, timeout) and retries `complete()` with exponential backoff and jitter, capped at N attempts, then re-throws. Compose it: retry-wrap each provider *inside* the fallback chain.
+- **Why it earns its place:** It's the named gap (no backoff/circuit-breaker today) and it cements the decorator insight — resilience is a wrapper, not a rewrite, because everything is the same port. You'll feel why dependency inversion pays off when you stack guard → retry → fallback without touching a capability.
+- **Files to touch:** new file under `packages/providers/local/src/` (mirror `context-window-guard.ts:38-71`); wire into `packages/providers/fallback/src/fallback-provider.ts` (27-96); type from `packages/runtime/src/model-provider.ts` (54-58).
+- **Done when:** a provider that throws a rate-limit error is retried with growing delays then succeeds, a non-retryable error re-throws immediately, the wrapper still satisfies `ModelProvider`, and it composes inside the fallback chain.
+- **Estimated effort:** `1–2 days`
 
 ## Interview defense
 
-**Q: "How do you swap Gemma for Claude in aptkit?"**
-Construct `AnthropicModelProvider` instead of `GemmaModelProvider` and hand it to
-the agent. Nothing above the `ModelProvider` seam changes — agents only call
-`complete()`. There's no `getModel()` switch; the vendor lives entirely in the
-class you instantiate.
+**Q: How does a local model with no tool API expose the same tool-calling interface as Anthropic?**
 
 ```
-  agent(provider)  ── provider := new GemmaModelProvider()    (default, local)
-                   └─ provider := new AnthropicModelProvider() (one line, opt-in)
-       agent code: unchanged
+  Anthropic: vendor returns tool_use block          → return it (native)
+  Gemma:     inject tool schemas into prompt
+             "reply ONLY JSON {tool, arguments}"
+             parse reply → tool ?? name ?? tool_name  (lenient)
+             malformed? append RETRY_NUDGE, retry (max 2)
+             still bad? return as text
+             └ same tool_use block out the top
 ```
-Anchor: *the swap point is which class you construct, not any agent code.*
 
-**Q: "How do you know `ModelProvider` is a real abstraction and not a leaky type?"**
-Because the same discipline holds for a sibling seam, `VectorStore`, and an
-*external* repo (buffr) fills it with Postgres/pgvector by importing the contract —
-zero changes to aptkit. A seam an outsider can implement untouched is a real seam.
+The Gemma adapter emulates tool calling — prompts for a JSON tool call, parses it leniently, retries with a nudge — and emits the identical `tool_use` block, so callers can't tell. Anchor: *the adapter hides the model's missing features behind the port.*
+
+**Q: What changes upstream when you swap Anthropic for the fallback chain?**
 
 ```
-  aptkit: interface only ──► buffr: PgVectorStore implements VectorStore
-       no aptkit edits = the seam holds
+  capability ─holds─▶ ModelProvider ◀─ anthropic
+  capability ─holds─▶ ModelProvider ◀─ fallback[gemma→anthropic]
+                      └ same interface, zero upstream change
 ```
-Anchor: *a seam is proven when an outside repo fills it untouched.*
+
+Nothing. Everything above the waist depends only on `complete()`; the fallback chain *is* a `ModelProvider`, so it drops in transparently. Anchor: *depend on the port, swap the adapter, the policy never notices.*
 
 ## See also
 
-- `01-what-an-llm-is.md` — the `complete()` request/response contract in detail
-- `06-token-economics.md` — how `provider.id` selects (or fails) pricing
-- `05-streaming.md` — where a future streaming method plugs into this seam
+- [`04-structured-outputs.md`](./04-structured-outputs.md) — a tool call is a structured output.
+- [`01-what-an-llm-is.md`](./01-what-an-llm-is.md) — the port as the IO model.
+- [`05-streaming.md`](./05-streaming.md) — why the port returns once.

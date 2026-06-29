@@ -1,114 +1,112 @@
 # ReAct
 
-**Industry standard.** "ReAct," "reason+act," "the tool-use loop." Type label: reasoning pattern (the baseline).
+**Industry term:** ReAct (reason + act), the interleaved reasoning-action loop. *Industry standard.*
 
 ## Zoom out, then zoom in
 
-ReAct is the default single-agent pattern: interleave reasoning and action until you can answer. Every aptkit agent that takes tools runs it. This file's job isn't to re-teach the Thought-Action-Observation mechanics (that's in `study-ai-engineering`) — it's *placement*: ReAct is the baseline, and aptkit hasn't escalated past it because it hasn't needed to.
+ReAct is the default single-agent pattern and it's the one aptkit actually runs. The mechanics — the Thought-Action-Observation cycle — are walked in the AI-engineering guide. This file's job is *placement*: where ReAct sits in the reasoning-pattern family, and why the strong prior is to start here before anything fancier.
 
 ```
-  Zoom out — ReAct is the step-function aptkit's loop runs
+  Zoom out — ReAct is the step function aptkit plugs into the loop
 
-  ┌─ Pattern family (SECTION A) ────────────────────────────┐
-  │  ★ ReAct ★  → plan-execute → reflexion → tree-of-thoughts│ ← we are here
-  │  (the baseline)  (escalate only on a named failure)      │
-  └───────────────────────────┬──────────────────────────────┘
-                              │ instantiated as
-  ┌─ Loop layer ──────────────▼──────────────────────────────┐
-  │  runAgentLoop: model.complete ⇄ callTool ⇄ accumulate     │
-  └────────────────────────────────────────────────────────────┘
+  ┌─ Reasoning-pattern family ──────────────────────────────────┐
+  │   ★ ReAct ★  ← the baseline; aptkit runs this                │ ← we are here
+  │   plan-and-execute · reflexion · tree-of-thoughts            │
+  │   (escalations you reach for only when ReAct measurably fails)│
+  └───────────────────────────────┬──────────────────────────────┘
+                                   │ is the step() in runAgentLoop
+  ┌─ Runtime layer ─────────────────▼───────────────────────────┐
+  │  the agent loop skeleton (02-agent-loop-skeleton.md)         │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-## Structure pass
+Zoom in: aptkit's loop is ReAct. Each turn the model reasons (in its text output), acts (emits a `tool_use`), observes (the tool result comes back as a `tool_result` message), and repeats. There's no separate planning phase, no self-critique pass — just the interleaved cycle, bounded.
 
-**Layers:** the named pattern (ReAct) → the loop kernel (`02-agent-loop-skeleton.md`). **Axis: where does the reasoning live?** In ReAct, reasoning and acting are *interleaved in the same loop* — there's no separate plan phase. Trace that and the seam to plan-and-execute pops: plan-and-execute splits reasoning out front; ReAct keeps it inline. aptkit is entirely on the inline side.
+## The structure pass
+
+**Layers.** The pattern (ReAct's reason/act/observe) over the kernel (the loop skeleton from the previous file).
+
+**Axis: when to escalate past ReAct?** That's the only question worth holding here, because the mechanics are covered elsewhere.
+
+```
+  "should I escalate past ReAct?" — the gate
+
+  Default to ReAct
+       │
+       ├─ measure: success rate, tool-call accuracy, latency, cost
+       │
+       └─ escalate ONLY when a specific failure mode is identified
+          that ReAct structurally can't address
+```
+
+**The seam.** The escalation gate. Crossing it (to plan-and-execute, reflexion, or multi-agent) buys capability at a real cost. Most teams cross it too early.
 
 ## How it works
 
+**Use case in aptkit:** every agent. The clearest is `rag-query` — the model reasons "I should search for X," acts (calls `search_knowledge_base`), observes the ranked chunks, then either searches again or answers. The mechanics live in the loop; ReAct is the *shape* of how the model uses each turn.
+
 ### Move 1 — the mental model
 
-ReAct is the loop kernel from the previous file with the step function prompted to *think out loud, then act*. The model's text blocks are the reasoning; its `tool_use` blocks are the action; the `tool_result` it gets back is the observation. Same loop, no new machinery.
+You know how a `fetch()` has loading → success → error states you react to? ReAct is the same react-to-the-result instinct, except the "fetch" is a tool call the model chose, and the model decides what to do with the result. Reason about what you need, act to get it, observe what came back, decide again.
 
 ```
-  ReAct = the loop kernel, prompted to interleave thought + action
+  ReAct — one turn, interleaved
 
-  reason (text block) → act (tool_use) → observe (tool_result) → reason → ...
-       │                                                              │
-       └──────────────── until: answer, or budget exit ──────────────┘
+   Thought:  "I need passages about the user's running goals"
+      │
+      ▼
+   Action:   search_knowledge_base({ query: "running goals", top_k: 5 })
+      │
+      ▼
+   Observation: [ranked chunks with citations]
+      │
+      └──► loop (reason again) or stop (answer)
 ```
 
-### Move 2 — placement and the escalation ladder
+### Move 2 — the walkthrough
 
-**Where aptkit sits.** The rag-query agent is pure ReAct: its prompt tells the model to search first, then ground its answer. The model reasons about what to search, calls `search_knowledge_base`, observes the chunks, and either searches again or answers.
+**The interleaving is in the message history.** aptkit doesn't have a "ReAct module" — ReAct *emerges* from how the loop threads thoughts and observations through `messages`. The model's reasoning text and its `tool_use` ride in the same assistant turn (`run-agent-loop.ts:124`); the observation comes back as a user turn of `tool_result` blocks (`run-agent-loop.ts:189`). Next turn the model sees its own prior thought *and* the observation, and reasons forward. That threading is ReAct.
 
-```typescript
-// packages/agents/rag-query/src/rag-query-agent.ts:20-27 (the ReAct nudge)
-'Always call the search_knowledge_base tool first to retrieve relevant',
-'passages before answering. Ground every answer in the retrieved chunks and cite',
-'their sources. If the knowledge base does not contain the answer, say so plainly',
-```
+**aptkit's ReAct is bounded, not open-ended.** The textbook ReAct loop runs until the model says done. aptkit caps it (`maxTurns`, `maxToolCalls`) and forces a synthesis turn at the budget — see [02-agent-loop-skeleton.md](02-agent-loop-skeleton.md). That's the production version: ReAct with a hard stop.
 
-The recommendation agent is the multi-tool version: 13 read-only tools in its allowlist (`recommendation-agent.ts:21-35`), and the model decides which to query and in what order to build evidence before proposing actions. Still ReAct — reasoning and acting interleaved, no plan phase.
-
-**The escalation framing — why aptkit stays here.**
-
-```
-  Default to ReAct.
-    │
-    ├─ measure: success rate, tool-call accuracy, latency, cost
-    │
-    └─ escalate only when a SPECIFIC failure ReAct can't fix appears
-       (none has, in aptkit — so no plan-execute, no reflexion-over-answer)
-```
-
-aptkit's escalations are *targeted*, not pattern swaps:
-- A weak local model passing `top_k: 1` and starving multi-part questions → the `minTopK` floor (`search-knowledge-base-tool.ts:51`), not a planner.
-- The model asking for one more query forever → the forced synthesis turn, not a reflexion loop.
-- Prose instead of JSON → the recovery turn, not tree-of-thoughts.
-
-Each fix addresses a named failure mode inside the ReAct loop. That's the senior move: identify the specific failure, patch it, don't reach for a heavier pattern.
+**Why aptkit starts and stays here.** None of the six capabilities has a measured failure that ReAct can't fix. The recommendation agent doesn't need a separate planning phase — its path is short (gather evidence, propose). rag-query doesn't need branching exploration — one or two retrievals answer most questions. Starting with ReAct and not escalating is the *correct* default, not a missing feature.
 
 ### Move 3 — the principle
 
-Most teams jump past ReAct prematurely. The strong prior is to start here, measure, and escalate only on a named failure. aptkit's whole agent layer is ReAct-with-targeted-hardening, and the hardening (minTopK, forced synthesis, recovery turn) is more interview-worthy than a premature jump to multi-agent would be.
+Default to ReAct. Measure success rate, tool-call accuracy, latency, and cost. Escalate only when you can name the specific failure ReAct can't address. Most teams jump past ReAct prematurely; "I built a ReAct baseline, measured it, and escalated only when [specific failure]" is a stronger answer than reaching for plan-and-execute or multi-agent first.
 
 ## Primary diagram
 
 ```
-  ReAct in aptkit — rag-query, one frame
+  ReAct as aptkit runs it — bounded interleaving
 
-  ┌─ system prompt: "search first, ground, cite" ───────────┐
-  └───────────────────────────┬──────────────────────────────┘
-                              ▼
-  reason ──► search_knowledge_base(query, top_k)  [Service→Retrieval hop]
-    ▲                          │
-    │                          ▼
-  observe ◄── ranked chunks + citations ◄── InMemoryVectorStore
-    │
-    └─► enough? → answer (cited)   |   not enough? → reason again
-        (budget: maxToolCalls 4, then forced synthesis)
+  turn 0   Thought + Action ──► tool ──► Observation ──┐
+  turn 1   Thought + Action ──► tool ──► Observation ──┤  accumulating
+  turn 2   Thought + Action ──► tool ──► Observation ──┤  in messages[]
+    ...                                                │
+  budget   forceFinal: tools withheld ──► final answer ◄┘
+  hit      (the bounded ReAct stop — 02-agent-loop-skeleton)
 ```
 
 ## Elaborate
 
-ReAct came from the observation that letting a model reason in text *between* actions beats forcing it to act blind. In aptkit the reasoning is implicit — the agents don't demand an explicit "Thought:" prefix; the model's prose between tool calls is the reasoning. That's the pragmatic version: you get ReAct's interleaving without the brittle output-format contract.
+ReAct (Yao et al., 2022) won because interleaving reasoning with action beats doing all reasoning up front (which drifts from reality) or all action with no reasoning (which flails). It's the substrate the escalations refine: plan-and-execute pulls the reasoning to the front; reflexion adds a critique pass; tree-of-thoughts branches the reasoning. Knowing ReAct is the baseline is what lets you justify *not* using the fancier ones.
 
 ## Interview defense
 
-**Q: What reasoning pattern do your agents use?**
-ReAct — interleaved reason/act/observe in one loop, no separate plan phase. The rag-query agent searches then grounds; the recommendation agent queries up to 13 read-only tools to build evidence before proposing. I haven't escalated past ReAct because every failure I hit was patchable inside the loop — a top_k floor, a forced synthesis turn, a JSON recovery turn.
+**Q: What reasoning pattern does aptkit use, and why not something more advanced?**
+
+ReAct, bounded. Every capability interleaves reason-act-observe inside `runAgentLoop`, capped by turn and tool-call budgets. I didn't escalate because none of the capabilities has a measured failure ReAct can't fix — the paths are short and don't need a separate planning phase or a critique loop.
 
 ```
-  reason ⇄ act ⇄ observe — escalate only on a named failure
+  ReAct baseline → measure → escalate only on a named failure
+  (aptkit: never crossed that gate; correctly)
 ```
-*Anchor: "I built a ReAct baseline, measured it, patched specific failures" beats "I reached for multi-agent."*
 
-**Q: When would you move off ReAct?**
-When a failure appears that's structurally unfixable inside the loop — e.g. if planning quality, not execution, were the bottleneck (then plan-and-execute), or if I needed an independent reviewer to catch errors the producer shares blind spots on (then verifier-critic). Neither has shown up in aptkit.
+*Anchor: not escalating is a decision, not a gap — name the measurement that justified staying.*
 
 ## See also
 
-- `02-agent-loop-skeleton.md` — the loop ReAct's step function runs in
-- `04-plan-and-execute.md` — the first escalation, not yet exercised
-- `02-agentic-retrieval/01-agentic-rag.md` — ReAct with retrieval as the tool
-- `study-ai-engineering/04-agents-and-tool-use/03-react-pattern.md` — T-A-O mechanics (cross-ref)
+- [02-agent-loop-skeleton.md](02-agent-loop-skeleton.md) — the kernel ReAct plugs into.
+- [04-plan-and-execute.md](04-plan-and-execute.md) — the first escalation.
+- ReAct Thought-Action-Observation mechanics: `.aipe/study-ai-engineering/04-agents-and-tool-use/03-react-pattern.md`.

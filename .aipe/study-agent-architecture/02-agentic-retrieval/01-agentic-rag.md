@@ -1,200 +1,201 @@
 # Agentic RAG
 
-**Industry standard.** "Agentic RAG," "retrieval-as-a-tool," "tool-calling RAG." Type label: reasoning pattern (ReAct with retrieval as the primary tool). **In this codebase: yes — the rag-query agent is the capstone instance.**
+**Industry term:** agentic RAG (retrieval as a tool the agent decides to call). *Industry standard.*
 
 ## Zoom out, then zoom in
 
-This is the most interesting agent-architecture decision in aptkit, and it's worth stating sharply: **retrieval is a tool, not a prompt-splice.** Static RAG retrieves once, stuffs the chunks into the prompt, and generates — the framework decides when to retrieve. Agentic RAG hands the model a `search_knowledge_base` tool and lets *the model* decide when (and whether) to call it, how to phrase the query, and whether one search was enough.
+This is the pattern worth studying in aptkit above all others. Static RAG splices retrieved chunks into the prompt before generation — the engineer decides to retrieve. Agentic RAG makes retrieval a *tool the model calls when it judges it needs grounding*. The model owns the *when*; the loop owns the *budget*. That split is the whole idea.
 
 ```
-  Zoom out — retrieval-as-a-tool in aptkit
+  Zoom out — retrieval reaches the agent as a tool, not a prompt-splice
 
-  ┌─ Agent layer ───────────────────────────────────────────┐
-  │  RagQueryAgent.answer()   rag-query-agent.ts:62          │
-  └───────────────────────────┬──────────────────────────────┘
-                              │ runs runAgentLoop with ONE tool
-  ┌─ Loop layer ──────────────▼──────────────────────────────┐
-  │  ★ model decides WHEN to call search_knowledge_base ★    │ ← we are here
-  │  loop owns the budget (maxToolCalls: 4)                   │
-  └───────────────────────────┬──────────────────────────────┘
-                              │ tool wraps the query path
-  ┌─ Retrieval layer ─────────▼──────────────────────────────┐
-  │  pipeline.query → embed → InMemoryVectorStore.search      │
-  └────────────────────────────────────────────────────────────┘
+  ┌─ Capability layer (rag-query agent) ────────────────────────┐
+  │  RagQueryAgent.answer — model decides whether to search      │ ← we are here
+  └───────────────────────────────┬──────────────────────────────┘
+                                   │ runAgentLoop → tool_use: search_knowledge_base
+  ┌─ Tools layer ───────────────────▼───────────────────────────┐
+  │  search_knowledge_base tool (minTopK floor + filter guard)   │
+  └───────────────────────────────┬──────────────────────────────┘
+                                   │ pipeline.query()
+  ┌─ Retrieval layer ───────────────▼───────────────────────────┐
+  │  EmbeddingProvider (Ollama nomic, 768) + VectorStore (cosine)│
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-The reframe to hold onto: *all agentic RAG is agentic AI; not all agentic AI does retrieval.* aptkit's rag-query agent is agentic RAG; its recommendation agent is agentic AI that happens to use 13 non-retrieval tools.
+Zoom in: the `rag-query` agent (`packages/agents/rag-query/src/rag-query-agent.ts`) is the capstone. It composes a Gemma provider + the `search_knowledge_base` tool + an injected profile through `runAgentLoop`. The model decides to call the tool, reads the ranked chunks, and grounds its answer in them — or, if nothing comes back, says so. That's ReAct whose primary tool is retrieval.
 
-## Structure pass
+## The structure pass
 
-**Layers:** agent → loop → retrieval pipeline → vector store. **Axis: who decides *when* to retrieve?** Trace it and the difference from static RAG is the whole lesson.
+**Layers.** The agent (decides *whether/what* to search) over the tool (executes one ranked search) over the pipeline (embed → cosine search → rank).
+
+**Axis: control — who decides to retrieve?** This is the axis that separates static from agentic RAG.
 
 ```
-  "who decides when to retrieve?" — static vs agentic
+  "who decides to retrieve?" — the static→agentic flip
 
-  STATIC RAG:                      AGENTIC RAG (aptkit):
-  ┌─ framework ─┐                  ┌─ model ──────────┐
-  │ retrieve    │ → always, once   │ call search tool │ → when it judges
-  │ then stuff  │                  │ ...maybe again   │   it needs grounding
-  └─────────────┘                  └──────────────────┘
-       │                                │
-  CODE decides when                LLM decides when (loop caps how many)
+  ┌─ static RAG ─────┐   seam    ┌─ agentic RAG ─────┐
+  │ ENGINEER splices │ ═══╪═════► │ MODEL calls the    │
+  │ chunks in front  │ (it flips) │ tool when it judges│
+  │ of generation    │            │ it needs grounding │
+  └──────────────────┘           └───────────────────┘
 ```
 
-**The seam that flips:** control over *when to retrieve* moves from CODE (static) to LLM (agentic). That single flip is what makes RAG "agentic." The loop's `maxToolCalls` is the code reasserting the budget — the model picks when, the loop picks how many.
+**The seam.** The `search_knowledge_base` tool boundary. The model emits a `tool_use` with a query and top_k; the tool runs the pipeline and returns ranked, cited chunks. The loop bounds how many times this can happen (`maxToolCalls: 4`).
 
 ## How it works
 
+**Use case in aptkit:** the personal knowledge assistant. Index a corpus (the reader's notes, profile, docs), then ask free-text questions. The agent retrieves grounding when it needs it and cites sources.
+
 ### Move 1 — the mental model
 
-You know how a ReAct loop calls whatever tool it needs? Agentic RAG is that loop where the primary tool happens to be search. The model reasons "I need to know X," calls `search_knowledge_base("X")`, reads the ranked chunks, and either answers or searches again for a missing piece.
+You already know static RAG as a shape: retrieve → augment → generate, one pass, no second try. Agentic RAG is that shape wrapped in a `while` loop where the model decides each iteration whether one more retrieval would help — like a `fetch` you fire conditionally based on what the last response told you, not unconditionally up front.
 
 ```
-  Agentic RAG = ReAct whose primary tool is retrieval
+  Static RAG (one shot):
+    query → retrieve top-k → stuff → generate   (no evaluation, no retry)
 
-  ┌─ decompose / decide what to look up ────────────┐
-  └────────────────────┬─────────────────────────────┘
-                       ▼
-  search_knowledge_base(query, top_k)  ← model calls when it needs grounding
-                       │
-                       ▼
-  ┌─ evaluate: enough to answer? ───────────────────┐
-  └──────────┬─────────────────────┬─────────────────┘
-             ▼ no                  ▼ yes
-        search again           generate cited answer
-             │
-             └──── loop (capped: maxToolCalls 4)
+  Agentic RAG (a loop):
+  ┌───────────────────────────────────────────────┐
+  │  model decides: do I need to search?           │
+  └────────────────────┬──────────────────────────┘
+             ┌──────────┴──────────┐
+             ▼ yes                 ▼ no
+   search_knowledge_base      answer directly
+        │ ranked chunks
+        ▼
+   evaluate: enough to answer? ──no──► search again (refine)
+        │ yes                              │
+        ▼                                  └── loop (capped at 4 calls)
+   generate grounded + cited answer
 ```
 
-### Move 2 — the three packages composed
+### Move 2 — the walkthrough
 
-The rag-query agent is the 6th instance of aptkit's capability shape: **model + tool registry + profile, composed through `runAgentLoop`.**
+**The tool is the seam — retrieval is not bespoke control flow.** `search_knowledge_base` (`packages/retrieval/src/search-knowledge-base-tool.ts`) is a normal tool with a JSON schema. The agent reaches it through the same `runAgentLoop` machinery as any other tool. There's no special "RAG mode" in the loop — retrieval is just a tool the model is allowed to call:
 
-**Package A — the model (the *when* owner).** A `ModelProvider` (typically the guarded Gemma local model). It decides whether to search.
-
-**Package B — the tool registry (the *what* it can do).** Holds `search_knowledge_base`, filtered to a one-tool allowlist so this agent can do nothing *but* search.
-
-```typescript
-// packages/agents/rag-query/src/rag-query-agent.ts:14-18
-/** Least-privilege grant: this agent may only search the knowledge base. */
+```ts
+// rag-query-agent.ts:15 — least-privilege: this agent may ONLY search
 export const ragQueryToolPolicy: ToolPolicy = {
   capabilityId: RAG_QUERY_CAPABILITY_ID,
-  allowedTools: [SEARCH_KNOWLEDGE_BASE_TOOL_NAME],   // ← exactly one tool
+  allowedTools: [SEARCH_KNOWLEDGE_BASE_TOOL_NAME],   // exactly one tool
 };
 ```
 
-**Package C — the profile (the *who* it's serving).** `injectProfile` splices the user's `me.md` into the system prompt so answers are personalized — context engineering, covered in SECTION D.
+**The model owns the when; the loop owns the budget.** The system prompt nudges ("Always call search_knowledge_base first"), but the *decision* and the *query text* come from the model each turn. The loop caps the spend:
 
-```typescript
-// packages/agents/rag-query/src/rag-query-agent.ts:54-58
-const withProfile = options.profile
-  ? injectProfile(template, options.profile, { position: 'start', heading: PROFILE_HEADING })
-  : template;
-this.system = renderPromptTemplate(withProfile, {});
-```
-
-**The loop wiring — the *when* meets the budget.** `answer()` filters the tools to the policy, then runs the loop with retrieval-tuned caps:
-
-```typescript
-// packages/agents/rag-query/src/rag-query-agent.ts:63-80
-const toolSchemas = filterToolsForPolicy(allTools, ragQueryToolPolicy);
-const { finalText } = await runAgentLoop({
-  model: this.options.model,
-  tools: this.options.tools,
-  system: this.system,
+```ts
+// rag-query-agent.ts:66 — model decides; loop bounds
+await runAgentLoop({
+  system: this.system,          // "...call search first, ground every answer, cite sources"
   userPrompt: question,
-  toolSchemas,                  // ← only search_knowledge_base
-  maxTurns: 6, maxToolCalls: 4, // ← model owns WHEN; loop owns HOW MANY
+  toolSchemas,                  // just search_knowledge_base
+  maxTurns: 6,
+  maxToolCalls: 4,              // ← the budget the model can't exceed
   synthesisInstruction: buildSynthesisInstruction(
     'Now answer the question directly and concisely, citing the sources you retrieved.'),
 });
-return finalText.trim() || FALLBACK_ANSWER;
 ```
 
-The system prompt nudges the model to search first (`rag-query-agent.ts:23`), but it's a *nudge*, not a forced splice — the model could answer without searching, and on a question the KB can't answer it's told to say so plainly rather than guess (line 25). That's the agentic property: the model owns the decision.
+**Hardening a weak model: the minTopK floor.** Gemma has no native tool-calling and is weak — left alone it sometimes asks for `top_k: 1`, starving its own retrieval on a multi-part question. The tool clamps a floor:
 
-**The tool itself — the query path wrapped for the model.** `search_knowledge_base` embeds the query, searches the store, and returns ranked chunks *with citations* so the model can ground its answer.
-
-```typescript
-// packages/retrieval/src/search-knowledge-base-tool.ts:78-96
-const handler: ToolHandler = async (args) => {
-  const query = typeof args.query === 'string' ? args.query : '';
-  const requestedTopK = ... ;
-  const topK = Math.max(requestedTopK, minTopK);   // ← the floor (next file)
-  let hits = await pipeline.query(query, fetchK);
-  return { query, results: hits.map(toResult) };   // toResult builds the citation (:108)
-};
+```ts
+// search-knowledge-base-tool.ts:51 — floor against a weak model starving itself
+const minTopK = Math.max(1, options.minTopK ?? 1);
+// ...
+const topK = Math.max(requestedTopK, minTopK);   // :81 — model can't go below the floor
 ```
 
-`toResult` (line 108) builds a `[docId] snippet` citation per hit, so when the model answers it has the provenance to cite. The boundary condition: if the model passes `top_k: 1` (a weak-model failure), the `minTopK` floor catches it before it starves a multi-part question — that's the self-corrective guard, next file.
+Set `minTopK` above 1 and the model physically cannot retrieve fewer than that many chunks, even if it asks. This is the concrete fix for multi-part-question misses — a structural guard, not a prompt plea.
 
-### Move 2.5 — current state vs future state
+**Hardening a weak model: the hallucination-tolerant filter.** A weak model sometimes hallucinates a metadata filter (`{textContains: "x"}`) that, applied strictly, would wipe every result. aptkit's `matchesFilter` only excludes a hit that *has* that key with a *different* value — keys the chunk doesn't have are ignored:
 
-aptkit's vector store is `InMemoryVectorStore` (a cosine scan over an array). The retrieval *contracts* (`EmbeddingProvider`, `VectorStore`) are vendor-neutral, and buffr supplies a durable `PgVectorStore` implementing the same `VectorStore` interface.
-
-```
-  Phase A (aptkit, now)          Phase B (buffr, durable)
-  ─────────────────────          ────────────────────────
-  InMemoryVectorStore            PgVectorStore (pgvector)
-  cosine scan over array         indexed ANN in Postgres
-  re-index per process           persistent corpus
-       │                              │
-       └──── SAME VectorStore contract; agent code unchanged ────┘
+```ts
+// search-knowledge-base-tool.ts:101 — a hallucinated filter can't silently wipe results
+function matchesFilter(hit: VectorHit, filter: Record<string, unknown>): boolean {
+  return Object.entries(filter).every(
+    ([key, value]) => !(key in hit.meta) || hit.meta[key] === value,
+  );
+}
 ```
 
-The agent doesn't change at all — it speaks the contract, not the store. That's the payoff of retrieval-neutral design: the agentic-RAG loop is identical whether the store is an in-memory array or pgvector.
+Both guards exist for the same reason: agentic retrieval hands the model control of the retrieval parameters, and a weak model abuses that control. The fix is structural floors and tolerant matching, not trusting the model.
+
+**Citations come back with the chunks.** The tool returns `{ id, score, citation, meta }` where `citation` is a `[docId] snippet` string (`toResult`, `search-knowledge-base-tool.ts:108`). The model sees the source inline, so grounding-with-citation is one tool call, not a separate step.
+
+### Move 2.5 — current state vs the agentic-RAG ceiling
+
+aptkit's agentic RAG is the *first rung*: the model decides whether and what to search, and can search again within budget. It does **not** decompose a query into sub-questions or run an explicit relevance-grade step before generating (that's `02-self-corrective-rag.md`). So:
+
+```
+  Phase A (now):  model decides when/what to search → up to 4 searches → answer
+                  (re-search is the model's call; no explicit grader)
+
+  Phase B (would add):  decompose query → retrieve per sub-question →
+                        grade chunks → re-retrieve on low relevance → synthesize
+```
+
+What doesn't have to change to reach Phase B: the tool, the pipeline, the contracts. Phase B is more loop structure and a grader, layered on the same `search_knowledge_base` seam.
 
 ### Move 3 — the principle
 
-The tradeoff is steep — agentic RAG costs roughly 3-10x tokens and 2-5x latency over static RAG, because it's a loop with multiple model calls and possibly multiple searches. The above-threshold rule applies hard: use the loop only when one-shot retrieval measurably fails on multi-step or cross-source queries. aptkit bounds the cost with `maxToolCalls: 4` and the forced synthesis turn, so the loop can't run away — but the principle stands: don't make RAG agentic unless static RAG is measurably failing.
+The reframe to keep: *all agentic RAG is agentic AI; not all agentic AI does retrieval.* Agentic RAG is just ReAct whose primary tool happens to be retrieval. The tradeoff is steep — roughly 3-10x token cost and 2-5x latency over static RAG — so use the loop only when one-shot retrieval measurably fails on multi-step or cross-source queries. aptkit pays it because a single-shot retrieval can't handle "search, see it's not enough, refine and search again," which is exactly what a weak local model needs the option to do.
 
 ## Primary diagram
 
 ```
-  Agentic RAG in aptkit — rag-query, full frame
+  aptkit agentic RAG — full loop, one frame
+  (rag-query agent → search_knowledge_base → retrieval pipeline)
 
-  ┌─ Agent (3 packages composed) ───────────────────────────┐
-  │  A model · B tools(1-tool policy) · C injectProfile      │
-  └───────────────────────────┬──────────────────────────────┘
-                              ▼
-  ┌─ runAgentLoop (maxTurns 6, maxToolCalls 4) ─────────────┐
-  │  model reasons → search_knowledge_base(query, top_k)     │ [Loop→Retrieval]
-  │       ▲                          │                       │
-  │       │  ranked chunks + citation│                       │
-  │       └──────────────────────────┘                       │
-  │  enough? → cited answer | budget out → forced synthesis  │
-  └───────────────────────────┬──────────────────────────────┘
-                              ▼
-  ┌─ Retrieval pipeline ──────────────────────────────────────┐
-  │  embed(query) → InMemoryVectorStore.search → top-k hits    │
-  │  (contract-identical to buffr's PgVectorStore)             │
-  └────────────────────────────────────────────────────────────┘
+  question ─► runAgentLoop (maxToolCalls: 4)
+                  │
+       ┌──────────▼─────────── model turn ──────────────────┐
+       │  decide: search or answer?                          │
+       │     │ search                    │ answer            │
+       │     ▼                           ▼                   │
+       │  tool_use: search_knowledge_base   final text       │
+       │     │  { query, top_k }              + citations    │
+       │     ▼                                               │
+       │  TOOL: clamp top_k≥minTopK ─► pipeline.query()       │
+       │        ─► cosine search ─► rank ─► tolerant filter   │
+       │     │  ranked chunks + [docId] citations             │
+       │     ▼                                               │
+       │  observe ─► loop (until enough, or budget) ──────────┘
+                  │ budget hit
+                  ▼
+       forceFinal: tools withheld + "answer now, cite sources"
 ```
 
 ## Elaborate
 
-Agentic RAG emerged when teams hit static RAG's ceiling: one-shot retrieval can't handle "compare X and Y" (needs two retrievals) or "what's the latest on Z" (needs a query rewrite after seeing stale chunks). Exposing retrieval as a tool lets the model do the multi-step retrieval that the question actually needs. aptkit's version is the clean minimal form — one search tool, a tight budget, citations baked into the tool output — which is exactly what you'd build before adding self-correction or multi-source routing (the next two files).
+Agentic RAG emerged when teams hit static RAG's ceiling: one-shot top-k retrieval can't handle queries that need decomposition, cross-source lookup, or "that wasn't enough, try again." Making retrieval a tool inside a ReAct loop solves it — at a steep token/latency cost. aptkit's version is notable for *who it's hardened against*: a weak, tool-call-less local model. The `minTopK` floor and tolerant filter are the scar tissue of running this loop on Gemma instead of GPT-4. That's the load-bearing lesson — agentic RAG hands the model the retrieval knobs, and the production work is bounding what a bad model does with them.
 
 ## Interview defense
 
-**Q: Is your RAG static or agentic?**
-Agentic. Retrieval is a tool — `search_knowledge_base` — not a prompt-splice. The model decides *when* to call it and how to phrase the query; the loop owns the budget at `maxToolCalls: 4`. The rag-query agent is three packages composed: a model, a one-tool policy, and a profile injection — run through the shared loop.
+**Q: What makes aptkit's RAG "agentic" rather than static?**
+
+Retrieval is a tool the model calls, not a prompt-splice the engineer wires in. The `rag-query` agent hands the model exactly one tool — `search_knowledge_base` — and the model decides whether to call it, what query to use, and whether to search again, all inside a bounded loop.
 
 ```
-  model owns WHEN to search ═══ loop owns HOW MANY (maxToolCalls 4)
+  static:  engineer retrieves → stuffs → generates  (one shot)
+  agentic: MODEL decides to search → loop → ground   (model owns WHEN)
 ```
-*Anchor: the control flip — when-to-retrieve moves from code to model. That's what makes it agentic.*
 
-**Q: Why not just stuff the top-k into the prompt (static RAG)?**
-Static RAG can't do multi-step or query-rewrite-on-miss. But agentic RAG costs 3-10x tokens — so I'd only go agentic where one-shot retrieval measurably fails. I bound the cost with the tool-call cap and the forced synthesis turn, so the loop can't run away searching.
+*Anchor: the model owns the when; the loop owns the budget (maxToolCalls: 4).*
 
-**Q: How does the model cite?**
-The tool returns a `[docId] snippet` citation per hit (`toResult`, search-knowledge-base-tool.ts:108), and the system prompt requires grounding every claim in retrieved chunks. So provenance travels with the data into the model's context.
+**Q: You're running this on a weak local model. How do you stop it from breaking its own retrieval?**
+
+Two structural guards in the tool. A `minTopK` floor so it can't ask for `top_k: 1` and starve a multi-part question. And a hallucination-tolerant filter — `matchesFilter` only excludes hits that *have* a key with a different value, so a hallucinated filter can't wipe every result.
+
+```
+  model asks top_k:1  →  clamp to minTopK  →  enough chunks
+  model hallucinates filter  →  tolerant match  →  results survive
+```
+
+*Anchor: hand the model the retrieval knobs, then bound them structurally — don't trust a weak model to set them well.*
 
 ## See also
 
-- `02-self-corrective-rag.md` — the minTopK floor + matchesFilter guard that harden this loop
-- `02-agent-loop-skeleton.md` — the loop this runs in; the forced synthesis turn
-- `04-agent-infrastructure/01-context-engineering.md` — injectProfile (Package C)
-- `04-agent-infrastructure/03-tool-calling-and-mcp.md` — the registry + policy (Package B)
-- `study-ai-engineering/03-retrieval-and-rag/` — embeddings, chunking, vector store mechanics (cross-ref)
+- [02-self-corrective-rag.md](02-self-corrective-rag.md) — adding a relevance grader (the Phase B above).
+- [../01-reasoning-patterns/03-react.md](../01-reasoning-patterns/03-react.md) — agentic RAG is ReAct with a retrieval tool.
+- RAG / embeddings / chunking / vector-store mechanics: `.aipe/study-ai-engineering/03-retrieval-and-rag/`.
+- The retrieval-neutral contracts and the buffr pgvector binding: `.aipe/study-system-design/`.

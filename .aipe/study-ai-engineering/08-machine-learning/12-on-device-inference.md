@@ -1,314 +1,207 @@
-# On-device vs server inference
+# On-device inference
 
-**Subtitle:** where the trained model physically runs · *Language-agnostic*
+> on-device / edge inference · deployment topology
+
+Blunt up front: aptkit ships no on-device classifier. There is no embedded model running inside a mobile app anywhere in this codebase. This file is new ground, and it is `not yet exercised in aptkit` for an on-device classifier. I am scaffolding the deployment-topology decision so you can make it on purpose later, not stumble into it.
+
+You have actually shipped the hard version of this once. In contrl, MediaPipe runs *on the device* — pose-landmark inference happens in the app, in the hot path, frame by frame, with no network round-trip. That was not an aesthetic choice. A network call per frame would be fatal for a real-time rep counter: 30 frames a second, each waiting on a server, jitter and dropouts visible to the user mid-rep. On-device was the only topology that could meet the latency budget. Hold that example in your head — it is the canonical "why edge" story, and we will generalize from it.
 
 ## Zoom out, then zoom in
 
-A trained model is a function `f(X) → ŷ`. Before you can call it, you must decide
-*where the compute lives* — on the user's device, or on a server you control. That
-decision sits in the serving box of the supervised pipeline, and it is the whole
-subject of this file.
+On-device vs server is not a step in the pipeline; it is *where the Deploy box physically lives*. Same trained model, same features — the question is which machine runs the forward pass when a request arrives. The star sits on the Deploy box and asks: device, or server?
 
 ```
-  Zoom out — the pipeline, with the deploy decision marked
-
-  ┌─ Data layer ──────────────────────────────────────────────────┐
-  │  labeled rows                                                  │
-  └───────────────────────────┬────────────────────────────────────┘
-                              │ featurize
-  ┌─ Feature layer ───────────▼────────────────────────────────────┐
-  │  numeric X, label y                                            │
-  └───────────────────────────┬────────────────────────────────────┘
-                              │ split + fit
-  ┌─ Model layer ─────────────▼────────────────────────────────────┐
-  │  fitted f: X → ŷ                                               │
-  └───────────────────────────┬────────────────────────────────────┘
-                              │ ship
-  ┌─ Serving layer ───────────▼────────────────────────────────────┐
-  │  ★ WHERE does f(X) run? on-device  vs  server ★                │
-  └──────────────────────────────────────────────────────────────────┘
+On-device inference is a placement choice for the Deploy stage
+┌──────────┐   ┌──────────┐   ┌──────────────────┐   ┌────────┐   ┌──────────────────┐
+│  Data    │──▶│ Features │──▶│ Train / Val / Test│──▶│ Model  │──▶│ ★ Deploy / Serve │
+└──────────┘   └──────────┘   └──────────────────┘   └────────┘   └────────┬─────────┘
+                                                                           │
+                            where does the forward pass run?               │
+                       ┌───────────────────────────────────────────────────┘
+                       ▼
+            ┌──────────────────┐                 ┌──────────────────┐
+            │  SERVER inference │                 │  DEVICE inference │
+            │  (cloud GPU/CPU)  │                 │  (phone/edge)     │
+            └──────────────────┘                 └──────────────────┘
 ```
 
-Now zoom in. The model is identical either way — same weights, same `f`. What
-changes is the *physics* of the call: a function call inside the app's own memory,
-or an HTTP round-trip to a machine somewhere else. Every tradeoff in this file
-falls out of that one difference. You already live this tradeoff one layer up:
-aptkit defaults to a *local* Gemma and can fall back to *cloud* OpenAI. Same
-choice, different model.
+Everything before Deploy is identical between the two topologies. The split happens only at serve time, and it cascades into latency, privacy, update cadence, and how big a model you are even allowed to use.
 
 ## Structure pass
 
-**Layers.** Model → serving location → caller. The fitted `f` is fixed; the
-serving location is the knob; the caller (the app) feels the consequences as
-latency, a bill, or an offline failure.
+One axis: **where does the forward pass execute relative to the user?** On the server, far away, big and updatable. On the device, right next to the user, small and constrained. Every tradeoff hangs off that single distance.
 
-**Axis — where does the compute physically run?** Trace one prediction. On-device:
-`f` executes in the app's process, reading device RAM, returning in microseconds-
-to-milliseconds with no network. Server: the app serializes `X`, opens a
-connection, waits for a remote machine, parses the response. The *answer* is the
-same; everything around it — speed, privacy, cost, offline behavior — flips on
-this axis.
+```
+Axis: distance from forward pass to the user
+ far (server) ◀──────────────────────────────────────────────▶ near (device)
 
-**Seam.** The load-bearing boundary is the **inference call site** — the single
-function the app calls to get `ŷ`. Hide the location behind it (`predict(x)`),
-and you can move the model between device and server without the caller noticing.
-This is the same discipline as aptkit's `ModelProvider.complete()`: one method, and
-the agent above it never learns whether Gemma ran locally or OpenAI ran in the
-cloud.
+ SERVER                                                          DEVICE
+ + big models, easy to update                                   + low latency, offline, private
+ + central monitoring                                           + no per-request network cost
+ − network latency + jitter                                     − constrained compute/mem/battery
+ − offline = dead                                               − updates are slow (app ship)
+ − data leaves the device                                       − model must be SMALL
+```
+
+The seam is sharp: cross it and the entire set of constraints flips. You do not get to keep server's "update instantly" and device's "works offline" — pick the topology that matches the dominant constraint.
 
 ## How it works
 
-### Move 1 — the mental model
+### Move 1 — mental model
 
-You already make this exact call in aptkit, just with an LLM instead of a trained
-classifier. The default provider runs Gemma *on your own machine*: free per call,
-nothing leaves the box, but bounded by your hardware. Flip to the OpenAI provider
-and the same request leaves the machine: faster hardware, a per-call bill, and now
-a network dependency. On-device vs server inference for a trained model is the
-*identical* decision one floor down.
+Mental model: **inference placement is a latency-and-trust budget, not a model-quality question.** You do not choose device because the model is better there (it is usually worse — smaller). You choose device when the round-trip cost, the offline requirement, or the privacy requirement dominates the loss from a smaller model.
 
 ```
-  Pattern — the same call, two locations
-
-                       ┌──────────────────────────┐
-   app calls           │   predict(x)             │   ← one seam
-   predict(x) ───────► │   (location is hidden)   │
-                       └─────────────┬────────────┘
-                ┌────────────────────┴────────────────────┐
-                ▼                                          ▼
-       ON-DEVICE                                    SERVER
-   ┌────────────────┐                        ┌────────────────┐
-   │ f runs in app  │                        │ HTTP ─► remote │
-   │ RAM, no network│                        │ f, then back   │
-   └────────────────┘                        └────────────────┘
-   free · private · offline                  paid · fast HW · online-only
+PATTERN: the placement tradeoff seesaw
+        SERVER side                            DEVICE side
+   ┌────────────────────┐                 ┌────────────────────┐
+   │ + model capacity   │       ╱╲        │ + latency (no hop) │
+   │ + instant updates  │      ╱  ╲       │ + offline          │
+   │ + easy monitoring  │ ────●────────── │ + privacy          │
+   │ − latency + jitter │   fulcrum:      │ − tiny model only  │
+   │ − needs network    │   what          │ − slow updates     │
+   │ − data egress      │   dominates?    │ − battery/heat     │
+   └────────────────────┘                 └────────────────────┘
 ```
 
-You write the seam once. *Where* `f` lives behind it is a deployment decision, not
-an application-logic decision.
+Find the dominant constraint, and the seesaw tips itself. For contrl, the dominant constraint was per-frame latency, so it tipped hard to device.
 
-### Move 2 — the axes, one tradeoff at a time
+### Move 2 — step by step
 
-Five axes decide the location. Walk each; the diagram per axis shows which side
-wins and why.
-
-**Latency — on-device avoids the network; the server has faster silicon.** A
-server may run `f` in 2ms on a datacenter GPU, but the *round-trip* to reach it is
-20–200ms+ and varies with the user's connection. On-device adds zero network but
-runs on a phone CPU. For small models the round-trip dominates, so on-device wins
-the *wall-clock* race even with slower hardware.
+**Server inference, in full.** The forward pass runs on cloud hardware. Big models are fine — you have GPUs and memory. Updating is trivial: redeploy the server and every user gets the new model instantly. But every request pays a network round-trip, and when the network is bad the inference is bad or absent. And the input data leaves the device to reach the server, which is a privacy and compliance cost.
 
 ```
-  Latency budget — what the user actually waits
-
-  ON-DEVICE:  [ f: 8ms ]                              = 8ms
-  SERVER:     [ net out: 40ms ][ f: 2ms ][ net in: 40ms ] = 82ms
-                ▲ network round-trip dominates for small models
+Server inference path (per request)
+ device                         network                   server
+ ┌──────┐   input bytes   ┌───────────────┐   ┌──────────────────────┐
+ │ app  │ ──────────────▶ │ latency+jitter │─▶ │ big model forward pass│
+ │      │ ◀────────────── │  (+ offline=∅) │◀─ │  result               │
+ └──────┘    result        └───────────────┘   └──────────────────────┘
+            data has now LEFT the device ──────────────▲ privacy cost
 ```
 
-**Privacy — on-device data never leaves.** On-device, `X` is built and consumed in
-the same process; the raw input never crosses the network boundary. Server, you
-must transmit `X` (often derived from sensitive user data) off the device. This is
-the same reason aptkit's local Gemma is the privacy default: the conversation
-never leaves the user's machine.
+`Not yet exercised in aptkit` as a classifier topology — but note the nuance in the next part, because aptkit *does* have a local-execution story that is easy to confuse with this.
+
+**Device inference, in full.** The forward pass runs on the user's hardware — phone, tablet, laptop. No network hop, so latency is bounded by the device and inputs never leave it (offline-capable, private). The cost: the device has limited compute, memory, and battery, so the model must be small, and you can only update it by shipping a new app build, which is slow and fragmented across users who update on their own schedule.
 
 ```
-  Privacy — does X cross the device boundary?
-
-  ON-DEVICE   ┌──────────────┐               (boundary not crossed)
-              │ build X      │
-              │ f(X) → ŷ     │  ── stays inside ──
-              └──────────────┘
-  ─────────────────────────── device boundary ──────────────────────
-  SERVER      build X ──► │ X leaves device │ ──► remote f   ⚠ exposure
+Device inference path (per request)
+ device
+ ┌──────────────────────────────────────────────┐
+ │ app                                            │
+ │  input ─▶ SMALL model forward pass ─▶ result   │  no network hop
+ │  data never leaves this box ──── privacy ✓     │  offline ✓
+ │  constrained by: compute / memory / battery    │  update = ship app ✗ slow
+ └──────────────────────────────────────────────┘
 ```
 
-**Cost — on-device is free per call; the server bills every call.** On-device, the
-user's hardware does the work: marginal cost per prediction is zero. Server, every
-call consumes compute you pay for; cost scales with traffic. At high call volume
-this dominates the decision — the same arithmetic as free local Gemma vs metered
-cloud OpenAI tokens.
+This is the contrl topology: MediaPipe's pose model runs inside the box above, per frame.
+
+**The distinction you must not blur: local LLM ≠ on-device classifier.** aptkit has a local-execution angle — Gemma via Ollama. That means a *large language model running locally on the user's own machine* instead of a cloud LLM API. It is genuinely "local," and it earns the privacy and offline benefits of the device column. But it is **not** the same animal as an on-device *classifier* embedded in a mobile app, and conflating them will burn you in an interview.
 
 ```
-  Cost vs call volume
-
-  $ │            server (linear in calls) ╱
-    │                                  ╱
-    │                               ╱
-    │                            ╱
-    │  ─────────────────────────────────  on-device (flat ≈ 0)
-    └──────────────────────────────────► calls
+Two different things that both say "local" — keep them apart
+┌──────────────────────────────────────┬──────────────────────────────────────┐
+│ aptkit: LOCAL LLM (Gemma via Ollama)  │ contrl: ON-DEVICE CLASSIFIER (MediaPipe)│
+├──────────────────────────────────────┼──────────────────────────────────────┤
+│ host: user's machine (desktop/server) │ host: mobile device, inside the app   │
+│ model: large generative LLM           │ model: small specialized classifier   │
+│ runtime: Ollama process               │ runtime: embedded in the app binary    │
+│ workload: text generation, agentic    │ workload: per-frame pose landmarks     │
+│ latency need: seconds OK              │ latency need: per-frame, real-time     │
+│ "local" means: not a cloud LLM API    │ "device" means: not a server at all    │
+└──────────────────────────────────────┴──────────────────────────────────────┘
 ```
 
-**Size / latency budget — on-device must fit in RAM and the budget.** This is the
-hard constraint, not a preference. A trained `f` ships *inside the app*, so it
-competes for device RAM and must return within the interaction budget. Rule of
-thumb for a mobile/edge classifier: under ~50MB on disk and within a ~50–100ms
-inference budget. Check it before you choose on-device — if the model busts
-either limit, the decision is made for you.
+Both avoid the cloud, so both buy privacy and offline. But the local LLM is a *deployment-host* choice for a big generative model (Ollama instead of a hosted API), while the on-device classifier is a *real-time hot-path* choice for a tiny purpose-built model embedded in a mobile app. Different model classes, different latency regimes, different runtimes. `Not yet exercised in aptkit`: the on-device-classifier-in-a-mobile-app topology. aptkit only has the local-LLM flavor.
 
-```pseudo
-  // gate: can this trained model ship on-device?
-  // run BEFORE choosing a location — a fail forces server.
-  MAX_MODEL_BYTES   = 50 * 1024 * 1024   // ~50MB on disk/RAM budget
-  MAX_INFERENCE_MS  = 100                // interaction latency budget
+### Move 3 — principle
 
-  function fitsOnDevice(model, device):
-      sizeOk    = model.diskBytes <= MAX_MODEL_BYTES
-      // measured on the TARGET device, not the dev laptop
-      latencyOk = benchmark(model, device).p95Ms <= MAX_INFERENCE_MS
-      ramOk     = model.peakRamBytes <= device.availableRamBytes
-
-      if sizeOk and latencyOk and ramOk:
-          return ON_DEVICE        // small enough — keep it local
-      else:
-          return SERVER           // too big/slow — must run remote
-                                  // (file 13: quantization can shrink it
-                                  //  enough to pass this same gate)
-```
-
-**Updateability — the server updates instantly; on-device needs a ship.** A
-server model is one deploy away from every user; you can retrain nightly and roll
-out without touching the app. On-device weights are baked into the installed app —
-updating them means an app-store release (or a model-download channel you build)
-and waiting for users to adopt it.
-
-```
-  Update path — how a new model reaches users
-
-  SERVER:     retrain ──► deploy ──► every call now uses new f   (minutes)
-  ON-DEVICE:  retrain ──► rebuild app ──► store review ──►
-                          user updates ──► new f          (days, partial rollout)
-```
-
-**Move 2.5 — the aptkit reality.** Not yet exercised in aptkit — aptkit runs
-pre-trained LLMs, not trained models. The pattern is taught here as study ground.
-The honest anchor is one layer up: aptkit's default *local Gemma vs cloud OpenAI*
-choice is this exact tradeoff applied to LLM inference rather than a trained `f`.
-Local Gemma is free/private/hardware-bound; cloud OpenAI is fast/paid and leaves
-the machine. The same `ModelProvider` seam would hide a future on-device trained
-reranker the same way it hides Gemma today.
-
-### Move 3 — the principle
-
-Pick the location from the constraints, not from taste. **Small model + a
-privacy, offline, or latency need → on-device.** **Large model, or one that needs
-frequent retraining → server.** Then hide the choice behind one `predict(x)` seam
-so you can move the model later without rewriting the caller. The model is the same
-`f` either way; you are choosing physics, and the physics is reversible only if the
-seam is clean.
+Principle: **place inference where the dominant constraint lives, then pay the bill for that choice with eyes open.** Device buys latency, offline, and privacy at the price of model size and update speed. Server buys model capacity and instant updates at the price of network dependence and data egress. There is no free placement — name the constraint that decides it, write it down, and accept the bill.
 
 ## Primary diagram
 
-The full topology, both locations behind one seam, with each axis labeled on the
-side that wins it.
-
 ```
-  On-device vs server inference — one model, two homes
-
-                          app
-                           │  predict(x)        ← THE SEAM (location hidden)
-                           ▼
-              ┌────────────┴────────────┐
-              ▼                         ▼
-      ┌───────────────┐         ═══════════════ device boundary ═══════════
-      │  ON-DEVICE    │                 │ X leaves device
-      │  f in app RAM │                 ▼
-      │  ┌─────────┐  │         ┌───────────────┐   HTTP   ┌──────────────┐
-      │  │ f(X)→ŷ  │  │         │ serialize X   │ ───────► │  remote f    │
-      │  └─────────┘  │         │ wait...       │ ◄─────── │  fast HW     │
-      └───────────────┘         └───────────────┘          └──────────────┘
-       wins: latency             wins: model size, updateability
-             privacy             pays:  per-call cost, network round-trip
-             cost (free)         needs: connectivity
-             offline
+Placement decision tree (run this before you write any inference code)
+                         start: where to run the forward pass?
+                                       │
+                ┌──────────────────────┼────────────────────────┐
+                ▼                       ▼                        ▼
+      is per-request latency    must it work OFFLINE?    can data NOT leave
+      in a real-time hot path?   (no network assumed)     the device (privacy)?
+                │                       │                        │
+           yes  │ no               yes  │ no                yes  │ no
+                ▼                       ▼                        ▼
+          ┌──────────┐           ┌──────────┐            ┌──────────┐
+          │  DEVICE  │           │  DEVICE  │            │  DEVICE  │
+          └──────────┘           └──────────┘            └──────────┘
+                                       │ (if all "no")
+                                       ▼
+                            ┌────────────────────────┐
+                            │ default to SERVER:      │
+                            │ bigger model, instant   │
+                            │ updates, central monitor │
+                            └────────────────────────┘
+                                       │
+                            but can the model even FIT
+                            on the device's budget?  ── no ─▶ stay SERVER
+                                       │ yes
+                                       ▼
+                            quantize to fit (see 13)
 ```
+
+The load-bearing node is the last one: even when latency/offline/privacy all say "device," you only get to go there if the model *fits the device budget*. That is the bridge to quantization.
 
 ## Elaborate
 
-The hard-won lesson: the size/latency gate decides more cases than engineers
-expect. People debate privacy and cost in the abstract, but most of the time the
-model simply does not fit the device budget, and that *forces* server — which is
-exactly why file 13 (quantization) matters: it is the technique that shrinks `f`
-enough to pass the `fitsOnDevice` gate, converting a forced-server case into a real
-choice. The second lesson is to always benchmark on the *target* device, never the
-dev laptop; a model that returns in 8ms on an M-series Mac can blow a 100ms budget
-on a three-year-old phone. The third is the seam: teams that hard-code the location
-into business logic pay for it when traffic, privacy law, or a bigger model later
-flips the right answer. aptkit's `ModelProvider` is the reference shape for that
-seam — local and cloud are interchangeable because nobody above the contract knows
-which ran.
+A few edges. First, **hybrid is real and common**: run a small model on-device for the hot path and call a big server model for the rare hard cases (an on-device gate that escalates). Contrl-style real-time work would gate on-device and could escalate ambiguous segments off the hot path. Second, **"device budget" is concrete, not vibes** — memory ceiling, sustained compute before thermal throttling, battery drain per minute, app-binary size limit. Write those four numbers down before choosing device; they are the actual constraint. Third, **update cadence asymmetry is underrated**: a bug in a server model is fixed in one deploy; a bug in an on-device model lives until every user updates the app, which for some users is *never*. Plan for stale device models in the field.
+
+Cross-reference: `13-quantization.md` is the answer to "the model doesn't fit the device budget." On-device inference is the *why*; quantization is one of the *hows*.
 
 ## Project exercises
 
-### Add an on-device-vs-server gate to the local/cloud provider choice
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a small `fitsOnDevice`-style decision function that, given a
-  (hypothetical) trained reranker's size and a measured p95 latency, returns
-  `ON_DEVICE | SERVER`, mirroring how buffr already prefers local Gemma and falls
-  back to cloud — wire it as a documented helper next to the provider selection.
-- **Why it earns its place:** forces you to express the five axes as a single
-  constraint check and to connect it to the *real* local/cloud decision aptkit
-  already makes one layer up.
-- **Files to touch:** new `/Users/rein/Public/buffr/src/inference-location.ts`,
-  referencing the provider-selection path in `/Users/rein/Public/buffr/src` where
-  the local Gemma vs cloud provider is chosen.
-- **Done when:** a unit test passes asserting a 12MB / 30ms model returns
-  `ON_DEVICE` and a 400MB / 250ms model returns `SERVER`.
-- **Estimated effort:** `<1hr`
+### Inference-placement decision doc + device-budget check
 
-### Write the deployment decision note for a learned reranker
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a design note that takes a learned reranker over aptkit
-  retrieval and walks all five axes (latency, privacy, cost, size/budget,
-  updateability), then states a recommendation and the `predict(x)` seam that would
-  let the team reverse it later.
-- **Why it earns its place:** the senior move is justifying the location from
-  constraints and naming the seam *before* writing code — the same reasoning that
-  justifies local Gemma as aptkit's default.
-- **Files to touch:** new `/Users/rein/Public/buffr/docs/reranker-deployment.md`,
-  citing `/Users/rein/Public/aptkit/packages/evals/src/precision-at-k.ts` as the
-  metric the reranker would be graded by.
-- **Done when:** the note gives a per-axis verdict table and a final
-  on-device-or-server recommendation with the gate that would flip it.
-- **Estimated effort:** `1–4hr`
+- **Exercise ID:** EX-ML-12a — Phase 5 ML hardening, because placement is a deployment-topology decision you make once you know real constraints, not a day-one guess.
+- **What to build:** A short written decision doc that runs the placement decision tree for a concrete buffr use case (e.g. a hypothetical on-device intent classifier vs the Gemma-via-Ollama local LLM), *plus* a small `device-budget.ts` utility that takes a model's size and a device's memory/compute/battery ceilings and returns fits/doesn't-fit with the binding constraint named.
+- **Why it earns its place:** It forces you to (a) name the dominant constraint instead of cargo-culting "edge is cool," and (b) make "device budget" concrete numbers rather than a vibe — exactly the discipline that separates a real placement decision from a guess. It also makes you write down the local-LLM-vs-on-device-classifier distinction so you never blur it.
+- **Files to touch:** `/Users/rein/Public/buffr/docs/inference-placement.md` (Case B (new)); `/Users/rein/Public/buffr/src/inference/device-budget.ts` (Case B (new)); `/Users/rein/Public/buffr/src/inference/device-budget.test.ts` (Case B (new)).
+- **Done when:** The doc walks the decision tree to a placement with the dominant constraint named, explicitly separates aptkit's local-LLM (Ollama) story from an on-device-classifier story, and `device-budget.ts` returns the binding constraint (memory vs compute vs battery vs binary size) for at least two model/device pairs with tests.
+- **Estimated effort:** 1–4hr
 
 ## Interview defense
 
-**Q: "On-device or server — how do you decide for a trained model?"**
-From constraints, in order. First the size/latency gate: does it fit RAM and the
-interaction budget? If not, server, full stop. If it fits, then a privacy, offline,
-or latency need pushes on-device; a large model or frequent retraining pushes
-server. Then hide the choice behind one `predict(x)` seam so it's reversible.
+**Q: Why did contrl run pose inference on-device instead of calling a server?**
+
+Per-frame latency dominated. A real-time rep counter processes ~30 frames/sec; a network round-trip per frame adds latency and jitter you can feel mid-rep, and a dropped connection kills the feature. On-device was the only topology meeting the latency budget.
 
 ```
-  fits budget? ─no─► SERVER
-       │yes
-       ▼
-  privacy / offline / latency need? ─yes─► ON-DEVICE
-       │no
-       ▼
-  big model / retrains often? ─yes─► SERVER
+30 fps × network hop = visible jitter ─▶ device wins
 ```
-*Anchor: it's the same call aptkit makes — local Gemma (private/free/hardware-bound)
-vs cloud OpenAI (fast/paid/off-machine), one layer up.*
 
-**Q: "Why might on-device be *faster* than a server with a better GPU?"**
-Because the user waits on wall-clock, not on `f`. The server's GPU may run the
-model in 2ms, but the round-trip to reach it is tens to hundreds of ms and varies
-with the user's network. On-device adds zero network, so for a small model it wins
-the total even on slower silicon.
+Anchor: MediaPipe ran inside the app, no hop, per frame.
+
+**Q: aptkit runs Gemma locally via Ollama. Is that on-device inference like contrl?**
+
+Both avoid the cloud, so both buy privacy and offline — but they are different animals. Gemma-via-Ollama is a *large generative LLM* hosted on the user's machine instead of a cloud API. contrl's MediaPipe is a *small specialized classifier embedded in a mobile app* in a real-time hot path. Different model class, latency regime, and runtime.
 
 ```
-  on-device:  [ f 8ms ]                          = 8ms
-  server:     [ net 40 ][ f 2 ][ net 40 ]         = 82ms
-                ▲ the network, not the model, sets the budget
+local LLM (Ollama, big, seconds OK) ≠ on-device classifier (embedded, tiny, per-frame)
 ```
-*Anchor: latency is round-trip + compute; on-device deletes the round-trip.*
+
+Anchor: aptkit has the local-LLM flavor only; the embedded-mobile-classifier topology is not exercised.
+
+**Q: When does server inference beat device?**
+
+When none of latency/offline/privacy dominate and you want model capacity plus instant updates. Server lets you run a big model and fix it in one deploy instead of waiting for every user to update an app.
+
+```
+no hot-path / no offline / no egress concern ─▶ default SERVER
+```
+
+Anchor: the placement tree defaults to server only when all three device-pulling constraints are absent.
 
 ## See also
 
-- `13-quantization.md` — HOW you shrink `f` to pass the on-device size/latency gate
-- `01-supervised-pipeline.md` — the serving box this decision lives in
-- `../01-llm-foundations/01-what-an-llm-is.md` — the `complete()` seam that hides
-  local Gemma vs cloud OpenAI the same way `predict(x)` hides device vs server
+- [13-quantization.md](./13-quantization.md) — how you shrink a model to fit the device budget
+- [11-cold-start.md](./11-cold-start.md) — the personal agent that has to run somewhere

@@ -1,161 +1,164 @@
-# TCP, UDP, Connections, and Sockets
+# TCP/UDP, Connections, and Sockets
 
-**Industry name:** transport layer / connection lifecycle / sockets · *Industry standard*
+**Transport-layer connections · socket lifecycle · the fetch under the hood** — *Industry standard*
 
-## Zoom out, then zoom in
+## Zoom out — where the socket lives
 
-One layer below HTTP is the connection itself: the socket that gets opened, used, and torn down. Here's where aptkit's code opens one.
-
-```
-  Zoom out — where a socket gets opened
-
-  ┌─ Service layer ────────────────────────────────────────────┐
-  │  defaultHttpTransport → fetch(`${base}/api/chat`, ...)     │
-  │                          ★ this opens a TCP connection ★    │
-  └───────────────────────────┬────────────────────────────────┘
-                              │ TCP handshake → request → response → close
-  ┌─ Provider layer ─────────▼─────────────────────────────────┐
-  │  Ollama daemon listening on TCP :11434 (loopback)          │
-  └────────────────────────────────────────────────────────────┘
-
-  ┌─ Storage layer (buffr) ────────────────────────────────────┐
-  │  pg.Pool — keeps a SET of TCP connections OPEN, reuses them │
-  └────────────────────────────────────────────────────────────┘
-```
-
-**Zoom in.** A socket is the OS handle for one connection between two `(IP, port)` pairs. TCP gives you an ordered, reliable byte stream after a 3-way handshake; UDP gives you fire-and-forget datagrams with no ordering. Everything aptkit and buffr touch is TCP — HTTP rides on it, the pg wire protocol rides on it. The pattern to learn: **a connection has a lifecycle (open → use → close), and the big design choice is whether you pay that lifecycle cost per request or amortize it with a pool.**
-
-## Structure pass
-
-**Layers:** the agent loop (caller) → the transport (`fetch` / `pg.Pool`) → the OS socket → the listening daemon.
-
-**Axis — lifecycle: "when does the connection open and close?"** Trace it across the two socket-owners in this system:
+A `fetch` looks like one line, but under it is a whole connection lifecycle: open a TCP socket, three-way handshake, write the request, read the response, close or keep-alive. aptkit never touches that layer directly — it delegates entirely to Node's `fetch` (undici). Here's where the socket sits relative to your code.
 
 ```
-  Axis — connection lifecycle — across the two owners
+  Zoom out — the socket under the transport
 
-  owner            opens when            closes when         reused?
-  ──────────────────────────────────────────────────────────────────
-  fetch (Gemma)    each complete() call  response done       NO (per request)
-  fetch (embed)    each embed() call     response done       NO (per request)
-  pg.Pool (buffr)  lazily, up to a cap   pool idle/shutdown  YES (checked out/in)
+  ┌─ aptkit code ─────────────────────────────────────────────┐
+  │  defaultHttpTransport: await fetch(url, {method, body})    │
+  └──────────────────────────┬─────────────────────────────────┘
+                             │  fetch delegates to undici
+  ┌─ Node HTTP stack (undici) ▼────────────────────────────────┐
+  │  connection pool · keep-alive · the actual Socket           │ ← we are here
+  └──────────────────────────┬─────────────────────────────────┘
+                             │  TCP three-way handshake
+  ┌─ OS TCP stack ────────────▼────────────────────────────────┐
+  │  loopback socket → Ollama listening on :11434               │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-**Seam:** the boundary between aptkit's per-request `fetch` and buffr's pooled `pg` is where the lifecycle axis flips from "open-use-close every time" to "open once, lend out repeatedly." That flip is the entire reason connection pools exist.
+## Zoom in — the concept
+
+A **connection** is a live, ordered byte channel between two sockets; **TCP** is the protocol that makes it reliable and ordered; a **socket** is the endpoint your code holds. The question this topic answers: when aptkit calls `fetch`, what connection actually opens, who owns it, and when does it close? The short version — aptkit owns *none* of it; undici does — but you still need to know the lifecycle to reason about hangs and reuse.
+
+## Structure pass — the skeleton
+
+**Layers:** aptkit transport → undici (Node's HTTP client) → OS TCP → loopback. aptkit lives only at the top; everything socket-shaped is delegated downward.
+
+**Axis traced — "who owns the socket?"**
+
+```
+  One question down the stack: "who owns the socket?"
+
+  ┌────────────────────────────────────┐
+  │ aptkit defaultHttpTransport         │  → owns NOTHING (just a URL + body)
+  └────────────────────────────────────┘
+      ┌────────────────────────────────┐
+      │ undici (global fetch)            │  → owns the pool, keep-alive, the socket
+      └────────────────────────────────┘
+          ┌────────────────────────────┐
+          │ OS TCP stack                 │  → owns the handshake, buffers, FIN
+          └────────────────────────────┘
+              ┌────────────────────────┐
+              │ Ollama daemon            │  → owns the listening socket on :11434
+              └────────────────────────┘
+
+  the socket is owned two layers below aptkit — that's why there's nothing to tune here
+```
+
+**Seam — `fetch` itself.** The boundary between "aptkit's concern" and "the transport's concern" is the `fetch` call. Above it: request shape. Below it: the entire connection lifecycle, untouched and undocumented in aptkit.
 
 ## How it works
 
-#### Move 1 — the mental model
+### Move 1 — the mental model
 
-You know a `fetch()` from the browser: you call it, a request goes out, a response comes back, you don't think about the connection underneath. Under that `fetch` is a TCP socket — a handshake (SYN / SYN-ACK / ACK), then a reliable ordered byte stream, then a teardown. The kernel of TCP is *reliability through acknowledgement*: every byte is accounted for, retransmitted if lost, delivered in order.
+You know how when you call `fetch()` in the browser you never think about the TCP handshake — the platform handles open/reuse/close? Identical here, just Node's undici instead of the browser. aptkit hands undici a URL and a body; undici decides whether to open a new socket or reuse a pooled one.
 
 ```
-  The pattern — TCP connection lifecycle
+  The delegated-socket pattern — fetch owns the lifecycle
 
-  client                              server
-    │ ── SYN ──────────────────────►   │   handshake
-    │ ◄──── SYN-ACK ──────────────────│   (1 round trip
-    │ ── ACK ──────────────────────►   │    before any data)
-    │                                  │
-    │ ── request bytes ─────────────►  │   ordered, ack'd
-    │ ◄──── response bytes ───────────│   stream
-    │                                  │
-    │ ── FIN / close ───────────────►  │   teardown
+   aptkit: fetch(url, {method:'POST', body, signal})
+              │
+              ▼
+   undici:  [ pool ] ── reuse idle socket? ──► yes → write request
+              │                              └► no  → open new TCP socket
+              │                                       (SYN → SYN/ACK → ACK)
+              ▼
+   socket:  write headers+body → read status+body → keep-alive (back to pool)
+              │
+              └─ signal.abort() → undici destroys the socket
 ```
 
-The part people forget: the handshake is a full round trip *before the first byte of your request*. Pay it once and reuse the connection (a pool), or pay it every single time (per-request `fetch`). That's the load-bearing tradeoff.
+### Move 2 — walking the lifecycle
 
-#### Move 2 — walking the sockets in this repo
-
-**aptkit opens a fresh TCP connection per Ollama call.** The `fetch` in `defaultHttpTransport` (`packages/providers/gemma/src/gemma-provider.ts:204`) has no agent, no keep-alive hint, no pool — Node's default `fetch` (undici) may keep-alive under the hood, but aptkit's code makes no attempt to manage or reuse the connection. Each `complete()` is a standalone request:
+**aptkit opens nothing explicitly — `fetch` does.** There is no `net.Socket`, no `http.Agent`, no `keepAlive` config anywhere in the transports. The single line that triggers a connection:
 
 ```ts
+// packages/providers/gemma/src/gemma-provider.ts:204-209
 const res = await fetch(`${base}/api/chat`, {
   method: 'POST',
   headers: { 'content-type': 'application/json' },
-  body: JSON.stringify(payload),     // one request, one connection's worth of work
-  ...(signal ? { signal } : {}),     // the ONLY lifecycle control: abort
+  body: JSON.stringify(payload),
+  ...(signal ? { signal } : {}),
 });
 ```
 
-Because the target is loopback, the handshake cost is negligible (no network latency on `127.0.0.1`), so per-request connections are cheap here. The same code pointed at a remote host would pay a real handshake RTT per call — the cost the missing pool would then matter for (`07`).
+When this runs, undici either reuses a pooled keep-alive socket to `localhost:11434` or opens a fresh TCP connection (SYN/SYN-ACK/ACK). On loopback that handshake is microseconds — no network latency — but it's still TCP, still ordered, still reliable delivery. The embedding transport (`ollama-embedding-provider.ts:63`) does the same.
 
-**UDP appears nowhere.** No datagram sockets, no QUIC in aptkit's code (HTTP/3 would be QUIC-over-UDP, but the SDKs decide their own protocol). Mark it `not yet exercised` — UDP would become relevant only if the repo grew something latency-sensitive and loss-tolerant (telemetry, a metrics firehose), which it hasn't.
+**The transport always uses TCP — never UDP.** HTTP rides on TCP, so every aptkit wire is a connection-oriented, ordered, retransmitting stream. There's no UDP anywhere (no QUIC config, no datagram protocol). That matters because it means *ordering and delivery are free* — aptkit never has to handle out-of-order or dropped application messages. The cost: a connection must be established before the first byte, and a half-open connection (Ollama accepted but stalled) looks identical to a slow one to the caller.
 
-**buffr is where connection pooling actually lives.** `createPool` builds a `pg.Pool` (`buffr/src/db.ts:4-6`), and `PgVectorStore` uses it two ways:
-
-```ts
-// pg-vector-store.ts — a multi-statement transaction CHECKS OUT one connection
-const client = await this.pool.connect();   // borrow a socket from the pool
-try {
-  await client.query('begin');
-  for (const c of chunks) { /* upsert each */ }
-  await client.query('commit');
-} finally {
-  client.release();                          // return the socket to the pool
-}
-
-// search() uses the pool DIRECTLY — pool picks an idle connection for one query
-const { rows } = await this.pool.query(`select ... order by embedding <=> $1::vector limit $3`, ...);
-```
+**`stream:false` makes the response one buffered read.** The payload sets `stream:false` (`gemma-provider.ts:71`), so Ollama writes the *entire* JSON response before aptkit reads it. The socket carries one request, then one complete response body — no chunked streaming of model tokens. `await res.json()` reads to EOF and parses.
 
 ```
-  Layers-and-hops — pool checkout vs direct query
+  Socket exchange — one request, one full response (stream:false)
 
-  ┌─ buffr: PgVectorStore ─────────────────────────────────────┐
-  │  upsert():  pool.connect() → client → begin/commit → release│  (needs ONE
-  │             ◄── borrows a single socket for the txn ──────► │   socket the
-  │  search():  pool.query()  → pool lends any idle socket      │   whole txn)
-  └──────────────────────────┬─────────────────────────────────┘
-                  hop E: pg wire over reused TCP sockets
-                             ▼
-                    ┌─ Supabase Postgres ─┐
-                    │ accepts pooled conns │
-                    └──────────────────────┘
+  aptkit ──► [SYN]──────────────────────► Ollama   (handshake, if no pooled socket)
+         ◄── [SYN/ACK] ◄──────────────────
+         ──► [ACK] ─────────────────────►
+         ──► POST /api/chat + JSON body ─►          (one write)
+         ◄── 200 + FULL JSON body ◄───────          (one buffered read, stream:false)
+         (socket returns to undici keep-alive pool)
 ```
 
-The distinction matters: `upsert` runs a multi-statement transaction, so it must hold *one* connection across `begin`/`commit` — hence `connect()`/`release()`. `search` is a single statement, so `pool.query()` lets the pool pick any idle connection. Getting this wrong (running `begin`/`commit` on the pool directly) would scatter the transaction across different sockets and break atomicity — that's the load-bearing reason for the checkout pattern.
+**Cancellation destroys the socket — but nothing triggers cancellation on a deadline.** If a caller's `AbortSignal` fires, undici tears the socket down and `fetch` rejects with an abort error. The signal threads all the way from `run-agent-loop.ts:91` → `provider.complete(request)` → the transport's `...(signal ? {signal} : {})`. But — and this is the gap repeated across this guide — *nothing fires that signal on a timeout*. So the socket lifecycle has a clean cancel path that's only used if an *outer* caller aborts; a wedged Ollama with a live-but-silent socket will hold the connection open indefinitely. → `07`.
 
-#### Move 3 — the principle
+**Connection reuse is undici's default, untuned.** undici keeps sockets alive and pools them per origin. Since aptkit talks to one origin (`localhost:11434`), repeated calls likely reuse one warm socket — but aptkit neither configures nor relies on this. There's no `Agent` with `keepAlive`/`maxSockets`, so the behavior is whatever the Node version's undici defaults are. That's fine for a single-user local tool; it's `not yet exercised` as a tuned concern.
 
-The principle: **connection lifecycle is a cost you either pay per request or amortize with a pool, and the right choice is set by latency and concurrency, not taste.** aptkit's per-request `fetch` to loopback is correct *because* the handshake is free on `127.0.0.1`. buffr's pool is correct *because* the database is remote and queried often — paying a handshake per query would dominate latency. Same transport (TCP), opposite lifecycle decision, each justified by its distance.
+### Move 3 — the principle
+
+Delegating the socket to `fetch` is the right call — you don't reimplement TCP. But delegation hides the lifecycle, and the one part of the lifecycle aptkit *must* own anyway is the deadline. TCP will happily hold a connection open forever; the application has to decide "this is taking too long, kill the socket." aptkit wired the *mechanism* for that (the `AbortSignal` plumbing) but not the *policy* (a timer that fires it). The lesson: when you delegate the socket, you still own the timeout.
 
 ## Primary diagram
 
-```
-  Connection lifecycle recap — two owners, opposite choices
+The full connection lifecycle, with the abort path and the missing trigger marked.
 
-  aptkit (loopback, cheap handshake)        buffr (remote, expensive handshake)
-  ──────────────────────────────────        ───────────────────────────────────
-  complete() → fetch → [SYN/ACK]            search() → pool.query()
-             → POST /api/chat                        → reuse an OPEN socket
-             → response → CLOSE              upsert() → pool.connect()
-             (new socket each call)                   → begin..commit on ONE socket
-                                                      → release (back to pool)
-  no pool, fine because loopback            pool, required because remote+frequent
+```
+  aptkit socket lifecycle — owned by undici, aborted only by an outer caller
+
+  ┌─ aptkit transport ─────────────────────────────────────────┐
+  │  await fetch(url, {method, body, signal?})                  │
+  └──────────────────────────┬─────────────────────────────────┘
+                             │
+  ┌─ undici ──────────────────▼─────────────────────────────────┐
+  │  pool → reuse keep-alive socket OR open new TCP (handshake) │
+  │  write request → read FULL response (stream:false)          │
+  │  signal.abort() ──► destroy socket, reject fetch            │
+  │       ▲                                                     │
+  │       │  fired by: outer caller abort  ✓                    │
+  │       │  fired by: a timeout            ✗  ← MISSING        │
+  └──────────────────────────┬─────────────────────────────────┘
+                             │  TCP, loopback
+  ┌─ Ollama :11434 ───────────▼─────────────────────────────────┐
+  │  accepts → (may stall here with socket still open) → responds│
+  └──────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-TCP's handshake-before-data cost is the reason every serious database client pools connections and every HTTP/1.1 client tries keep-alive. The reason aptkit can skip pooling is purely that it talks to loopback; the reason buffr can't is that it talks across the internet to Supabase. This is also where `pg`'s pool gives you backpressure for free — when all connections are checked out, `connect()` queues, which is the closest thing to flow control in the whole system (`07`). For the reliability guarantees TCP provides under partial failure, see `study-distributed-systems`.
+TCP vs UDP, connection pooling, and keep-alive are the bread and butter of high-throughput services — at scale you tune `maxSockets`, you reuse connections to amortize handshakes, you sometimes reach for UDP/QUIC to dodge head-of-line blocking. aptkit needs none of that because it's one client to one local origin: handshake cost is negligible on loopback, and there's no throughput pressure from a single user. The interesting part isn't the tuning aptkit skipped — it's the one socket-level concern (the deadline) it can't delegate away and currently hasn't filled.
 
 ## Interview defense
 
-**Q: "Do you pool connections? Why or why not?"**
-Two-part answer: "For my Ollama calls, no — they're plain per-request `fetch` to loopback, where the TCP handshake is free, so pooling buys nothing. For the database in the companion repo, yes — a `pg.Pool`, because the DB is remote and queried per request, so reusing open sockets avoids a handshake RTT every time." Then name the subtlety: "Transactions check out a single connection with `connect()`/`release()`; single queries go through `pool.query()` so the pool picks any idle socket."
+**Q: When you call `fetch`, what happens at the connection level?**
+undici either reuses a pooled keep-alive socket to `localhost:11434` or opens a fresh TCP connection — handshake, then it writes the POST and reads the full response, because I use `stream:false`. It's all TCP, so ordering and delivery are free. I don't tune the pool; one local origin doesn't need it.
 
 ```
-  sketch: the lifecycle flip
-
-  loopback:  open→use→close  (per call, fine)
-  remote:    open ONCE → lend → return  (pool, required)
-              ▲ handshake paid once, not per query
+  fetch → undici pool → (reuse | new TCP handshake) → write → read full body
+                                              abort signal → destroy socket
 ```
+Anchor: *"undici owns the socket; I own the request shape and the deadline — and the deadline is the gap."*
 
-Anchor: *the handshake is a round trip before your first byte — pool it when that round trip costs something.*
+**Q: Could a socket leak or hang?**
+A hang, yes. The abort plumbing is there end-to-end, but nothing fires it on a timeout. If Ollama accepts the connection and then stalls, the socket stays open and `await fetch` never resolves. The fix is an `AbortController` with a timer at the transport. Leak — no, undici manages socket close/reuse.
 
 ## See also
 
-- `02-dns-routing-and-addressing.md` — resolution happens before the handshake
-- `04-tls-and-trust-establishment.md` — TLS adds more round trips on top of the TCP handshake
-- `07-timeouts-retries-pooling-and-backpressure.md` — the pool as backpressure; the missing timeout on the socket
+- `04-tls-and-trust-establishment.md` — the (absent) TLS layer above this socket
+- `05-http-semantics-caching-and-cors.md` — what travels over the connection
+- `07-timeouts-retries-pooling-and-backpressure.md` — the missing deadline, in depth
+- `02-dns-routing-and-addressing.md` — what the socket connects *to*

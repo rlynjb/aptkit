@@ -1,90 +1,100 @@
 # Design Docs — AptKit
 
-You're not writing these to teach yourself the code (that's `study-*`). You're writing them so a skeptical reviewer reads three pages, nods, and aligns behind a call you already made. The bottleneck at staff level isn't the diff — it's getting a room to agree on the diff *before* you cut it. These are the artifacts that do that.
+The decisions in this repo that were worth writing down, the bar they had to
+clear, and a reusable template so the next one is fast to write.
 
-Three decisions in this repo clear the bar. The rest don't, and saying which is which is half the skill.
+This is the human layer, not the study layer. The `study-*` books exist so you
+understand AptKit. These docs exist so a *room* aligns behind a decision — a
+reviewer, a teammate, a promo committee. Same engineer, coach posture: lead with
+the call, own the cost, surface what's open.
 
-## Which decisions warrant a doc
+## Which decisions warranted a doc
 
-A design doc is expensive attention. Spend it only where the decision was **significant and non-obvious** — hard to reverse, a real alternative existed, the impact crosses package boundaries, and someone will ask "why this way?" Rank the candidates, write the top few, and skip everything that's a default nobody would question.
+A design doc is expensive attention. Spend it where the decision was
+**significant and non-obvious** — hard to reverse, a real alternative existed,
+cross-cutting, and someone will ask "why this way?". Here's how AptKit's
+candidates ranked against that bar.
 
 ```
-  Decision ranking — AptKit
+  AptKit decisions ranked against the warrants-a-doc bar
 
-  decision                  reverse?   real alt?   cross-cut?   "why?"   → doc?
-  ────────────────────────  ────────   ─────────   ──────────   ──────   ──────
-  emulated-tool-calling     medium     yes (3)     no (1 pkg)   YES      ✔ 01
-  rag-from-contracts        HARD       yes (2)     YES (3 pkgs) YES      ✔ 02
-  single-bundle-publishing  HARD       yes (2)     YES (build)  YES      ✔ 03
+  decision                       reverse?   alt?   cross-cut?  asked?  → doc
+  ─────────────────────────────  ────────   ────   ──────────  ──────  ─────
+  emulated-tool-calling          hard       yes    yes         yes     01
+    Gemma has no native tools;
+    render schemas, parse JSON
+  rag-from-contracts             hard       yes    yes         yes     02
+    pipeline on two contracts,
+    never names a vendor
+  single-bundle-publishing       hard       yes    yes         yes     03
+    one npm tarball, 16 pkgs
+    inlined via bundledDeps
   ─────────────────────────────────────────────────────────────────────────
-  ESM-only / NodeNext       easy       weak        yes          no       skip
-  Node built-in test runner easy       yes         no           no       skip
-  per-package tsc -b build  easy       weak        yes          no       skip
-  capability = prompt+       —         —           yes          no       skip
-    policy+loop+validator                                       (pattern, not a fork)
-  cosine over an array       easy       yes         no           no       skip
-    (InMemoryVectorStore)
+  replay-centric eval            medium     yes    yes         maybe   skip
+  capability = pkg+policy+loop    medium     some   yes         maybe   skip
+  ESM-only / NodeNext            easy       weak   no          no      skip
+  Node built-in test runner      easy       yes    no          no      skip
 ```
 
-Why the skips are skips, in one line each so a reviewer doesn't wonder if you missed them:
+Three cleared the bar. The rest are real choices but don't earn a full RFC:
 
-- **ESM-only / NodeNext** — a 2024 TypeScript default; reversing it is a tsconfig flag, and no real alternative was weighed. Convention, not a decision.
-- **Node's built-in test runner over jest/vitest** — defensible, but cheap to reverse per-package and contained to test files. A preference, not a fork in the road.
-- **`capability = prompt package + tool policy + loop config + validator`** — this is a *pattern* the repo repeats six times, not a single non-obvious choice. It's worth a study file, not an RFC; there was never a competing design on the table.
-- **`InMemoryVectorStore` does a cosine scan over an array** — obvious for a dev/test default, and it sits *behind* the `VectorStore` contract that doc 02 is actually about. The interesting decision is the contract, not the toy implementation.
+- **replay-centric evaluation** (`packages/evals`) — live run → artifact → eval
+  → promote to fixture → deterministic replay. Genuinely load-bearing for
+  testing, but it's a well-trodden pattern (record/replay) and the "why" is
+  self-evident: deterministic tests over a non-deterministic model. No room
+  needs convincing. It's a *study* topic, not an *alignment* one.
+- **capability = prompt package + tool policy + loop config + validator** — the
+  shape every agent follows. A convention, not a contested decision; nobody was
+  going to argue for the alternative. Document it in onboarding, not an RFC.
+- **ESM-only, `NodeNext`, Node's built-in test runner** — defaults a reviewer
+  nods at. No real alternative was on the table once the repo committed to
+  modern Node. Skip.
 
-The three that made the cut are each a fork where a credible engineer would have gone the other way — and where this repo can point at the consequence of its choice in shipped code.
+If you're tempted to write a fourth, ask the four questions above. If you can't
+answer "yes" to "someone will ask why," you're documenting a default, and a
+default doesn't need a doc.
 
-## The reusable RFC template
+## The reusable template
 
-Every doc below uses the same nine-part spine — the canonical RFC shape. Copy this for the next decision you write up. It's ordered so a reviewer who reads top-to-bottom never has to scroll back up to find context.
-
-```
-  The 9-part RFC spine
-
-  ┌─ 1. Title + one-line summary ──────────────────────────┐
-  │     the decision in ONE sentence, at the top.          │
-  │     a reader who stops here still knows what you did.   │
-  └────────────────────────────┬───────────────────────────┘
-  ┌─ 2. Context / problem ──────▼───────────────────────────┐
-  │     what FORCED the decision — real repo constraints.   │
-  └────────────────────────────┬───────────────────────────┘
-  ┌─ 3. Goals & non-goals ──────▼───────────────────────────┐
-  │     what it must do + what it WON'T (kills scope creep).│
-  └────────────────────────────┬───────────────────────────┘
-  ┌─ 4. The decision ───────────▼───────────────────────────┐
-  │     the chosen design. MANDATORY diagram — shape first. │
-  └────────────────────────────┬───────────────────────────┘
-  ┌─ 5. Alternatives (2–3) ─────▼───────────────────────────┐
-  │     each real option + why it LOST. "design it twice."  │
-  └────────────────────────────┬───────────────────────────┘
-  ┌─ 6. Tradeoffs accepted ─────▼───────────────────────────┐
-  │     "we chose X, accepting Z." no apology.              │
-  └────────────────────────────┬───────────────────────────┘
-  ┌─ 7. Risks & mitigations ────▼───────────────────────────┐
-  │     what breaks, what guards it.                        │
-  └────────────────────────────┬───────────────────────────┘
-  ┌─ 8. Rollout / migration ────▼───────────────────────────┐
-  │     how it ships safely; what changes for callers/data. │
-  └────────────────────────────┬───────────────────────────┘
-  ┌─ 9. Open questions ─────────▼───────────────────────────┐
-  │     what's still undecided. honesty = staff signal.     │
-  └─────────────────────────────────────────────────────────┘
-```
-
-Two rules that make these land, both from the coach:
-
-- **Lead with the decision, not the suspense.** Section 1 is the call in a sentence. A reviewer should be able to disagree with you from the title alone — that's what gets you the fast "yes" or the early "wait, why?".
-- **A doc with no alternatives reads as undercooked.** Section 5 is "design it twice" written down. If you can't name two options you rejected and why, you haven't designed yet — you've defaulted, and a sharp reviewer will smell it.
-
-## How to use these
+Every doc here is the same nine-part spine — the canonical RFC shape. Copy it
+for the next decision:
 
 ```
-  .aipe/rehearse-design-doc/
-    00-overview.md                  ← you are here (ranking + template)
-    01-emulated-tool-calling.md     ← Gemma has no native tools; we fake them
-    02-rag-from-contracts.md        ← RAG depends on 2 interfaces, not a vendor
-    03-single-bundle-publishing.md  ← ship 16 packages as ONE npm tarball
+  The RFC spine — nine parts, same order every time
+
+  1. Title + one-line summary    the decision in a sentence, at the top
+  2. Context / problem           what forced it — real constraints, not theory
+  3. Goals & non-goals           what it must do; what it explicitly won't
+  4. The decision                the chosen design + a mandatory diagram
+  5. Alternatives considered     2–3 real options, each with why it lost
+  6. Tradeoffs accepted          what it costs, owned without flinching
+  7. Risks & mitigations         what breaks, what guards it
+  8. Rollout / migration         how it ships safely; what changes for callers
+  9. Open questions              what's still undecided (honesty = signal)
 ```
 
-Read 02 first if you're being asked about architecture — it's the load-bearing call, and it's the one with the cleanest proof (two unrelated consumers ride the same two interfaces). Read 01 if the conversation is about local models and weak-model reliability. Read 03 if it's about packaging, release, or "why is the repo root private?". Each stands alone; none depends on the others.
+How to use it:
+
+- **Lead with the decision.** Part 1 is one sentence a skeptic can quote back.
+  No suspense — the reviewer should know your call before the context.
+- **Part 4 always has a diagram.** The shape before the prose. If you can't draw
+  it, you don't understand it yet.
+- **Part 5 is "design it twice" written down.** A doc with no alternatives reads
+  as undercooked — it looks like you found the first thing that worked and
+  stopped. Two-to-three real options, each with the specific reason it lost.
+- **Parts 6 and 9 are where staff signal lives.** Owning the cost without an
+  apology, and naming what you still don't know, is what separates a doc that
+  gets the yes from a sales pitch that gets picked apart.
+
+## The three docs
+
+```
+  01-emulated-tool-calling.md     teach a tool-less local model to call tools
+  02-rag-from-contracts.md        own the RAG pipeline behind two contracts
+  03-single-bundle-publishing.md  ship 16 packages as one npm tarball
+```
+
+Read them in any order — they're independent decisions. If you're walking
+someone through "why does AptKit look like this," `02` is the spine (the
+contract boundary that everything else rides), `01` is the cleverest local
+detail, and `03` is the one that bit hardest in practice.

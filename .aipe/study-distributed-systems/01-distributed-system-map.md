@@ -1,254 +1,197 @@
 # 01 — The Distributed System Map
 
-**Industry names:** system topology · failure domains · service boundary map · trust/ownership map — *Industry standard.*
+**Industry names:** coordination map · failure domains · trust/ownership boundaries · the "fallacies of distributed computing." **Type:** Industry standard.
 
 ## Zoom out, then zoom in
 
-Before any mechanism, look at where coordination actually happens. aptkit *looks*
-like one process, and most of it is. The distributed-systems content lives only at
-the boundaries where one process talks to another over a network it doesn't own.
+Here's the whole thing in one frame. aptkit runs in one process; the moment a call leaves that process you've crossed into distributed-systems territory. There are exactly four crossings, and this guide is built around them.
 
 ```
-  Zoom out — the four bands, and where boundaries cross them
+  Zoom out — where the coordination boundaries live
 
-  ┌─ App layer (single Node process) ──────────────────────────────────┐
-  │   runAgentLoop · RagQueryAgent · ToolRegistry                       │
-  │   ★ everything here is in-process: no coordination ★                │
-  └───────────────────────────┬─────────────────────────────────────────┘
-                              │  ModelProvider.complete() / EmbeddingProvider.embed()
-  ┌─ Provider / adapter layer ▼─────────────────────────────────────────┐
-  │   FallbackModelProvider · ContextWindowGuardedProvider              │
-  │   GemmaModelProvider · OllamaEmbeddingProvider                      │
-  │   ★ THE SEAM: in-process call on the near side,                     │
-  │     network call on the far side ★                                  │ ← we are here
-  └───────────────────────────┬─────────────────────────────────────────┘
-                              │  HTTP :11434          │  TCP (pg)
-  ┌─ External services ───────▼───────────────────────▼─────────────────┐
-  │   Ollama daemon (separate process)   Supabase Postgres (network DB) │
-  │   ★ partial failure originates here ★                               │
-  └─────────────────────────────────────────────────────────────────────┘
+  ┌─ App process (aptkit, in-memory) ──────────────────────────────┐
+  │  runAgentLoop → providers → tools → InMemoryVectorStore         │  ← one failure domain:
+  │  everything here lives or dies together                         │    process crash = all gone
+  └───────┬──────────────────────────────────────────┬─────────────┘
+          │ ★ seam 1: HTTP                            │ ★ seam 3+4: TCP/SQL
+          ▼                                           ▼
+  ┌─ Provider service ──────────┐          ┌─ Network database ──────────────┐
+  │  Ollama daemon :11434       │          │  Supabase Postgres + pgvector   │  ← separate
+  │  (separate process/host)    │          │  agents.documents / chunks /    │    failure
+  │  ★ seam 2 = the chain of    │          │  messages                       │    domains
+  │    providers in front of it │          │                                 │
+  └─────────────────────────────┘          └─────────────────────────────────┘
 ```
 
-Zoom in: a **system map** answers one question — *which boxes can fail
-independently of which other boxes?* A box that can crash, hang, or fall off the
-network without taking its caller down with it is a **failure domain.** Drawing
-those domains, and the boundaries between them, is the first move before you reason
-about anything else. You can't reason about partial failure until you know which
-parts can fail *partially*.
+Zoom in: a **coordination map** is just this — the nodes, the messages between them, who owns which state, and where the *failure domains* split. A failure domain is a blast radius: everything that fails together when one thing fails. Inside the process there's one domain (a crash takes the whole agent loop and the in-memory vector store with it). Cross a seam and you've created a second domain that can fail *independently* — and independent failure is the entire subject of distributed systems.
 
-## Structure pass
+## Structure pass — layers, one axis, the seams
 
-**Layers.** Three nested levels: (1) the in-process app, (2) the provider adapters
-that sit on the seam, (3) the external services across the network.
-
-**Axis — trace `failure origin` down the layers.** Hold one question constant:
-*where does a failure start, and what contains it?*
+**Layers** (outer to inner):
 
 ```
-  One axis — "where does failure originate / get contained?" — top to bottom
-
-  ┌─ App layer ───────────────────────────────┐
-  │  failure = a thrown error from complete()  │  → caught by runAgentLoop's
-  │                                            │    try/catch around the tool call
-  └─────────────────────┬──────────────────────┘
-       ┌────────────────▼───────────────────────┐
-       │ Provider layer: FallbackModelProvider   │  → CONTAINS failure: catches,
-       │                                         │    records attempt, tries next
-       └────────────────┬───────────────────────┘
-            ┌───────────▼────────────────────────┐
-            │ External: Ollama / Postgres         │  → ORIGINATES failure: HTTP
-            │                                     │    non-200, ECONNREFUSED, hang
-            └─────────────────────────────────────┘
-
-  the answer flips at each altitude — that flip is where the contracts live
+  Layer                         Lives in
+  ────────────────────────────  ──────────────────────────────────
+  Orchestration   runAgentLoop  packages/runtime/src/run-agent-loop.ts
+  Provider port   ModelProvider  packages/runtime/src/  (the contract)
+  Provider adapter  Gemma/Fallback  packages/providers/*/src/
+  Transport         HTTP fetch / pg.Pool   (the wire)
+  External node     Ollama / Postgres      (separate process)
 ```
 
-**Seams (boundaries where the axis-answer flips).** The flip from "originates" to
-"contains" happens at the provider adapter. That's the load-bearing seam: the
-near side is a normal in-process method call (`provider.complete(request)`); the
-far side is a network round-trip that can fail in ways an in-process call never
-does (it can *hang*, it can return *stale* data, it can *partially* apply a write).
-Every distributed-systems lesson in this repo hangs off one of these four seams.
+**The one axis to trace: *failure containment* — "when this layer's callee dies, what happens?"** Hold that question still and walk down:
+
+```
+  "when the thing below me fails, what do I do?"  — traced downward
+
+  ┌──────────────────────────────────────────────┐
+  │ runAgentLoop                                  │  → catches, emits warning, may force a
+  │                                               │    final turn (run-agent-loop.ts:216-225)
+  └───────────────────────┬───────────────────────┘
+        ┌─────────────────▼──────────────────────────┐
+        │ FallbackModelProvider                       │  → catches a THROW, records attempt,
+        │                                             │    advances to next provider (:64)
+        └─────────────────┬──────────────────────────┘
+              ┌───────────▼────────────────────────────┐
+              │ GemmaProvider (fetch)                   │  → throws on !res.ok; on a HANG,
+              │                                         │    never throws → nobody contains it
+              └───────────┬────────────────────────────┘
+                    ┌─────▼──────────────────────────────┐
+                    │ Ollama daemon                       │  → can be down, slow, or wedged
+                    └─────────────────────────────────────┘
+
+  the answer flips at the fetch: above it, failure is contained;
+  AT the wire, a hang is invisible — that's the load-bearing gap
+```
+
+**The seams** (a boundary matters when the axis flips across it):
+
+- **Seam 1 — app ↔ Ollama** (`gemma-provider.ts:201`). Failure containment flips: above the `fetch`, errors are caught and classified; the `fetch` itself contains a *thrown* HTTP error (`!res.ok`) but **not a hang**. No timeout, no `AbortController` of its own.
+- **Seam 2 — the failover chain** (`fallback-provider.ts:50`). Control flips: the chain decides *which* provider runs next, but only when the current one *throws*. A provider that hangs never yields control back.
+- **Seam 3 — app ↔ Postgres** (`pg-vector-store.ts:40`). State ownership flips: in-memory state is gone on crash; Postgres state is durable and shared across processes. A connection pool (`pg.Pool`) sits on the boundary.
+- **Seam 4 — the dual write** (`runtime.ts:11`/`:17`). Atomicity flips: the chunk upsert is one transaction; the doc-then-chunks pair is *two*, with no envelope. → walked in `08`.
 
 ## How it works
 
-### Move 1 — the mental model: a process can only see messages, never state
+### Move 1 — the mental model
 
-The single hardest thing about a boundary: your process never sees the other side's
-*state*. It only sees the *messages* that come back — or the silence when none do.
-A successful `fetch()` is a message. An `ECONNREFUSED` is a message. But a `fetch()`
-that hasn't returned yet is **ambiguous** — the daemon might be working, might be
-wedged, might be dead. You cannot tell from inside your process. That ambiguity is
-the entire problem.
+You already know the shape from a `fetch()` in the browser: your component owns its state, the server owns its state, and the network in between can drop, delay, or duplicate the request. A distributed system is that picture with more boxes. The map names every box, every arrow (message), and — the part people skip — draws the dotted line around each *failure domain*.
 
 ```
-  The boundary — you see messages, never the far side's state
+  The map's kernel — node, message, ownership, failure domain
 
-  near side (your process)        boundary         far side (you can't see in)
-  ┌────────────────────┐                           ┌──────────────────────┐
-  │ provider.complete()│ ──── request message ───► │  Ollama: working?    │
-  │                     │                           │          wedged?      │
-  │   awaiting...       │ ◄─── response message ─── │          crashed?     │
-  │   (ambiguous!)      │      ...or silence        │  YOU CANNOT TELL      │
-  └────────────────────┘                           └──────────────────────┘
-              ▲
-              └─ the gap between "sent" and "received" is where
-                 every distributed-systems bug lives
+   ┌───────────┐   message    ┌───────────┐
+   │  node A   │ ───────────► │  node B   │
+   │  owns: X  │ ◄─────────── │  owns: Y  │
+   └───────────┘   reply      └───────────┘
+   └── domain 1 ──┘            └── domain 2 ──┘
+        ▲                            ▲
+        └── can crash without ───────┘
+            taking the other down
 ```
 
-### Move 2 — walking the four seams
+The kernel: **two things own different state, talk over a channel that can fail, and can die independently.** Lose any one element and it stops being a distributed problem — collapse them into one process and you're back to ordinary function calls.
 
-**Seam 1 — the app↔Ollama HTTP boundary.** This is the one you cross most. The
-default transport is a bare `fetch`:
+### Move 2 — walking the map
 
-```ts
-// packages/providers/gemma/src/gemma-provider.ts:201-215
-function defaultHttpTransport(host: string): GemmaChatTransport {
-  const base = host.replace(/\/$/, '');
-  return async ({ signal, ...payload }) => {
-    const res = await fetch(`${base}/api/chat`, {       // ← network round-trip
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(payload),
-      ...(signal ? { signal } : {}),                    // ← only cancellation, no deadline
-    });
-    if (!res.ok) {
-      throw new Error(`ollama HTTP ${res.status}: ...`); // ← failure becomes a thrown error
-    }
-    return (await res.json()) as OllamaChatResponse;
-  };
-}
+**The nodes and what each owns.** Map ownership before mechanics; a bug is usually "who did I think owned this?"
+
+```
+  Node              Owns (authoritative state)        Volatile?
+  ────────────────  ─────────────────────────────────  ─────────
+  aptkit process    agent-loop state, InMemoryVector-   YES — gone
+                    Store, usage ledger                  on crash
+  Ollama daemon     loaded model weights, its own        separate
+                    request queue                        lifecycle
+  Supabase PG       agents.documents / chunks /          durable,
+                    messages (the system of record)      shared
 ```
 
-The annotation that matters: the `signal` is *caller-driven cancellation*, not a
-*timeout*. Nothing in this function gives up on its own. The embedding provider is
-the same shape (`ollama-embedding-provider.ts:60-75`). This is failure domain #1 —
-Ollama is a separate OS process that can die or hang without your process knowing.
+The in-memory vector store (`packages/retrieval`, `InMemoryVectorStore`) is *not* authoritative — it's a cache/test double. The authoritative copy is buffr's `PgVectorStore` against Postgres. That distinction is the whole reason the `VectorStore` contract exists: same interface, two failure profiles.
 
-**Seam 2 — the fallback chain (a failure-containment boundary).** This is the one
-adapter whose entire job is to *contain* a far-side failure:
+**The messages and their direction.** Every arrow on the map is a message that can fail. Label its direction and its failure mode:
 
-```ts
-// packages/providers/fallback/src/fallback-provider.ts:50-64
-for (let index = 0; index < this.providers.length; index += 1) {
-  const provider = this.providers[index];
-  request.signal?.throwIfAborted();
-  try {
-    const response = await provider.complete(request);  // ← may be the network call
-    this.lastSelectedProvider = { providerId: provider.id, ... };
-    return { ...response, model: response.model ?? provider.defaultModel };
-  } catch (error) {
-    // ← failure CONTAINED here: recorded, then we fall through to the next provider
-  }
-}
+```
+  Layers-and-hops — one agent turn that searches the KB and persists a trace
+
+  ┌─ App (aptkit) ──────────┐  hop 1: POST /api/chat   ┌─ Provider node ────┐
+  │  GemmaProvider.complete  │ ───────────────────────► │  Ollama :11434     │
+  │                          │  hop 4: JSON reply  ◄──── │  (may hang here)   │
+  └───────────┬──────────────┘                          └────────────────────┘
+       hop 2  │ tool_call: search_knowledge_base
+              ▼
+  ┌─ Storage (buffr → PG) ──┐  hop 3: SELECT … ORDER BY embedding <=> $1  ┌─ Postgres ─┐
+  │  PgVectorStore.search    │ ──────────────────────────────────────────► │  pgvector  │
+  └───────────┬──────────────┘                                            └────────────┘
+       hop 5  │ trace event (NDJSON) → SupabaseTraceSink → INSERT messages
+              ▼  (created_at = emit timestamp)  → agents.messages
 ```
 
-This is the seam where the axis flips from "originates" to "contains." Notice what
-it *can't* contain: a provider that hangs forever never reaches the `catch`, so the
-loop never advances. Containment depends on the far side actually *failing* rather
-than stalling — which is exactly why finding #1 (no timeout) undermines this seam.
+Hop 1 is the dangerous one: it's the only hop with no deadline. Hop 3 lives behind a connection pool that can exhaust. Hop 5 is fire-and-forget-ish — the trace insert failing should not fail the turn (a property `study-debugging-observability` cares about).
 
-**Seam 3 — buffr↔Postgres (a network database).** buffr opens a `pg.Pool`
-(`buffr/db.ts:4-6`) and every `PgVectorStore` query crosses it. A pool is itself a
-small distributed-systems object: a bounded set of TCP connections shared across
-concurrent callers. Run out of connections and callers *queue*; the DB goes away
-and every checked-out connection errors. → walked in
-`05-replication-partitioning-and-quorums.md` and `09`.
-
-**Seam 4 — the trace as an event log.** The `CapabilityEvent` union
-(`runtime/events.ts:1-24`) is an append-only log emitted as the agent runs. In
-aptkit it's streamed as NDJSON; in buffr it's drained into `agents.messages`. An
-event log that has to survive racing writers and reconstruct order is a
-distributed-systems artifact even inside one process — walked in `06` and `07`.
+**The failure domains.** Draw the blast radius. Inside aptkit, everything shares one — kill the process and the loop, the in-memory store, and the ledger all vanish together; that's *fine* because none of it is authoritative. The two external nodes are separate domains: Ollama can be restarting while Postgres is healthy, or vice versa. The skill is asking, for each piece of state, "if this domain dies mid-operation, what's left half-done?" For the dual write, the answer is "an orphaned document" (→ `08`).
 
 ### Move 3 — the principle
 
-A "distributed system" is not defined by how many machines you have. It's defined
-by how many **independent failure domains** a single operation depends on. The
-instant your operation's success depends on a box that can fail without telling
-you, you're doing distributed systems — even if both boxes are on your laptop. Map
-the failure domains first; the mechanisms are all answers to "what happens when
-domain X is slow, dead, or racing?"
+The map is the first artifact you draw for *any* system, before any mechanism. Nodes, messages, ownership, failure domains. Most distributed bugs are not exotic — they're "I drew the boundary in the wrong place" or "I forgot this arrow could fail." aptkit has only four arrows that can fail independently; a system at scale has thousands. The discipline is identical, and learning it on four is how you earn the right to reason about thousands.
 
 ## Primary diagram
 
-The full map, with every boundary and failure domain labelled.
+The full map, every node, message, ownership, and failure domain in one frame.
 
 ```
-  aptkit + buffr — failure domains and the boundaries between them
+  aptkit + buffr — the complete coordination map
 
-  ┌─ FAILURE DOMAIN A: aptkit process ────────────────────────────────────┐
-  │  runAgentLoop ──► provider.complete() ──► [adapters: fallback, guard]  │
-  │  emit(CapabilityEvent) ─────────────► trace (NDJSON stream)            │
-  └───────────────┬─────────────────────────────────┬──────────────────────┘
-                  │ HTTP :11434 (no timeout)         │  (aptkit core also consumed
-                  ▼                                  │   by buffr as a library)
-  ┌─ FAILURE DOMAIN B: Ollama daemon ──┐             │
-  │  /api/chat   (Gemma)               │             │
-  │  /api/embed  (nomic-embed-text)    │             │
-  └────────────────────────────────────┘             │
-                                                      ▼
-  ┌─ FAILURE DOMAIN C: buffr process ─────────────────────────────────────┐
-  │  ChatSession.ask() ──► PgVectorStore ──► pg.Pool ──┐                    │
-  │                   └──► SupabaseTraceSink.flush() ──┤                    │
-  └────────────────────────────────────────────────────┼───────────────────┘
-                                                        │ TCP (pg)
-  ┌─ FAILURE DOMAIN D: Supabase Postgres ────────────────▼─────────────────┐
-  │  agents.documents · agents.chunks (pgvector) · conversations · messages│
-  └─────────────────────────────────────────────────────────────────────────┘
-
-  A operation can depend on A→B (every model call) and C→B + C→D (every buffr turn).
-  Each arrow is a place the operation can hang, fail, or partially apply.
+  ╔═ Failure domain: APP PROCESS (volatile) ════════════════════════════════╗
+  ║  ┌────────────────────────────────────────────────────────────────────┐ ║
+  ║  │ runAgentLoop (maxTurns=8)  — orchestration, contains caught errors  │ ║
+  ║  └───┬───────────────────────────────────────────────┬─────────────────┘ ║
+  ║      │ ModelProvider.complete()                       │ tool: search_kb   ║
+  ║  ┌───▼─────────────────────────┐               ┌──────▼─────────────────┐ ║
+  ║  │ FallbackModelProvider (seam2)│               │ RetrievalPipeline       │ ║
+  ║  │  advances on THROW only      │               │  (in-mem OR PgVector)   │ ║
+  ║  └───┬──────────────────────────┘               └──────┬──────────────────┘ ║
+  ║      │ GemmaProvider.complete                          │                   ║
+  ╚══════┼═══════════════════════════════════════════════ ┼═══════════════════╝
+         │ seam1: HTTP POST /api/chat  (NO TIMEOUT)        │ seam3: pg.Pool / TCP:5432
+         ▼                                                 ▼
+  ╔═ Domain: OLLAMA ═══════╗        ╔═ Failure domain: SUPABASE POSTGRES (durable) ═══╗
+  ║ Ollama daemon :11434   ║        ║  agents.documents ◄┄┄ soft link ┄┄ agents.chunks ║
+  ║ down | slow | WEDGED   ║        ║  (no FK — 001_agents_schema.sql:27)              ║
+  ╚════════════════════════╝        ║  agents.messages (created_at = emit ts)          ║
+                                    ║         ▲ seam4: dual write lands here, non-atomic║
+                                    ╚══════════════════════════════════════════════════╝
 ```
 
 ## Elaborate
 
-The "failure domain" framing comes from large-scale systems work where the
-question is never "is the system up?" but "*which parts* are up, and what's still
-correct given the parts that aren't?" The classic reference is the *fallacies of
-distributed computing* (the network is reliable, latency is zero, bandwidth is
-infinite...). aptkit violates the first fallacy at exactly two arrows: the Ollama
-HTTP call and the pg TCP connection. Everything else is in-process and immune.
+The framing comes from Peter Deutsch's "Eight Fallacies of Distributed Computing" (Sun, 1994): the network is *not* reliable, latency is *not* zero, bandwidth is *not* infinite, the network is *not* secure, topology *does* change, and so on. Each fallacy maps to a seam here: "the network is reliable" is exactly the assumption the timeout-less Ollama fetch makes. The reason you draw the map first is that every fallacy is a question you can only ask once you've located the boundary it applies to.
 
-What makes this repo a *good* place to learn the subject rather than a frustrating
-one: the failure domains are few and concrete. You can hold all four in your head.
-At Google scale the map has thousands of boxes and you reason statistically; here
-you reason exactly, which is the right place to build the intuition first.
+The repo is a good *teacher* precisely because it's small. With four seams you can hold the entire map in your head and reason about each failure exhaustively — which is impossible at scale but is how you build the instinct that transfers.
 
 ## Interview defense
 
-**Q: "Is this a distributed system?"**
-Answer with the verdict, not a dodge: "It's a single-process app with two real
-network boundaries — Ollama over HTTP and Supabase Postgres over TCP. So the
-*distributed-systems surface* is exactly those two arrows plus the fallback chain
-that sits on them. Everything else is in-process and has no partial-failure
-semantics. I'd rather name the two real seams precisely than claim a cluster I
-didn't build."
+**Q: "Walk me through where this system can partially fail."**
+Sketch the four-seam map. Say: "single process, so most of it is one failure domain — a crash takes the in-memory store and the loop together, and that's acceptable because none of it is authoritative. The authoritative state is Postgres. The independent-failure surface is four boundaries: the Ollama HTTP call, the failover chain in front of it, the Postgres connection, and the dual write. The one I'd fix first is the Ollama call — no timeout, so a hung daemon hangs everything above it."
 
 ```
-  the one-line map you sketch while answering
+  the answer sketch — four arrows that can fail
 
-  [aptkit] ──HTTP──► [Ollama]        ← seam 1: can hang (no timeout)
-  [buffr]  ──TCP───► [Postgres]      ← seam 3: pool, transactions, racing writes
-       └─ fallback chain wraps seam 1 ← seam 2: contains failure
+  loop → [chain → gemma] ──HTTP, no timeout──► Ollama   ★ fix first
+  loop → pipeline ──pool/TCP──► Postgres ──► (doc, then chunks: not atomic)
 ```
 
-**Q: "What's a failure domain and why map it first?"**
-"A failure domain is a box that can fail independently of its caller. I map them
-first because partial failure — the whole subject — is only meaningful between
-domains. Inside one process a function either runs or the process dies; across a
-domain boundary the callee can hang, return stale data, or partially apply a write
-while the caller keeps running. The map tells me which arrows need timeouts,
-retries, and idempotency, and which don't need anything because they never leave
-the process."
+Anchor: *failure domains are blast radii; aptkit has one volatile and one durable, joined by four fallible arrows.*
 
-*Anchor:* four failure domains, two network arrows, `fallback-provider.ts:50-64`
-is the one that contains failure.
+**Q: "Why call a single-process library a distributed system at all?"**
+Because the moment a call crosses to Ollama or Postgres, you have two parties owning different state over a channel that can fail independently — that's the definition, full stop. The honest answer is most of the canon (consensus, quorums) is `not yet exercised`; what *is* exercised is partial failure and idempotency, and those are the ones that actually bite small systems.
+
+Anchor: *distributed ≠ scaled; distributed = independent failure across a boundary.*
 
 ## See also
 
-- `02-partial-failure-timeouts-and-retries.md` — what to do at each boundary arrow
-- `09-distributed-systems-red-flags-audit.md` — ranked risks per seam
-- **study-networking** — the wire-level mechanics of the two network arrows
-- **study-system-design** — why these boundaries exist (local-first, single DB)
-```
+- `02-partial-failure-timeouts-and-retries.md` — seam 1, the missing deadline
+- `08-sagas-outbox-and-cross-boundary-workflows.md` — seam 4, the orphaning dual write
+- `09-distributed-systems-red-flags-audit.md` — the ranked risk list
+- `study-system-design` (`.aipe/study-system-design/`) — the architectural shape of these same boundaries
+- `study-networking` — the transport beneath every arrow on this map

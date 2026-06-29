@@ -1,83 +1,91 @@
-# 00 — System Overview
+# 00 — The whole system in one map
 
-One page. The whole of aptkit in one diagram, plus the seam that connects it to
-buffr. Read this and you can place every pattern file that follows.
-
-## What aptkit *is*, in one sentence
-
-aptkit is a provider-neutral agent toolkit: a stack of swappable contracts
-(`ModelProvider`, `EmbeddingProvider`, `VectorStore`, `CapabilityTraceSink`) with
-a default local implementation of each, packaged as one npm bundle so a host app
-can `npm install` it and fill the slots. It runs end-to-end with zero cloud. The
-durable deployment lives in a separate repo, **buffr**, which fills the slots with
-Postgres.
-
-## The full-system map
-
-The whole system, top to bottom, with the library/deployment boundary drawn as a
-hard horizontal line. Above the line ships to npm; below it is one consumer.
+Read only this file and you have the architecture. aptkit is a library of
+agent capabilities that depend on two ports and never name a vendor; buffr is
+the deployment that plugs real implementations into those ports. The diagram
+below is the forest — every later file zooms into one tree.
 
 ```
-  aptkit — the full system, and the seam to buffr
+  AptKit system map — library (aptkit) + deployment (buffr), one bundle between them
 
-  ┌─ UI layer (apps/studio, React 18 + Vite) ───────────────────────────────┐
-  │  AgentReplayShell (5 analytics agents)  +  RagQueryWorkspace             │
-  │  + CapabilitiesWorkspace + DocPage                                       │
-  │  Vite middleware: 5 replay routes, streams CapabilityEvent as NDJSON     │
-  └───────────────────────────────┬──────────────────────────────────────────┘
-                                  │  in-process call + application/x-ndjson
-  ┌─ agents layer (packages/agents/*) ─────────────────────────────────────┐
-  │  recommendation · anomaly-monitoring · diagnostic-investigation ·        │
-  │  query · rubric-improvement · rag-query                                  │
-  │  each = prompt package + tool policy + loop config + validator           │
-  └───────────────────────────────┬──────────────────────────────────────────┘
-                                  │  runAgentLoop({ model, tools, trace, ... })
-  ┌─ runtime layer (packages/runtime) ─────────────────────────────────────┐
-  │  runAgentLoop (bounded)  ·  CapabilityEvent trace  ·  parseAgentJson     │
-  │  ★ ModelProvider.complete() — the contract everything depends on ★       │
-  └───────────────┬─────────────────────────────────┬─────────────────────────┘
-                  │ ModelProvider                    │ tools.callTool
-  ┌─ providers ───▼──────────────┐   ┌─ retrieval/memory ▼────────────────────┐
-  │ gemma  (local Ollama,default)│   │ EmbeddingProvider + VectorStore         │
-  │ local  (context-window guard)│   │ InMemoryVectorStore (cosine scan)       │
-  │ fallback (sequential chain)  │   │ OllamaEmbeddingProvider (nomic, 768)    │
-  │ anthropic · openai (unbundled│   │ search_knowledge_base tool              │
-  │   adapters, no key in default)│   │ @aptkit/memory (remember/recall)        │
-  └───────────────┬──────────────┘   └────────────────┬───────────────────────┘
-                  │ HTTP :11434 (no key, no TLS)       │ VectorStore.upsert/search
-                  ▼                                    │
-        ┌──────────────────┐                           │
-        │  Ollama (local)  │                            │
-        └──────────────────┘                            │
-  ═══════════════════════════════════════════════════════│════════════════════
-  LIBRARY / DEPLOYMENT SEAM — above ships as @rlynjb/aptkit-core@0.4.1 to npm
-  ═══════════════════════════════════════════════════════│════════════════════
-  ┌─ buffr (separate repo, consumes the bundle) ──────────▼──────────────────┐
-  │  PgVectorStore implements VectorStore   →  Supabase pgvector + HNSW       │
-  │  SupabaseTraceSink implements CapabilityTraceSink → agents.messages       │
-  │  ChatSession: warm pg pool, one conversation, memory.remember per turn    │
-  │  shared `agents` schema in reindb (chunks/documents/conversations/...)    │
-  └────────────────────────────────────────────────────────────────────────┘
+  ┌─ PRESENTATION ────────────────────────────────────────────────────────────┐
+  │  apps/studio  (React 18 + Vite)        buffr CLI  (React + Ink, TUI)        │
+  │  preview + replay UI, 5 NDJSON         one conversation, held in-process    │
+  │  replay routes via Vite middleware     buffr/src/cli/chat.tsx               │
+  └───────────┬──────────────────────────────────────┬─────────────────────────┘
+              │ HTTP / NDJSON                          │ in-process call
+  ┌─ CAPABILITY (agents) ──────────────────────────────▼─────────────────────────┐
+  │  6 agents, each = prompt package + tool policy + loop config + validator      │
+  │  recommendation · anomaly-monitoring · diagnostic-investigation               │
+  │  query · rubric-improvement · rag-query        packages/agents/*              │
+  └───────────┬───────────────────────────────────────────────────────────────────┘
+              │ runAgentLoop(...)  — bounded turns + tool-call budget + forced synthesis
+  ┌─ RUNTIME ─▼───────────────────────────────────────────────────────────────────┐
+  │  runAgentLoop   CapabilityEvent trace   parseAgentJson   usage-ledger           │
+  │  packages/runtime/src/run-agent-loop.ts        events.ts                        │
+  └──────┬──────────────────────────────────┬──────────────────────────────────────┘
+         │ ModelProvider.complete()          │ tool calls (ToolExecutor)
+  ┌─ MODEL PORT ─▼──────────────┐   ┌─ RETRIEVAL PORTS ─▼─────────────────────────────┐
+  │  ModelProvider (the port)   │   │  EmbeddingProvider + VectorStore (the two ports) │
+  │  packages/runtime/          │   │  packages/retrieval/src/contracts.ts             │
+  │   model-provider.ts         │   │                                                  │
+  │  adapters:                  │   │  reached via search_knowledge_base tool          │
+  │   gemma (local default)     │   │  adapters:                                       │
+  │   local (ctx-window guard)  │   │   OllamaEmbeddingProvider (nomic, 768-dim)       │
+  │   fallback (chain)          │   │   InMemoryVectorStore (cosine scan) ── aptkit     │
+  │   anthropic · openai        │   │   PgVectorStore (pgvector + HNSW) ──── buffr      │
+  └──────┬──────────────────────┘   └──────────────────┬───────────────────────────────┘
+         │ HTTP :11434 (no key/TLS) / SDK              │ memory reuses these same ports
+         ▼                                             ▼  (@aptkit/memory: remember/recall)
+  ┌─ EXTERNAL ──────────────────┐   ┌─ DURABLE STORE (buffr only) ────────────────────┐
+  │  Ollama (local)             │   │  Supabase Postgres, schema `agents`             │
+  │  Anthropic / OpenAI (cloud) │   │  documents·chunks·conversations·messages        │
+  │                             │   │  SupabaseTraceSink persists CapabilityEvent     │
+  └─────────────────────────────┘   └─────────────────────────────────────────────────┘
+
+  ════════ deployment boundary ════════
+  everything above the EXTERNAL/DURABLE band ships as ONE npm tarball:
+  @rlynjb/aptkit-core@0.4.1  (bundledDependencies inlines 16 @aptkit/* packages)
+  buffr installs that tarball and supplies PgVectorStore + SupabaseTraceSink + agents schema
 ```
 
 ## Legend — what each component is, owns, and talks to
 
-| Component | What it is | Owns | Talks to |
-| --- | --- | --- | --- |
-| **Studio** (`apps/studio`) | React/Vite preview + replay UI; dev-only | Replay routes, NDJSON trace streaming, in-browser RAG demo | Agents in-process; serves over Vite middleware (`apps/studio/vite.config.ts:201`) |
-| **agents** (`packages/agents/*`) | 6 capabilities, each a thin assembly | Prompt + tool policy + loop config + validator | `runAgentLoop`, a `ModelProvider`, a `ToolRegistry` |
-| **runtime** (`packages/runtime`) | The contracts + the loop | `ModelProvider` type (`model-provider.ts:54`), `runAgentLoop` (`run-agent-loop.ts:76`), `CapabilityEvent` (`events.ts:1`) | Nothing internal — it is the foundation |
-| **gemma provider** | Local Ollama adapter, default model | Tool-call emulation + parse-retry (`gemma-provider.ts:52`) | Ollama HTTP `:11434` |
-| **local guard** | Context-window pre-check wrapper | Token estimate + loud reject (`context-window-guard.ts:57`) | Wraps any inner `ModelProvider` |
-| **fallback** | Sequential provider chain | Try-in-order, record attempts (`fallback-provider.ts:47`) | A list of `ModelProvider`s |
-| **retrieval** (`packages/retrieval`) | The RAG pipeline | `EmbeddingProvider`/`VectorStore` contracts (`contracts.ts:22`), `InMemoryVectorStore`, the search tool | Embedder + store, injected |
-| **memory** (`packages/memory`) | Episodic memory | `remember`/`recall` over the *same* retrieval contracts | A shared or dedicated `VectorStore` |
-| **core** (`packages/core`) | The published bundle | Re-export of all 16 packages (`index.ts:1`); the compatibility surface | npm; buffr imports from here |
-| **buffr** | The durable deployment body | `PgVectorStore` (`pg-vector-store.ts:19`), `SupabaseTraceSink` (`supabase-trace-sink.ts:49`), the `agents` schema | Supabase Postgres; imports `@rlynjb/aptkit-core` |
+- **Studio** (`apps/studio`) — React/Vite preview + replay UI. Owns the
+  in-browser developer view. Talks to the agents through a Vite dev-server
+  middleware that exposes 5 replay routes and streams `CapabilityEvent`s as
+  NDJSON (`apps/studio/vite.config.ts`). No production server — it's a dev
+  tool and a static GitHub Pages demo.
+- **buffr CLI** (`buffr/src/cli/chat.tsx`) — a TUI that holds one
+  conversation in-process. Owns the laptop runtime. Talks to a single
+  `RagQueryAgent` and a single warm `pg.Pool` across turns.
+- **Agents** (`packages/agents/*`) — six capabilities. Each owns one
+  `*_CAPABILITY_ID`, one read-only tool policy (least-privilege allowlist),
+  one prompt package, and one output validator. Talk to the runtime via
+  `runAgentLoop`. → `01`, `02`, `03`.
+- **Runtime** (`packages/runtime`) — the foundation, zero internal deps.
+  Owns the agent loop, the trace event union, JSON extraction, and the usage
+  ledger. Talks down to the model port and out to the trace sink. → `03`, `04`.
+- **Model port** (`ModelProvider`, `packages/runtime/src/model-provider.ts`)
+  — the single contract everything depends on instead of a vendor SDK. Five
+  adapters implement it; the default is the local gemma adapter, so the
+  default path makes no cloud call. → `01`.
+- **Retrieval ports** (`EmbeddingProvider` + `VectorStore`,
+  `packages/retrieval/src/contracts.ts`) — the two RAG seams. Vendor-neutral.
+  In-memory + Ollama in aptkit; pgvector in buffr. Episodic memory
+  (`@aptkit/memory`) is a *second* consumer of the exact same two ports. → `02`.
+- **buffr durable store** — Supabase Postgres, schema `agents`, with an HNSW
+  index over a `vector(768)` column. The only durable store in the system;
+  aptkit itself persists nothing. → `05`, and `study-database-systems` /
+  `study-data-modeling` for engine + schema internals.
+- **The bundle** (`@rlynjb/aptkit-core`) — the deployment boundary made
+  literal: 16 internal packages inlined into one tarball so a consumer
+  installs one dependency. → `06`.
 
-## The one thing to take away
+## The one thing to remember
 
-Every box above either *is* a contract or *implements* one. The architecture isn't
-a stack of services — it's a stack of seams with a default implementation behind
-each, and one consumer (buffr) that swaps the bottom two for Postgres without
-aptkit knowing. That's the whole design. The pattern files walk each seam in turn.
+The architecture is **two ports and a bounded loop, published as one bundle,
+with the deployment in a different repo.** Control flows down (Studio/CLI →
+agent → loop → port → external), data flows back up as `CapabilityEvent`s.
+Every boundary in the diagram is a seam where you can swap the implementation
+without touching the layer above — that swappability is the whole design.

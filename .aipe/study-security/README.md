@@ -1,51 +1,89 @@
 # Study — Security (aptkit + buffr)
 
-The one question this guide answers: **what can an attacker reach, and what happens when they do?**
+The trust axis, made into an audit. One question runs through every file
+here: **what can an attacker reach, and what happens when they do?** Not
+"is this secure" — that word is banned. Trace the boundary, name the trust
+assumption, say what breaks if it's wrong.
 
-This is an audit-style guide. It traces the *trust axis* across every boundary in the aptkit toolkit and its buffr runtime — where untrusted input enters, who's allowed past, what's hidden vs exposed, and what the dependencies drag in. The interesting surface here isn't a login form (there isn't one yet). It's **the model**: an LLM that decides which tools to call, emits arguments that flow into a vector search, and produces output that gets persisted. The model is an untrusted input source sitting *inside* your trust boundary, and most of the real controls in this repo are about keeping it boxed.
+This guide spans two repos because the threat surface does. `aptkit`
+(`/Users/rein/Public/aptkit`) is the deployment-agnostic library — the
+agent loop, the tool policies, the retrieval pipeline. `buffr`
+(`/Users/rein/Public/buffr`) is the laptop body that binds aptkit to a
+real Postgres and persists trajectories. The interesting controls live in
+aptkit; the interesting *exposures* live in buffr.
 
-## The trust axis, traced top to bottom
+## Trace the trust axis
 
 ```
-  Where untrusted input enters, and what boxes it
+  The trust axis across the system — who can reach what
 
-  ┌─ Untrusted: the human ──────────────────────────────────┐
-  │  question string → agent.answer(question)               │
-  └───────────────────────────┬─────────────────────────────┘
-                              │ flows into a prompt (no sanitize)
-  ┌─ Semi-trusted: the MODEL ─▼─────────────────────────────┐
-  │  decides tool calls + emits tool ARGS                   │
-  │  ── boxed by ──                                          │
-  │    · filterToolsForPolicy  (can only call allowed tools)│  ← 01
-  │    · maxTurns / maxToolCalls (can't loop forever)       │  ← 02
-  │    · minTopK / matchesFilter (bad args can't wipe results)│ ← 03
-  └───────────────────────────┬─────────────────────────────┘
-                              │ tool call → parameterized SQL
-  ┌─ Trusted: the store (buffr) ▼───────────────────────────┐
-  │  PgVectorStore: pg `$1` params, `where app_id = $2`     │  ← 04 (no RLS)
-  │  SupabaseTraceSink: full trajectory → agents.messages   │     (PII surface)
-  └─────────────────────────────────────────────────────────┘
+  ┌─ UNTRUSTED ────────────────────────────────────────────────┐
+  │  the model's output         user question / retrieved docs  │
+  │  (tool calls, JSON, text)   (flow into the prompt)          │
+  └───────────┬──────────────────────────┬──────────────────────┘
+              │ gated by                  │ NOT gated
+              ▼                           ▼
+  ┌─ TRUSTED (aptkit) ─────────────────────────────────────────┐
+  │  tool allowlist (filterToolsForPolicy)   ← lens 7, 01       │
+  │  bounded loop (maxTurns/maxToolCalls)     ← lens 7, 02       │
+  │  defensive parse (parseAgentJson)         ← lens 3, 03       │
+  │  hallucination-tolerant filter            ← lens 3, 03       │
+  └───────────────────────┬─────────────────────────────────────┘
+                          │ app_id passed in code (no RLS)
+                          ▼
+  ┌─ STORAGE (buffr) ──────────────────────────────────────────┐
+  │  parameterized SQL ($1)        ← lens 3 (safe)              │
+  │  app_id tenancy, NO RLS        ← lens 2/5, 04 (real risk)   │
+  │  agents.messages = full PII    ← lens 5, 05 (real risk)     │
+  └─────────────────────────────────────────────────────────────┘
+```
 
-  Side surface — Studio dev server (Vite middleware):
-    POST /api/replays/promote { path } → resolveReplayPath  ← 05 (traversal gate)
+The model output is hostile-by-default and aptkit gates it three ways
+(allowlist, loop bound, defensive parse). The retrieved/user content that
+flows *into* the prompt is not gated at all — prompt injection is
+undefended. And once a run finishes, buffr writes the entire trajectory to
+a Postgres table whose tenant isolation is enforced in app code, not by
+the database.
+
+## Map of the guide
+
+```
+  README.md                          ← you are here
+  00-overview.md                     ← one-page orientation, ranked
+  audit.md                           ← Pass 1: the 8-lens walk
+
+  01-least-privilege-tool-policy.md  ← Pass 2: the controls that hold
+  02-bounded-agent-loop.md
+  03-hallucination-tolerant-retrieval.md
+  04-app-code-tenancy-without-rls.md ← the exposures worth a deep walk
+  05-trajectory-persistence-pii.md
 ```
 
 ## Reading order
 
-1. **`00-overview.md`** — one-page orientation: the trust map, where the boundaries are, the single worst exposure ranked first.
-2. **`audit.md`** — Pass 1. The 8-lens security walk, every lens grounded or honestly marked `not yet exercised`. Start here for the full picture.
-3. **Pattern files** — Pass 2. The five controls/gaps this repo actually exercises, each a deep walk:
-   - `01-tool-policy-least-privilege.md` — the per-agent allowlist that caps what the model can call.
-   - `02-bounded-agent-loop.md` — `maxTurns` / `maxToolCalls` as the runaway-model brake.
-   - `03-hallucination-tolerant-tool-args.md` — `minTopK` + `matchesFilter` defending against a weak model's bad arguments.
-   - `04-app-id-tenancy-without-rls.md` — the named gap: cross-tenant isolation enforced in app code, not the database.
-   - `05-path-traversal-containment.md` — `resolveReplayPath`, the one input-sanitization seam in the repo.
+1. `00-overview.md` — the ranked verdict. What's worst, what holds.
+2. `audit.md` — every lens checked, `not yet exercised` named honestly.
+3. The pattern files in number order. `01`–`03` are controls the repo
+   gets right; `04`–`05` are the two exposures that matter most.
 
-## Cross-links to neighboring guides
+## Cross-links to neighbouring guides
 
-- **`study-data-modeling`** — the `agents` schema shape, and the RLS question from the data-integrity side (this guide covers RLS as a *trust* gap; data-modeling covers it as a *constraint* gap).
-- **`study-system-design`** — the provider-neutral and retrieval-neutral seams these controls sit behind.
-- **`study-agent-architecture`** — the bounded agent loop and tool registry as architecture (this guide covers them as *safety* mechanisms).
-- **`study-ai-engineering`** — RAG grounding and the eval/replay backbone; prompt-injection defense ties back here.
+- **`study-data-modeling`** — the `agents` schema shape, the `app_id`
+  column, and why Row-Level Security (RLS) is the data-modeling fix for
+  the tenancy gap walked in `04`.
+- **`study-agent-architecture`** — the bounded loop (`02`) and the
+  tool-policy seam (`01`) as *architecture*; here they're read as *trust
+  controls*.
+- **`study-system-design`** — the provider/retrieval seams as boundaries;
+  here the same seams are read for what crosses them untrusted.
+- **`study-ai-engineering`** — the RAG pipeline and agentic retrieval;
+  here `03` reads its defensive edges.
 
-One rule honored throughout: **no real secret values appear anywhere in this guide.** The `.env` files in both repos hold live provider keys and a Postgres connection string with a password. This guide describes the *surface* — where secrets live and how they're handled — never a single value.
+## A note on secrets
+
+Cloud provider keys (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `NPM_TOKEN`)
+and buffr's `DATABASE_URL` live in `.env` files that are gitignored in
+both repos (`.gitignore:4` in aptkit, `.gitignore:2` in buffr). This guide
+describes the secret *surface* — where keys are read, what they protect —
+and never reproduces a key, token, or connection string. The local-default
+path (Gemma over Ollama) makes no cloud call and needs no key at all.

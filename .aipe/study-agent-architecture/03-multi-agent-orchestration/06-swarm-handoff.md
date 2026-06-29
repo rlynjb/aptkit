@@ -1,85 +1,81 @@
 # Swarm / Handoff
 
-**Industry standard.** "Swarm," "handoff," "peer-to-peer agents," "agent-to-agent transfer." Type label: orchestration topology. **In this codebase: not yet exercised.** aptkit has no agent-to-agent control transfer. Its agents never call each other; there is no peer handoff and no central boss either.
+**Industry term:** swarm / handoff (peer-to-peer control transfer, no central boss). *Industry standard.*
 
 ## Zoom out, then zoom in
 
-Peer-to-peer control transfer, no central supervisor. One agent decides "you take it" and hands control to a peer specialist, who can hand it back or onward. More flexible than supervisor-worker (no central bottleneck), much harder to debug (no single place that knows the whole state). aptkit does none of this.
+Peer agents pass control to each other directly — the model itself decides when to hand off to a specialist peer. There is no supervisor. aptkit has no handoff of any kind.
 
 ```
-  Zoom out — swarm/handoff (the shape, not in aptkit)
+  Zoom out — not built; aptkit has no agent-to-agent control transfer
 
+  ┌─ Capability layer ──────────────────────────────────────────┐
+  │  6 agents; none transfers control to another                 │ ← we are here
+  └──────────────────────────────────────────────────────────────┘
+```
+
+Zoom in: **Not yet implemented in aptkit.** No agent says "you take it" to a peer. The host calls agents in a fixed order (a pipeline), which is the *opposite* of swarm — there the *code* decides the order, not the model.
+
+## How it works
+
+**Use case it would fit:** a support assistant where a general agent hands off to a billing specialist mid-conversation when it detects a billing question, and the billing agent hands back when done.
+
+### Move 1 — the topology
+
+```
       ┌────────┐  "you take it"  ┌────────┐
-      │agent A │ ──────────────► │agent B │
-      └────────┘                 └───┬────┘
+      │agent A │ ──────────────► │agent B  │
+      └────────┘                 └───┬─────┘
            ▲                         │ "back to you"
            └─────────────────────────┘
 ```
 
-## Structure pass
+### Move 2 — the walkthrough
 
-**Axis: who holds control, and who knows the whole state?** In supervisor-worker, control and global state live in the supervisor. In a swarm, control *moves* between peers and no one holds the global state. The seam is the handoff itself: a control transfer with no central record. That missing central record is both the flexibility (no bottleneck) and the danger (no one can answer "what's the whole conversation state").
+**The defining trait: the model decides the handoff.** In swarm, the handoff is an action the model emits — like a tool call whose effect is "transfer control to peer B." That's more flexible than supervisor-worker (no central bottleneck) and harder to debug (no single point knows the whole state).
 
-## How it works
+**Why aptkit is structurally the opposite.** aptkit's flow control is the host's fixed sequence — the code decides monitor → diagnose → recommend. Swarm would invert that: the *agents* decide who runs next. aptkit has no mechanism for one agent to emit "now run agent B"; the loop only emits tool calls, and no tool transfers control.
 
-### Move 1 — the mental model
+**The failure mode it introduces.** Infinite handoff — A → B → A → B forever. The mitigation is a handoff counter that force-stops or escalates ([09-coordination-failure-modes.md](09-coordination-failure-modes.md)). aptkit doesn't face this because it has no handoff, but any swarm adoption would need the counter on day one.
 
-A swarm is supervisor-worker with the supervisor deleted — agents transfer control directly, peer to peer. The model itself decides when to hand off. Think of an on-call rotation where one engineer pages another directly, no manager routing the page.
-
-```
-  Swarm — peers transfer control, no boss
-
-  agent A ──handoff──► agent B ──handoff──► agent C
-     ▲                                         │
-     └──────────────── handoff back ───────────┘
-  (the MODEL decides each transfer; no central router)
-```
-
-### Move 2 — why aptkit is far from this, and the failure it would introduce
-
-**aptkit is the opposite of a swarm.** Its agents are isolated capabilities with no awareness of each other — there's no "hand off to the diagnostic agent" tool, no shared conversation state to transfer. Even the would-be supervisor-worker (file 02) keeps central control (tools-style). A swarm would require giving each agent handoff tools (`handoff_to(diagnostic)`) and a shared state object that travels with control.
-
-**The failure mode a swarm introduces: infinite handoff.** A → B → "back to you" → A → B forever, because no one agent decides the work is done. aptkit's single-agent loops can't have this — there's no peer to hand to — but a swarm built on aptkit would need the mitigation from the coordination-failure-modes file: a handoff counter that force-stops or escalates after N transfers, the multi-agent analog of the `maxToolCalls` budget aptkit already uses inside one loop.
-
-**Why aptkit wouldn't reach for a swarm.** Swarm's flexibility buys nothing for aptkit's tasks. Its analytics task is a strict dependency chain (pipeline), and its rag-query task is one specialist (no peers to hand to). Swarm earns its debugging cost only when the routing between specialists is genuinely dynamic and unpredictable — a customer-support system where any agent might need any other. aptkit has neither dynamic routing needs nor multiple peers per task.
+**What it would cost aptkit.** A handoff primitive (a special tool or control signal the loop interprets as "switch active agent"), a shared or passed conversation state, and a handoff counter. This is the largest departure from aptkit's current design — it breaks the one-loop-per-capability model entirely. **Not yet implemented**, and the least likely topology for aptkit given its debuggable, replay-centric style.
 
 ### Move 3 — the principle
 
-Swarm trades the supervisor's central control (and central observability) for peer flexibility. The price is debuggability — no single point knows the whole state — and a new failure class (infinite handoff) that needs its own budget. It's the topology you reach for *last*, when routing is too dynamic for a supervisor to enumerate. aptkit, with static task shapes, would never benefit.
+Swarm trades a central bottleneck for debuggability: peers decide the flow, so no single point knows the whole state. It's the most flexible and least traceable topology. For a replay-centric system like aptkit, that tradeoff runs against the grain — supervisor-worker (one trace) fits far better than swarm (distributed state).
 
 ## Primary diagram
 
 ```
-  Swarm vs aptkit's isolation
+  Swarm vs aptkit's host-fixed order
 
-  SWARM (not in aptkit):
-    A ⇄ B ⇄ C   control moves peer-to-peer, shared state travels
-    needs: handoff tools + shared state + handoff counter (anti-infinite-loop)
+  swarm:   agent A ──model decides──► agent B ──model decides──► A
+           (no boss; handoff counter required to stop A↔B loops)
 
-  APTKIT (today):
-    A   B   C   isolated capabilities, NO handoff, NO shared state
-    each is a self-contained runAgentLoop
+  aptkit:  HOST fixes monitor → diagnose → recommend
+           (code decides order; the opposite of swarm)
+  (Not yet implemented)
 ```
 
 ## Elaborate
 
-Swarm/handoff (popularized by OpenAI's Swarm and similar) is the most decentralized topology — agents as autonomous peers that route work among themselves. It shines for open-ended, dynamic routing (you can't predict which specialist a request needs), and it suffers exactly where decentralization always does: no global view, hard debugging, new coordination failures. aptkit sits at the far other end — fully centralized, isolated capabilities — which is correct for its static, predictable tasks. The honest read: aptkit is so far from a swarm that adopting one would be a near-total rewrite, and nothing in its task shape asks for it.
+Swarm topologies (popularized by OpenAI's Swarm and similar handoff frameworks) suit conversational systems where the right specialist changes mid-conversation and a central router would be a bottleneck. The cost is observability — debugging "why did the conversation end up here" across peer handoffs is genuinely hard. For analytics and retrieval workloads like aptkit's, where the flow is knowable and traceability is prized, swarm is the wrong tool; supervisor-worker gives the same specialization with one trajectory to debug.
 
 ## Interview defense
 
-**Q: Does aptkit use agent handoff / a swarm?**
-No — it's the opposite. My agents are isolated capabilities with no awareness of each other; there's no handoff tool and no shared state to transfer. A swarm transfers control peer-to-peer with no central boss, which buys flexibility for dynamic routing I don't have — my analytics task is a strict dependency chain and my rag-query task has one specialist. Swarm is the topology you reach for last.
+**Q: Would a swarm topology fit aptkit?**
+
+No — it runs against aptkit's grain. Swarm lets agents decide the flow with no central point that knows the whole state, which is the hardest topology to debug. aptkit is replay-centric and prizes one trace per run. If specialization were needed I'd reach for supervisor-worker (one trajectory) over swarm (distributed state) every time.
 
 ```
-  swarm: A ⇄ B ⇄ C (dynamic, no boss)   vs   aptkit: A | B | C (isolated)
+  swarm: peers decide flow, distributed state, hard to trace
+  aptkit fit: supervisor-worker — same specialization, one trace
 ```
-*Anchor: swarm's flexibility buys nothing for static, predictable task shapes.*
 
-**Q: What new failure would a swarm introduce?**
-Infinite handoff — A → B → A forever, because no peer decides it's done. The fix is a handoff counter that force-stops after N transfers, which is the multi-agent version of the `maxToolCalls` budget I already use inside one loop.
+*Anchor: swarm trades a bottleneck for debuggability; a replay-centric system should not make that trade.*
 
 ## See also
 
-- `02-supervisor-worker.md` — the centralized contrast aptkit is closer to
-- `09-coordination-failure-modes.md` — the infinite-handoff mitigation
-- `02-agent-loop-skeleton.md` — the budget exit that's the single-agent analog of a handoff counter
+- [02-supervisor-worker.md](02-supervisor-worker.md) — the traceable alternative.
+- [09-coordination-failure-modes.md](09-coordination-failure-modes.md) — infinite handoff and its counter.
+- [07-graph-orchestration.md](07-graph-orchestration.md) — explicit-state control flow, the opposite extreme.

@@ -1,163 +1,169 @@
 # HTTP Semantics, Caching, and CORS
 
-**Industry name:** HTTP/1.1 semantics / caching / CORS / browser fetch policy · *Industry standard*
+**Methods · status codes · headers · caching · CORS** — *Industry standard*
 
-## Zoom out, then zoom in
+## Zoom out — where HTTP semantics live
 
-This is the application layer — the methods, status codes, and headers that ride on top of the connection. Here's where aptkit speaks HTTP.
-
-```
-  Zoom out — where HTTP semantics are decided
-
-  ┌─ UI layer ─────────────────────────────────────────────────┐
-  │  Studio browser: fetch('/api/...', {method, headers, body}) │
-  └───────────────────────────┬────────────────────────────────┘
-                              │ same-origin HTTP (dev) — methods, status, headers
-  ┌─ Service layer ──────────▼─────────────────────────────────┐
-  │  vite middleware: checks req.method, sets res statusCode +  │
-  │    content-type, cache-control, x-accel-buffering           │
-  └───────────────────────────┬────────────────────────────────┘
-                              │
-  ┌─ Provider layer ─────────▼─────────────────────────────────┐
-  │  Gemma transport: POST /api/chat, content-type json,        │
-  │    res.ok check, res.status in the thrown error             │
-  └────────────────────────────────────────────────────────────┘
-```
-
-**Zoom in.** HTTP semantics are the rules everyone agrees on so a request means the same thing on both ends: `GET` reads, `POST` writes, `2xx` succeeded, `4xx` you-messed-up, `5xx` I-messed-up, and headers carry the metadata. aptkit speaks a small, disciplined subset. The pattern to learn: **HTTP is a contract of methods + status + headers, and the repo uses exactly the parts it needs — POST for actions, the `res.ok` boundary for errors, a few cache and streaming headers — and nothing more.**
-
-## Structure pass
-
-**Layers:** browser `fetch` (UI) → vite middleware (Service) → Gemma/Ollama transport (Provider). HTTP semantics appear at each.
-
-**Axis — "what does each side promise via the HTTP envelope?"** Trace it:
+HTTP is the contract layer on top of the socket: which verb, which status, which headers. aptkit uses a deliberately tiny slice of it — one method, one content type, and a binary read of the status. Here's where that contract sits.
 
 ```
-  Axis — the HTTP contract — across the surfaces
+  Zoom out — HTTP semantics in the transport + Studio middleware
 
-  surface              method      success signal     error signal       headers that matter
-  ──────────────────────────────────────────────────────────────────────────────────────────
-  Studio → /api/...    GET / POST  response.ok        4xx/5xx + {error}  content-type: json
-  middleware handlers  guards POST 200 + json body    405 method-not-... content-type, cache-control
-  Gemma → Ollama       POST        res.ok (2xx)       throw on !res.ok   content-type: json
-  stream endpoints     POST        ndjson body        error record       content-type: x-ndjson
+  ┌─ aptkit outbound ──────────────────────────────────────────┐
+  │  POST /api/chat   content-type: application/json            │ ← we are here
+  │  if (!res.ok) throw    ← status semantics, binary           │
+  └──────────────────────────┬─────────────────────────────────┘
+                             │  HTTP/1.1
+  ┌─ Ollama daemon ───────────▼─────────────────────────────────┐
+  │  200 + JSON  |  non-2xx → thrown error                       │
+  └──────────────────────────────────────────────────────────────┘
+
+  ┌─ Studio inbound (dev) ─────────────────────────────────────┐
+  │  GET /api/model-status (405 on wrong verb)                  │
+  │  POST /api/stream/* → 200 + application/x-ndjson            │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-**Seam:** the `res.ok` / `response.ok` check is the seam where "the server answered" flips to "the server answered with a failure." Everything before it is transport success; everything after is application-level error handling. That boundary is drawn explicitly in the Gemma transport (`throw on !res.ok`).
+## Zoom in — the concept
+
+**HTTP semantics** are the agreed meanings of methods (GET reads, POST writes), status codes (2xx ok, 4xx your fault, 5xx mine), and headers (content negotiation, caching, cookies). **Caching** is reusing a prior response; **CORS** is the browser's cross-origin permission gate. The question: which of these does aptkit actually rely on? Answer — a narrow, opinionated subset, and the omissions (no caching, no CORS, no conditional requests) are as telling as what's there.
+
+## Structure pass — the skeleton
+
+**Layers:** method choice → content negotiation → status interpretation → caching/CORS policy. aptkit fully uses the first three at a minimal level and skips the fourth.
+
+**Axis traced — "how much of HTTP's vocabulary is used?"**
+
+```
+  One question across HTTP's feature set: "is this used?"
+
+  ┌──────────────────────────────────────────────┐
+  │ methods       │ POST out, GET/POST in          │  → minimal, used
+  │ status codes  │ res.ok (2xx) vs throw          │  → binary, used
+  │ content-type  │ application/json, x-ndjson     │  → used
+  │ caching       │ cache-control: no-cache (stream)│ → only on the stream
+  │ cookies/auth  │ none                            │  → not used
+  │ CORS          │ none (same-origin dev)          │  → not used
+  │ conditional   │ ETag / If-None-Match           │  → not used
+  └──────────────────────────────────────────────┘
+```
+
+**Seam — `res.ok`.** The single most important HTTP semantic in aptkit is the boundary between 2xx and everything else. `res.ok` is `true` for 200–299; anything else throws. That one boolean is aptkit's entire status-code policy.
 
 ## How it works
 
-#### Move 1 — the mental model
+### Move 1 — the mental model
 
-You write `fetch(url, { method: 'POST', headers, body })` constantly. That object *is* HTTP semantics: the method says what kind of action, the headers carry metadata (content type, caching), the body is the payload, and the response comes back with a status code you branch on. The kernel: **request = method + headers + body; response = status + headers + body; `2xx` means it worked.**
+You know how a `fetch().then(res => { if (!res.ok) throw })` in a React app collapses every error status into one catch? That's aptkit's whole HTTP error model. The shape:
 
 ```
-  The pattern — request/response envelope
+  The binary-status pattern — 2xx is success, all else is failure
 
-  REQUEST                         RESPONSE
-  ┌──────────────────┐            ┌──────────────────┐
-  │ POST /api/chat    │            │ 200 OK            │
-  │ content-type:json │  ───────►  │ content-type:json │
-  │ { ...body... }    │            │ { ...body... }    │
-  └──────────────────┘            └──────────────────┘
-        ▲ method+headers              ▲ status decides
-          decide intent                 success vs failure
+   POST /api/chat ──► Ollama ──► response
+                                   │
+                            ┌──────┴──────┐
+                       res.ok (2xx)    !res.ok (3xx/4xx/5xx)
+                            │               │
+                       parse JSON      throw `ollama HTTP ${status}`
+                            │               │
+                         return        bubbles up to caller
 ```
 
-The part people trip on: a `4xx`/`5xx` *is still a successful round trip* — the bytes arrived. `fetch` does NOT throw on `404` or `500`; you have to check `res.ok` yourself. Forgetting that is the classic HTTP-client bug.
+No 429-means-retry, no 404-means-empty, no 3xx-means-redirect. One bit.
 
-#### Move 2 — walking the HTTP in this repo
+### Move 2 — walking the semantics
 
-**The Gemma transport draws the success/failure line explicitly.** It does what raw `fetch` won't do for you — turns a non-2xx status into a thrown error (`packages/providers/gemma/src/gemma-provider.ts:204-214`):
+**Method: always POST for the API wires.** Both Ollama endpoints are `POST` (`gemma-provider.ts:205`, `ollama-embedding-provider.ts:64`) because each carries a JSON body (the chat messages, the texts to embed). There's no GET — these aren't cacheable reads, they're requests that produce computed output. Inside Studio's dev middleware, the read endpoints use GET and reject other verbs with **405**:
 
 ```ts
-const res = await fetch(`${base}/api/chat`, {
-  method: 'POST',                                 // POST: this is an action with a body
-  headers: { 'content-type': 'application/json' },// declare the body's media type
-  body: JSON.stringify(payload),
-  ...(signal ? { signal } : {}),
-});
-if (!res.ok) {                                    // ← the seam: 2xx vs everything else
-  throw new Error(`ollama HTTP ${res.status}: ${await res.text()}`); // status + body in the message
-}
-return (await res.json()) as OllamaChatResponse;  // 2xx → parse the JSON body
-```
-
-`res.ok` is `true` only for `200–299`. A `500` from a crashed Ollama, a `404` from a wrong path — both fall into the `throw`, carrying the status code and the server's error text. The embedding transport mirrors this exactly (`packages/retrieval/src/ollama-embedding-provider.ts:69-71`). This is the one place aptkit's code decides HTTP success.
-
-**The Studio middleware enforces method semantics.** Each route guards its method and returns `405` for the wrong one (`apps/studio/vite.config.ts`, e.g. `:218-231` for `/api/promoted-fixtures` which only allows `GET`, and the POST-only replay/promote routes):
-
-```ts
+// apps/studio/vite.config.ts:218-224
 server.middlewares.use('/api/promoted-fixtures', async (req, res) => {
-  if (req.method !== 'GET') {                 // GET = read-only listing
-    res.statusCode = 405;                      // 405 Method Not Allowed
+  if (req.method !== 'GET') {
+    res.statusCode = 405;                              // method-not-allowed, correct semantics
     sendJson(res, { error: 'method not allowed' });
     return;
   }
-  // ...
+  ...
 });
 ```
 
+That 405 is the one place aptkit-adjacent code uses a status code *meaningfully* rather than as a binary.
+
+**Content negotiation: `application/json` out, `application/x-ndjson` for streams.** The outbound transports set `content-type: application/json` (`gemma-provider.ts:206`) and parse the response with `res.json()`. Studio's JSON responses set the same on the way out (`vite.config.ts:884`), and the *streaming* responses set the NDJSON content type plus cache directives:
+
+```ts
+// apps/studio/vite.config.ts:900-903
+res.setHeader('content-type', 'application/x-ndjson; charset=utf-8');
+res.setHeader('cache-control', 'no-cache');     // never cache a live trace
+res.setHeader('x-accel-buffering', 'no');       // tell any proxy: don't buffer, flush chunks
 ```
-  Layers-and-hops — method-guarded routes
 
-  ┌─ UI: browser ──────────┐  hop A: GET /api/replays      ┌─ Service: middleware ─┐
-  │  fetch('/api/replays') │ ────────────────────────────► │ if method!=GET → 405  │
-  │                        │ ◄──── 200 + {replays:[...]} ── │ else read dir → json  │
-  └────────────────────────┘                                └────────────────────────┘
+`x-accel-buffering: no` is a deliberate touch — it's the nginx directive that disables proxy buffering so NDJSON chunks reach the browser as they're written, not batched at the end. Even though the dev server has no nginx in front, the header is correct for the day one does.
+
+**Status interpretation: 2xx or throw.** The error model is `if (!res.ok) throw new Error(...)` in both transports (`gemma-provider.ts:210`, `ollama-embedding-provider.ts:69`), with the status code and response body interpolated into the message. The consequence: a `503 model loading` from Ollama is a hard failure that bubbles up through `complete()`, not a signal to wait and retry. A `404` (wrong path) and a `500` (Ollama crash) are indistinguishable to the caller beyond the message string. That's the right altitude for a local tool — but it means no status-aware behavior (no retry-after, no backoff on 429). → `07`.
+
+**Caching: none on the API path, `no-cache` on streams.** There's no `Cache-Control`, no `ETag`, no `If-None-Match` on the outbound wires — every chat and embed call hits Ollama fresh. That's correct: LLM generation isn't idempotent or cacheable at the HTTP layer. The only cache directive in the system is `no-cache` on the NDJSON stream, which is the *anti*-cache (don't store a live trace). The production caching that matters — GitHub Pages serving Studio's static assets with CDN cache headers — is GitHub's, not aptkit's.
+
+**CORS: not present — same-origin by construction.** The Studio dev middleware sets no `Access-Control-Allow-Origin` and no preflight handling, because the React app and the middleware are the *same origin* (`127.0.0.1:4187`). The browser never makes a cross-origin request, so CORS never engages. In the Pages build there's no API at all — the agents run in-browser against fixtures — so again, no cross-origin call. CORS is `not yet exercised` because the architecture never crosses an origin.
+
+```
+  Layers-and-hops — Studio dev, same origin (no CORS gate)
+
+  ┌─ Browser :4187 ─┐  POST /api/stream/query/replay   ┌─ Vite :4187 ─┐
+  │  React fetch()  │ ───────────same origin─────────► │  middleware  │
+  └─────────────────┘  ◄── x-ndjson chunks ──────────  └──────────────┘
+       no Origin mismatch → browser never sends a preflight
 ```
 
-Read endpoints are `GET`; actions (run a replay, promote a fixture, save an artifact) are `POST`. The `405` for a mismatched method is correct HTTP — it tells the client "right URL, wrong verb."
+### Move 3 — the principle
 
-**Errors are a `4xx` plus a JSON `{error}` body.** Handlers wrap work in try/catch and on failure set `res.statusCode = 400` and send `{ error: message }` (`vite.config.ts:227-230` and throughout). The client mirrors this — it reads the body and throws the `error` field if `!response.ok` (`apps/studio/src/api.ts:13-16`, `:200-204`). So the contract is consistent end to end: status code says *category*, JSON body says *detail*.
-
-**Caching headers appear once, on the stream.** `streamReplayResponse` sets `cache-control: no-cache` and `x-accel-buffering: no` (`vite.config.ts:901-903`) so the NDJSON trace isn't cached or buffered by an intermediary. There is no HTTP caching strategy anywhere else — no `ETag`, no `Cache-Control: max-age`, no conditional requests. That's `not yet exercised` and appropriate: the dynamic endpoints are all `POST` actions or freshly-read listings, which shouldn't be cached.
-
-**CORS is `not yet exercised`.** Every Studio `fetch` is same-origin (`/api/...` against the page's own origin), so no cross-origin headers (`Access-Control-Allow-Origin`, preflight `OPTIONS`) appear or are needed. The static Pages build has no API at all. CORS becomes relevant only if Studio's UI and its API ever live on different origins — they don't.
-
-**Cookies, sessions, auth headers:** `not yet exercised` in aptkit. The cloud SDKs carry the API key (an `Authorization`-style header) internally; aptkit's own HTTP never sets an auth header because loopback Ollama needs none and the Studio dev API is unauthenticated local tooling.
-
-#### Move 3 — the principle
-
-The principle: **HTTP gives you a shared vocabulary — use the parts that carry meaning and skip the rest.** aptkit uses `POST` for actions, `GET` for reads, `405` for verb mismatches, `4xx`+JSON for errors, and the `res.ok` check to draw the success line — and deliberately uses *no* caching, CORS, or cookies because none of its traffic needs them. Knowing which HTTP features a system *doesn't* use, and why, is as much a sign of understanding as knowing the ones it does.
+HTTP gives you a rich vocabulary — verbs, status families, conditional requests, cache validators, CORS — and the discipline is to use exactly the slice your problem needs. aptkit's problem is "send a JSON body to a local computed endpoint and read the result," so it uses POST + JSON + a binary status check, and nothing else. The risk isn't under-use; it's that the binary status check throws away information (429 vs 500) that a more resilient client would act on. When the wire is local and single-user, that information has no use. When it isn't, the missing status-awareness is the first thing you'd add.
 
 ## Primary diagram
 
+The full HTTP-semantics surface: what's used, what's deliberately absent.
+
 ```
-  HTTP semantics recap — methods, status, headers, end to end
+  aptkit HTTP semantics — the used slice and the absent rest
 
-  Browser ──GET /api/replays──────────────► middleware ── method guard ─► 405 or 200+json
-  Browser ──POST /api/replay {fixtureId}──► middleware ── runReplay ────► 200+result / 400+{error}
-  Browser ──POST /api/stream/...──────────► middleware ── ndjson ───────► content-type x-ndjson,
-                                                                            cache-control no-cache
-  Gemma   ──POST /api/chat {messages}─────► Ollama ──── res.ok? ────────► json / throw(status+body)
+  OUTBOUND (aptkit → Ollama)
+  ┌──────────────────────────────────────────────────────────┐
+  │ POST /api/chat | /api/embed                                │
+  │ content-type: application/json                             │
+  │ res.ok ? parse JSON : throw `ollama HTTP ${status}`        │
+  │ ✗ no caching  ✗ no retry-after  ✗ no conditional GET      │
+  └──────────────────────────────────────────────────────────┘
 
-  used:    POST, GET, 200, 400, 405, content-type, cache-control, x-accel-buffering
-  unused:  CORS, cookies, ETag/conditional caching, auth headers  (not yet exercised)
+  INBOUND (browser → Studio dev middleware)
+  ┌──────────────────────────────────────────────────────────┐
+  │ GET  /api/model-status, /api/promoted-* → 405 on wrong verb│
+  │ POST /api/stream/* → 200 application/x-ndjson              │
+  │       cache-control: no-cache, x-accel-buffering: no       │
+  │ ✗ no CORS headers (same-origin)  ✗ no cookies/auth         │
+  └──────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-HTTP's genius is that the envelope (method + status + headers) means the same thing to every client and server, so you can reason about a request without reading the handler. The discipline aptkit shows — `GET` for reads, `POST` for actions, explicit `405`/`400`, a hand-rolled `res.ok` gate — is exactly the subset that matters for a small tool. The streaming `content-type: application/x-ndjson` is the one place HTTP semantics get interesting, and it bridges straight into `06` (realtime). For *whether* the unauthenticated dev API is a problem, see `study-security`; this file owns *what the HTTP says*, not *whether it's safe*.
+The HTTP spec's depth — idempotency, safe methods, cache validators, the 4xx/5xx split — exists for the public web, where clients and servers are written by strangers and must agree on meaning without a conversation. aptkit's client and server (well, Ollama) have a fixed, known contract, so the rich semantics buy little. The one place richer semantics would pay off is resilience: a 429-aware client could back off instead of failing, a 503-aware client could wait for model load. That's a `07` concern. For *whether* the missing CORS/auth is a security gap, see **study-security** — this guide only describes the semantics on the wire.
 
 ## Interview defense
 
-**Q: "How do you handle HTTP errors from your model provider?"**
-Lead with the trap and how you avoid it: "`fetch` doesn't throw on `4xx`/`5xx` — a `500` is still a completed round trip — so my Gemma transport explicitly checks `res.ok` and throws an error carrying the status code and the response body. That turns a transport-level non-2xx into a normal exception the agent loop can catch." Then the breadth: "On the Studio side, read endpoints are `GET`, actions are `POST`, wrong verbs get `405`, and errors come back as a `4xx` with a JSON `{error}` the client re-throws."
+**Q: How does your client handle HTTP error statuses?**
+Binary: `res.ok` means 2xx, anything else throws with the status and body interpolated. There's no status-specific handling — a 429 and a 500 both just throw. For a single-user local Ollama that's the honest model; the cost is no retry-after or backoff awareness, which I'd add the moment the wire became flaky or remote.
 
 ```
-  sketch: the res.ok seam
-
-  fetch ──► response arrives (round trip OK)
-                 │
-            res.ok?  ──yes──► parse json
-                 └──no──────► throw(status + body)   ← fetch won't do this for you
+  res.ok → parse JSON
+  !res.ok → throw `ollama HTTP ${status}: ${body}`   (one path for all errors)
 ```
+Anchor: *"one bit of status policy — 2xx or throw."*
 
-Anchor: *a 500 is a successful round trip — you have to check `res.ok` yourself.*
+**Q: Do you handle CORS?**
+No, and I don't need to — Studio's UI and its dev middleware are the same origin, and the production build has no API at all (in-browser fixtures). CORS never engages because nothing crosses an origin.
 
 ## See also
 
-- `06-websockets-sse-streaming-and-realtime.md` — the `x-ndjson` streaming response in detail
-- `03-tcp-udp-connections-and-sockets.md` — the connection HTTP rides on
-- `07-timeouts-retries-pooling-and-backpressure.md` — what `res.ok` doesn't protect you from (a hang)
+- `06-websockets-sse-streaming-and-realtime.md` — the NDJSON streaming response in detail
+- `03-tcp-udp-connections-and-sockets.md` — the socket these semantics ride on
+- `07-timeouts-retries-pooling-and-backpressure.md` — the status-awareness aptkit doesn't have
+- `00-overview.md` — CORS/caching under `not yet exercised`

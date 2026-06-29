@@ -1,277 +1,230 @@
 # 08 — Sagas, Outbox, and Cross-Boundary Workflows
 
-**Industry names:** dual write · saga · compensating transaction · transactional outbox · reconciliation · best-effort side-effect — *Industry standard.*
+**Industry names:** saga · compensating transaction · transactional outbox · dual-write problem · reconciliation. **Type:** Industry standard.
 
 ## Zoom out, then zoom in
 
-A saga is what you reach for when one logical operation spans *multiple systems* that
-can't share a single transaction. The repo has one real instance: `indexDocumentRow`
-writes a `documents` row to Postgres, then calls `pipeline.index()` which embeds via
-Ollama and upserts chunks in a *separate* transaction. That's a **dual write** — two
-commits, no shared atomicity — and it's the latent saga seam (finding #3). Full
-sagas with compensation and a transactional outbox are `not yet exercised`; this file
-shows the seam where they'd attach.
+This is finding #2, and it's the most concrete distributed-systems bug in the repo. buffr's ingestion does a **dual write** — a `documents` row, then `chunks` in a *separate* transaction — and there is nothing tying them together. An embed failure between the two leaves a document with no chunks and no way to detect or repair it. It's a **saga with no compensation and no outbox.**
 
 ```
-  Zoom out — the one multi-system workflow
+  Zoom out — a two-step workflow with no envelope around it
 
-  ┌─ buffr: indexDocumentRow(doc) ──────────────────────────────────────┐
-  │  STEP 1: insert agents.documents row ──── commit #1 (Postgres)       │ ← write A
-  │  STEP 2: pipeline.index(doc):                                        │
-  │            embed(text) ──── Ollama HTTP (can fail/hang)              │ ← network call
-  │            store.upsert(chunks) ──── commit #2 (Postgres txn)         │ ← write B
-  └──────────────────────────────┬───────────────────────────────────────┘
-                                 │  ★ no transaction spans STEP 1 and STEP 2 ★
-  ┌─ Postgres ───────────────────▼───────────────────────────────────────┐
-  │  documents row committed; chunks may or may not follow                │ ← we are here
-  └─────────────────────────────────────────────────────────────────────┘
+  ┌─ App (buffr) ───────────────────────────────────────────────────┐
+  │  indexDocumentRow()                                              │
+  │    step 1: INSERT documents   (pool, auto-commit)                │ ← we are here
+  │    step 2: pipeline.index()  → PgVectorStore.upsert chunks       │   (the gap is
+  │            (its OWN transaction)                                 │    BETWEEN them)
+  └──────────────────────────────────┬───────────────────────────────┘
+                                     │
+  ┌─ Storage (Postgres) ───────────── ▼─────────────────────────────┐
+  │  agents.documents  ◄┄┄ no FK ┄┄┄  agents.chunks                  │
+  │  doc committed                    chunks may never arrive         │
+  └────────────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: a single ACID transaction guarantees all-or-nothing — but only *within one
-database*. The moment a workflow touches a second system (a second DB, an HTTP
-service, a queue), you can't wrap them in one transaction, so you get a **partial
-commit**: step 1 succeeds, step 2 fails, and now the systems disagree. A **saga** is
-the pattern for that: break the workflow into steps, and for each step define a
-**compensating action** that undoes it if a later step fails.
+Zoom in: a **saga** is a multi-step workflow where each step is its own transaction, because the steps can't share one (different systems, or — here — different transaction scopes). The problem a saga must solve: if step 2 fails after step 1 committed, you have a *partial* workflow, and there's no automatic rollback because step 1 already committed. Sagas fix this with **compensation** (an undo for each step) or you avoid the split entirely with a **transactional outbox** (commit the intent atomically, do the side effect later). The repo has the dual write and neither fix — so the partial state just sits there.
 
-## Structure pass
+## Structure pass — layers, one axis, the seams
 
-**Layers.** The workflow (`indexDocumentRow`) → step 1 (Postgres write) → step 2
-(Ollama embed + Postgres write).
+**Layers:** the workflow (`indexDocumentRow`) → write 1 (documents, on the pool) → write 2 (chunks, in `PgVectorStore.upsert`'s own transaction).
 
-**Axis — trace `atomicity` across the workflow's steps.**
+**The one axis: *what is the atomic unit?*** Trace it:
 
 ```
-  Axis — "is this all-or-nothing?" — within a step vs across steps
+  "what commits together as one unit?"  — traced down
 
-  ┌─ STEP 2's chunk upsert (PgVectorStore) ────┐
-  │  begin / inserts / commit / rollback        │  → ATOMIC within itself ✓
-  └──────────────────────┬──────────────────────┘   (file 03's transaction)
-       ┌─────────────────▼────────────────────────┐
-       │ STEP 1 + STEP 2 together                  │  → NOT atomic ✗
-       └─────────────────┬────────────────────────┘   (two separate commits)
-            ┌────────────▼──────────────────────────┐
-            │ if STEP 2 fails after STEP 1 committed │  → orphan: doc with no chunks
-            └─────────────────────────────────────────┘
+  ┌──────────────────────────────────────────────┐
+  │ indexDocumentRow()   atomic unit = NOTHING     │  ✗ no envelope over
+  │  (no BEGIN/COMMIT around the two writes)       │    the two steps
+  └────────────────────┬──────────────────────────┘
+       ┌───────────────▼──────────────────────────┐
+       │ INSERT documents (pool.query)  atomic =    │  ✓ atomic, but ALONE —
+       │   just this one statement (auto-commit)    │    commits immediately
+       └───────────────┬──────────────────────────┘
+             ┌─────────▼──────────────────────────┐
+             │ chunks upsert  atomic = all chunks   │  ✓ atomic (BEGIN/COMMIT
+             │   (PgVectorStore wraps BEGIN/COMMIT) │    inside upsert)
+             └─────────────────────────────────────┘
 ```
 
-**Seam.** Atomicity holds *inside* each step (the chunk upsert is a clean
-transaction) but is *lost between* the steps — there's no transaction, saga, or
-outbox spanning the documents-write and the chunks-write. That gap between steps is
-where a partial commit lives, and it's the exact seam a saga or outbox would close.
+Each *step* is atomic; the *workflow* is not. The atomic unit shrinks as you go down — the workflow has none, each write has its own. That mismatch is the bug: the unit you reason about ("index this document") is not the unit that commits.
+
+**The seam:** the gap *between* write 1 and write 2 (`runtime.ts:16` → `:17`). Atomicity flips across it — write 1 has committed and is durable; write 2 hasn't started. A crash or embed failure in that gap is the entire problem. The `chunks` table even *removes* the foreign key that would otherwise flag the orphan (`001_agents_schema.sql:27`), so the database won't complain.
 
 ## How it works
 
-### Move 1 — the mental model: a saga is a transaction you have to undo by hand
+### Move 1 — the mental model
 
-A database transaction gives you `ROLLBACK` for free — fail anywhere, everything
-reverts. Across systems you lose that, so a saga gives each step an *explicit undo*.
-You know this shape from a multi-step form with a "back" button that has to clean up
-what each step created: book the flight, book the hotel, charge the card — and if the
-charge fails, *cancel the hotel and cancel the flight* (the compensations), because
-the database can't roll them back for you.
+You know atomicity from a SQL transaction: `BEGIN; … COMMIT;` — all the writes land or none do. A saga is what you reach for when the steps *can't* be in one `BEGIN/COMMIT` — and then "all or none" is no longer free; you have to *build* it.
 
 ```
-  The saga kernel — forward steps, each with a compensation, undo in reverse
+  The saga kernel — steps commit separately, so failure leaves a partial
 
-  forward:   step1 ──► step2 ──► step3 ✗ (fails here)
-                                  │
-  compensate: undo1 ◄── undo2 ◄───┘   (run compensations in REVERSE order)
-
-  the kernel: every step that has a side effect needs a matching "undo this step"
-              — because no ROLLBACK spans the systems
+  step 1 ──COMMIT──►  step 2 ──COMMIT──►  done ✓
+     │                   │
+     │                   └── FAILS here → step 1 is ALREADY committed
+     │                                    → partial state, no auto-rollback
+     │
+     fix A (compensation): run undo(step 1) to repair
+     fix B (outbox):       commit "intent to do step 2" WITH step 1, atomically,
+                            then a worker does step 2 with retries
 ```
 
-The load-bearing part: the *compensation*. Without it, a failed step 3 leaves steps 1
-and 2 applied — an inconsistent state with no automatic cleanup. That's exactly
-`indexDocumentRow`'s gap.
+The kernel: **separately-committed steps + something that restores all-or-nothing.** Remove the "something" (compensation or outbox) and you have the repo's dual write: the steps commit separately and nothing restores the invariant.
 
 ### Move 2 — walking the mechanism
 
-**Step 1 — the dual write, exactly as written.** Here's the workflow. Two writes, no
-transaction between them:
+**Part 1 — the dual write, exactly as written.** Here's the whole function:
 
-```ts
-// buffr/src/runtime.ts (indexDocumentRow)
-export async function indexDocumentRow(pool, appId, pipeline, doc): Promise<void> {
-  await pool.query(
+```typescript
+// buffr/src/runtime.ts:5-18  (indexDocumentRow)
+export async function indexDocumentRow(
+  pool: pg.Pool, appId: string, pipeline: RetrievalPipeline,
+  doc: { id: string; text: string; sourcePath?: string },
+): Promise<void> {
+  await pool.query(                                   // ← STEP 1: documents row
     `insert into agents.documents (id, app_id, source_type, source_path, content)
      values ($1, $2, 'markdown', $3, $4)
-     on conflict (id) do update set content = excluded.content, ...`,   // ← COMMIT #1
+     on conflict (id) do update set content = excluded.content, source_path = excluded.source_path`,
     [doc.id, appId, doc.sourcePath ?? null, doc.text],
-  );
-  await pipeline.index({ id: doc.id, text: doc.text });   // ← embed (Ollama) + COMMIT #2 (chunks)
-}
+  );                                                  //   ← AUTO-COMMIT: doc is now durable
+  await pipeline.index({ id: doc.id, text: doc.text }); // ← STEP 2: embed + upsert chunks
+}                                                     //   in PgVectorStore's OWN transaction
 ```
 
-The annotation that matters: the `documents` insert commits *immediately* (it's a
-`pool.query`, auto-committed). Then `pipeline.index` runs — which calls Ollama to
-embed (a network call that can hang or fail, per file 02) and *then* upserts chunks in
-`PgVectorStore`'s own transaction. There is no `begin`/`commit` wrapping both. So if
-the embed throws, you've already committed a `documents` row that has no chunks.
+Two `await`s, no transaction around them. Step 1 commits the document *immediately* (a bare `pool.query` auto-commits). Step 2 calls `pipeline.index`, which embeds the text (a network call to Ollama — see `02`, and it can hang or fail) and then upserts chunks inside its *own* `BEGIN/COMMIT` (`pg-vector-store.ts:42-58`). **Between the two `await`s, the document is durable and the chunks don't exist yet.**
 
-**Step 2 — the partial-commit failure, traced.** Walk what happens when step 2 fails:
+**Part 2 — the failure that orphans the document.** Walk the crash:
 
 ```
-  Layers-and-hops — partial commit when the embed fails
+  Execution trace — embed fails between the two commits
 
-  ┌─ indexDocumentRow ─┐  hop 1: insert documents  ┌─ Postgres ─┐
-  │                     │ ───────────────────────► │ documents  │ ← COMMITTED ✓
-  │                     │ ◄──── ok ──────────────── │  row exists│
-  │                     │                           └────────────┘
-  │  pipeline.index():  │  hop 2: embed(text)       ┌─ Ollama ───┐
-  │                     │ ───────────────────────► │  /api/embed│
-  │                     │ ◄──── ERROR / hang ────── │  fails ✗   │ ← step 2 dies here
-  │                     │                           └────────────┘
-  │  throws ✗           │  hop 3: upsert chunks     ┌─ Postgres ─┐
-  │  (never reached)    │      NEVER HAPPENS        │  chunks: 0 │ ← orphan: doc, no chunks
-  └─────────────────────┘                           └────────────┘
-
-  result: agents.documents has the row, agents.chunks has nothing → searchable doc
-          that returns no chunks. No rollback undid the documents write.
+  state before:   documents = {}        chunks = {}
+  step 1 commits: documents = {doc1}     chunks = {}        ← doc durable
+  step 2 starts:  pipeline.index(doc1)
+                    → embed(text) → POST Ollama → FAILS (daemon down, or hang→timeout)
+                    → throws BEFORE chunks upsert
+  state after:    documents = {doc1}     chunks = {}        ← ORPHAN
+                  ─────────────────────────────────────────
+  doc1 exists, is searchable as a document, but has ZERO chunks
+  → retrieval returns nothing for it; nothing flags the inconsistency
 ```
 
-The document row exists but is *unsearchable* (no chunks to match a query). There's no
-compensation (no "delete the documents row if indexing failed") and no
-reconciliation (no background job that finds docs-without-chunks and re-indexes
-them). Today the blast radius is one local document and the caller sees the throw, so
-it's an acceptable trade — but it *is* a partial commit across two systems, which is
-the definition of the problem sagas solve.
+The document is now a lie: it's in the system of record, but it's invisible to retrieval because it has no embedded chunks. Nothing detects this — there's no foreign key (chunks → documents is a *soft* link, FK explicitly dropped), no reconciliation job, no status column saying "indexed: false." It just sits there, silently broken.
 
-**Step 3 — the best-effort side-effect: a deliberate non-saga.** Contrast the
-`memory.remember` call (file 03/04), which is the *opposite* choice — explicitly
-accept the partial outcome:
+**Part 3 — why there's no foreign key (and why that's a real tradeoff).** The schema deliberately drops the FK:
 
-```ts
-// buffr/src/session.ts:64-69
-const answer = await agent.answer(question);
-await trace.flush();
-try {
-  await memory.remember({ conversationId, question, answer });   // ← step that may fail
-} catch {
-  // swallow: memory is best-effort, the turn already succeeded   ← NO compensation, BY DESIGN
-}
-return answer;
+```sql
+-- buffr/sql/001_agents_schema.sql:14-27
+create table if not exists agents.chunks (
+  id text primary key,
+  -- Soft link to documents.id (no FK): the VectorStore contract upserts chunks
+  -- with no notion of a documents row, so a hard FK would break drop-in parity.
+  document_id text,
+  …
+);
+alter table agents.chunks drop constraint if exists chunks_document_id_fkey;
 ```
 
-This is a saga step with the compensation deliberately set to *nothing*: if remember
-fails, don't undo the answer (the user already has it), don't retry, just drop it.
-That's a valid choice for a best-effort side-effect — the cost of losing one memory is
-low, the cost of failing the whole turn is high. Naming it as a *chosen* non-saga
-(rather than an oversight) is the point: not every cross-boundary step needs
-compensation; some side-effects are correctly fire-and-forget.
+This is a defensible call: the `VectorStore` contract (the load-bearing abstraction from `context.md`) upserts chunks knowing *nothing* about a `documents` row — that's what makes `InMemoryVectorStore` and `PgVectorStore` interchangeable. A hard FK would force every chunk write to have a parent document, breaking that parity. So the repo traded referential integrity for contract cleanliness — a real, deliberate tradeoff. The cost it accepted: the database can no longer flag an orphan, so the dual-write inconsistency is invisible at the storage layer.
 
-### Move 2.5 — current state vs the saga/outbox it would become
+**Part 4 — the two fixes, mapped to attach points.** Both are `not yet exercised`; here's where each would go.
+
+*Fix A — compensation (make it a real saga).* Wrap the workflow so that if step 2 fails, you *undo* step 1:
 
 ```
-  Phase A: today (dual write, sync, local)   Phase B: if indexing went async
-  ────────────────────────────────────────   ────────────────────────────────────
-  insert documents (commit #1)                insert documents + outbox row
-  embed + upsert chunks (commit #2)             IN ONE transaction (commit #1)
-  fail in step 2 → orphan doc                 worker reads outbox → embed → upsert
-  caller sees the throw                         chunks → mark outbox done
-                                              fail → outbox row stays → RETRIED
-  acceptable: 1 local doc, sync caller        reconciliation: orphans get fixed
+  saga with compensation
+
+  try:    INSERT documents       (step 1)
+          pipeline.index(chunks)  (step 2)
+  catch:  DELETE documents WHERE id = doc.id   ← compensating transaction
+          (or mark indexed=false)
 ```
 
-The **transactional outbox** is the standard fix and it's elegant: instead of two
-separate commits, write the documents row *and* an "index this doc" outbox row in
-*one* transaction. A separate worker reads the outbox, does the embed+chunk-upsert,
-and marks the outbox row done. If the worker dies mid-way, the outbox row is still
-there, so it gets retried — at-least-once + idempotent upsert (file 03) =
-effectively-once indexing. The documents-write and the intent-to-index become atomic,
-which is exactly the guarantee the dual write lacks. It would attach the moment
-indexing moved off the request path.
+Attach point: a `try/catch` in `indexDocumentRow` with a delete-or-mark in the catch. Cheap, and it closes the orphan window for the common case.
+
+*Fix B — transactional outbox (avoid the split).* Commit the document *and* an "index this" job in one transaction, then a worker drains the outbox with retries:
+
+```
+  transactional outbox
+
+  ┌─ one transaction ──────────────────────────┐
+  │ INSERT documents                            │
+  │ INSERT outbox (task='index', doc_id, …)     │  ← intent committed atomically
+  └─────────────────────────────────────────────┘
+        later: worker reads outbox → pipeline.index → mark done (idempotent, retryable)
+```
+
+Attach point: an `agents.outbox` table plus a drain loop. This is the stronger fix — it survives a *crash* between the writes (the job is durable), not just an exception you can catch. It also leans on the idempotent upsert from `03`: the worker can retry safely because re-indexing converges.
+
+*Fix C — reconciliation (the safety net).* Periodically scan for `documents` with zero `chunks` and re-index them. Attach point: a scheduled query `SELECT d.id FROM documents d LEFT JOIN chunks c … WHERE c.id IS NULL`. This catches whatever A and B miss — the backstop every saga system eventually grows.
+
+### Move 2.5 — current state vs the fix
+
+```
+  Phase A (now)                          Phase B (any one fix)
+  ─────────────────────────────────────  ────────────────────────────────────
+  INSERT documents (auto-commit)          A: + catch → DELETE/mark on failure
+  pipeline.index() (own txn)              B: + outbox row in step-1 txn, worker drains
+  no envelope, no undo, no detection      C: + reconciliation scan for orphans
+  embed failure → silent orphan           embed failure → repaired or never-committed
+```
+
+What *doesn't* change: the idempotent upsert (`03`) is already the convergence operation every fix relies on — the worker (B) or the retry (A) re-runs `pipeline.index` and the corpus converges. The repo's data model is already saga-friendly; it's only missing the envelope.
 
 ### Move 3 — the principle
 
-A single transaction is the cheapest consistency you can buy — use it whenever the
-whole operation lives in one database. The moment an operation spans two systems, that
-free atomicity is gone and you face a choice: accept the partial commit (best-effort,
-like `remember`), compensate it (a saga), or make the *intent* atomic and process it
-reliably later (an outbox). The mistake is *not noticing you've crossed the boundary*
-— writing two commits as if they were one transaction and being surprised by the
-orphan. aptkit's dual write is fine at its scale, but the discipline is to *name* it
-as a dual write so the day it scales, you reach for the outbox deliberately.
+The moment a workflow spans two transactions, "all or none" stops being free — the database gave it to you inside one transaction, and you have to *rebuild* it across two. The three tools are compensation (undo on failure), outbox (commit intent atomically, do the work later), and reconciliation (scan and repair). The dual-write problem is the canonical trap because the code *reads* atomic — two `await`s in a row look like one operation — but commits in two units. The skill is seeing the seam between the `await`s and asking "what's left half-done if I crash here?"
 
 ## Primary diagram
 
+The dual write, the orphan window, and the three fixes in one frame.
+
 ```
-  Cross-boundary workflows in aptkit — one dual write, one best-effort step
+  The dual-write saga — current gap and the three closures
 
-  ┌─ indexDocumentRow (the dual write — finding #3) ────────────────────┐
-  │  STEP 1: insert documents ─── commit #1 ──────────► Postgres ✓       │
-  │  STEP 2: embed (Ollama) ──► upsert chunks ─ commit #2 ─► Postgres    │
-  │          │                                                           │
-  │          └─ if embed fails: STEP 1 already committed → ORPHAN doc    │
-  │             no compensation, no reconciliation (acceptable @ 1 doc)  │
-  └─────────────────────────────────────────────────────────────────────┘
-
-  ┌─ session.ask → memory.remember (the deliberate non-saga) ───────────┐
-  │  step that may fail, compensation = NONE (try/catch swallow)         │
-  │  best-effort by design: losing a memory < failing the turn          │
-  └─────────────────────────────────────────────────────────────────────┘
-
-  NOT YET: transactional outbox (atomic intent + retrying worker),
-           explicit compensating transactions, reconciliation jobs
+  ┌─ indexDocumentRow (buffr/src/runtime.ts:5-18) ─────────────────┐
+  │                                                                 │
+  │  INSERT documents ──COMMIT──► [ORPHAN WINDOW] ──► pipeline.index │
+  │  (pool, auto-commit)              ▲                (own txn)     │
+  │                                   │                             │
+  │                       crash / embed failure here                │
+  │                       → doc durable, chunks absent, no FK to flag│
+  └─────────────────────────────────────────────────────────────────┘
+        │                          │                         │
+   fix A: catch → undo/mark   fix B: outbox + worker    fix C: reconcile scan
+   (closes exception window)  (closes crash window,     (backstop: find docs
+                               durable + retryable)       with 0 chunks)
+        └──────────── all three lean on the idempotent upsert (03) ───────┘
 ```
 
 ## Elaborate
 
-The dual-write problem is one of the most common ways real systems end up
-inconsistent, precisely because it's invisible: each individual write looks correct,
-and the bug only appears when step 2 fails after step 1 commits. The transactional
-outbox became the standard answer because it sidesteps distributed transactions (2PC,
-which is slow and has its own failure modes) entirely — you only ever commit to *one*
-database per transaction, and the "second system" reads the outbox asynchronously.
-It's the pattern behind reliable event publishing in most modern services.
+The dual-write problem is one of the most common bugs in service-oriented systems: "write to the database, then publish an event" (or "write to DB A, then DB B") looks atomic in code and isn't. The transactional outbox is the standard fix in the microservices literature (it's how you reliably get a database change into a message broker) — commit the event *into the same database transaction* as the data, then a separate process relays it. The saga pattern (Garcia-Molina & Salem, 1987, originally for long-lived database transactions) is the compensation-based cousin: define an undo for each forward step.
 
-Sagas (the term comes from a 1987 paper on long-lived database transactions) generalize
-this to multi-step workflows where each step has a compensation. The key insight that
-trips people up: compensations aren't perfect rollbacks — you can't un-send an email,
-so the compensation is "send a correction." Sagas trade strict atomicity for
-*eventual* consistency with explicit cleanup, which is usually the right trade when a
-true distributed transaction is too expensive. aptkit's `remember` is a degenerate
-saga (one step, empty compensation); `indexDocumentRow` is a two-step workflow that
-*should* be a saga or outbox the day it leaves the request path.
+The repo is a clean teaching case because the dual write is *small and visible* — two `await`s in a thirteen-line function. At scale this same shape hides across service boundaries and is far harder to spot. Learning to see the orphan window in `indexDocumentRow` is exactly the instinct that catches it in a 200-service architecture.
 
 ## Interview defense
 
-**Q: "Walk me through indexing a document — is it atomic?"**
-"It's a dual write, and no, it's not atomic across the two steps — I'll name that
-plainly. `indexDocumentRow` commits the `documents` row first, then `pipeline.index`
-embeds via Ollama and upserts chunks in a *separate* transaction. If the embed fails
-after the documents commit, I get an orphan — a document row with no chunks, so it's
-searchable but returns nothing. Each step is atomic internally (the chunk upsert is a
-proper `begin/commit/rollback`), but nothing spans them. At one-local-doc scale that's
-acceptable and the caller sees the error. If indexing moved async, I'd use a
-transactional outbox: write the documents row and an 'index me' outbox row in one
-transaction, then a worker does the embed+upsert and retries on failure — atomic
-intent plus at-least-once processing on an idempotent upsert."
+**Q: "Walk me through a consistency bug in this codebase."**
+"`indexDocumentRow` in buffr does a dual write — `INSERT documents` auto-commits, then `pipeline.index()` upserts chunks in its own transaction (`runtime.ts:16-17`). They're not atomic. If the embed fails in between — and it calls Ollama, which can hang or be down — the document is committed with zero chunks: an orphan. And `agents.chunks` has the FK to documents explicitly dropped (`001_agents_schema.sql:27`) for `VectorStore` contract parity, so the DB won't even flag it. It's a saga with no compensation."
 
 ```
-  sketch
-
-  insert documents (commit) ─► embed (FAIL) ─► chunks NEVER written = orphan
-  fix: insert documents + outbox IN ONE TXN ─► worker drains outbox ─► retry-safe
+  INSERT doc (commit) → [embed fails] → doc with no chunks, nothing detects it
 ```
 
-**Q: "What's the difference between a saga and a transaction?"** — load-bearing:
-"A transaction gives you `ROLLBACK` for free but only within one database. A saga is
-for when the operation spans systems and you've lost that — so each step gets an
-explicit *compensation* to undo it, run in reverse if a later step fails. The catch
-people forget: compensations aren't true rollbacks — you can't un-charge a card
-instantly, so the compensation is a *new* action (a refund). My `memory.remember` is a
-one-step saga with an empty compensation by choice — best-effort, losing it is cheaper
-than failing the turn."
+Anchor: *two `await`s read atomic but commit in two units — that's the dual-write trap.*
 
-*Anchor:* `indexDocumentRow` is a dual write (two commits, no atomicity); the outbox is
-the fix; `remember`'s `catch {}` is a deliberate empty compensation.
+**Q: "How would you fix it?"**
+"Three options, escalating. Cheapest: `try/catch` in `indexDocumentRow`, and on failure delete-or-mark the document — closes the *exception* window. Stronger: a transactional outbox — write the document and an 'index' job in one transaction, a worker drains it with retries — closes the *crash* window too, because the intent is durable. And a reconciliation scan for documents with zero chunks as a backstop. All three lean on the upsert already being idempotent, so retrying `pipeline.index` converges. The data model's already saga-friendly; it just needs the envelope."
+
+Anchor: *compensation closes the exception window, outbox closes the crash window, reconciliation is the backstop.*
 
 ## See also
 
-- `03-idempotency-deduplication-and-delivery-semantics.md` — idempotent upsert makes outbox retries safe
-- `02-partial-failure-timeouts-and-retries.md` — the embed failure that triggers the partial commit
-- `04-consistency-models-and-staleness.md` — the orphan doc is an application-level inconsistency
-- **study-database-systems** — single-DB transactions, the atomicity the dual write loses
-```
+- `03-idempotency-deduplication-and-delivery-semantics.md` — the idempotent upsert every fix relies on
+- `02-partial-failure-timeouts-and-retries.md` — the embed call (Ollama) that fails in the orphan window
+- `01-distributed-system-map.md` — seam 4 on the full map
+- `09-distributed-systems-red-flags-audit.md` — this is finding #2
+- `study-database-systems` — transactions, why the FK would normally guard this
+- `study-data-modeling` — the soft `document_id` link and the contract-parity tradeoff

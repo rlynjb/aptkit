@@ -1,226 +1,283 @@
 # 04 — Token budgeting and context window management
 
-**Industry name:** context window management / token budgeting — *Industry standard*
+**Subtitle:** token budgeting / context-window management — allocate, count,
+compress, position (Industry standard)
 
 ## Zoom out, then zoom in
 
-The chain that worked fine in the demo and fell over in production almost always
-fails the same way: nobody counted tokens. Small inputs fit; then a real
-workspace shows up with a 40-table schema, the prompt blows past the window, and
-the model either truncates silently or the call times out. **Token counting is
-not optional — it's basic hygiene, the thing that separates amateur from
-professional prompt work.** You allocate a budget: system prompt, retrieved
-context, history, response — and you defend the boundaries in code.
-
-Here's where token pressure shows up in this repo.
+This is the most operational concept in the guide. Counting tokens is not
+optional — it's the hygiene that separates amateur prompt work from
+professional. A chain that runs fine on small inputs and silently truncates
+at scale is the signature failure of skipping it. aptkit's budget lives at
+the assembly seam, where context gets spliced into the prompt.
 
 ```
-  Zoom out — where tokens get spent and bounded
+  Zoom out — where tokens accumulate before a model call
 
-  ┌─ Authoring ───────────────────────────────────────────────┐
-  │  PromptPackage.system (big) + compactSystem? (budget cut)  │
-  │  schemaSummary() — context renderer, the variable cost     │
-  └───────────────────────────┬────────────────────────────────┘
-  ┌─ Runtime (the budget defenses) ─▼──────────────────────────┐
-  │  ★ run-agent-loop.ts: maxTokens, maxToolCalls, maxTurns ★   │ ← we are here
-  │  ★ truncate() tool results @ 16_000 chars ★                │
-  │  generateStructured: maxTokens                             │
-  └───────────────────────────┬────────────────────────────────┘
-  ┌─ Provider ────────────────▼────────────────────────────────┐
-  │  ★ local provider: context-window GUARD ★                  │
-  │  usage-ledger.ts: inputTokens/outputTokens accounting      │
-  └──────────────────────────────────────────────────────────────┘
+  ┌─ Source ────────────────────────────────────────────────────┐
+  │  system prompt (constant)  + compactSystem? (budget variant) │
+  └───────────────────────────┬──────────────────────────────────┘
+                              │ + injected context
+  ┌─ ★ Assembly (budget seam) ▼───────────────────────────────────┐
+  │  ★ system + profile + {schema} + tool schemas + history ★     │ ← we are here
+  │     this is where the window fills up                         │
+  └───────────────────────────┬──────────────────────────────────┘
+                              │ maxTokens caps the RESPONSE
+  ┌─ Provider ────────────────▼───────────────────────────────────┐
+  │  Anthropic: huge window   |   Gemma: small LOCAL window        │
+  └────────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: the budget isn't one number, it's a set of caps spread across the loop —
-`maxTokens` on the response, `maxToolCalls` on the retrieval fan-out, `maxTurns`
-on the conversation, and a hard `truncate()` on tool results. Each cap defends a
-different slice of the window.
+Zooming in: the context window is a fixed budget split four ways — system
+prompt, retrieved context, conversation history, and the reserved space for
+the response. Token budgeting is the discipline of allocating that budget on
+purpose instead of discovering you blew it when the model truncates.
 
-## The structure pass
+## Structure pass
 
-**Layers:** the static prefix (system + schema, sent every call) → the growing
-middle (history + tool results, accumulates per turn) → the response (bounded by
-`maxTokens`).
+**Layers.** Source (system text, sized at authoring) → assembly (context
+injected, where the window actually fills) → provider (the window size,
+which *differs per provider*).
 
-**Axis — what consumes the window, and does it grow?** This is the axis that
-exposes the danger:
+**Axis — how much of the window is left for the response?** Trace it down:
 
 ```
-  Axis: "does this token cost grow per turn?" — traced down
+  Axis: "what fraction of the window is consumed before the answer?"
 
-  ┌──────────────────────────────────────────┐
-  │ system + {schema} prefix                  │  → FIXED per call (but re-sent)
-  └──────────────────────────────────────────┘
-      ┌──────────────────────────────────────┐
-      │ messages[] history + tool results     │  → GROWS every turn  ⚠
-      └──────────────────────────────────────┘
-          ┌──────────────────────────────────┐
-          │ response                          │  → bounded by maxTokens
-          └──────────────────────────────────┘
-
-  the GROWING middle is where windows blow — that's the seam to defend
+  system prompt    → fixed cost, every call
+  profile inject   → + a whole me.md document (rag-query)
+  {schema} summary → + workspace fields (query agent)
+  tool schemas     → + rendered JSON (Gemma: into system TEXT)
+  history          → + grows per turn in the loop
+  ─────────────────────────────────────────────────
+  response budget  → whatever's LEFT (maxTokens caps it)  ← the squeeze
 ```
 
-**Seam:** the per-turn append in the loop (`run-agent-loop.ts:124` and `:189`).
-Every turn pushes the assistant message *and* the tool results back onto
-`messages[]`. That's the accumulator that silently grows toward the window
-ceiling. The defenses — `truncate()` (`:54`), `maxToolCalls` (`:101`),
-`maxTurns` (`:87`) — all exist to keep that growing middle bounded. **What breaks
-without them:** a loop that searches 10 times stacks 10 tool results into the
-context and the 11th call exceeds the window.
+**Seam.** The load-bearing boundary is the *provider*. The same assembled
+prompt that fits comfortably in Anthropic's window can blow Gemma's local
+window. The window size flips across the provider seam, so a prompt that's
+safe on one model is one provider-swap away from truncating on another.
 
 ## How it works
 
-### Move 1 — the mental model
+You know how a fixed-height flex container distributes space among its
+children, and if you cram too many in, the last one gets clipped? The
+context window is that container. Every prompt section is a child competing
+for the same fixed height. Let's walk the budget.
 
-You already manage a fixed budget when you paginate an API: you have a page size,
-and you don't fetch 10,000 rows into memory just because you can. The context
-window is the same fixed budget. You decide how much goes to instructions, how
-much to retrieved context, how much you reserve for the answer — and you cap the
-things that grow.
-
-```
-  Pattern — the context window as a budget
-
-  ┌──────────── total window (model-specific) ────────────┐
-  │ system+schema │  retrieved context  │ history │ resp.  │
-  │  (prefix,     │  (tool results,     │ (turns, │ (cap:  │
-  │   re-sent)    │   truncate@16k)     │ maxTurns│ maxTok)│
-  └───────────────┴─────────────────────┴─────────┴────────┘
-  the 80% rule: stay under ~80% — if you're at the ceiling,
-  you're one model change (smaller window) away from breaking
-```
-
-### Move 2 — walking the budget defenses
-
-**Cap 1 — the response: `maxTokens`.** `runAgentLoop` defaults `maxTokens = 4096`
-(`run-agent-loop.ts:87`); `generateStructured` passes its own
-(`structured-generation.ts:70`). The intent classifier sets `maxTokens: 16`
-(`intent.ts:22`) — it returns one word, so it reserves almost nothing for the
-response. **What breaks without a sane cap:** either you reserve too little and
-the answer truncates mid-JSON (breaking the parser, concept 02), or too much and
-you starve the input.
-
-**Cap 2 — tool results: `truncate()`.** This is the most concrete defense in the
-repo:
+### Step 1 — the four claimants on the window
 
 ```
-  Inline annotation — run-agent-loop.ts:52 truncate
+  The window as a fixed budget — four claimants
 
-  const MAX_TOOL_RESULT_CHARS = 16_000;          ← hard ceiling per tool result
-  function truncate(value: string): string {
-    if (value.length <= MAX_TOOL_RESULT_CHARS)
-      return value;
-    return `${value.slice(0, MAX_TOOL_RESULT_CHARS)}\n...[truncated]`;  ← visible, not silent
-  }
-  // applied to EVERY tool result before it re-enters messages[] (:162, :167)
+  ┌───────────────────────── context window ─────────────────────┐
+  │ system prompt │ retrieved context │ history │  RESPONSE        │
+  │  (constant)   │  (per call)       │ (grows) │  (reserved)      │
+  └───────────────┴───────────────────┴─────────┴──────────────────┘
+                                                  ↑ maxTokens caps THIS
+   if the first three grow, the response space shrinks — silently
 ```
 
-A `search_knowledge_base` call that returns a huge chunk can't dump 50k chars
-into the growing middle — it's clipped to 16k with a visible `[truncated]`
-marker. **The boundary condition done right:** the truncation is *visible* to the
-model, so it knows the result was cut rather than silently reasoning over partial
-data.
+In aptkit the response cap is explicit: `maxTokens` defaults to 4096 in the
+loop (`run-agent-loop.ts:87`) and 16 for the intent classifier
+(`intent.ts:22` — it only needs one word). That cap is you *reserving*
+response space. The other three sections eat the rest.
 
-**Cap 3 — the fan-out: `maxToolCalls`.** The rag-query agent sets
-`maxToolCalls: 4` (`rag-query-agent.ts:76`). The loop checks `budgetSpent` when
-`toolCalls.length >= maxToolCalls` (`run-agent-loop.ts:101`) and forces a final
-answer. **What breaks without it:** a model that keeps searching stacks unbounded
-tool results into the window.
+### Step 2 — counting tokens: aptkit measures, it doesn't guess
 
-**Cap 4 — the conversation: `maxTurns`.** Default 8 (`:87`), rag-query uses 6.
-`forceFinal` triggers on the last turn (`:102`). This bounds the number of
-history rounds, which bounds the accumulated `messages[]`.
+The honest position: aptkit does not bundle a tokenizer or pre-count the
+assembled prompt. What it does instead is *measure actual usage after the
+call* and record it. The Gemma provider reads Ollama's real counts:
 
-**Cap 5 — the provider guard.** The `local` provider is explicitly a
-context-window guard (per the repo's provider set) — a provider-layer check
-that fails before a request exceeds the window, rather than letting the model
-truncate. And `usage-ledger.ts` accounts `inputTokens`/`outputTokens` per call
-(threaded from `response.usage`, `run-agent-loop.ts:111`) so spend is *measured*,
-not guessed.
+```ts
+// packages/providers/gemma/src/gemma-provider.ts:116 (toResponse)
+usage: {
+  inputTokens: response.prompt_eval_count,   // real count from Ollama
+  outputTokens: response.eval_count,
+  estimated: false,                          // ← not a guess
+},
+```
 
-**Retrieval as compression.** The most important budgeting move isn't a cap, it's
-the architecture: RAG retrieves *only the relevant chunks* instead of stuffing
-the whole corpus into the prompt. `search_knowledge_base` returns top-k ranked
-results with 160-char citation snippets (`search-knowledge-base-tool.ts:111`) —
-that's deliberate context compression. The `compactSystem?` slot on the
-`PromptPackage` (`prompts/src/types.ts:15`) is the same instinct for the system
-prompt: a budget-cut variant for when the window is tight.
+That `estimated: false` flag is the tell — aptkit distinguishes a real token
+count from an estimate, and surfaces it as a `model_usage` trace event
+(`run-agent-loop.ts:112`). So the budgeting discipline here is
+*measurement and observability*, not pre-flight estimation. You learn your
+real input-token cost per call from the trace, then size your prompt
+accordingly. Knowing your model's tokenizer and rough ratios is still on
+you; the repo gives you the ground truth to calibrate against.
 
-### Move 2.5 — current state vs future state
+### Step 3 — compression slot: `compactSystem`
+
+The `PromptPackage` carries a second, shorter system variant:
+
+```ts
+// packages/prompts/src/types.ts:13
+export type PromptPackage = {
+  system: string;
+  compactSystem?: string;   // ← the budget variant
+  ...
+};
+```
+
+This is the compression lever at the system layer: a long, detailed system
+prompt for a roomy model, a terse one for a tight window. It's a slot the
+type provides; whether a given package fills it is per-package. The pattern
+it encodes is the right one — keep two sizes of the same instruction and
+pick by budget — even where it's `not yet exercised` in every package.
+
+### Step 4 — retrieval AS context compression
+
+The most important compression technique in this repo isn't summarization —
+it's retrieval. The RAG-query agent doesn't stuff the whole knowledge base
+into the prompt. It retrieves the top-k relevant chunks and injects only
+those:
+
+```ts
+// packages/retrieval/src/search-knowledge-base-tool.ts:22
+const DEFAULT_TOP_K = 5;
+// the tool returns at most top_k ranked chunks, each a ~160-char snippet:
+// toResult(): const snippet = text.length > 160 ? `${text.slice(0,157)}...` : text;
+```
 
 ```
-  Comparison — token discipline: shipped vs gap
+  Retrieval as compression — don't stuff, retrieve
 
-  NOW (shipped)                      │  GAP (not yet exercised)
-  ─────────────────────────────────  │  ────────────────────────────────
-  maxTokens / maxTurns / maxToolCalls│  no tokenizer-accurate counting
-  truncate() tool results @ 16k      │    (caps are char/turn proxies)
-  usage-ledger accounts spend        │  no prefix CACHING (no cache_control
-  retrieval compresses context       │    anywhere — static prefix re-sent
-  compactSystem? budget variant slot │    every call, full cost each time)
-  local provider window guard        │  no sliding-window history summarizer
-                                     │  no lost-in-the-middle mitigation
+  whole KB (1000s of chunks)        retrieved (top 5)
+  ┌────────────────────────┐        ┌──────────────┐
+  │ ████████████████████   │  embed │ relevant 5   │ → into prompt
+  │ ████████████████████   │ ──ANN─►│ ~160 chars ea│
+  │ ████████████████████   │        └──────────────┘
+  └────────────────────────┘        fits the budget by design
+   would blow any window               (concept lives in study-ai-engineering)
 ```
+
+Retrieval is context compression: instead of paying tokens for everything,
+you pay an embedding+ANN search and bring back only what's relevant. The
+160-char snippet truncation in `toResult` is a second compression — even the
+retrieved chunks are clipped before they hit the prompt.
+
+### Step 5 — history growth and the loop's truncation guard
+
+In the agent loop, conversation history grows every turn — each assistant
+turn and each tool result gets appended to `messages`
+(`run-agent-loop.ts:124,189`). Unbounded, that's how a chain that worked on
+turn 2 blows the window on turn 6. aptkit's guard is at the tool-result
+boundary:
+
+```ts
+// packages/runtime/src/run-agent-loop.ts:52
+const MAX_TOOL_RESULT_CHARS = 16_000;
+function truncate(value: string): string {
+  if (value.length <= MAX_TOOL_RESULT_CHARS) return value;
+  return `${value.slice(0, MAX_TOOL_RESULT_CHARS)}\n...[truncated]`;
+}
+```
+
+A tool that returns a giant blob can't single-handedly evict the system
+prompt from the window — it's capped at 16k chars before being appended.
+That's a crude but real budget control on the fastest-growing claimant.
+
+### Step 6 — the 80% rule and lost-in-the-middle
+
+Two principles aptkit doesn't enforce in code but that govern how you should
+author against it:
+
+- **The 80% rule.** If your assembled prompt uses more than 80% of the
+  window, you're one model change away from breaking. The provider seam
+  makes this concrete: a prompt at 60% of Anthropic's window might be at 95%
+  of Gemma's. Leave headroom.
+- **Lost-in-the-middle.** Even when context fits, content buried in the
+  middle of a long prompt is poorly attended. Position matters — put the
+  retrieved chunks and the actual question where the model attends, not
+  buried after a wall of rules. aptkit's prompts front-load the role and
+  rules and put `{schema}` / the question near the end, which is the right
+  instinct.
+
+Prefix caching — caching the static prompt prefix across calls so you don't
+re-pay for it — is the natural next lever (and an argument for keeping the
+stable system prompt at the front). aptkit does `not yet exercise` it: there
+is no `cache_control` anywhere in `packages/`. It's the highest-leverage
+unbuilt budgeting feature here.
+
+### The principle
+
+**The context window is a fixed budget, and the professional move is to
+allocate it on purpose — measure real usage, reserve response space,
+compress with retrieval, and leave headroom for the next model.** The
+amateur move is to assume it fits and find out it didn't when the output
+truncates in production.
 
 ## Primary diagram
 
-Every cap, mapped onto the window it defends.
+The full budget picture, claimants and controls labelled.
 
 ```
-  Token budgeting — caps mapped to window slices
+  Token budget in aptkit — claimants and the controls on each
 
-  PROVIDER GUARD (local provider): reject if request > window
-  ┌──────────────── context window ────────────────────────────┐
-  │ SYSTEM+SCHEMA      │ TOOL RESULTS        │ HISTORY  │ RESP.  │
-  │ (compactSystem? to │ truncate() @16k     │ maxTurns │ maxTok │
-  │  shrink)           │ each (loop:52,162)  │ (=8/6)   │ (=4096)│
-  │ re-sent every call │ maxToolCalls (=4)   │          │        │
-  │ — no prefix cache  │ bounds the fan-out  │          │        │
-  └────────────────────┴─────────────────────┴──────────┴────────┘
-  usage-ledger.ts measures inputTokens/outputTokens per call
+  ┌───────────────────────── context window ─────────────────────┐
+  │ SYSTEM         │ RETRIEVED        │ HISTORY    │  RESPONSE      │
+  │ (constant)     │ (per call)       │ (per turn) │  (reserved)    │
+  │  ↑ compactSystem│ ↑ top_k=5 +     │ ↑ 16k-char │  ↑ maxTokens   │
+  │    variant slot │   160-char snip  │   truncate │    cap (4096)  │
+  └────────────────┴──────────────────┴────────────┴────────────────┘
+   measured after the call:  model_usage event { inputTokens, estimated:false }
+   provider seam:  Anthropic window ≫ Gemma local window  ← the squeeze flips here
+   not yet exercised:  prefix caching (cache_control)
 ```
 
 ## Elaborate
 
-Three ideas from the literature that this repo half-touches. **The 80% rule:**
-if you routinely use >80% of the window, you're one model swap (to a
-smaller-window model, or a model whose tokenizer counts your language heavier)
-away from breaking — the char-based caps here are a proxy for the real
-tokenizer-accurate count, which is the honest gap. **Lost-in-the-middle**
-(Liu et al.): content placed in the middle of a long context is attended worse
-than content at the start or end — position matters, and the repo doesn't yet
-reorder retrieved chunks to fight it. **Prefix caching:** providers can cache the
-static prefix of a prompt across calls so you don't pay to re-encode the system
-prompt and schema every time — Anthropic exposes this via `cache_control`, and
-the move is to keep everything stable at the *front* of the prompt. This repo
-sends the full prefix every call (no `cache_control` exists in the codebase),
-which is correct-but-uncached: a real cost lever left on the table.
+The token-budget discipline comes straight from production LLM work — the
+OpenAI cookbook's context-management notes, the lost-in-the-middle paper
+(Liu et al.), and every postmortem where a prompt grew past the window. The
+repo's stance is measurement-first: it records real `prompt_eval_count` from
+Ollama and flags estimates, rather than shipping a tokenizer. That's a
+defensible call for a toolkit — the host app knows its model's tokenizer
+better than the toolkit does.
+
+The connection to retrieval (`study-ai-engineering`) is the load-bearing
+one: retrieval is the dominant compression technique here, and the 160-char
+snippet plus `top_k=5` are both budget decisions wearing retrieval clothes.
+The connection to prompts-as-code (concept 3) is `compactSystem` — a budget
+variant versioned alongside the full prompt.
 
 ## Interview defense
 
-**Q: How do you keep a tool-calling agent from blowing the context window?** Cap
-the things that grow: bound the response (`maxTokens`), the fan-out
-(`maxToolCalls`), the turns (`maxTurns`), and hard-truncate tool results before
-they re-enter the message history. Use retrieval to compress context instead of
-stuffing the corpus. In this repo all four caps live in `runAgentLoop`.
+**Q: How do you budget a context window?**
+
+Treat it as a fixed allocation: system prompt + retrieved context + history
++ reserved response space. Reserve the response (a `maxTokens` cap),
+compress context with retrieval rather than stuffing, cap the fastest
+grower (tool results / history), and stay under ~80% so the next model
+doesn't tip you over. Measure real usage and calibrate — don't guess.
 
 ```
-  fixed prefix │ GROWING middle (the danger) │ bounded response
-               └─ truncate@16k + maxToolCalls + maxTurns ─┘
+  [ system | retrieved | history | RESPONSE ]  ← reserve the last box first
+   under 80% full = one model change of headroom
 ```
-*Anchor: `truncate` @ `run-agent-loop.ts:52`; `budgetSpent`/`maxToolCalls` @ `:101`.*
 
-**Q: The part people forget?** The **growing middle**. People budget the system
-prompt and the response and forget that tool results and history *accumulate* per
-turn — that's the slice that actually blows the window in a multi-turn agent. The
-load-bearing defense is the per-result `truncate()` plus the tool-call budget,
-not the response cap.
+Anchor: "aptkit reserves with `maxTokens`, caps tool results at 16k chars,
+compresses via `top_k=5` retrieval, and records `model_usage` with
+`estimated:false` so the real cost is observable."
+
+**Q: Name the budgeting failure mode you watch for.**
+
+A chain that works on small inputs and silently truncates at scale because
+nobody counted. The provider seam makes it worse: a prompt safe on a
+big-window cloud model blows a small local window. The control is the
+truncation guard (`MAX_TOOL_RESULT_CHARS`) plus measuring real usage per
+provider — and the unbuilt lever is prefix caching, which aptkit doesn't do
+yet.
+
+Anchor: "Works small, truncates at scale — the provider window flips the
+budget; prefix caching is the unbuilt fix."
 
 ## See also
 
-- `03-prompts-as-code.md` — `compactSystem` is the budget variant of the package.
-- `06-single-purpose-chains.md` — small models for classifiers spend fewer tokens.
-- `09-chain-of-thought.md` — CoT is a deliberate token spend; budget it.
-- `../study-performance-engineering/` — cost and latency at depth.
+- [01-anatomy.md](01-anatomy.md) — bloating the constant section costs
+  tokens every call
+- [03-prompts-as-code.md](03-prompts-as-code.md) — `compactSystem` as a
+  versioned budget variant
+- [08-few-shot.md](08-few-shot.md) — examples cost context tokens; budget
+  them
+- study-ai-engineering — retrieval as the dominant compression technique

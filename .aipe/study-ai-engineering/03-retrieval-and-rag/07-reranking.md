@@ -1,229 +1,179 @@
-# Reranking — two-stage retrieval
+# Reranking
+> Two-stage cross-encoder · Industry standard
 
-**Subtitle:** Reranking · cheap recall then expensive precision · *Industry standard*
+Your retriever is a *bi-encoder*: it embeds the query and the chunks separately, then compares vectors. That separation is what makes it fast — you precompute every chunk's vector once. But it's also what makes it imprecise: the query and chunk never actually "look at each other," so subtle relevance gets blurred. A *cross-encoder* reranker fixes that by feeding the query and each candidate chunk through a model *together*, scoring true relevance — but it's far too slow to run over your whole corpus. So you do both: retrieve cheaply (aptkit has this), then rerank the top ~20 expensively (the gap). Critically, you only add reranking once you've *measured* that retrieval precision is your bottleneck — and aptkit can measure it. This is `not yet exercised`.
 
 ## Zoom out, then zoom in
 
-Reranking is the answer to "retrieval found the right chunk, but it's ranked #7."
-It sits *between* the store's top-k and the model, re-ordering candidates with a
-slower, sharper scorer. aptkit's retrieval is single-stage cosine top-k — so the
-rerank stage is `not yet exercised`, and it is the most natural next build in the
-whole pipeline.
+Reranking is a second, narrower stage that would sit between retrieval and the agent.
 
 ```
-  Zoom out — rerank sits between retrieve and generate
-
-  ┌─ search_knowledge_base tool ────────────────────────────────┐
-  │  retrieve top-k (cosine) ─► ★ RERANK ★ ─► top-n to model     │ ← we are here
-  └──────────────┬──────────────────────────┬───────────────────┘
-   stage 1: fast │              stage 2: slow │
-  ┌─ pipeline.query ▼────────┐   ┌─ cross-encoder ▼────────────┐
-  │ bi-encoder cosine, top-k │   │ NOT YET EXERCISED            │
-  │ DEFAULT_TOP_K = 5         │   │ score (query, chunk) pairs   │
-  └───────────────────────────┘   └─────────────────────────────┘
+two-stage retrieval (stage 2 is the gap)
+┌──────────────────────────────────────────────────────────┐
+│  search_knowledge_base → agent context                      │
+└───────────────┬────────────────────────────────────────────┘
+                ▲
+┌──────────────────────────────────────────────────────────┐
+│  ★ STAGE 2: cross-encoder rerank ★   ✗ not yet exercised    │  ← the gap
+│  takes top ~20, scores (query,chunk) jointly, keeps top 5   │
+└───────────────┬────────────────────────────────────────────┘
+                ▲ over-fetch 20
+┌──────────────────────────────────────────────────────────┐
+│  STAGE 1: bi-encoder retrieve   pipeline.query (exists ✓)   │
+│  cosine over precomputed vectors — fast, approximate         │
+└──────────────────────────────────────────────────────────┘
 ```
 
-Now zoom in. You know the database pattern: a cheap index narrows millions of rows
-to a few hundred, then an expensive `WHERE` predicate filters those few precisely.
-You'd never run the expensive predicate over all millions. Reranking is that exact
-shape for retrieval — a cheap bi-encoder recalls 50 candidates, an expensive
-cross-encoder precisely re-scores those 50. aptkit only has the cheap stage today.
+aptkit has stage 1 — `queryKnowledgeBase` does the cheap cosine retrieve. Stage 2 is the precision pass it lacks. The shape is "retrieve wide, rerank narrow": ask the cheap retriever for 20 candidates, run the expensive cross-encoder over just those 20, return the best 5. You'd never run a cross-encoder over 10k chunks — that's the point of staging.
 
 ## Structure pass
 
-**Layers.** Stage 1 (bi-encoder recall — cosine, exists) → stage 2 (cross-encoder
-rerank — `not yet exercised`) → the model (gets the reranked top-n).
+Pick the **cost** axis: what does each stage pay, and what does it buy?
 
-**Axis — cost.** Trace the cost per stage. Stage 1 embeds the query *once* and
-compares against precomputed chunk vectors — cheap, fast, runs over the whole
-corpus. Stage 2 runs the model *per (query, chunk) pair* — expensive, so it only
-runs over the ~50 stage-1 survivors, never the corpus. The axis "how many model
-calls?" flips: stage 1 is O(1) embeddings, stage 2 is O(candidates) cross-encodes.
+```
+cost vs precision across the two stages
+  STAGE 1 (bi-encoder)              STAGE 2 (cross-encoder)
+  ┌──────────────────────┐         ┌──────────────────────────┐
+  │ query & chunk embedded │         │ query & chunk scored      │
+  │ SEPARATELY             │         │ TOGETHER (joint attention)│
+  │ vectors precomputed    │         │ NOTHING precomputable     │
+  │ cost: O(n) cheap ops   │         │ cost: 1 model call /chunk │
+  │ precision: blurry      │         │ precision: sharp          │
+  └──────────────────────┘         └──────────────────────────┘
+   run over: whole corpus            run over: top ~20 only
+        ▲ seam: candidate-set size is what makes stage 2 affordable ▲
+```
 
-**Seam.** The would-be seam is the search tool: `pipeline.query(query, fetchK)`
-returns the candidates (`search-knowledge-base-tool.ts:89`), and a rerank step would
-re-score and re-slice them before `toResult`. Today there is no stage 2 — what the
-cosine ranks, the model gets.
+The seam is the candidate set. A cross-encoder is ~100x the cost per pair of a cosine compare, so it's affordable only because stage 1 already narrowed 10k chunks to 20. Flip it — run the cross-encoder first — and the latency is catastrophic. The two stages are cheap-and-wide then expensive-and-narrow, and that ordering is non-negotiable.
 
 ## How it works
 
-### Move 1 — the mental model
-
-You know why a database has an index *and* a `WHERE` clause. The index is a cheap
-filter that's slightly imprecise; the `WHERE` is an exact predicate too expensive to
-run over everything. You run the cheap filter first to get a small candidate set,
-then the exact predicate on just those. Reranking is recall-then-precision:
-bi-encoder for cheap recall (cast a wide net), cross-encoder for expensive precision
-(judge each catch closely).
+**Move 1 — bi-encoder vs cross-encoder.** The whole distinction is *when* the query meets the chunk:
 
 ```
-  Two-stage retrieval — cheap recall, expensive precision
-
-  corpus (all chunks)
-        │ stage 1: bi-encoder cosine — fast, wide
-        ▼
-  top-50 candidates
-        │ stage 2: cross-encoder — slow, sharp, per (query,chunk) pair
-        ▼
-  top-5 to the model
-   bi-encoder embeds q and chunk SEPARATELY; cross-encoder reads them TOGETHER
+bi-encoder (retrieve)              cross-encoder (rerank)
+  query ──► [encoder] ──► q_vec      ┌──────────────────────┐
+  chunk ──► [encoder] ──► c_vec      │ [query  ‖  chunk]     │  concatenated
+                  │                  │        ↓              │
+            cosine(q_vec, c_vec)     │   [transformer]       │  joint attention
+                  │                  │        ↓              │
+            score (chunks scored     │   relevance score     │  query & chunk
+            INDEPENDENTLY)           └──────────────────────┘  attend to each other
+   FAST: c_vec precomputed once       SLOW: must run per (query,chunk) pair
 ```
 
-### Move 2 — bi-encoder vs cross-encoder, and the rerank slot
+In a bi-encoder the chunk's vector is computed once at index time and never sees the query. In a cross-encoder there's nothing to precompute — every (query, chunk) pair is a fresh forward pass — which is exactly why it's both more accurate (the two texts attend to each other) and too slow for the whole corpus.
 
-**Stage 1: the bi-encoder aptkit already has.** The cosine path is a bi-encoder
-setup — query and chunks are embedded *independently* and compared by angle
-(`in-memory-vector-store.ts:25`), and the tool returns the top-k with
-`DEFAULT_TOP_K = 5` (`search-knowledge-base-tool.ts:22`). Independent embedding is
-what makes it cheap: chunk vectors are precomputed at index time, so a query costs
-one embed plus a scan.
+**Move 2 — the staged flow.** aptkit already over-fetches; reranking would slot into that pattern. `not yet exercised`:
 
 ```
-  Bi-encoder (stage 1, exists) — embed separately, compare
-
-  query ─► embed ─► qv ┐
-                        ├─► cosine(qv, cv)   chunk vectors precomputed
-  chunk ─► embed ─► cv ┘   cheap: query pays one embed, not one per pair
+proposed rerank step (pseudocode — DOES NOT EXIST in aptkit)
+function searchWithRerank(query, finalK = 5):
+    candidates = pipeline.query(query, finalK * 4)     # stage 1: over-fetch 20
+    scored = []
+    for chunk in candidates:
+        s = crossEncoder.score(query, chunk.meta.text) # stage 2: joint score, 1 call each
+        scored.push({ ...chunk, score: s })
+    return sort(scored by s DESC)[:finalK]             # keep the sharpest 5
 ```
 
-**Stage 2: the cross-encoder that's missing.** A cross-encoder reads the query and a
-candidate chunk *together* in one model pass and outputs a relevance score for that
-specific pair. It's far more accurate — it sees the interaction between query and
-chunk — and far slower, because nothing is precomputed: every (query, chunk) pair is
-a fresh model call. So it only runs over the handful of stage-1 survivors.
+The over-fetch instinct already lives in aptkit's tool — the filtering path fetches 4x before trimming:
 
-```
-  Cross-encoder (stage 2, not yet exercised) — read together, score
-
-  [query ⊕ chunk] ─► model ─► relevance score    one call PER PAIR
-   only over the ~50 stage-1 candidates — never the whole corpus
+```ts
+// packages/retrieval/src/search-knowledge-base-tool.ts:88-90
+const fetchK = filter ? topK * 4 : topK;        // ← over-fetch when post-processing
+let hits = await pipeline.query(query, fetchK);
+if (filter) hits = hits.filter((hit) => matchesFilter(hit, filter)).slice(0, topK);
+//          a reranker would slot in HERE: fetch wide, rescore, slice to topK
 ```
 
-**Where it slots in aptkit.** Single-stage today; the rerank wraps the candidate
-list (`search-knowledge-base-tool.ts:89`):
+A reranker is the same shape as that filter: fetch `topK * N`, post-process, slice to `topK`. The seam already exists in the tool — reranking reuses it, swapping the boolean filter for a relevance rescore.
+
+**The gate — measure before you rerank.** This is the part people skip. Reranking adds latency and a model dependency; you earn it only if retrieval precision is actually your problem. aptkit can measure that:
 
 ```
-  Reranked handler (PSEUDOCODE — not yet exercised)
-
-  candidates = await pipeline.query(query, 50)     # widen stage-1 net (exists)
-  scored     = await reranker.score(query, candidates)   # cross-encoder, NOT built
-  hits       = scored.sort(desc).slice(0, 5)       # then existing toResult path
+the measurement gate (cross-link to file 05/evals)
+   build a fixture: queries with KNOWN relevant chunk ids
+        │
+        ▼ run stage-1 retrieval
+   hit@k = fraction of queries where the right chunk is in top-k
+        │
+        ├─ hit@5 already high (>0.9)? → DON'T rerank (no headroom)
+        └─ hit@20 high but hit@5 low? → RERANK (right chunk is retrieved,
+                                          just ranked too low — exactly
+                                          what a cross-encoder fixes)
 ```
 
-**Prove it with the metric the repo already has.** Reranking is only worth its cost
-if it lifts a measured number. aptkit ships `scorePrecisionAtK`
-(`packages/evals/src/precision-at-k.ts:47`) — the fraction of the top-k that's
-relevant — and `scoreRecallAtK`. Measure precision@5 before and after the rerank:
-widen stage 1 to recall@50 (catch the right chunk somewhere), then show the rerank
-lifts it into the top-5.
+The diagnostic that *justifies* reranking is specifically "hit@20 ≫ hit@5": the relevant chunk is in the candidate set but ranked 8th instead of 2nd. That's a precision problem a reranker solves. If hit@20 is also low, the chunk isn't being retrieved at all — that's a *recall* problem, and reranking can't conjure a candidate that isn't there.
 
-```
-  The measurement that justifies the cost (precision-at-k.ts:47)
-
-  before: cosine top-5 ─► precision@5 = m/5
-  after:  cosine top-50 ─► rerank ─► top-5 ─► precision@5 should rise
-   recall@50 must already contain the right chunk, or rerank can't help
-```
-
-### Move 2.5 — current state vs future state
-
-```
-  Phase A (aptkit, now)             Phase B (reranked — not yet exercised)
-  ┌────────────────────────┐        ┌──────────────────────────────────┐
-  │ single-stage cosine     │        │ two-stage: cosine recall + rerank │
-  │ top-5 to the model      │  add   │ cosine top-50 ─► cross-enc ─► top-5│
-  │ what cosine ranks, model │ stage2 │ precision@5 measured before/after │
-  │  gets                   │        │ slot: search-…-tool.ts:89          │
-  └────────────────────────┘        └──────────────────────────────────┘
-```
-
-### Move 3 — the principle
-
-Split recall from precision and pay for precision only where it counts. The cheap
-stage casts a wide net over the whole corpus; the expensive stage judges only the
-catch. Never run the cross-encoder over the corpus, and never ship a reranker without
-a before/after precision@k number — an extra model call per chunk has to *earn* its
-latency. aptkit's single-stage cosine is the right starting point, and the reranker
-over its candidates is the highest-leverage next build precisely because the eval
-to prove it already exists.
+**Move 3 — the principle.** Reranking is a precision tool with a strict precondition: the relevant chunk must already be in the candidate set. So you measure first. The architecture is always "retrieve wide and cheap, then rerank narrow and expensive," and you add stage 2 only when the numbers say recall is fine but ranking is off. Bolting a cross-encoder onto a recall problem burns latency and fixes nothing.
 
 ## Primary diagram
 
 ```
-  Two-stage retrieval in aptkit terms
-
-  query
-    │ stage 1 (exists): pipeline.query — bi-encoder cosine over the corpus
-    ▼
-  top-50 candidates  ── recall@50 must contain the right chunk
-    │ stage 2 (not yet exercised): cross-encoder scores each (query,chunk) pair
-    ▼
-  top-5  ─► toResult/citation (unchanged) ─► model
-    │
-    └─ measure: precision@5 before vs after (precision-at-k.ts:47)
+two-stage retrieval, gated on measurement
+   query
+     │ stage 1: pipeline.query(query, 20)   ← cheap, wide, recall
+     ▼
+   [20 candidates by cosine]
+     │   ┌─────── GATE: is hit@20 ≫ hit@5? ───────┐
+     │   │ NO  → skip rerank (no precision gap)     │
+     │   │ YES → proceed                            │
+     │   └──────────────────────────────────────────┘
+     ▼ stage 2: crossEncoder.score(query, chunk) × 20  ← expensive, narrow, precision
+   [20 rescored] ── sort ── slice(5) ──► top 5 sharpest ──► agent
 ```
+
+Retrieve wide, gate on measured precision, rerank narrow — skip stage 2 unless the candidate set already contains the answer but ranks it poorly.
 
 ## Elaborate
 
-The reason reranking is the "natural next build" and not, say, GraphRAG is leverage
-vs cost. aptkit already retrieves the right chunk most of the time — it just
-sometimes ranks it #4 instead of #1. A cross-encoder over the existing cosine
-candidates fixes ranking without touching the store, the contracts, or the agent,
-and the repo *already has the eval* to prove the lift
-(`packages/evals/src/precision-at-k.ts`). That combination — small surface, real
-metric, common interview topic — is why it tops the build queue. Read
-`06-hybrid-retrieval-rrf.md` for fusing the candidates before reranking and
-`05-evals-and-observability/01-eval-set-types.md` for precision@k as the gate.
+The bi-/cross-encoder split is from the Sentence-BERT line of work (Reimers & Gurevych, 2019); the SBERT library popularized the two-stage retrieve-then-rerank pattern. Today you'd reach for **cross-encoder/ms-marco-MiniLM** (a small local reranker — fits aptkit's local-first stance), Cohere Rerank, or BGE-reranker (hosted/heavier). Adjacent: **ColBERT** (late interaction — a middle ground between bi- and cross-encoder that precomputes per-token vectors), and **listwise rerankers** (LLM-as-reranker — feed all candidates to an LLM and ask it to order them). The measurement piece connects to sub-section 05 (evals): hit@k / precision@k is the metric that gates this whole decision. Read next: `06-hybrid-retrieval-rrf.md` (the fusion stage reranking often follows) and the evals sub-section for the measurement harness.
 
 ## Project exercises
 
-### Add a rerank stage over the cosine candidates and measure precision@5
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** widen `pipeline.query` to fetch top-50 in the tool, add a
-  `Reranker` that scores (query, chunk) pairs (a cross-encoder, or an LLM-judge stub
-  for the test), re-sort, slice top-5; report precision@5 before and after with the
-  existing scorer.
-- **Why it earns its place:** this is the single highest-leverage RAG upgrade in the
-  repo — small surface, the eval already exists, and "retrieve wide then rerank" is
-  the most-probed two-stage pattern in interviews.
-- **Files to touch:** a new `packages/retrieval/src/reranker.ts`,
-  `packages/retrieval/src/search-knowledge-base-tool.ts` (around line 89),
-  `packages/evals/src/precision-at-k.ts` (reuse), a new test in
-  `packages/retrieval/test/`.
-- **Done when:** a test shows the right chunk recalled at top-50 but ranked low by
-  cosine moves into the top-5 after rerank, and precision@5 rises.
+### Measure hit@k first, add rerank only if it helps
+
+- **Exercise ID:** `EX-RAG-07a`
+- **What to build:** A retrieval-quality harness — a fixture of queries with known-relevant chunk ids — that reports hit@5 and hit@20 over `pipeline.query`. Add a cross-encoder rerank step *only* on the queries where hit@20 ≫ hit@5, and re-measure.
+- **Why it earns its place:** This is the disciplined version: the harness is the artifact that *justifies or rejects* reranking, and it's reusable for every other retrieval change (chunking, hybrid). Building the measurement before the feature is the whole lesson. Case B. Phase 2B.
+- **Files to touch:** new harness under `packages/retrieval/`; measures `queryKnowledgeBase` (`packages/retrieval/src/pipeline.ts:50-59`); rerank step slots into the over-fetch seam in `packages/retrieval/src/search-knowledge-base-tool.ts:88-90`.
+- **Done when:** the report shows hit@5 vs hit@20 per query, and the rerank step is added only where the gap exists — with before/after hit@5 proving it moved the metric (or proving it didn't, and you back it out).
 - **Estimated effort:** `1–2 days`
+
+### Wire a local cross-encoder behind a Reranker contract
+
+- **Exercise ID:** `EX-RAG-07b`
+- **What to build:** A `Reranker { rerank(query, hits, topK): VectorHit[] }` contract + a stub/local implementation, slotted into the search tool's over-fetch path.
+- **Why it earns its place:** Names the seam so reranking is a drop-in adapter (like `EmbeddingProvider`), not a hardcoded branch — and proves the over-fetch path generalizes beyond the existing filter.
+- **Files to touch:** new `packages/retrieval/src/reranker.ts`; integrate at `packages/retrieval/src/search-knowledge-base-tool.ts:88-90`.
+- **Done when:** the tool optionally reranks the over-fetched candidates and slices to `topK`, with a test using a deterministic stub reranker.
+- **Estimated effort:** `1–4hr`
 
 ## Interview defense
 
-**Q: "Why two stages instead of one good ranker?"**
-Cost. A cross-encoder reads the query and chunk together and is far more accurate,
-but it costs one model call per (query, chunk) pair — running it over the whole
-corpus is infeasible. So stage 1 is a cheap bi-encoder (precomputed chunk vectors,
-one query embed, cosine scan) that recalls ~50 candidates, and stage 2 runs the
-expensive cross-encoder only over those 50. Recall cheap, then precision expensive.
+**Q: Why not just use the cross-encoder for retrieval and skip the bi-encoder?**
 
 ```
-  bi-encoder: precompute chunks, cheap recall over corpus
-  cross-encoder: per-pair, expensive precision over ~50 survivors only
+cross-encoder: 1 model call PER (query, chunk) pair, nothing precomputable
+  over 10k chunks = 10k forward passes per query = seconds-to-minutes
+bi-encoder: chunk vectors precomputed once; query is 1 embed + cheap cosine
 ```
-Anchor: *cast a wide cheap net, then judge only the catch closely.*
 
-**Q: "How do you know reranking actually helped?"**
-Measure precision@k before and after. aptkit has `scorePrecisionAtK`
-(`precision-at-k.ts:47`): widen stage 1 to recall@50 so the right chunk is *somewhere*
-in the candidates, then show the rerank lifts it into the top-5 — precision@5 rises.
-If recall@50 already misses the chunk, reranking can't help, and the number says so.
+Anchor: a cross-encoder can't precompute chunk representations, so running it over the whole corpus is intractable — it only works on a pre-narrowed candidate set.
+
+**Q: Reranking didn't improve your answers. What did you fail to check?**
 
 ```
-  recall@50 contains it? ─► rerank ─► precision@5 ↑   (proven, not asserted)
+hit@20 ≫ hit@5  → precision gap → rerank HELPS
+hit@20 ALSO low → recall gap → relevant chunk isn't even retrieved
+                  → reranking can't promote what isn't there
 ```
-Anchor: *a reranker without a before/after precision@k number hasn't earned its latency.*
+
+Anchor: reranking only reorders the candidate set — if the right chunk isn't retrieved into the top-20, reranking is powerless; that's a recall problem (better chunking/embedding/hybrid), not a ranking one.
 
 ## See also
 
-- `05-dense-vs-sparse.md` — the bi-encoder recall stage 1 builds on
-- `06-hybrid-retrieval-rrf.md` — fuse candidates before reranking
-- `04-vector-databases.md` — the single-stage cosine retrieval today
-- `11-rag.md` — the search tool the rerank slots into
-- `05-evals-and-observability/01-eval-set-types.md` — precision@k as the gate
+- [06-hybrid-retrieval-rrf.md](06-hybrid-retrieval-rrf.md) — fusion, the stage reranking often follows
+- [05-dense-vs-sparse.md](05-dense-vs-sparse.md) — recall-side fixes when reranking can't help
+- [11-rag.md](11-rag.md) — where the reranked list feeds the agent

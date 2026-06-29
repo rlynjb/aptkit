@@ -1,311 +1,196 @@
-# Train / validation / test split
+# Train / Validation / Test Split Discipline
 
-**Subtitle:** train fits · val tunes · test reports once · *Industry standard*
+> train/validation/test split · evaluation hygiene
+
+One more time, plainly: **aptkit trains no model, so aptkit has no split.** There is no `train_test_split`, no held-out set, no grouped-split utility in `packages/`. This is new ground — study material and exercises, not shipped code.
+
+This is also the file with the highest ratio of "looks trivial, ruins everything." Splitting data sounds like a one-liner: shuffle, take 80% to train, 20% to test. For contrl-shaped data — time series where adjacent rows are near-identical — that naive one-liner produces a model that looks brilliant offline and fails on the first new person. The bug is invisible in the metrics. That's why this gets its own file.
 
 ## Zoom out, then zoom in
 
-aptkit has no trained model, so the layers below are the *generic* supervised
-pipeline. You saw this stack in file 01. This file lives inside the starred box:
-how you carve the rows so the number you report actually predicts production.
+The split is the third stage. It's the seam between features and the model, and it decides whether your reported numbers mean anything. Star on the split.
 
 ```
-  Zoom out — where the split sits (generic; aptkit has none)
-
-  ┌─ Data layer ───────────────────────────────────────────────────┐
-  │  raw rows + LABELS                                              │
-  └───────────────────────────┬─────────────────────────────────────┘
-                              │ feature engineering (file 02)
-  ┌─ Feature layer ───────────▼─────────────────────────────────────┐
-  │  fixed-width numeric vectors X, label vector y                  │
-  └───────────────────────────┬─────────────────────────────────────┘
-                              │ split (this file)
-  ┌─ Split layer ─────────────▼─────────────────────────────────────┐
-  │  ★ train · val · test — disjoint, split at the inference unit ★ │
-  └───────────────────────────┬─────────────────────────────────────┘
-                              │ fit + select (files 04–08)
-  ┌─ Model layer ─────────────▼─────────────────────────────────────┐
-  │  fitted f(X) → ŷ — graded ONCE on held-out test                │
-  └───────────────────────────┬─────────────────────────────────────┘
-                              │ ship
-  ┌─ Serving layer ───────────▼─────────────────────────────────────┐
-  │  new units arrive — the model has never seen them               │
-  └──────────────────────────────────────────────────────────────────┘
+Where the split lives (★ = this file)
+┌──────┐   ┌──────────┐   ┌────────────────────┐   ┌───────┐   ┌────────┐
+│ DATA │──▶│ FEATURES │──▶│ TRAIN / VAL / TEST ★ │──▶│ MODEL │──▶│ DEPLOY │
+└──────┘   └──────────┘   └────────────────────┘   └───────┘   └────────┘
+                            ▲ split at the level the model
+                              will see as NEW, or your metrics lie
 ```
 
-Now zoom in. The split is the one box that protects you from lying to yourself.
-A model can memorize its training rows and score perfectly on them — and then
-fail the moment a *new* input arrives in production. The split exists to simulate
-that new input *before* you ship, by hiding a slice of data and grading on it.
-Get the split wrong and every downstream number is fiction. This is the cheapest
-box to build and the most expensive to get wrong.
+The split's only job is to *simulate the future*. Val and test exist to answer "how will this do on data it has never seen?" If the data it's tested on isn't truly new — because near-identical rows leaked into training — the answer is a comforting lie. Everything in this file is about making "new" mean new.
 
 ## Structure pass
 
-**Layers.** One labeled dataset → three disjoint subsets. **Train** is what the
-model fits on. **Validation** is what you tune knobs and pick models against.
-**Test** is the sealed envelope you open exactly once, at the end, to report the
-number you'll quote in the PR. Three sets, three jobs, no overlap.
+There are three sets and one rule that governs how they're carved.
 
-**Axis — where does leakage enter?** Trace any row from raw data to its subset.
-Leakage is any path by which information about a test row reaches the model
-before scoring: the *same query* split across train and test, the *same user*'s
-events on both sides, a *future* fact used to predict a past event, or a feature
-computed over the whole dataset before splitting. Every one of these inflates the
-test score and the model fails in prod.
+- **Train.** The model fits on this. Big.
+- **Validation.** You tune hyperparameters and choose between models against this. You may look at it many times.
+- **Test.** You touch this **once**, at the very end, to report a number. Look at it twice and it becomes a second validation set — its honesty is spent.
+- **The split rule (the whole file).** Carve along the unit the model sees as new at serving time. Row-level for independent rows; **group-level (session/user) for correlated rows.** For contrl, that's per-workout-session and ultimately per-person — never per-frame.
 
-**Seam.** The load-bearing boundary is **the split key** — the column you group
-by before partitioning. Split by `row` and a per-query model leaks; split by
-`query_id` and it holds. The seam is "what unit arrives *new* at inference time?"
-You must split at exactly that unit. Everything else follows from naming it.
+The seam that bites: choosing the split granularity. Get it wrong and the other three sets are fine individually but the boundary between them leaks.
 
 ## How it works
 
-### Move 1 — the mental model
+### Move 1 — Mental model
 
-You already know not to test your code against the same fixture you hand-tuned it
-to pass — that's grading the answer key. The split is that instinct made
-statistical. Train is the practice problems; test is the sealed exam you write
-once. If a single exam question appeared in the practice set, the score tells you
-nothing about a real student.
+A leak is a **peek at the answer key.** Whenever information from val/test reaches the model during training — directly or through a near-duplicate row — the model is partly memorizing the test, and its score is inflated. The mental model: imagine the model is a student and the test is an exam. Row-wise splitting of time series hands the student the exam questions during study, just slightly reworded.
 
 ```
-  Pattern — the sealed envelope
-
-  one labeled dataset
-  ┌───────────────────────────────────────────────┐
-  │  ████████████████  ██████████  ░░░░░░░░░░░░░░  │
-  └───────┬──────────────────┬──────────────┬──────┘
-          ▼                  ▼              ▼
-     ┌─────────┐        ┌─────────┐    ┌─────────┐
-     │  TRAIN  │        │   VAL   │    │  TEST   │
-     │ fit on  │        │ tune /  │    │ open    │
-     │ these   │        │ select  │    │ ONCE ★  │
-     └─────────┘        └─────────┘    └─────────┘
-       ~70%               ~15%           ~15%
-       (touch freely)   (touch often)  (touch once)
+Mental model — the leak is a peek at the answer key
+  CORRECT split (by session)            LEAKY split (by frame)
+  session A ─┐                          frame 1 ─┐
+  session B ─┼─▶ TRAIN                  frame 2 ─┼─▶ TRAIN
+  session C ─┘                          frame 3 ─┘
+  ─────────────────────                 frame 4 ─┐   ← frame 3 and 4 are
+  session D ──▶ TEST (truly new)        frame 5 ─┼─▶ TEST   nearly identical!
+                                        frame 6 ─┘   model already "saw" it
+   model meets a NEW person             model is graded on near-copies → fake 0.99
 ```
 
-You write the split key, not the model. The split decides whether your test
-number is a promise or a lie.
+Adjacent frames in a 30fps pose stream differ by millimeters. A row-wise shuffle scatters frame 3 into train and frame 4 into test — so the test is essentially the training data with a tiny jitter. The score is meaningless.
 
-### Move 2 — building the split
+### Move 2 — Step by step
 
-**Part 1 — split at the inference unit, not the row.** Ask: what arrives *new* in
-production? For a learned reranker over aptkit retrieval, a whole *query* arrives
-new — never an individual `(query, doc)` row. So you group by `query_id` and send
-whole queries to one side. Split by row and the model sees `q1`'s docs in
-training, then gets graded on more of `q1`'s docs in test — it has effectively
-memorized that query.
+Pseudocode for a *new* grouped-split utility. **Not yet exercised in aptkit** — there is no split code anywhere in `packages/`; the contrl reference is prose only.
+
+**Part 1 — Identify the group key.**
 
 ```
-  Wrong: split by row            Right: split by query_id
-  ┌──────────────────┐           ┌──────────────────┐
-  │ q1·d4 → TRAIN     │          │ q1·d4 → TRAIN     │
-  │ q1·d9 → TEST  ✗   │  leak →  │ q1·d9 → TRAIN     │  q1 whole → TRAIN
-  │ q2·d2 → TRAIN     │          │ q2·d2 → TEST      │  q2 whole → TEST
-  │ q2·d7 → TEST  ✗   │          │ q2·d7 → TEST      │
-  └──────────────────┘           └──────────────────┘
-   same query both sides          each query one side only
+Group-key decision
+Are rows independent?
+   yes ──▶ row-level split is fine (rare for sensor/time data)
+   no  ──▶ what makes two rows "the same situation"?
+            same workout session?  → group = session_id
+            same person?           → group = user_id  (stronger: tests new people)
+```
+
+Pick the *strongest* grouping you can afford. For contrl, splitting by `user_id` answers the question you actually care about: "does this work for someone the model has never seen?"
+
+**Part 2 — Split by group, not by row.**
+
+```
+Grouped split
+all sessions: [A B C D E F G H]   (each session = many correlated frames)
+group-shuffle, then carve:
+   TRAIN: [A B C D E]      VAL: [F G]      TEST: [H]
+   ▲ no session appears in more than one set → no frame leaks across the boundary
 ```
 
 ```python
-# PSEUDOCODE — group-aware split for a per-query reranker
-# rows: (query_id, doc_id, features, label) — many rows share a query_id
-def split_by_query(rows, val_frac=0.15, test_frac=0.15, seed=0):
-    query_ids = unique(r.query_id for r in rows)
-    shuffle(query_ids, seed)                  # randomize the UNIT, not the row
-    n = len(query_ids)
-    test_ids  = set(query_ids[: int(n*test_frac)])
-    val_ids   = set(query_ids[int(n*test_frac): int(n*(test_frac+val_frac))])
-    # a query lands wholly in one bucket — never straddles two
-    train = [r for r in rows if r.query_id not in test_ids | val_ids]
-    val   = [r for r in rows if r.query_id in val_ids]
-    test  = [r for r in rows if r.query_id in test_ids]
-    return train, val, test
-# For a per-USER intent model, the same code with key = r.user_id.
+def grouped_split(rows, group_key, ratios=(0.7, 0.15, 0.15)):  # not in aptkit
+    groups = unique(r[group_key] for r in rows)
+    shuffle(groups)
+    cut1 = int(len(groups) * ratios[0])
+    cut2 = cut1 + int(len(groups) * ratios[1])
+    train_g, val_g, test_g = groups[:cut1], groups[cut1:cut2], groups[cut2:]
+    return (filter_by(rows, group_key, train_g),
+            filter_by(rows, group_key, val_g),
+            filter_by(rows, group_key, test_g))
 ```
 
-**Part 2 — three sets, three jobs.** Train fits the parameters. Val is where you
-*choose*: which hyperparameters, which features, which of two models. Every time
-you look at val and change something, val gets a little "used up" — that's fine,
-it's the tuning set. Test is touched once, after all decisions are frozen,
-because the moment you tune against test it becomes another training set and
-stops predicting prod.
+The key line: you shuffle and split *groups*, then assign every row to the set its group landed in. A whole session moves together.
+
+**Part 3 — Prove the absence of a leak with a test.**
 
 ```
-  ┌─────────┐  fit params   ┌─────────┐
-  │  TRAIN  │ ────────────► │ model A │
-  └─────────┘               └────┬────┘
-  ┌─────────┐  score, tune,      │ pick the winner on VAL
-  │   VAL   │ ◄──── repeat ──────┘   (look as often as you like)
-  └─────────┘
-  ┌─────────┐  ONE final score → the number you report
-  │  TEST   │ ◄──── open once, never tune against it ★
-  └─────────┘
+Leakage assertion
+TRAIN groups ∩ VAL groups ∩ TEST groups  ==  ∅   (empty)
+        │
+        ▼ if any group_id appears in two sets → FAIL the build
 ```
 
 ```python
-# PSEUDOCODE — the three jobs, in order
-candidates = [model_simple, model_strong]
-fitted = [m.fit(X_train, y_train) for m in candidates]          # TRAIN: fit
-best = argmax(fitted, key=lambda f: score(f, X_val, y_val))     # VAL: select/tune
-final_number = score(best, X_test, y_test)                      # TEST: report ONCE
-# If you now go back and re-tune to beat final_number, test is burned.
+def assert_no_leak(train, val, test, group_key):    # not in aptkit
+    g = lambda rows: {r[group_key] for r in rows}
+    assert g(train).isdisjoint(g(val))
+    assert g(train).isdisjoint(g(test))
+    assert g(val).isdisjoint(g(test))
 ```
 
-**Part 3 — temporal split when you predict the future.** If the prediction is
-about something that happens *later* (will this user click next week?), a random
-split leaks the future into the past. Sort by time and cut: train on the past,
-test on the future. Random splitting here lets the model peek at outcomes it
-could never know at serve time.
+This test is your insurance. It's three set-intersection checks and it catches the single most expensive ML mistake before it ever reaches a metric.
 
-```
-  time ──────────────────────────────────────────────►
-  ┌──────────────── TRAIN ────────────┬─ VAL ─┬─ TEST ─┐
-  │  weeks 1–8                         │ wk 9  │ wk 10  │
-  └────────────────────────────────────┴───────┴────────┘
-   the cut is a DATE, not a random shuffle
-   serving = "predict week 11" — test mimics exactly that
-```
+### Move 3 — The principle
 
-**Part 4 — leakage, the silent inflator.** Leakage is any way test-row
-information reaches the model before scoring. Most common: featurizing or
-normalizing over the *whole* dataset before splitting (the test rows' statistics
-bleed into train). Fit transforms on train only, then apply them to val/test.
-
-```
-  Wrong order                     Right order
-  normalize(ALL rows)             split first
-        │                              │
-     then split          ──►      fit scaler on TRAIN only
-   (test stats leaked)            apply that scaler to VAL/TEST
-```
-
-```python
-# PSEUDOCODE — fit transforms on train, apply to the rest
-train, val, test = split_by_query(rows)
-scaler = fit_scaler(train.features)     # statistics from TRAIN only
-Xtr = scaler.apply(train.features)
-Xva = scaler.apply(val.features)        # test/val never inform the scaler
-Xte = scaler.apply(test.features)
-```
-
-**Move 2.5 — the aptkit reality.** Not yet exercised in aptkit — aptkit runs
-pre-trained LLMs, not trained models. The pattern is taught here as study ground.
-The closest real artifact is the eval layer: aptkit's fixtures
-(`packages/agents/query/fixtures/*.json`) and replay artifacts
-(`artifacts/replays/*.json`) are a held-out test set *in spirit* — graded by
-`scorePrecisionAtK`/`scoreRecallAtK` (`packages/evals/src/precision-at-k.ts`) and
-`scoreDetections` (`packages/evals/src/detection-scorer.ts`), and never trained
-on, because there's nothing to train. They are the sealed envelope without a
-model behind it.
-
-### Move 3 — the principle
-
-Split at the unit that arrives new at inference time, and keep the test set
-sealed until the end. The split key is the seam: name "what is new in
-production?" and group by it. Everything that inflates a test score — query
-leakage, user leakage, future leakage, transform leakage — is a failure to
-respect that one boundary. *(K-fold cross-validation is the same idea spun: when
-data is scarce, rotate which fold is held out across k runs and average — but
-each fold still splits at the inference unit, never the row.)*
+**Split at the level the model will see as new, then prove the sets are disjoint at that level.** Validation honesty is not a property of the percentages — it's a property of the boundary. If correlated rows straddle the boundary, no amount of test-set size saves you.
 
 ## Primary diagram
 
-```
-  The split, the keys, and the one-shot test
+The canonical picture: the same dataset split two ways, with the resulting (real) metric next to each, so you see the leak as a number.
 
-  labeled rows (query_id · doc_id · features · label)
-        │
-        │  ★ group by INFERENCE UNIT (query_id / user_id / time) ★
-        ▼
-  ┌───────────┐   fit    ┌───────────┐  select  ┌───────────┐  report once
-  │  TRAIN    │ ───────► │  model(s) │ ───────► │   VAL     │ ──────┐
-  │  ~70%     │          │           │          │  ~15%     │       │
-  └───────────┘          └───────────┘          └───────────┘       ▼
-                                                              ┌───────────┐
-   transforms fit on TRAIN only, applied outward ───────────►│   TEST    │
-   (no whole-dataset normalize · no future · no shared unit) │  ~15% ★   │
-                                                              └───────────┘
-                                                               opened ONCE
 ```
+Two splits, same data — the leak shown as a metric
+                 ┌─────────────────────────────────────────────┐
+  ROW-WISE       │ shuffle all frames, take 20% as test         │
+  (LEAKY)        │ test frames are near-copies of train frames  │  VAL: 0.99 ──▶ PROD: 0.71
+                 │ ┌──────────────┐  ┌────────┐                 │  ▲ the lie
+                 │ │ train frames │  │ test ≈ │  same sessions  │
+                 │ │  A1 A2 B1 B2 │  │ A3 B3  │  in BOTH         │
+                 │ └──────────────┘  └────────┘                 │
+                 └─────────────────────────────────────────────┘
+                 ┌─────────────────────────────────────────────┐
+  GROUP-WISE     │ split whole sessions; no session in two sets │  VAL: 0.84 ──▶ PROD: 0.83
+  (HONEST)       │ ┌──────────────┐  ┌────────┐                 │  ▲ the truth
+                 │ │ sessions A,B │  │ session│  disjoint        │
+                 │ │   (train)    │  │ C (test)│  groups         │
+                 │ └──────────────┘  └────────┘                 │
+                 └─────────────────────────────────────────────┘
+```
+
+The leaky split reports 0.99 and ships something that does 0.71 in production. The honest split reports a humbler 0.84 that *holds*. The lower offline number is the more valuable one — it didn't lie to you.
 
 ## Elaborate
 
-The hard-won lesson: a leaked split produces a *beautiful* test number and a
-model that dies in prod, and the failure is invisible until production traffic
-arrives. That's why this is the most dangerous box in the pipeline — wrong
-features merely underperform, but a wrong split actively lies and tells you to
-ship. The discipline is mechanical: name the inference unit first, split on it,
-fit every transform on train only, and don't look at test until you've frozen
-every decision. The reranker case makes this concrete — `query_id` is the unit
-because aptkit retrieval (`PgVectorStore.search()` →
-`{ id, score, meta }[]` in `/Users/rein/Public/buffr/src/pg-vector-store.ts`)
-returns a ranked list *per query*, and a whole query is what arrives new. Read
-file 02 first for where `features` comes from, file 04 for what `fit`/`select`
-actually do.
+- **The leak is silent — that's what makes it dangerous.** A leaky split produces *better* offline metrics, so nothing alerts you. You only find out in production, weeks later, when it's expensive.
+- **Test set is touch-once.** Every time you peek at the test set to make a decision, you leak a little of it into your choices. Keep a frozen test set and report against it exactly once per real release.
+- **Fit transforms on train only.** Scalers, encoders, imputers — anything that *learns* parameters — must be fit on train and applied to val/test. Fitting a scaler on the whole dataset leaks test statistics. This is the same disease as a group leak, just subtler.
+- **Time-based data wants a time-based split.** If there's temporal structure ("predict tomorrow from today"), split by time — train on the past, test on the future — so you never train on data from after your test window. For contrl's offline modeling, grouping by session/person usually dominates, but if you ever predict *across* time, respect the arrow.
+- **Stratify when classes are rare.** If "bad rep" is 5% of examples, a naive split can leave the test set with almost none. Stratify so each set keeps the class balance — but stratify *within* the grouping, not across it.
+- **contrl anchor.** This is the trap contrl sits directly on top of. Pose data is 30+ frames a second of near-duplicates; a row-wise shuffle would scatter consecutive frames across train and test and report a near-perfect score that collapses on a new person. The discipline is to split by workout session, and ideally by person — so the held-out set represents a body the model has never trained on. That's the difference between "works in my recordings" and "works for a stranger."
 
 ## Project exercises
 
-### Build a group-aware split for the reranker dataset
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a script that takes the labeled rows (one positive + several
-  negatives per query, built from `/Users/rein/Public/buffr/eval/queries.json`
-  and the retrieval results) and partitions them into train/val/test *by
-  `query_id`*, asserting no `query_id` appears in more than one bucket.
-- **Why it earns its place:** group-aware splitting at the inference unit is the
-  single most-tested ML correctness skill; doing it by row is the classic
-  rejection.
-- **Files to touch:** new
-  `/Users/rein/Public/buffr/eval/split-rerank-dataset.ts`, reading the labeled
-  output and `/Users/rein/Public/buffr/eval/queries.json`.
-- **Done when:** running it prints three disjoint sets whose `query_id` sets have
-  empty pairwise intersection, and a test asserts that intersection is empty.
-- **Estimated effort:** `1–4hr`
+### Build a grouped-split utility
 
-### Write the temporal-split design note for a per-user intent model
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a written note that, for a learned replacement of the
-  keyword heuristic in `packages/agents/query/src/intent.ts`, decides the split
-  key (`user_id` vs row vs time), justifies whether the prediction is about the
-  future, and shows where leakage would enter.
-- **Why it earns its place:** forces you to name the inference unit and the
-  leakage paths *before* writing code — the senior move that prevents a buried
-  prod failure.
-- **Files to touch:** new
-  `/Users/rein/Public/buffr/docs/intent-split-plan.md`.
-- **Done when:** the note names the split key, states whether a temporal cut is
-  required, and lists the three leakage paths (shared user, future fact,
-  whole-dataset transform) with how each is closed.
-- **Estimated effort:** `<1hr`
+- **Exercise ID:** EX-ML-03a (Phase 2C — the split stage of the new belt; aptkit has no split code today)
+- **What to build:** A `groupedSplit(rows, groupKey, ratios)` that carves train/val/test along a group key (session or user) so no group straddles two sets. Drop-in replacement for the naive row-wise split in the EX-ML-01a skeleton.
+- **Why it earns its place:** This is the single most leverage-per-line hygiene tool in classical ML. It directly encodes the lesson that wrecks contrl-shaped data, and it's the thing an interviewer will press on when they hear "time series."
+- **Files to touch:** Case B (new) — `aptkit/packages/ml-evals/src/split.ts` exporting `groupedSplit()`; wired into `pipeline.ts` from EX-ML-01a. No existing source edits.
+- **Done when:** Given rows tagged with `session_id`, the three returned sets contain disjoint session sets, and the ratios are respected at the group level (not the row level).
+- **Estimated effort:** 1–4hr
+
+### Add a leakage test to the pipeline
+
+- **Exercise ID:** EX-ML-03b (Phase 5 — ML hardening; make leaks fail the build)
+- **What to build:** An `assertNoLeak(train, val, test, groupKey)` plus a unit test that *deliberately* constructs a leaky row-wise split and confirms the assertion catches it, and a clean grouped split that passes.
+- **Why it earns its place:** It turns the most expensive invisible bug into a loud build failure. Demonstrating that you test for leakage — not just avoid it by hand — is a strong staff-level signal.
+- **Files to touch:** Case B (new) — `aptkit/packages/ml-evals/src/split.test.ts`; `assertNoLeak()` in `aptkit/packages/ml-evals/src/split.ts`, invoked by `pipeline.ts` before any `fit`. Optional: a `buffr` training-log column noting `split_strategy` and `group_key` so every recorded run states how it split.
+- **Done when:** The test proves the assertion throws on an intentionally leaky split and passes on a grouped split, and the pipeline refuses to fit if the sets share a group.
+- **Estimated effort:** 1–4hr
 
 ## Interview defense
 
-**Q: "Why three sets and not just train/test?"**
-Because two jobs hide inside "evaluation": *choosing* (which model, which knobs)
-and *reporting* (the honest number). If you choose against test, you've tuned to
-it and it's no longer held out — it predicts your tuning, not production. Val
-absorbs all the looking; test stays sealed for one final score.
+**Q: You shuffled and split 80/20 and got 0.99. Why am I skeptical?**
 
 ```
-  TRAIN ─ fit │ VAL ─ choose (look often) │ TEST ─ report (look once ★)
+shuffle ──▶ frame 3 → TRAIN
+            frame 4 → TEST   (frame 3 ≈ frame 4)  ──▶ test is near-copy ──▶ 0.99 is fake
 ```
-*Anchor: val is for selection, test is the sealed envelope opened once.*
 
-**Q: "You split a per-query reranker by row and it scored great. What's wrong?"**
-The same `query_id` is on both sides, so the model memorized those queries
-instead of learning to rank — the test score is inflated and it'll collapse on
-genuinely new queries in prod. Split by `query_id` so a whole query lands in one
-bucket; the inference unit is the query, never the row.
+Because your rows are probably correlated, so a row-wise shuffle leaks near-duplicates across the boundary and inflates the score. I'd re-split by the group the model sees as new — session or user — and expect a lower, truthful number. Anchor: contrl's adjacent pose frames are near-identical; row-wise splitting there is the textbook leak.
+
+**Q: Why touch the test set only once?**
 
 ```
-  by row:  q1 in TRAIN & TEST  → leak → inflated, fails in prod
-  by query_id: q1 wholly one side → honest, mimics a new query
+peek → tune → peek → tune ...  ──▶ test set silently becomes a 2nd val set
+                                     reported number no longer honest
 ```
-*Anchor: split at the unit that arrives new at inference time.*
+
+Every decision made by looking at the test set leaks a bit of it into the model's design, so its honesty erodes with each peek. Tune on validation, freeze test, report against it once per release. Anchor: if I kept re-checking contrl against the same held-out person and tweaking, I'd eventually overfit to that one person and lose the generalization the test set was supposed to measure.
 
 ## See also
 
-- `01-supervised-pipeline.md` — the full arc this split lives inside
-- `02-feature-engineering.md` — where `features` and the train-only transforms come from
-- `04-evals-and-observability/` — how aptkit grades its held-out fixtures today
+- [01-supervised-pipeline.md](./01-supervised-pipeline.md) — the five stages this split sits inside
+- [02-feature-engineering.md](./02-feature-engineering.md) — why correlated features make the split rule matter

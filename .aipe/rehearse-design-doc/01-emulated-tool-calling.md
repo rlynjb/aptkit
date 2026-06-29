@@ -1,120 +1,196 @@
-# RFC: Emulated tool-calling for the local Gemma provider
+# RFC 01 — Emulated tool-calling for a tool-less local model
 
-## 1. Summary
+**Summary:** Gemma over Ollama has no native tool-calling API, so the adapter
+(`GemmaModelProvider`) renders tool schemas into the system prompt, demands a
+single JSON object back, and parses it into the runtime's tool-use block
+(`ModelToolUseBlock`) — with bounded retries and a graceful text fallback — so a
+local model satisfies the same `ModelProvider` contract that Anthropic and
+OpenAI do.
 
-Gemma-over-Ollama has no native tool-calling API, so `GemmaModelProvider` **renders tool schemas into the system prompt and parses a JSON tool-call back out of the model's text** — turning a vendor that can't take a `tools` array into one that satisfies the same `ModelProvider` contract as Anthropic and OpenAI. Bounded retries, a corrective nudge, and a graceful text fallback keep a weak model's sloppy JSON from breaking the agent loop.
+## Context / problem
 
-Lives in `packages/providers/gemma/src/gemma-provider.ts`.
+AptKit's whole core depends on one provider contract (`ModelProvider.complete()`
+in `packages/runtime/src/model-provider.ts`). A `ModelRequest` can carry a
+`tools` array; the agent loop (`runAgentLoop`) expects the response to come back
+as content blocks, where a `tool_use` block means "the model wants to call this
+tool with these arguments." Anthropic and OpenAI both have native tool-calling
+APIs that produce exactly that.
 
-## 2. Context / problem
+Gemma, run locally through Ollama's `POST /api/chat`, has no such API. The
+request body Ollama accepts is a flat `messages` array of `{role, content}`
+strings — there is nowhere to put a `tools` array, and nothing in the response
+that comes back as a structured tool call. The Ollama chat response is just
+`{ message: { content: "<text>" } }`.
 
-The whole repo is built on one seam: every model rides `ModelProvider.complete(request) → ModelResponse`, where `ModelResponse.content` is an array of `text` and `tool_use` blocks (`packages/runtime/src/model-provider.ts`, lines 20, 48–58). The agent loop, the tool registry, the trace events — all of it assumes a provider can return a `ModelToolUseBlock`. That's how Anthropic and OpenAI providers work: you hand the SDK a `tools` array, it hands you back a structured tool-call.
+So the constraint is concrete: the contract promises tool-calling; the local
+transport offers a text-in / text-out channel. Either the local provider can't
+participate in any agent that uses tools — which is most of them, including the
+capstone RAG agent — or the gap gets closed inside the adapter.
 
-Gemma running on local Ollama (`POST /api/chat`, no key, no TLS, `:11434`) doesn't have that API. There's no `tools` field on the request and no structured tool-call on the response — just a `message.content` string (`OllamaChatResponse`, lines 11–16). So either the local provider can't participate in tool-using agents at all, or it has to *fake* the contract everyone else implements natively.
+## Goals & non-goals
 
-The forcing function: the capstone `@aptkit/agent-rag-query` composes Gemma + the `search_knowledge_base` tool through `runAgentLoop`. For that to be agentic retrieval — the model *decides* when to search — the local provider has to emit `tool_use` blocks. Without emulation, the local default can't do RAG, and "runs with no cloud call" stops being true.
+**Goals:**
 
-## 3. Goals & non-goals
-
-**Goals**
-- A local provider that satisfies `ModelProvider` including `tool_use` output, so it drops into `runAgentLoop` unchanged.
+- `GemmaModelProvider` satisfies the same `ModelProvider` contract as the cloud
+  adapters — a tool-using agent runs against it unchanged.
+- A tool call comes back as a real `ModelToolUseBlock` the loop can dispatch.
 - Survive a weak model's malformed JSON without crashing the loop.
-- Stay testable without a running Ollama — recorded responses must be injectable.
+- Stay testable offline — no live Ollama required to test the parse logic.
 
-**Non-goals**
-- Multi-tool / parallel tool-calls in one turn. The parser returns a single `{name, input}` (`parseToolCall`, lines 168–182).
-- Matching frontier-model tool-call *reliability*. Emulation is a competence floor, not parity.
-- A per-call network timeout. Cancellation is via `AbortSignal` only (see Open questions).
+**Non-goals:**
 
-## 4. The decision
+- Matching frontier-model tool-calling *quality*. Gemma will be worse at
+  deciding when and how to call a tool; this RFC closes the *mechanism* gap, not
+  the capability gap.
+- Parallel/multi-tool calls in one turn. One JSON object = one tool call.
+- Streaming. The transport is `stream: false`.
+- A general grammar-constrained decoder. Out of scope (see Alternatives).
 
-Two halves of one trick: **outbound**, fold the tool schemas into the system text and demand a bare JSON object; **inbound**, leniently parse the model's text back into a `ModelToolUseBlock`, retrying with a nudge if it fumbled.
+## The decision
 
-```
-  Emulated tool-calling — the two halves
-
-  ┌─ Service layer: GemmaModelProvider.complete() ──────────────────────┐
-  │                                                                     │
-  │  request.tools[]  ──► buildSystemText()                             │
-  │  (ModelTool[])         "You can call the following tools: <JSON>    │
-  │                         respond with ONLY {"tool":..,"arguments"..}"│
-  │                              │                                      │
-  └──────────────────────────────┼──────────────────────────────────────┘
-                                  │ hop 1: messages[] (system + turns)
-                                  ▼
-  ┌─ Provider layer: Ollama HTTP :11434 ────────────────────────────────┐
-  │  POST /api/chat   {model, messages, stream:false}                   │
-  │  (no `tools` field exists)        │                                 │
-  └────────────────────────────────────┼────────────────────────────────┘
-                                  │ hop 2: { message: { content: "..." } }
-                                  ▼
-  ┌─ Service layer: inbound parse ──────────────────────────────────────┐
-  │  raw = response.message.content                                     │
-  │       │                                                             │
-  │       ▼                                                             │
-  │  parseToolCall(raw) ── valid? ──► return [{type:'tool_use', ...}]   │
-  │       │ null                                                        │
-  │       ▼                                                             │
-  │  looksLikeToolAttempt(raw)?  (contains '{')                         │
-  │       │ yes → append RETRY_NUDGE, loop (≤ maxToolCallAttempts)      │
-  │       │ no  → it's a real prose answer                              │
-  │       ▼                                                             │
-  │  return [{type:'text', text: raw}]   ← graceful fallback           │
-  └─────────────────────────────────────────────────────────────────────┘
-```
-
-The kernel — name each part by what breaks if you remove it:
-
-- **`buildSystemText()` (lines 133–165)** — renders each tool as `{name, description, input_schema}` JSON into the system message with the instruction "respond with ONLY a single JSON object." *Remove it:* the model never knows the tools exist; emulation is gone.
-- **`parseToolCall()` (lines 168–182)** — runs the raw text through `parseAgentJson` (the same lenient extractor the runtime uses), then accepts `tool`/`name`/`tool_name` for the name and `arguments`/`input`/`args` for the input. *Remove it:* every reply is treated as prose; the model can never call a tool.
-- **The retry loop (lines 62–89)** — up to `maxToolCallAttempts` (default 2, floored at 1) when tools were requested. On a retry it appends `RETRY_NUDGE` (lines 35–37). *Remove it:* one bad JSON emission and the tool-call is silently lost as text.
-- **`looksLikeToolAttempt()` (lines 185–187)** — the `'{'` heuristic. Only retry if the model *tried* to emit JSON; plain prose is a legitimate answer, not a failure. *Remove it:* you burn a retry (and a model round-trip) every time the model correctly answers in words.
-- **Graceful text fallback (line 91)** — when retries are spent or the reply is prose, return a `text` block. *Remove it:* a flaky local model throws instead of degrading to "here's my best text answer."
-
-Optional hardening on top of that kernel: the **injectable `chat` transport** (`GemmaChatTransport`, lines 19–25; constructor line 48) — defaults to `defaultHttpTransport`, but tests feed recorded `OllamaChatResponse` objects so the provider runs with no Ollama process.
-
-## 5. Alternatives considered
-
-**A. Cloud-only frontier model with native tools (Anthropic/OpenAI).** The path of least resistance — `tools` array in, structured tool-call out, no parsing. *Why it lost:* it kills the local-default goal. Every run becomes a paid API call with a key requirement and a network dependency; you can't demo or develop offline. The repo deliberately keeps a no-cloud default. Flip condition: if reliability mattered more than locality (a production-grade tool-using agent), the frontier provider already exists in the repo and wins.
-
-**B. Wait for a local model with native tool-calling.** Punt — keep Gemma text-only until Ollama exposes a structured tool API. *Why it lost:* it's a bet on someone else's roadmap to unblock your capstone agent. The emulation is ~50 lines; waiting is unbounded. You don't block a shippable feature on an external "soon."
-
-**C. Constrained / grammar decoding (force the model to emit valid JSON at the token level).** Strongest *correctness* story — the model literally can't produce malformed JSON. *Why it lost:* Ollama's `/api/chat` doesn't expose grammar constraints in the path this provider uses, and it couples emulation to a decoding feature that the injectable-transport test seam doesn't model. The lenient-parse-plus-retry approach gets most of the benefit with none of the coupling.
-
-## 6. Tradeoffs accepted
-
-We chose prompt-rendered emulation, accepting that **a weak model's JSON is fragile** — Gemma will sometimes wrap the object in prose, add a trailing comment, or invent a filter argument. That's the cost, and it's owned, not apologized for. The mitigation isn't one guard, it's a chain: lenient `parseAgentJson` extraction, the bounded retry with a corrective nudge, and — critically — **two downstream guards in the retrieval layer that assume the model is unreliable**:
-
-- `search_knowledge_base` floors `top_k` at `minTopK` (`packages/retrieval/src/search-knowledge-base-tool.ts`, line 81) so a model that asks for `top_k: 0` still gets results.
-- `matchesFilter` (lines 101–106) only excludes a hit that *has* the filter key with a different value — a hallucinated filter like `{textContains: "x"}` is ignored rather than wiping every result.
-
-The emulation is brittle by nature; the system is built to tolerate the brittleness downstream.
-
-## 7. Risks & mitigations
+Emulate the tool-calling protocol inside the adapter, in two halves — an
+outbound half that teaches the model the protocol, and an inbound half that
+parses the model's attempt back into the contract's shape, guarded by a bounded
+retry loop.
 
 ```
-  Risk → guard
+  Emulated tool-calling — the adapter bridges contract ⇄ text transport
 
-  malformed JSON tool-call    ─► parseAgentJson lenient extract + RETRY_NUDGE
-  model answers in prose       ─► looksLikeToolAttempt skips the wasted retry
-  retries exhausted            ─► graceful text-block fallback (no throw)
-  hallucinated filter args     ─► matchesFilter ignores unknown keys
-  model asks for top_k:0       ─► minTopK floor
-  Ollama process down / hangs  ─► AbortSignal only — NO per-call timeout (open)
+  ┌─ Runtime layer ───────────────────────────────────────────────┐
+  │  runAgentLoop  →  ModelRequest { system, messages, tools[] }   │
+  └───────────────────────────────┬────────────────────────────────┘
+                                  │ complete(request)
+  ┌─ Provider layer (GemmaModelProvider) ──────────────────────────┐
+  │                                                                 │
+  │  OUTBOUND  buildSystemText():                                   │
+  │    system + "You can call the following tools:" + JSON schemas  │
+  │    + "respond with ONLY {\"tool\":...,\"arguments\":{...}}"     │
+  │                              │                                  │
+  │            ┌─────────────────▼─────────────────┐  retry ≤ N    │
+  │            │  for attempt in 0..maxAttempts:    │◄────────────┐ │
+  │            │    chat(messages) → raw text       │             │ │
+  │            │    call = parseToolCall(raw)       │             │ │
+  │            │    if call → return tool_use block ├──► done     │ │
+  │            │    if looksLikeToolAttempt(raw):   │             │ │
+  │            │       append RETRY_NUDGE ──────────┼─────────────┘ │
+  │            │    else break (prose is an answer) │               │
+  │            └─────────────────┬──────────────────┘               │
+  │                              │ no valid call after N attempts   │
+  │                   return { type:'text', text: raw }  (fallback) │
+  └───────────────────────────────┬────────────────────────────────┘
+                                  │ HTTP POST /api/chat (injectable transport)
+  ┌─ Provider / transport boundary ────────────────────────────────┐
+  │  Ollama :11434   message:{role,content}  (no native tools)      │
+  └─────────────────────────────────────────────────────────────────┘
 ```
 
-The one risk with no guard is a hung Ollama call with no `signal` passed: `complete()` checks `request.signal?.throwIfAborted()` (lines 53, 63) but there's no internal `fetch` timeout in `defaultHttpTransport` (lines 201–215). A wedged local server blocks the turn indefinitely.
+The load-bearing parts, by what breaks if you remove each:
 
-## 8. Rollout / migration
+- **Outbound schema injection** (`buildSystemText`, lines 133–165). Drop it and
+  the model has no idea the tools exist — it answers in prose every time and the
+  agent never retrieves anything. This is what makes the text channel carry a
+  tool protocol at all.
+- **Lenient parse** (`parseToolCall`, lines 168–182). It runs `parseAgentJson`
+  (the runtime's tolerant extractor that digs JSON out of prose/code-fences),
+  then accepts `tool | name | tool_name` for the name and `arguments | input |
+  args` for the args. Drop the leniency and a model that says `"name"` instead
+  of `"tool"`, or wraps the JSON in a code fence, fails a call it actually got
+  right.
+- **The `looksLikeToolAttempt` heuristic** (lines 185–187): a `'{'` in the reply
+  is the cheap tell that the model *tried* a tool call and botched it. This is
+  the part that decides retry-vs-accept. Without it you face a dilemma: retry on
+  *every* non-call and you punish a model that correctly answered in prose
+  (burning attempts, latency); retry on *none* and a single malformed brace
+  throws the call away. The `'{'` check splits the two cases cheaply.
+- **Bounded `maxToolCallAttempts`** (default 2, floored at 1, lines 49, 57). On
+  a retry it appends `RETRY_NUDGE` — a corrective message telling the model
+  exactly the JSON shape to emit. Drop the bound and a model that never produces
+  valid JSON loops forever against your local GPU.
+- **Graceful text fallback** (line 91). After the attempts are spent, whatever
+  text came back is returned as a `text` block — a real answer, not an error.
+  Drop it and a hard question (model genuinely can't form the call) crashes
+  instead of degrading to a plain answer.
 
-Nothing to migrate — this is additive. Gemma is one more `ModelProvider` adapter; it ships inside the `@rlynjb/aptkit-core` bundle as `@aptkit/provider-gemma` and slots into `runAgentLoop` exactly like the cloud providers. No existing caller changes: an agent that wired Anthropic keeps working; pointing it at Gemma is a one-line provider swap. The injectable transport means tests and fixtures keep running with zero Ollama dependency.
+Optional hardening already in place: the **injectable transport**
+(`GemmaChatTransport`, lines 19–25) lets tests feed recorded Ollama responses,
+so the entire parse/retry path is testable with zero network.
 
-## 9. Open questions
+## Alternatives considered
 
-- **No per-call fetch timeout.** Should `defaultHttpTransport` wrap `fetch` in an `AbortController` with a deadline, or stay caller-driven via `signal`? Today a hung Ollama hangs the turn.
-- **Single tool-call per turn.** `parseToolCall` returns one call. If a local model ever wants to fan out two tools in a turn, the parser needs to accept an array — currently it rejects arrays outright (line 175).
-- **Retry budget is global-ish.** `toolUseCount` increments across calls for id uniqueness (lines 110–114), but `maxToolCallAttempts` is per-`complete()`. Is 2 the right default for a 9B model, or should it scale with model size?
+**1. Cloud-only — use Anthropic/OpenAI native tools, skip local entirely.**
+Native tool-calling is more reliable and the code is simpler (no emulation).
+*Why it lost:* AptKit's premise is a local-first agent body (buffr runs on a
+laptop, no cloud call in the default path). A cloud-only tool story means no
+offline operation and a per-call API bill for every agent step. The local
+provider is a product requirement, not a nice-to-have.
 
----
+**2. Wait for a local model with native tool-calling.** Punt the problem; let
+the ecosystem ship a tool-native local model and adopt it. *Why it lost:* it's a
+bet on someone else's timeline against a real deadline, and it leaves the
+contract un-implementable for local in the meantime. Emulation is reversible —
+when a tool-native local model lands, the adapter swaps and the contract is
+unchanged. Waiting is the more expensive option, not the cheaper one.
 
-**Coach note.** A reviewer's first push is "you're parsing LLM text — that's a hack." The framing that holds: *"It's emulating a contract the frontier providers get natively, behind the same `ModelProvider` interface, so the agent loop doesn't know the difference — and the brittleness is contained by `minTopK` and `matchesFilter` downstream, not papered over."* Lead with the contract, not the parser. The sentence that gets the yes is naming the guard people forget — the `'{'` heuristic that avoids burning a retry on a correct prose answer. That detail says you built it, not just sketched it.
+**3. Grammar / constrained decoding.** Force the model's output to a JSON
+grammar at the token level so the reply is *always* parseable. *Why it lost:*
+Ollama's `/api/chat` doesn't expose a portable grammar knob across model
+versions, and constrained decoding still doesn't make the model pick the right
+tool — it makes the *syntax* valid, not the *choice* correct. It's more
+machinery for the easier half of the problem. The prompt-render + lenient-parse
+approach handles the same syntax failure with a retry and stays portable.
+
+## Tradeoffs accepted
+
+We chose prompt-rendered emulation, accepting that a weak model's JSON is
+fragile — it will sometimes emit malformed or wrong-keyed tool calls. We absorb
+that fragility deliberately, at four layers:
+
+- the **retry + `RETRY_NUDGE`** gives the model a second, corrected shot;
+- the **lenient parse** accepts key variants and fenced JSON;
+- downstream, the retrieval tool's **`minTopK` floor**
+  (`packages/retrieval/src/search-knowledge-base-tool.ts:51,81`) stops a weak
+  model from starving its own retrieval by passing `top_k: 1`;
+- and the tool's **hallucination-tolerant `matchesFilter`** (lines 101–106)
+  ignores filter keys absent from a chunk's meta, so a hallucinated filter can't
+  silently wipe every result.
+
+That's the honest shape of it: the model is the weak link, so the code around it
+is forgiving on purpose. The cost is more defensive code than a frontier
+provider needs. The benefit is a local model that actually completes tool-using
+agent runs.
+
+## Risks & mitigations
+
+- **Model never produces valid JSON** → bounded attempts + text fallback: the
+  run degrades to a plain answer instead of hanging or crashing.
+- **Correct prose answer mistaken for a botched call** → `looksLikeToolAttempt`
+  only retries when a `'{'` is present; brace-free prose is accepted as the
+  answer on the first pass.
+- **Tool-use ids collide within a run** → `nextToolUseId` increments a
+  per-instance counter (`gemma-<tool>-<n>`, lines 110–114), so each emitted
+  block has a unique id the loop can match a result to.
+- **Untestable without a live model** → the injectable `GemmaChatTransport`
+  feeds recorded responses; the parse/retry logic is covered offline.
+
+## Rollout / migration
+
+Additive. The adapter is a new `ModelProvider` (`@aptkit/provider-gemma`); no
+existing agent or contract changed shape. An agent opts in by being constructed
+with a `GemmaModelProvider` instead of the Anthropic/OpenAI one — the capstone
+RAG agent (`@aptkit/agent-rag-query`) is the first consumer. Default model
+`gemma2:9b`, host `http://localhost:11434`, both overridable. When a tool-native
+local model arrives, replace the adapter internals; callers and the contract
+don't move.
+
+## Open questions
+
+- **No per-call fetch timeout.** The default transport (lines 201–215) honors an
+  `AbortSignal` but sets no timeout of its own — a wedged Ollama process can
+  hang a call indefinitely until something upstream aborts. The fix is a
+  per-call timeout in `defaultHttpTransport`; it isn't there yet.
+- **Is the `'{'` heuristic too coarse?** A prose answer that legitimately
+  contains a brace (a code snippet, JSON-in-an-explanation) trips a retry it
+  shouldn't. Cheap and good enough today; worth revisiting if it shows up in
+  eval traces.
+- **`maxToolCallAttempts` default of 2** is a guess, not a measured optimum. No
+  eval yet ties attempt count to tool-call success rate per model size.

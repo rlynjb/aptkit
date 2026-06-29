@@ -1,267 +1,157 @@
-# Lost in the middle
+# Lost-in-the-middle
 
-**Subtitle:** Position bias in long contexts · retrieve few, rank well · *Industry pattern, aptkit mitigates by top-k*
+> Positional attention bias (Industry standard)
+
+Models don't read a long context evenly. Attention concentrates at the *start* and the *end*; content buried in the *middle* gets the weakest treatment — the documented "lost-in-the-middle" effect. So stuffing 20 retrieved chunks into a prompt doesn't help linearly; the relevant chunk sitting at position 11 may as well not be there. aptkit's answer is exposure-reduction: keep retrieval small (default `topK=5`) and floor it with `minTopK` so you pass a few high-relevance docs rather than a wall of them. It does *not* reorder or rerank to exploit the start/end positions — that's the honest gap, and it cross-links to reranking.
 
 ## Zoom out, then zoom in
 
-Before the failure mode, here's where the lever lives in aptkit. The search tool
-sits between the agent and the vector store, and the one knob that fights this
-problem is how many chunks it returns.
+Picture attention as a U-curve over the prompt: high at the edges, sagging in the middle. The more documents you stuff in, the deeper and wider the sag — more content lands in the dead zone. aptkit shrinks the problem by shrinking the input: a small `topK` means fewer docs, so fewer of them fall into the middle in the first place.
 
 ```
-  Zoom out — where the count is decided
+Attention over a long context — the U-curve (LAYERS)
 
-  ┌─ Agent layer ───────────────────────────────────────────────┐
-  │  rag-query agent: "search first, then answer"                │
-  └───────────────────────────┬─────────────────────────────────┘
-                              │ search_knowledge_base(query, top_k)
-  ┌─ Retrieval tool ──────────▼─────────────────────────────────┐
-  │  ★ createSearchKnowledgeBaseTool ★  top_k default 5, minTopK │ ← we are here
-  └───────────────────────────┬─────────────────────────────────┘
-                              │ pipeline.query(query, k)
-  ┌─ Vector store ────────────▼─────────────────────────────────┐
-  │  cosine similarity, sort desc, slice(k) — best k chunks      │
-  └──────────────────────────────────────────────────────────────┘
+  attention
+    high │█                                             █
+         │██                                           ██
+         │ ██                                         ██
+         │  ███         ← lost-in-the-middle →       ███
+    low  │    ████████████████░░░░░░░░░░░░░████████████
+         └────────────────────────────────────────────────► position
+          START                MIDDLE                  END
+          (read well)        (under-attended)       (read well)
+
+  aptkit's lever: keep topK small (default 5) so fewer docs land in the sag
+  aptkit's GAP:   no reordering to push the best docs to START/END
 ```
 
-Now zoom in. "Lost in the middle" is a measured property of LLMs: when you stuff
-a lot of content into the context, the model reliably uses what's near the
-*start* and the *end*, and reliably under-uses what's in the *middle*. Accuracy
-sags in the center even when the answer is sitting right there. The naive RAG
-instinct — "retrieve 20 chunks, the model will find the right one" — walks straight
-into this. aptkit's stance is the opposite: retrieve *few*, rank them *well*, and
-keep the high-relevance chunks where the model actually reads.
+The edges are prime real estate; the middle is the bargain bin. aptkit avoids overfilling the bin but doesn't yet move its best items to the prime spots.
 
 ## Structure pass
 
-**Layers.** Agent asks → search tool chooses `k` → vector store ranks by cosine
-and returns the top `k`. The count `k` is the lever.
+One axis: **how many documents reach the prompt, and in what order**.
 
-**Axis — how many chunks reach the model?** Trace it. The model may request a
-`top_k`; the tool floors it at `minTopK` and defaults to 5
-(`search-knowledge-base-tool.ts:22,50,80-81`); the store sorts all chunks by
-score and slices `k` (`in-memory-vector-store.ts:31-32`). Small, ranked, top-of-
-list. The opposite design — return everything and let the model sort it out —
-maximizes middle content, exactly what the model ignores.
+- **How many (addressed)** — RAG retrieval defaults to `topK=5` (`packages/retrieval/src/pipeline.ts`, `queryKnowledgeBase` 50-59). The knowledge-base search tool also enforces a `minTopK` floor so a caller can't accidentally retrieve zero (`packages/retrieval/src/search-knowledge-base-tool.ts:51, 81`). Small and bounded — few high-relevance docs, not a wall.
+- **What order (not addressed)** — whatever order the retriever returns, that's the order the model sees. There's no step that pushes the highest-relevance chunk to position 1 or the last position. No reranker, no middle-avoidance reorder. `not yet exercised`.
 
-**Seam.** The boundary is `pipeline.query(query, fetchK)` called from the tool
-handler (`search-knowledge-base-tool.ts:89`). Above it: a model that asked a
-question. Below it: a ranked, length-bounded result list. The axis "how much does
-the model have to read?" flips here — above, one query; below, exactly `k`
-scored chunks.
+The seam: `topK` is the single knob that controls exposure. `Math.max(requestedTopK, minTopK)` (search-knowledge-base-tool.ts:81) clamps it from below; the default clamps it sensibly from the top.
 
 ## How it works
 
-### Move 1 — the mental model
-
-You know how users read a long list: they read the top few items, glance at the
-bottom, and skim past the middle. Search results, a long settings page, an
-infinite feed — the middle is dead zone. The LLM has the same attention profile
-over its context. So you don't fight the reader's behavior; you put the important
-thing where they look. In RAG terms: return few enough chunks that there *is* no
-neglected middle, and order them so the best one is at the top.
+**Move 1 — the mental model.** If the middle of the prompt is a blind spot, the cheapest defense is to make the prompt short enough that there's barely a middle. Five well-ranked chunks have almost no dead zone. Twenty chunks have a big one — and your best chunk might be sitting right in it.
 
 ```
-  Attention over context position (the failure mode)
+Why small topK reduces exposure (PATTERN)
 
-  recall │█████                              █████
-         │█████ ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁ █████
-         │ high │       low (the middle)      │ high
-         └──────┴─────────────────────────────┴────────► position
-           start            middle               end
-   stuff 20 chunks → the right one lands in the dead zone → missed
+  topK = 20:  [1][2][3][4][5][6][7][8][9][10][11][12]...[20]
+              └edge┘└──────── big middle, mostly ignored ───────┘└edge┘
+              relevant chunk at #11  →  likely lost
+
+  topK = 5:   [1][2][3][4][5]
+              └────── tiny middle ──────┘
+              relevant chunk at #3  →  still near an edge, survives
 ```
 
-### Move 2 — aptkit's lever, step by step
+**Move 2 — walk the pieces.**
 
-**Default to few, not many.** The tool's default `top_k` is 5, not 20 or 50.
-From `search-knowledge-base-tool.ts:22,50`:
-
-```ts
-const DEFAULT_TOP_K = 5;
-// ...
-const defaultTopK = options.defaultTopK ?? DEFAULT_TOP_K;
-```
-
-Five chunks is small enough that there's barely a middle to get lost in. This is
-the mitigation: you never create the long-context condition in the first place.
+**The default keeps retrieval small.** Five is the standard, not "as many as fit."
 
 ```
-  top_k = 5 — no dead zone to fall into
-
-  ┌──[1]──┐ best
-  ┌──[2]──┐
-  ┌──[3]──┐  ← "middle" is two chunks, not eighteen
-  ┌──[4]──┐
-  ┌──[5]──┐ worst of the kept set
-   all five are near an edge of the prompt
+pipeline.ts queryKnowledgeBase (50-59)        the exposure lever
+  query(text, topK = 5) ───────────────────  default 5, not "fill the window"
+    → ranked chunks (top 5)                    few high-relevance docs
 ```
 
-**Floor the count so a weak model can't starve itself.** A small local model
-sometimes asks for `top_k: 1`, which misses multi-part questions. `minTopK`
-clamps the floor. From `search-knowledge-base-tool.ts:51,80-81`:
+`packages/retrieval/src/pipeline.ts:50-59` defaults `topK` to 5. This is the whole exposure-reduction strategy in one number: fewer docs in, smaller middle, less lost.
 
-```ts
-const minTopK = Math.max(1, options.minTopK ?? 1);
-// ...
-const requestedTopK = typeof args.top_k === 'number' && args.top_k > 0 ? args.top_k : defaultTopK;
-const topK = Math.max(requestedTopK, minTopK);   // never below the floor
-```
-
-So the count is bounded on *both* sides by intent: default keeps it from being
-huge, `minTopK` keeps it from collapsing to one. The model proposes, the tool
-disposes.
+**The floor stops topK from collapsing to nothing.** A caller passing a bad `top_k` can't silently retrieve zero relevant docs.
 
 ```
-  topK = max(requestedTopK, minTopK)
-
-   model asks top_k:1 ──► max(1, minTopK) ──► floored up
-   model omits top_k  ──► defaultTopK (5)
-   model asks top_k:50──► passed through (caller can cap upstream)
+search-knowledge-base-tool.ts (51, 81)        the lower clamp
+  minTopK = max(1, options.minTopK ?? 1)  ──  never below 1 (51)
+  topK    = max(requestedTopK, minTopK)   ──  floor the request (81)
 ```
 
-**Rank well — cosine, sort desc, slice.** "Few" only helps if the few are the
-*right* few. The store scores every chunk by cosine similarity, sorts highest
-first, and returns the top slice. From `in-memory-vector-store.ts:28-32`:
+`packages/retrieval/src/search-knowledge-base-tool.ts:51` sets the floor; `:81` applies it as `Math.max(requestedTopK, minTopK)`. The two clamps together — default 5 from above, `minTopK` from below — keep retrieval in a narrow, useful band. That band is itself a lost-in-the-middle mitigation: a narrow band can't become a wall of docs.
 
-```ts
-for (const chunk of this.chunks.values()) {
-  hits.push({ id: chunk.id, score: cosineSimilarity(vector, chunk.vector), meta: chunk.meta });
-}
-hits.sort((a, b) => b.score - a.score);   // best relevance first
-return hits.slice(0, Math.max(0, k));     // keep only k
-```
-
-Because the list is sorted by relevance descending, the most relevant chunk is
-chunk #1 — the top of the prompt, the high-attention zone. Ranking *is* the
-position mitigation: best content lands where the model reads.
+**There is no reorder step — say it plainly.** The chunks reach the prompt in retrieval order; nothing repositions the strongest one to an edge.
 
 ```
-  rank → slice → best at the top of the prompt
-
-  all chunks ──cosine──► [0.91, 0.88, 0.55, 0.40, 0.31, 0.12, ...]
-                            │ sort desc
-                            ▼
-                         [0.91, 0.88, 0.55, 0.40, 0.31]  slice(5)
-                            ▲ chunk #1 = highest relevance = start of context
+the gap                                       what a fix would add
+  retriever returns [c1, c2, c3, c4, c5]
+  prompt sees       [c1, c2, c3, c4, c5]  ──  same order, no reranking
+                          ▲
+                    strongest chunk might sit here (middle) — and stay there
 ```
 
-**What aptkit does NOT do.** It does not rerank by *position* — there's no pass
-that reorders the kept chunks to push the most relevant ones to both the start
-and the end of the prompt (the textbook lost-in-the-middle fix). There's also no
-cross-encoder reranker re-scoring candidates after retrieval. Both are `not yet
-exercised`. aptkit's bet is simpler: keep `k` small enough that position bias
-barely bites, and rely on cosine ranking to put the best chunk first. If recall
-ever degraded at scale, position-aware reranking is the next move — and it would
-slot in right after `pipeline.query` returns, before the chunks become a
-`tool_result`.
+The mitigation is purely "fewer docs," not "best docs at the edges." Reranking and edge-placement are `not yet exercised` — cross-linked below.
 
-### Move 3 — the principle
-
-Don't fight the model's attention curve — avoid creating the condition that
-triggers it. The lever is the *count*, governed at the tool boundary: default
-small, floor sensible, rank by relevance so the best chunk sits at the top. "More
-context" is not "more signal"; past a small `k`, extra chunks mostly add middle
-that the model neglects and tokens you pay for. Retrieve few, rank well.
+**Move 3 — the principle.** Two independent levers fight lost-in-the-middle: *reduce the middle* (small `topK`) and *avoid the middle* (reorder best-to-edges). aptkit pulls the first lever well and leaves the second untouched. Pulling the first is the cheaper, higher-floor move — it helps regardless of ranking quality — which is why it's the right thing to ship first. But it's only half the standard defense.
 
 ## Primary diagram
 
 ```
-  Retrieve-few-rank-well as the lost-in-the-middle mitigation
+aptkit's lost-in-the-middle scorecard
 
-  agent                     search tool                    vector store
-  ┌──────────┐  query+top_k ┌────────────────────┐  query,k ┌──────────────┐
-  │ "search  │ ───────────► │ topK = max(         │ ───────► │ cosine score │
-  │  first"  │              │   requested||5,     │          │ sort desc    │
-  │          │ ◄─────────── │   minTopK)          │ ◄─────── │ slice(k)     │
-  └──────────┘  ≤5 ranked   └────────────────────┘  k hits  └──────────────┘
-                chunks
-   model reads a SHORT, RANKED list → best chunk at top → no neglected middle
-   (position-reranking / cross-encoder rerank = not yet exercised)
+  REDUCE the middle (small topK=5)        ████████████  pipeline.ts:50-59
+  FLOOR topK so it can't collapse         ████████████  search-...-tool.ts:51,81
+  ─────────────────────────────────────────────────────
+  REORDER best chunks to START/END        ░░░░░░░░░░░░  not yet exercised
+  RERANK retrieved chunks                 ░░░░░░░░░░░░  not yet exercised  ← Case B
 ```
 
 ## Elaborate
 
-The lost-in-the-middle finding is robust across model families and context
-lengths — it's not a quirk of one model, it's how attention over long sequences
-behaves. The standard mitigations split into two families: *reduce* (retrieve
-fewer, higher-quality chunks) and *reorder* (place the best chunks at the
-start and end where attention peaks). aptkit commits hard to "reduce" via
-`top_k: 5` plus cosine ranking, and skips "reorder" entirely. That's a reasonable
-call for a personal knowledge base where the corpus is small and five chunks
-genuinely covers most questions; it would *not* hold for a large enterprise corpus
-where you must over-fetch dozens of candidates and rerank. Note the one place
-aptkit over-fetches: when a metadata filter is present it fetches `topK * 4` and
-post-filters back down (`search-knowledge-base-tool.ts:88-90`) — but it still
-returns only `topK`, so the model never sees the long list. Read
-`03-prompt-chaining.md` next: another way to keep context short is to never put
-everything in one prompt at all — split the work across steps.
+Why "fewer docs" is the right first lever: it raises the floor without depending on ranking being perfect. Even a mediocre retriever benefits — with only 5 chunks, the dead zone is 1-2 positions deep, so even a misranked relevant chunk is never far from an edge. Reordering, by contrast, only helps if you *know* which chunk is best, which assumes good relevance scores. Cheap, robust, ship-it-first — then add reordering once you trust your scores.
+
+The honest gap, stated for an interview: "We reduce exposure with a small `topK` and a `minTopK` floor, but we don't reorder or rerank — the strongest chunk can still land in the middle. The standard next step is to place the top-scored chunks at the start and end of the prompt and demote the rest toward the center." That's the move the Case B exercise builds.
 
 ## Project exercises
 
-### Add position-aware reranking after retrieval
+### Reorder retrieved chunks to put highest-relevance at the ends
 
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a pure function `interleaveByRelevance(hits)` that takes the
-  cosine-sorted hits and reorders them so the top chunks land at the *start and
-  end* of the returned array (best, 3rd, 5th... then ...6th, 4th, 2nd), then call
-  it in the tool handler before `toResult`.
-- **Why it earns its place:** implements the canonical lost-in-the-middle fix the
-  repo currently skips, and proves you understand position bias, not just count.
-- **Files to touch:** `packages/retrieval/src/search-knowledge-base-tool.ts`, plus
-  a test in `packages/retrieval/test/` asserting the highest-score chunk is first
-  and the second-highest is last.
-- **Done when:** `node --test` shows a 5-hit input comes back reordered with the
-  two best scores at index 0 and index 4.
+- **Exercise ID:** `EX-CTX-02a`
+- **What to build:** A reorder step in the retrieval-to-prompt path that places the top-scored chunks at the *start* and *end* of the assembled context and pushes lower-scored ones toward the middle (the "edge-loading" anti-lost-in-the-middle layout). This extends the Phase 1 (context) lost-in-the-middle mitigation from "fewer docs" to "best docs at the edges."
+- **Why it earns its place:** It pulls the second, untouched lever — exploiting the U-curve instead of just shrinking it. It's the standard mitigation aptkit is missing, and it directly targets the documented attention bias.
+- **Files to touch:** `packages/retrieval/src/search-knowledge-base-tool.ts` (after `pipeline.query`, ~88+); ordering applied before chunks become prompt text.
+- **Done when:** for a ranked result `[c1..c5]`, the prompt order becomes edge-loaded (e.g. `c1, c3, c5, c4, c2`) with the two strongest at the ends, and the ordering is covered by a test.
 - **Estimated effort:** `1–4hr`
 
-### Make top_k respond to query complexity
+### Add a relevance-aware rerank pass
 
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** raise `minTopK` (or the effective `topK`) when the query
-  looks multi-part — e.g. detect a conjunction ("and", "compare", "versus") and
-  bump the floor — so multi-part questions surface more evidence without globally
-  inflating `k`.
-- **Why it earns its place:** turns the `minTopK` knob from a static floor into a
-  signal-aware one, the kind of judgment that separates "set a constant" from
-  "matched retrieval to the question."
-- **Files to touch:** `packages/retrieval/src/search-knowledge-base-tool.ts`, plus
-  a test asserting a single-clause query returns the default and a conjunction
-  query returns more.
-- **Done when:** a test passing a two-part query yields a larger result set than a
-  one-part query against the same store.
-- **Estimated effort:** `1–4hr`
+- **Exercise ID:** `EX-CTX-02b`
+- **What to build:** A rerank hook that re-scores the over-fetched candidates before truncating to `topK`, so the surviving 5 are the genuinely-best 5 (not just the retriever's first 5).
+- **Why it earns its place:** Edge-loading only helps if the top chunks are actually the best — reranking earns that assumption. Together they form the full defense.
+- **Files to touch:** `packages/retrieval/src/search-knowledge-base-tool.ts` (the over-fetch path, `fetchK`, ~88) and `pipeline.ts`.
+- **Done when:** a candidate ranked #7 by the base retriever but most relevant ends up in the returned `topK`.
+- **Estimated effort:** `1–2 days`
 
 ## Interview defense
 
-**Q: "How does aptkit avoid lost-in-the-middle in its RAG path?"**
-It avoids creating the condition. The search tool defaults to `top_k: 5` and the
-store ranks chunks by cosine similarity descending, so the model reads a short
-list with the most relevant chunk at the top — there's barely a middle to neglect.
-It does not rerank by position; that's `not yet exercised`.
+**Q: How does aptkit fight lost-in-the-middle?**
 
 ```
-  20 chunks ──► middle ignored        5 ranked chunks ──► best at top, all near edges
-   (the failure)                       (aptkit: retrieve few, rank well)
+  small topK (default 5) → tiny middle → fewer docs in the dead zone
+  minTopK floor          → can't collapse to zero
 ```
-Anchor: *`DEFAULT_TOP_K = 5` plus `sort desc; slice(k)` — `search-knowledge-base-tool.ts:22`, `in-memory-vector-store.ts:31`.*
 
-**Q: "Why not just retrieve more chunks to be safe?"**
-Because more chunks means more middle, which the model under-attends to, plus more
-tokens you pay for and a closer brush with the window budget. Past a small `k`,
-extra chunks add noise, not signal. The floor (`minTopK`) guards the other
-direction so a weak model can't collapse to `top_k: 1` and miss multi-part
-questions.
+Anchor: `pipeline.ts:50-59` (default 5), `search-knowledge-base-tool.ts:51,81` (floor). It reduces exposure.
+
+**Q: Why small `topK` instead of reordering?**
+
+Anchor: reducing docs raises the floor *regardless of ranking quality*; reordering only helps if relevance scores are trustworthy. Cheaper, more robust — the right first lever.
+
+**Q: What's the gap?**
 
 ```
-  k too high ──► neglected middle + token cost
-  k too low  ──► misses multi-part questions  ──► minTopK floor
-  k ≈ 5, ranked ──► the sweet spot
+  retriever order == prompt order — no reorder, no rerank
+  strongest chunk can still sit in the middle
 ```
-Anchor: *the tool clamps both ends — `topK = max(requestedTopK, minTopK)` at `search-knowledge-base-tool.ts:81`.*
+
+Anchor: `search-knowledge-base-tool.ts` returns chunks in retrieval order; edge-loading/reranking `not yet exercised`.
 
 ## See also
 
-- `01-context-window.md` — fewer chunks also means more budget headroom
-- `03-prompt-chaining.md` — splitting work is another way to keep each context short
-- `../01-llm-foundations/08-provider-abstraction.md` — the store contract that hides cosine vs pgvector
+- [01-context-window.md](01-context-window.md) — why you can't just stuff every chunk in.
+- [03-prompt-chaining.md](03-prompt-chaining.md) — splitting work so each step's context stays focused.
+- [../05-evals-and-observability/02-eval-methods.md](../05-evals-and-observability/02-eval-methods.md) — precision@k/recall@k measure whether the right chunks were retrieved at all.

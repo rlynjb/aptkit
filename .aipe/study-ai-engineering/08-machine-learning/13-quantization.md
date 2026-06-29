@@ -1,311 +1,219 @@
 # Quantization
 
-**Subtitle:** shrink a model by storing weights at lower numeric precision · *Language-agnostic*
+> quantization · model compression
+
+Blunt up front: aptkit quantizes nothing. There is no model in `packages/` to compress, no precision knob to turn. This file is new ground and `not yet exercised in aptkit`. I am scaffolding the concept so that when you need to fit a model onto constrained hardware, you reach for the right lever on purpose.
+
+You met the *need* for this in contrl without naming it. A pose model running on-device in a real-time hot path lives or dies by how small and fast it is — every megabyte and millisecond on a phone is contested. Quantization is the standard lever for buying that headroom: trade a little numeric precision for a smaller, faster model. That is the whole pitch.
 
 ## Zoom out, then zoom in
 
-Quantization is not a stage you add to the pipeline — it is a *transform* you
-apply to the fitted model on its way from training to deployment. Same generic
-supervised arc as file 01; the starred box is where quantization lives, between
-"I have a trained `f`" and "this `f` runs on the target device."
+Quantization acts on the trained Model artifact, between training and deployment. You finish training in high precision, then *compress* the weights (and often activations) to lower precision before you serve. The star sits on the edge from Model to Deploy.
 
 ```
-  Zoom out — where quantization sits in the supervised arc (generic)
-
-  ┌─ Data layer ───────────────────────────────────────────────────┐
-  │  labeled rows  (files 01–02)                                    │
-  └───────────────────────────┬─────────────────────────────────────┘
-                              │ split (file 03)
-  ┌─ Model layer ─────────────▼─────────────────────────────────────┐
-  │  fitted model f: X → ŷ   weights stored as FP32                 │
-  └───────────────────────────┬─────────────────────────────────────┘
-                              │ quantize (THIS FILE)
-  ┌─ Compress layer ──────────▼─────────────────────────────────────┐
-  │  same f, weights re-stored at FP16 / INT8 / INT4 — smaller      │
-  └───────────────────────────┬─────────────────────────────────────┘
-                              │ ship to device under a size budget
-  ┌─ Serving layer ───────────▼─────────────────────────────────────┐
-  │  ★ on-device inference ★  fits RAM/disk budget (file 12)        │
-  └──────────────────────────────────────────────────────────────────┘
+Quantization sits on the Model → Deploy edge
+┌──────────┐   ┌──────────┐   ┌──────────────────┐   ┌────────┐         ┌──────────────┐
+│  Data    │──▶│ Features │──▶│ Train / Val / Test│──▶│ Model  │── ★ ──▶ │ Deploy/Serve │
+└──────────┘   └──────────┘   └──────────────────┘   └────────┘         └──────────────┘
+                                                       FP32 weights      smaller, faster
+                                                           │             lower precision
+                                                           ▼
+                                              ★ QUANTIZE: FP32 ─▶ INT8/INT4
+                                                shrink size, speed up math
 ```
 
-Now zoom in. The model's *function* does not change when you quantize — `f` still
-maps `X → ŷ`. What changes is how many bits each weight costs to store and to
-multiply. A weight that was a 32-bit float becomes an 8-bit integer plus a tiny
-recipe for turning it back into an approximate float. You trade numeric precision
-for size and speed, and you pay for it in a measurable drop in output quality.
-The job is to find the cheapest precision whose quality drop you can still accept.
+Training usually happens in FP32 (or FP16). Quantization is the post-training (or training-aware) step that maps those high-precision numbers down to low-precision ones so the deployed model is cheaper to store and faster to run.
 
 ## Structure pass
 
-**Layers.** Trained weights (FP32) → a precision-conversion step → the same
-network running on smaller integers. The network topology, the feature code, and
-the inference math are unchanged; only the *number format* of the parameters
-moves.
+One axis organizes the entire topic: **numeric precision of the weights/activations.** Slide from FP32 down to INT4 and you trade accuracy for size and speed. Every quantization decision is a point on that single axis.
 
-**Axis — bits-per-weight vs quality.** This is the only dial. Slide it from 32
-bits toward 4 bits: size and memory bandwidth fall roughly linearly, integer
-hardware gets faster, and output quality degrades — slowly at first (FP16 is
-nearly free), then sharply (INT4 is visible). Every quantization decision is a
-point chosen on this one axis.
+```
+Axis: numeric precision (bits per value)
+ high precision ◀────────────────────────────────────────────▶ low precision
+ (big, accurate, slow)                                    (tiny, fast, lossy)
 
-**Seam.** The load-bearing boundary is the **scale + zero-point mapping** — the
-pair of numbers that converts a float to an int and back. Above it, the model
-thinks in floats. Below it, storage and integer matmul happen in ints. Get the
-mapping wrong (bad scale, clipped outliers) and quality collapses; get it right
-and INT8 is nearly lossless. The whole art of quantization lives in this seam.
+ FP32            FP16             INT8                 INT4
+ 32-bit float    16-bit float     8-bit integer        4-bit integer
+ training        mixed-precision  edge inference       aggressive edge
+ baseline        training/serve   (the workhorse)      (LLM weight squeeze)
+```
+
+The seam between FP16 and INT8 is the important one: above it you are in float land (training, mild speedup); at and below it you are in integer land (real size/speed wins, real accuracy risk). That seam is where "compression for deployment" actually begins.
 
 ## How it works
 
-### Move 1 — the mental model
+### Move 1 — mental model
 
-You already do this with images. A PNG stores each pixel channel in 8 bits; a
-RAW photo stores 12–14. The RAW is "truer," but for a thumbnail nobody can tell,
-and the PNG is a quarter the size. Quantization is that, applied to model
-weights: store each number in fewer bits, accept that it is now an *approximation*
-of the original, and win on size. The catch — which images share — is that
-compression artifacts get worse the harder you push, and at some point a human
-(or, here, your eval) notices.
+Mental model: **quantization is lossy rounding of numbers, applied deliberately.** You take a continuous range of float values and snap them onto a small grid of integers. Fewer bits means a coarser grid means more rounding error — but also less storage and faster integer math. You are buying size and speed with accuracy.
 
 ```
-  Pattern — fewer bits per number, same meaning, more error
-
-  FP32 weight:  0.7421875…  (32 bits, ~7 decimal digits of precision)
-                   │  quantize: pick a scale, round to nearest grid point
-                   ▼
-  INT8 weight:  95          (8 bits) + scale 0.0078  ⇒ ≈ 0.7410
-                   │  the gap (0.7422 − 0.7410) is QUANTIZATION ERROR
-                   ▼
-  smaller storage · faster integer matmul · slightly wrong answer
+PATTERN: mapping a float range onto an integer grid
+ FP32 values (fine, continuous)
+ │··············································│   range [min, max]
+ ▼  snap each value to nearest grid point
+ INT8 grid (256 levels)
+ ●────●────●────●────●────●────●────●────●────●
+ │    │    │    │    rounding error = distance to nearest ●
+ INT4 grid (16 levels) — coarser, more error, smaller
+ ●─────────●─────────●─────────●─────────●
 ```
 
-You are not changing what the weight *means*. You are storing it on a coarser
-grid and accepting the rounding error that introduces.
+Coarser grid, more error, smaller footprint. The whole craft is choosing a grid coarse enough to save real resources but fine enough that accuracy survives.
 
-### Move 2 — the precision ladder, one rung at a time
+### Move 2 — step by step
 
-**FP32 — the baseline (4 bytes/param).** Full single-precision float. This is
-what training produces and what every quality number is measured *against*. A
-model with 50M params costs `50M × 4 bytes ≈ 200MB` just for weights. Treat FP32
-as the reference, not a deployment target — you rarely ship it to a device.
+**The precision ladder, as a tradeoff table.** This is the table to memorize. Read it as: more bits = bigger and more accurate; fewer bits = smaller and faster but lossier.
 
 ```
-  FP32: 50M params × 4 bytes = 200 MB   quality: 1.00× (reference)
+Precision tradeoff table (relative to FP32 baseline)
+┌────────┬───────────┬──────────────┬──────────────────────┬───────────────────────────┐
+│ format │ bits/value │ size vs FP32 │ typical accuracy hit  │ where it's used           │
+├────────┼───────────┼──────────────┼──────────────────────┼───────────────────────────┤
+│ FP32   │ 32        │ 1.0×  (base) │ none (the reference)  │ training baseline          │
+│ FP16   │ 16        │ ~0.5×        │ negligible            │ mixed-precision training;  │
+│        │           │              │                       │ GPU serving                │
+│ INT8   │ 8         │ ~0.25×       │ small, usually < ~1%  │ edge inference workhorse;  │
+│        │           │              │ with calibration      │ mobile, CPU                │
+│ INT4   │ 4         │ ~0.125×      │ noticeable; needs care│ aggressive edge; large-LLM │
+│        │           │              │ (QAT or good calib)   │ weight compression         │
+└────────┴───────────┴──────────────┴──────────────────────┴───────────────────────────┘
 ```
 
-**FP16 / BF16 — half precision (2 bytes/param).** Drop to 16 bits. Size halves;
-quality loss is near zero because 16 bits still covers the range training cared
-about. FP16 has more mantissa (precision) in a narrow range; BF16 keeps FP32's
-*exponent* range (fewer overflow surprises) with less mantissa. This is the
-default for serving large models — almost free, so almost always taken first.
+The numbers are rules of thumb, not guarantees — always measure on *your* model and *your* data. `Not yet exercised in aptkit`: no model exists here to place on this table, so the harness exercise below is how you would generate these rows for real.
+
+**Two ways to get there: PTQ vs QAT.** There are two roads from FP32 to a quantized model, and they differ in *when* the model learns to tolerate the rounding.
 
 ```
-  FP16/BF16: 50M × 2 bytes = 100 MB   quality: ≈1.00× (near-lossless)
+Post-training quantization (PTQ) vs quantization-aware training (QAT)
+┌───────────────────────────────┐        ┌───────────────────────────────────┐
+│ PTQ                            │        │ QAT                                 │
+│  train FP32 ─▶ DONE            │        │  train WITH fake-quant in the loop  │
+│       │ then quantize after    │        │  model learns to be robust to       │
+│       ▼                        │        │  rounding DURING training           │
+│  calibrate on sample data,     │        │       │                            │
+│  pick the int grid             │        │       ▼                            │
+│  ┌───────────────────────────┐ │        │  ┌───────────────────────────────┐ │
+│  │ + cheap, fast, no retrain │ │        │  │ + best accuracy at low bits   │ │
+│  │ − more accuracy loss,     │ │        │  │ − needs full retrain pipeline │ │
+│  │   esp. at INT4            │ │        │  │   + data + time               │ │
+│  └───────────────────────────┘ │        │  └───────────────────────────────┘ │
+└───────────────────────────────┘        └───────────────────────────────────┘
 ```
 
-**INT8 — 8-bit integer (1 byte/param).** Now you leave floats entirely: each
-weight is an integer in `[-128, 127]`, plus a per-tensor (or per-channel)
-**scale** and **zero-point** that map ints back to approximate floats. Size is
-~1/4 of FP32; integer matmul is much faster on hardware that has integer units
-(most CPUs, mobile NPUs). Quality loss is small *if the mapping is good*. The
-mapping is the seam:
+PTQ is what you reach for first: it is cheap and needs no retraining, just a calibration pass over sample data to choose the grid. QAT is what you escalate to when PTQ's accuracy loss is unacceptable — usually at INT4 — because the model trained *with* fake-quantization in the loop learns weights that survive the rounding. Rule of thumb: try PTQ, and only pay for QAT if INT8 PTQ already hurts or you need INT4.
+
+**Calibration is the quiet make-or-break.** PTQ needs a small representative dataset to find the float range to map onto the integer grid. Pick a bad range (clip too aggressively, or include outliers that stretch the grid) and accuracy craters even at INT8.
 
 ```
-  INT8 scale + zero-point mapping (annotated pseudocode — NOT aptkit code)
-
-  # PER-TENSOR calibration: find the float range this tensor actually uses
-  w_min, w_max = min(weights), max(weights)        # observed float range
-
-  # the 8-bit grid has 256 points; spread the range across them
-  scale      = (w_max - w_min) / 255               # float gap per int step
-  zero_point = round(-w_min / scale)               # which int maps to 0.0
-
-  # quantize: float -> int8   (store this)
-  q = round(w / scale) + zero_point
-  q = clamp(q, -128, 127)                           # outliers get clipped
-
-  # dequantize: int8 -> approx float   (at matmul time)
-  w_hat = scale * (q - zero_point)                  # ≈ w, not == w
+calibration: choose the [min,max] the int grid covers
+ outliers stretch grid ─▶ wasted resolution ─▶ accuracy ↓
+ clip too tight        ─▶ clipped values    ─▶ accuracy ↓
+ representative sample  ─▶ tight, well-placed grid ─▶ accuracy holds
 ```
 
-The two numbers that matter: `scale` is the size of one integer step in float
-units; `zero_point` is the integer that represents true 0.0 (so that exact zeros
-stay exact). Pick the range from extreme outliers and every normal weight gets a
-coarse grid — that is the #1 INT8 quality bug.
+`Not yet exercised in aptkit`.
 
-**INT4 — 4-bit integer (0.5 bytes/param).** Same idea, only 16 grid points
-(`[-8, 7]`). Size is ~1/8 of FP32 — the rung that lets a multi-billion-param LLM
-fit in a laptop's RAM. Quality loss is now *noticeable*: 16 levels cannot
-represent a weight distribution finely, so practitioners use tricks (group-wise
-scales, keeping a few sensitive layers at higher precision) to claw quality back.
+### Move 3 — principle
 
-```
-  INT4 group-wise mapping (annotated pseudocode — NOT aptkit code)
-
-  # one scale per SMALL GROUP of weights (e.g. 64), not per whole tensor —
-  # finer mapping limits the damage of only 16 grid points
-  for group in chunks(weights, size=64):
-      scale = max(abs(group)) / 7          # symmetric: zero_point = 0
-      q     = clamp(round(group / scale), -8, 7)   # 4 bits each
-  # store: q (4-bit) + one scale per 64 weights
-```
-
-**PTQ vs QAT — when you pay the quality bill.** Two ways to quantize:
-
-```
-  ┌─ Post-Training Quantization (PTQ) ───────────────────────────────┐
-  │  train in FP32 → AFTER training, convert weights to INT8/INT4    │
-  │  cheap, no retraining; calibrate scales on a few hundred samples │
-  │  good enough for INT8; INT4 quality often suffers                │
-  └───────────────────────────────────────────────────────────────────┘
-  ┌─ Quantization-Aware Training (QAT) ─────────────────────────────┐
-  │  SIMULATE the rounding error DURING training (fake-quant nodes)  │
-  │  the model learns weights robust to low precision               │
-  │  expensive (full retrain) but recovers most INT4 quality        │
-  └───────────────────────────────────────────────────────────────────┘
-```
-
-PTQ is the default reach because it needs no labels and no training loop. Escalate
-to QAT only when PTQ's measured quality drop blows your budget — usually at INT4.
-
-**Measure, then accept.** Quantization is the lever to hit the on-device size
-budget from file 12 (e.g. a 200MB FP32 model → 50MB at INT8 fits the budget). But
-size is not the deliverable — *quality within budget* is. The discipline:
-quantize, run the held-out eval, and accept the smallest precision whose metric
-stays inside tolerance.
-
-```
-  The quantize→measure→accept loop (annotated pseudocode — NOT aptkit code)
-
-  baseline = evaluate(model_fp32, held_out)        # the number to beat
-  for precision in [FP16, INT8, INT4]:             # smallest size last
-      q = quantize(model_fp32, precision)
-      score = evaluate(q, held_out)                # SAME metric as baseline
-      if baseline - score <= TOLERANCE:            # within budget?
-          candidate = q                            # keep going smaller
-      else:
-          break                                    # too lossy; stop here
-  ship(candidate)                                  # smallest acceptable
-```
-
-**Move 2.5 — the aptkit reality.** Not yet exercised in aptkit — aptkit runs
-pre-trained LLMs, not trained models. The pattern is taught here as study ground.
-The honest anchor that makes it concrete: aptkit's default *local* Gemma is itself
-already a quantized model — local LLMs ship in quantized formats (INT4/INT8 GGUF
-and friends) so they fit consumer hardware. aptkit does not quantize anything
-itself, but the model you already run is the output of exactly this transform.
-
-### Move 3 — the principle
-
-Quantization buys size and speed with precision, and the only honest currency for
-the trade is a quality metric on held-out data. Slide down the bits-per-weight
-axis as far as the metric lets you, and no further. The smallest precision whose
-quality stays in budget is the right one — not the smallest you can produce.
+Principle: **quantize as aggressively as the accuracy budget allows, and prove the tradeoff with measurement, not faith.** The table's "typical" numbers are starting hypotheses. The only honest precision choice is one where you measured size, latency, *and* accuracy on your model at each candidate precision and picked the smallest one that stayed inside your accuracy budget.
 
 ## Primary diagram
 
 ```
-  The precision ladder — pick the lowest rung that passes the eval
-
-  bits/param   format     size of a 50M-param model     quality vs FP32
-  ┌────────┐
-  │  32    │  FP32        200 MB  ████████████████████   1.00×  (reference)
-  ├────────┤
-  │  16    │  FP16/BF16   100 MB  ██████████             ≈1.00× (near-free)
-  ├────────┤
-  │   8    │  INT8         50 MB  █████                  ~0.99× (small drop)
-  ├────────┤
-  │   4    │  INT4         25 MB  ██▌                    ~0.95× (noticeable)
-  └────────┘
-       │  size & memory bandwidth fall ~linearly ─────────────►
-       │  quality holds, then degrades ───────────────────────►
-       ▼
-   accept the lowest rung whose MEASURED metric stays within budget
-   (numbers illustrative; the real ones come from YOUR held-out eval)
+Quantization workflow + the bridge to on-device
+   FP32 trained model
+          │
+          ▼
+   pick target precision (INT8 first; INT4 if you must)
+          │
+   ┌──────┴───────────────┐
+   ▼                       ▼
+  PTQ                     QAT
+  calibrate on            retrain with
+  sample data             fake-quant
+   │                       │
+   └──────────┬────────────┘
+              ▼
+   ┌──────────────────────────────────────┐
+   │ BENCHMARK the three axes together:    │
+   │  size   ── did it shrink enough?      │
+   │  latency── did it speed up enough?    │
+   │  accuracy─ still inside budget?       │
+   └──────────────────┬────────────────────┘
+                      │ smallest precision that passes all three
+                      ▼
+   ┌──────────────────────────────────────┐
+   │ now it FITS the device budget (see 12)│
+   │  this is HOW you get a model onto a   │
+   │  phone in the first place             │
+   └──────────────────────────────────────┘
 ```
+
+The load-bearing box is the benchmark: you do not choose a precision, you *measure your way* to one across all three axes at once. The bottom box is the bridge — quantization is the concrete answer to on-device's "but does it fit?" question.
 
 ## Elaborate
 
-The hard-won lesson is that quantization quality is not predictable from theory —
-it is *empirical per model*. Two networks of identical size can tolerate INT4
-very differently depending on their weight distributions and how many outlier
-activations they carry. That is why the loop in Move 2 measures rather than
-assumes, and why production teams keep a small held-out set specifically for the
-quantization decision. The second lesson: the mapping seam dominates. Most "INT8
-ruined my model" reports are a calibration bug — a few outlier weights stretched
-the range so the scale got coarse — not a fundamental limit of 8 bits. Fix the
-range (per-channel scales, clip outliers) before you blame the precision. File 12
-is the budget this all serves; this file is how you hit it.
+A few edges. First, **size and latency do not improve in lockstep** — INT8 reliably quarters storage, but the speedup depends on whether the hardware has fast integer kernels; on hardware without them you can shrink the model and gain little speed. Measure latency separately, never infer it from size. Second, **not every layer should be quantized equally** — sensitive layers (often the first and last) are sometimes kept at higher precision (mixed-precision quantization) because quantizing them tanks accuracy for little size win. Third, **INT4 is mostly an LLM-weights story** — it is how large language models get squeezed onto consumer hardware, and it almost always needs careful calibration or QAT; do not casually drop a small classifier to INT4 and expect INT8-grade accuracy.
+
+Cross-reference: this is the direct sequel to `12-on-device-inference.md`. That file ends on "but does the model fit the device budget?" — quantization is the primary lever that makes the answer yes.
 
 ## Project exercises
 
-### Measure precision@k drop across a simulated precision ladder
+### Quantize-and-benchmark harness
 
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a script that takes the existing vector-retrieval scores from
-  buffr, simulates "quantizing" the stored embeddings at FP32 / INT8 / INT4 (round
-  each dimension to a coarser grid via a scale), re-ranks, and scores each rung
-  with `scorePrecisionAtK` against the known relevant ids — printing the metric
-  drop per precision.
-- **Why it earns its place:** turns the abstract size/quality tradeoff into the
-  exact measured-quality-delta loop from Move 2, using the same eval metric the
-  real pipeline uses. You feel quality fall as bits fall.
-- **Files to touch:** new `/Users/rein/Public/buffr/eval/quantize-ladder.ts`,
-  importing `scorePrecisionAtK` from
-  `/Users/rein/Public/aptkit/packages/evals/src/precision-at-k.ts` and reading
-  `/Users/rein/Public/buffr/src/pg-vector-store.ts`.
-- **Done when:** the script prints a table of `precision → precision@k`, showing
-  FP32 as the baseline and a monotone-or-near-monotone drop toward INT4.
-- **Estimated effort:** `1–4hr`
+- **Exercise ID:** EX-ML-13a — Phase 3 ML evals, because the deliverable is an eval-shaped harness that measures a tradeoff, which is exactly where measurement discipline belongs.
+- **What to build:** A harness that takes a small reference model and a held-out eval set, produces FP32 / FP16 / INT8 (PTQ) variants, and emits a table of (size, latency, accuracy) per precision — the real version of the tradeoff table in this file. Add an INT4 row if the tooling supports it for your model.
+- **Why it earns its place:** It converts the memorized "typical" numbers into *measured* numbers for a real model, and forces the discipline of benchmarking all three axes together rather than assuming size implies speed. That is the principle of the whole file, made executable.
+- **Files to touch:** `/Users/rein/Public/buffr/tools/quantize-benchmark/run.ts` (Case B (new)); `/Users/rein/Public/buffr/tools/quantize-benchmark/report.ts` (Case B (new)) to render the size/latency/accuracy table; a fixtures dir at `/Users/rein/Public/buffr/tools/quantize-benchmark/fixtures/` (Case B (new)).
+- **Done when:** Running the harness prints a precision table with measured size, latency, and accuracy for at least FP32/FP16/INT8, and the report flags which precisions stay inside a stated accuracy budget so the smallest passing one is obvious.
+- **Estimated effort:** 1–2 days
 
-### Write the scale + zero-point quantizer and round-trip test
+### PTQ-vs-QAT comparison on the same model
 
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a small, dependency-free `quantizeInt8(floats) → {ints,
-  scale, zeroPoint}` plus `dequantize(...) → floats`, with a unit test asserting
-  the round-trip error stays below a tolerance and that exact zeros survive.
-- **Why it earns its place:** the scale+zero-point mapping is the seam of the
-  whole topic; implementing it once kills the mystery and exposes the outlier bug
-  firsthand.
-- **Files to touch:** new `/Users/rein/Public/buffr/src/quantize.ts` and
-  `/Users/rein/Public/buffr/eval/quantize.test.ts`.
-- **Done when:** `node --test` passes with bounded round-trip error and a case
-  proving an outlier-stretched range degrades a normal weight's accuracy.
-- **Estimated effort:** `<1hr`
+- **Exercise ID:** EX-ML-13b — also Phase 3 ML evals, building directly on 13a's harness once INT8/INT4 numbers exist.
+- **What to build:** Extend the harness to produce both a PTQ INT8 variant and a QAT INT8 (or INT4) variant of the same model and compare their accuracy at equal size, so the PTQ→QAT escalation rule becomes a measured result rather than a claim.
+- **Why it earns its place:** It makes the PTQ-vs-QAT decision concrete: you see exactly how much accuracy QAT buys back at a given precision, which is the only honest basis for paying QAT's retraining cost.
+- **Files to touch:** Extend `/Users/rein/Public/buffr/tools/quantize-benchmark/run.ts` (Case B (new)); add `/Users/rein/Public/buffr/tools/quantize-benchmark/qat.ts` (Case B (new)) for the training-aware path.
+- **Done when:** The report shows PTQ vs QAT accuracy at the same precision/size, and you can state from the numbers whether QAT's retraining cost was worth it for this model.
+- **Estimated effort:** ≥1 week
 
 ## Interview defense
 
-**Q: "Walk me from FP32 to INT4 — what am I trading?"**
-Bits per weight for size and speed, paid in output quality. FP32 is the 4-byte
-baseline. FP16/BF16 halves size for near-zero loss — almost always free. INT8
-quarters it via a scale + zero-point that map ints↔floats, with a small loss on
-integer hardware. INT4 is ~1/8 the size, the rung that fits LLMs on laptops, but
-with noticeable loss you fight back with group-wise scales or QAT.
+**Q: What does quantization actually trade, and how do you choose a precision?**
+
+It trades accuracy for size and speed by rounding weights/activations onto a coarser integer grid. You don't choose by reputation — you benchmark size, latency, and accuracy at each candidate precision and take the smallest one that stays inside the accuracy budget.
 
 ```
-  FP32 ─► FP16 ─► INT8 ─► INT4
-   4B      2B      1B     0.5B   bytes/param
-  1.00×   ≈1.0×  ~0.99×  ~0.95×  quality   (slide down till the eval says stop)
+FP32 ──▶ INT8 ──▶ INT4
+big/accurate    tiny/lossy
+measure all 3 axes, pick smallest passing
 ```
-*Anchor: one axis — bits-per-weight vs quality; pick the lowest passing rung.*
 
-**Q: "How do you decide which precision to ship?"**
-You don't decide by size; you decide by measured quality. Quantize at each rung,
-run the *same* held-out eval you scored FP32 with — precision@k on a reranker,
-macro-F1 on a classifier — and accept the smallest precision whose metric stays
-within tolerance. Size buys you into the device budget (file 12); the eval is
-what makes the trade honest.
+Anchor: a phone pose model lives or dies on size and ms — quantization buys both.
+
+**Q: PTQ or QAT — when do you reach for which?**
+
+PTQ first: cheap, no retraining, just calibrate on sample data. Escalate to QAT only when PTQ's accuracy loss is unacceptable — typically at INT4 — because training with fake-quant in the loop teaches the model to survive rounding.
 
 ```
-  quantize ─► evaluate(held_out, SAME metric) ─► within budget? ─► keep & go smaller
-                                                  └─ no ─► stop, ship previous rung
+INT8 PTQ ok? ─▶ ship it
+INT8 PTQ hurts / need INT4? ─▶ pay for QAT
 ```
-*Anchor: the quality delta is measured with `scorePrecisionAtK`
-(`packages/evals/src/precision-at-k.ts`), not assumed.*
+
+Anchor: you don't pay QAT's retrain bill until the numbers say PTQ failed.
+
+**Q: INT8 quartered the model — why didn't it run 4× faster?**
+
+Size and latency aren't locked together. INT8 reliably quarters storage, but the speedup needs hardware with fast integer kernels. Without them you shrink the model and gain little speed — which is why you measure latency separately, never infer it from size.
+
+```
+size ↓ 4×  ≠  latency ↓ 4×   (depends on int kernels)
+```
+
+Anchor: the benchmark harness measures latency as its own axis for exactly this reason.
 
 ## See also
 
-- `12-on-device-inference.md` — the size/RAM budget quantization exists to hit
-- `04-model-selection.md` — pick the simplest model that wins, then shrink it
-- `09-calibration.md` — another post-training transform measured on held-out data
-- `01-supervised-pipeline.md` — where the FP32 model the transform consumes is built
+- [12-on-device-inference.md](./12-on-device-inference.md) — the "does it fit the device?" question this answers
+- [11-cold-start.md](./11-cold-start.md) — the upstream personalization context for any deployed model

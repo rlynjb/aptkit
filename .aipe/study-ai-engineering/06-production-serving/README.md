@@ -1,37 +1,21 @@
-# 06 — Production serving
+# 06 — Production serving (LLM side)
 
-> Anchor: LLM application engineering. · Curriculum: Phase 6 (no curriculum file
-> in this repo; exercises cite real aptkit/buffr paths instead).
+> Anchor: LLM application engineering (loopd-shaped) — Phase 5.
+> Mostly `not yet exercised`: aptkit is local-first and zero-cloud by default.
 
-This is the section where you'd expect cloud war stories — cache hit rates, a
-per-token cost dashboard, a rate limiter eating 429s, a circuit breaker tripping
-on a dead provider. aptkit has almost none of that, and that's the honest
-lesson. aptkit is **local-first**: the default model is Gemma `gemma2:9b` running
-on local Ollama (`packages/providers/gemma/src/gemma-provider.ts:47`). Zero
-cloud, zero rate limits, zero provider bill. So most production-serving concepts
-here are `not yet exercised` — taught as the pattern, anchored to the *nearest
-thing* aptkit actually built, with Case-B exercises for when it goes cloud.
+This sub-section is honest about a gap. aptkit's default is local-first
+(Gemma via Ollama, no cloud call), so most production-serving hardening —
+caching, rate limiting, circuit breakers — `not yet exercised`. What *is*
+present: the fallback chain (a primitive serving concern), the
+structured-generation retry (a bounded retry, not backoff), and the
+context-window guard. Each file marks current state and names the exercise.
 
-Read that as a feature, not an apology. Knowing what you *didn't* build, and why,
-and exactly where it would slot in, is the senior signal. The strong file in this
-section is `03` — prompt injection — because aptkit's architecture answers it
-structurally, not with a band-aid LLM.
+## Files
 
-## Files (self-contained per concept)
+- `01-llm-caching.md` — `not yet exercised`; prompt/semantic/exact-match caches and where they'd hook in.
+- `02-llm-cost-optimization.md` — the cost ledger exists; model routing is `not yet exercised`.
+- `03-prompt-injection.md` — the tool-schema-as-only-output-path defense aptkit already has; sanitization is the gap.
+- `04-rate-limiting-backpressure.md` — `not yet exercised`; the local default makes this unforced.
+- `05-retry-circuit-breaker.md` — bounded retry exists (`generateStructured`, fallback); backoff/breaker is `not yet exercised`.
 
-1. `01-llm-caching.md` — the 3 cache layers (exact / semantic / prompt) as the
-   pattern; aptkit's `FixtureModelProvider` replay is the nearest exact-match
-   cache (for tests, not production); production caching `not yet exercised`.
-2. `02-llm-cost-optimization.md` — the usage ledger; pricing covers OpenAI
-   gpt-4.1 only; the fallback chain is failover-by-availability, not
-   cost-routing (gap); Gemma is free because it's local.
-3. `03-prompt-injection.md` — the strongest story here: tool-call schema as the
-   only structured-output path, least-privilege tool policies, and
-   model-names-a-tool / your-code-runs-it via the registry. Input sanitization
-   and an output-safety LLM are `not yet exercised`.
-4. `04-rate-limiting-backpressure.md` — the pattern, then the honest gap; the
-   loop's `maxToolCalls`/`maxTurns` bound *work*, not request *rate*.
-5. `05-retry-circuit-breaker.md` — aptkit's three retries (Gemma's tool-call
-   nudge, `generateStructured`'s parse retry, the loop's recovery turn) plus
-   fallback failover; exponential backoff and a real circuit breaker are
-   `not yet exercised`. Precise on why retry ≠ breaker.
+Read `03-prompt-injection.md` first — it has the most real code.

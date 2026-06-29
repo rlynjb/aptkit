@@ -1,180 +1,149 @@
 # Trees, Tries & Balanced Indexes
 
-**Industry name(s):** binary search tree · self-balancing trees (AVL / red-black / B-tree) · trie (prefix tree) · index structures — *Industry standard*
-
-> **Status in aptkit: `not yet exercised`.** No tree, trie, or balanced index runs in aptkit's source. You've built `BinarySearchTree.ts` (insert/search/delete, all traversals, successor/predecessor) and `Tree.ts` (n-ary, generator traversals) from scratch. This file is curriculum — with **one real seam**: the thing aptkit's linear scan is missing *is* an index, and in the companion repo buffr that index is built (an HNSW graph, file **05**; B-tree/GIN indexes underneath, owned by `study-database-systems`). Trees are the answer to aptkit's `O(n)`-per-query problem.
-
----
+**Hierarchies · binary search trees · tries (prefix trees) · balanced trees (B-tree / B+tree) · hierarchical graph indexes** — Industry standard. **Status in aptkit: `not yet exercised`. In buffr: HNSW is a hierarchical graph index (cross-repo).**
 
 ## Zoom out, then zoom in
 
-aptkit has no tree because it has no index — it scans a flat array. The whole reason trees matter *to this repo* is as the structure that would end the scan.
+aptkit runs no tree. No BST, no trie, no B-tree, nothing recursive over a hierarchy. The *production* retrieval path, though, leans hard on a hierarchical index — HNSW — but that lives in **buffr**, not aptkit. This file teaches the tree family, then walks the one real hierarchical index in the story (buffr's HNSW, more graph than tree) and is honest that aptkit's own code has none.
 
 ```
-  Zoom out — the index-shaped hole in aptkit
+  Zoom out — where hierarchical structures sit (none in aptkit)
 
-  ┌─ aptkit Retrieval layer ────────────────────────────────────┐
-  │  InMemoryVectorStore.search:                                │
-  │    scan ALL n chunks, sort, slice    ← no index, O(n)       │
-  │    ★ a tree/index would make lookup sub-linear ★            │
-  └───────────────────────────┬─────────────────────────────────┘
-                              │ same VectorStore contract, drop-in
-  ┌─ buffr Storage layer (companion) ─▼─────────────────────────┐
-  │  PgVectorStore → Postgres:                                  │
-  │    HNSW graph index over embeddings (file 05)               │
-  │    B-tree indexes on id/app_id columns (Postgres default)   │
-  │    → query touches log(n) rows, not all n                   │
-  │    [storage-engine mechanics owned by study-database-systems]│
-  └──────────────────────────────────────────────────────────────┘
+  ┌─ aptkit Storage layer — packages/retrieval ──────────────────┐
+  │  InMemoryVectorStore → FLAT array + linear scan              │ ← NO index,
+  │    no tree, no balanced structure, no prefix index           │   no tree
+  └───────────────────────────────────────────────────────────────┘
+
+  ┌─ buffr Storage layer — sql/001_agents_schema.sql ────────────┐
+  │  ★ HNSW index → hierarchical layered graph ★                  │ ← the one
+  │    create index ... using hnsw (vector_cosine_ops)           │   hierarchical
+  │  B-tree → Postgres primary-key / btree indexes (implicit)    │   index, and
+  └───────────────────────────────────────────────────────────────┘   it's in BUFFR
 ```
 
-Zoom in: a tree keeps data *ordered by a key* so you can find, range-scan, or rank without touching everything — `O(log n)` instead of `O(n)`. A trie does the same for *string prefixes*. A balanced index (B-tree) is the database's industrial version. aptkit's linear scan is precisely the structure you replace with one of these when `n` grows.
-
----
+Zoom in: a tree is a hierarchy where each node has children and there's one path from the root to any node. The *point* of the tree family is `O(log n)` operations by halving the search space at each level — a BST halves by value, a trie by character prefix, a B-tree by key range (and packs many keys per node for disk), HNSW by "skip-list-over-a-graph" layers. aptkit's flat array is the *opposite* choice: no hierarchy, `O(n)` scan, but dead simple. You've built BST and n-ary `Tree` in `reincodes`; this file is about the *index* role trees play — which aptkit declines and buffr accepts.
 
 ## Structure pass
 
-**Layers (curriculum):** BST (ordered by comparable key), balanced BST / B-tree (ordered + height-bounded), trie (ordered by string prefix).
-
-**Axis — lookup cost as a function of structure:** trace "how many elements do I touch to find one?"
-
 ```
-  One axis — "how many elements to find a target?"
+  layers:  the hierarchy  →  what it splits on  →  the lookup cost
+  axis held constant: "how does each level shrink the search space?"
 
-  flat array (aptkit) → touch ALL n           O(n)   — scan
-  BST (balanced)      → touch one root-to-leaf O(log n) — comparisons
-  B-tree (database)   → touch one path, wide   O(log n) — fewer disk pages
-  trie                → touch len(key) nodes   O(L)   — prefix walk
+  ┌─ BST ───────────────────────┐   split by VALUE; balanced → O(log n)
+  │  reincodes/BinarySearchTree  │   → ordered keys, in-order = sorted
+  └──────────────┬───────────────┘
+                 │  seam: split key flips value → character prefix
+  ┌─ trie ──────────────────────┐   split by PREFIX char; O(len) lookup
+  │  autocomplete, routing       │   → shared prefixes stored once
+  └──────────────┬───────────────┘
+                 │  seam: split flips to KEY RANGE, packed for disk
+  ┌─ B-tree / B+tree ───────────┐   split by range, high fan-out; O(log n)
+  │  Postgres btree index        │   → disk-friendly, the DB default
+  └──────────────┬───────────────┘
+                 │  seam: split flips to PROXIMITY in vector space
+  ┌─ HNSW (layered graph) ──────┐   split by layer; greedy → ~O(log n)
+  │  buffr pgvector index        │   → approximate, vectors not keys
+  └──────────────────────────────┘
 ```
 
-**Seam — the no-index → indexed boundary at the `VectorStore` contract.** Both `InMemoryVectorStore` (aptkit) and `PgVectorStore` (buffr) implement the *same* `VectorStore` interface. On the aptkit side: no index, scan all `n`. Cross the contract into buffr: an HNSW index, touch `~log(n)`. The lookup-cost axis flips across that one seam — and because it's the *same contract*, swapping is a wiring change, not a rewrite.
-
----
+The axis to hold: every level of every one of these *shrinks the search space*. A BST throws away half the values; a B-tree throws away all-but-one range; HNSW drops a layer and zooms in on a neighborhood. aptkit's flat array shrinks *nothing* per step — it just reads everything. That's the trade: zero index-build cost and exactness, paid for with `O(n)`.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You built a BST: each node holds a key, everything in the left subtree is smaller, everything right is larger, so searching is "compare, go left or right, repeat" — `O(height)`, which is `O(log n)` if balanced. The index idea generalizes that: **keep data organized by a key so a query follows a path instead of scanning a list.** aptkit doesn't do this — it scans. The lesson is seeing the scan *as* a missing tree.
+The tree family is one idea wearing different clothes: **make each step eliminate a chunk of the remaining candidates.** A balanced BST eliminates half the values per node (`O(log n)`). HNSW does the same trick but for *proximity* instead of *order*, and on a graph instead of a strict tree.
 
 ```
-  Pattern — what a tree buys: path not scan
+  the shared trick — each level eliminates candidates
 
-  flat array (aptkit search):
-    [c0][c1][c2][c3][c4]...[cn]   ← compare EVERY one (O(n))
-
-  BST / index (what replaces it):
-                  [c_m]
-                 /     \
-            [c_lo]     [c_hi]      ← compare, branch, recurse
-            /   \       /   \         touch only one root→leaf path
-                                      O(log n)
+  flat scan (aptkit)        balanced tree / index (buffr)
+  ───────────────────       ──────────────────────────────
+  [▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓]        [▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓]
+  check all n: O(n)              ╱ halve ╲
+                            [▓▓▓▓▓▓▓▓]  drop
+                              ╱ halve ╲
+                          [▓▓▓▓] drop
+                          → O(log n) levels, each halves
 ```
 
-But — and this is the catch that makes file **05** the real answer — a BST orders by a *scalar comparable key*. Embeddings are 768-dimensional vectors. There's no "<" on a vector. So a plain BST can't index them; you need a *spatial* / *approximate* structure, which is the HNSW graph. The tree intuition is the on-ramp; the vector case needs the graph.
+### Move 2 — the one real hierarchical index: buffr's HNSW
 
-### Move 2 — the walkthrough
+aptkit has nothing to walk here, so the honest move is to walk the structure the *production* path actually uses — in buffr — and clearly label it cross-repo.
 
-#### Why aptkit has no tree: its key isn't orderable
+**HNSW is a hierarchical small-world graph — a skip-list over a proximity graph.** It lives in `buffr/sql/001_agents_schema.sql:28`:
 
-The honest reason aptkit scans instead of indexing: its similarity query has no scalar key to build a BST on. Look at what `search` compares:
-
-```ts
-// packages/retrieval/src/in-memory-vector-store.ts:28-30
-for (const chunk of this.chunks.values()) {
-  hits.push({ id: chunk.id,
-    score: cosineSimilarity(vector, chunk.vector),  // ← key computed PER QUERY
-    meta: chunk.meta });
-}
+```sql
+  create index if not exists chunks_embedding_hnsw
+    on agents.chunks using hnsw (embedding vector_cosine_ops);
 ```
 
-The ranking key — cosine similarity to *this query* — doesn't exist until the query arrives. You can't pre-order chunks in a tree by "distance to a query you haven't seen yet." That's why a naive vector store *must* either scan everything (aptkit) or use an index that approximates nearness in the embedding space *independent* of any single query (HNSW). A BST works when the key is fixed and scalar (the `chunk.id`, say); it does not work for nearest-neighbor over vectors.
-
-The boundary condition: aptkit *does* have one place a tree-like index would trivially apply — keyed lookup by `chunk.id`. And it already uses one: the `Map<string, VectorChunk>` (file **02**) is a hash index on the id, `O(1)` lookup. So aptkit isn't index-free; it's *hash-indexed on the id key* and *scan-based on the similarity key*. Those are two different lookup problems.
-
-#### The trie case: prefix search, and why aptkit doesn't need it
-
-A trie indexes strings by shared prefix — each node is a character, paths spell words, `O(L)` lookup in word length regardless of dictionary size. It's the structure behind autocomplete and IP routing tables. aptkit does string work (the chunker, `parseAgentJson`) but never *prefix search* over a string set — it never asks "which keys start with `foo`?" So no trie. The contrast teaches the trie's niche: it earns its place only when you query by prefix, and aptkit's string operations are windowing and parsing, not prefix matching.
-
-#### The balanced-index case: what buffr's pgvector adds underneath
-
-When aptkit's `InMemoryVectorStore` is swapped for buffr's `PgVectorStore`, two index families enter — and they're both trees/graphs:
+Read what that one line buys. `using hnsw` tells Postgres (via pgvector) to build a multi-layer graph over the chunk embeddings. The top layer has a few nodes with long-range links; each layer down is denser; the bottom layer holds every vector. A search drops in at the top, greedily hops toward the query vector, descends a layer, repeats — so it touches `O(log n)` nodes instead of all `n`. The `vector_cosine_ops` part says "measure closeness by cosine," matching aptkit's `cosineSimilarity` exactly — same *metric*, completely different *traversal*.
 
 ```
-  buffr's indexes (companion repo — mechanics owned by study-database-systems)
+  HNSW — hierarchical layers, greedy descent (buffr's index)
+  (Storage layer — Postgres / pgvector)
 
-  ┌─ on the embedding column ──────────────────────────────────┐
-  │  HNSW (a layered GRAPH, not a tree) — file 05               │
-  │  approximate nearest neighbor in vector space               │
-  │  buffr/sql/001_agents_schema.sql:28-29                      │
-  │    create index chunks_embedding_hnsw                       │
-  │      using hnsw (embedding vector_cosine_ops)               │
-  └──────────────────────────────────────────────────────────────┘
-  ┌─ on the scalar columns (id, app_id) ──────────────────────┐
-  │  B-tree (Postgres default) — balanced, height-bounded      │
-  │  O(log n) keyed/range lookup on orderable columns          │
-  └──────────────────────────────────────────────────────────────┘
+  layer 2 (sparse)   ●━━━━━━━━━━━━━━━●        ← enter, long hops
+                     │               │
+  layer 1 (denser)   ●──●────●───────●──●     ← descend, medium hops
+                     │  │    │       │  │
+  layer 0 (all n)    ●─●●─●─●●─●─●─●─●●─●─●    ← every vector, short hops
+                          ▲
+                       query lands near here
+  greedy: hop toward query each layer, descend → ~O(log n) nodes touched
 ```
 
-This is the punchline of the whole tree topic for aptkit: the embedding can't go in a B-tree (no scalar order), so the vector index is the *graph* in file **05**; the scalar columns get ordinary B-trees. The "tree" answer to aptkit's scan splits into "B-tree for the orderable keys, ANN graph for the vectors."
+The boundary condition — and it's the whole reason aptkit *doesn't* use it: HNSW is **approximate**. The greedy descent can miss the true nearest neighbor if it commits to the wrong neighborhood early. aptkit's flat scan is **exact** — it cannot miss, because it scores everything. So the seam between aptkit and buffr isn't "in-memory vs Postgres," it's **exact `O(n)` scan vs approximate `O(log n)` graph walk.** You trade a small recall error for a massive speedup, and you only make that trade when `n` is too big to scan. (File 05 walks HNSW as a *graph*; this file frames it as the *index/hierarchy* role.)
+
+**Postgres's B-tree — the index you get for free.** buffr's `agents` schema has primary keys, and Postgres backs those with B-tree indexes automatically. A B-tree is the balanced tree built for *disk*: huge fan-out (hundreds of keys per node) so the tree is shallow and each node is one disk page. You won't see it in the SQL — it's implicit in `primary key` — but it's the reason a lookup by chunk id in buffr is `O(log n)`, not a table scan. aptkit's `Map<id, chunk>` is the in-memory equivalent (`O(1)` hash vs `O(log n)` tree) — same job, the structure differs because memory and disk reward different shapes.
+
+**Tries — `not yet exercised` anywhere.** No autocomplete, no prefix routing, no longest-prefix match in aptkit or buffr. If aptkit ever added prefix-based tool routing or a typeahead over capability names, a trie would be the fit. Today: nothing. Don't manufacture it.
 
 ### Move 3 — the principle
 
-**An index is a tree (or graph) that pre-pays the ordering cost so each query walks a path instead of scanning a list — but only when the key can be ordered.** aptkit scans because its similarity key is computed per-query and lives in 768-dim space where there's no "<". The moment you fix the key (an id) you *do* see an index — the hash `Map`. The moment you need *vector* nearness at scale, the index isn't a tree at all; it's the HNSW graph. Reach for a tree when the key is scalar and orderable; reach for a graph when "nearness" is the query.
-
----
+A tree (or any hierarchical index) earns its keep by eliminating candidates per level — that's `O(log n)`. aptkit declines the index entirely: a flat array, `O(n)`, exact, zero build cost — correct while `n` is small. buffr accepts a *graph* index (HNSW) the moment `n` is large enough that exactness isn't worth a full scan. The structure you choose encodes how much you'll pay for certainty.
 
 ## Primary diagram
 
-The tree/index landscape against aptkit's actual structures.
-
 ```
-  Indexes vs aptkit — what's used, what's missing, what buffr adds
+  trees & indexes across the story — one frame
 
-  KEY TYPE          STRUCTURE              WHERE IN THE SYSTEM
-  ────────────────  ─────────────────────  ──────────────────────────
-  chunk id (scalar) hash Map (hash index)  aptkit InMemoryVectorStore ✓
-  id / app_id       B-tree                 buffr Postgres (default)   ✓
-  string prefix     trie                   NOT NEEDED (no prefix query)
-  768-d vector      — no BST possible —    aptkit: linear SCAN (O(n))
-  768-d vector      HNSW graph (ANN)       buffr PgVectorStore  → file 05 ✓
+  WHERE          structure         role                  status
+  ──────────────────────────────────────────────────────────────────
+  aptkit         (flat array)      no index, O(n) scan   no tree
+  aptkit         Map<id, chunk>    O(1) identity lookup   hash, not tree
+  buffr          B-tree (implicit) O(log n) key lookup   cross-repo
+  buffr        ★ HNSW graph        O(log n) ANN search   cross-repo ★
+  reincodes      BST, n-ary Tree   you BUILT these       drill, not evidence
 
-  the tree intuition (O(log n) path not O(n) scan) is right;
-  for vectors the realization is a GRAPH, not a tree.
+  the seam:  aptkit EXACT O(n)  ═══►  buffr APPROXIMATE O(log n)
+             (the metric is the same cosine; the traversal flips)
 ```
-
----
 
 ## Elaborate
 
-The B-tree (1970) was designed for exactly aptkit's eventual problem: too much data to scan, stored where each access is expensive (disk pages then, network/memory now). It stays balanced and wide so the path from root to any record is short and touches few pages. Tries (1959) solve the orthogonal problem — prefix queries over strings — and underlie spell-checkers, autocomplete, and longest-prefix-match routing. Your `BinarySearchTree.ts` is the conceptual ancestor of both: the ordered-key, branch-and-recurse idea.
-
-The reason this topic is curriculum-only in aptkit and not a gap to feel bad about: aptkit's job is *vector* retrieval, and vectors don't fit the comparable-key model trees assume. The correct index for aptkit's hard problem is the HNSW *graph* — which is why file **05**, not this one, holds the real production structure. Read `study-database-systems` for how buffr's Postgres actually builds and uses these indexes; this file only names them as the structural answer to the scan.
-
----
+The B-tree (Bayer & McCreight, 1972) and the trie (Fredkin, 1960) are the classic answers to "index by range" and "index by prefix." HNSW (Malkov & Yashunin, 2016) is the modern answer to "index by proximity in high-dimensional space" — and it's a *graph*, not a tree, because in 768 dimensions there's no clean ordering to build a BST on. That's the deep reason aptkit's array→HNSW jump skips trees entirely: vectors don't have a total order to split on, so the index has to be a navigable graph. The DB-engine view of HNSW (build params, `m`, `ef_construction`, recall tuning) belongs to **study-database-systems**; the graph-traversal view belongs to file 05; this file owns only the "it's a hierarchical index that beats the flat scan" framing.
 
 ## Interview defense
 
-**Q: aptkit scans every chunk on every query. Why not put them in a tree for `O(log n)` lookup?**
-
-> Because the ranking key — cosine similarity to the query — doesn't exist until the query arrives, and embeddings are 768-dimensional, so there's no scalar "<" to build a BST on. A tree indexes an *orderable* key; nearest-neighbor over vectors isn't that. aptkit *does* use a hash index (`Map` on chunk id) for keyed lookup — it's only similarity ranking that scans. The real index for the vector case is a spatial/approximate structure: an HNSW graph, which is what buffr's `PgVectorStore` uses behind the same `VectorStore` contract.
+**Q: aptkit scans a flat array. What index would the production version use, and what does it trade?**
+buffr uses HNSW — a hierarchical navigable small-world graph. It drops search from exact `O(n)` to approximate `O(log n)` by greedily hopping toward the query through layered graph links. The trade is exactness: HNSW can miss the true nearest neighbor. You accept that recall error only when `n` is too large to scan exactly.
 
 ```
-  scalar key  → B-tree / hash       O(log n) / O(1)
-  vector key  → no tree; HNSW graph ≈ O(log n) ANN   ← file 05
+  aptkit flat array   exact   O(n)       small n
+  buffr HNSW graph    approx  O(log n)   large n
+  same cosine metric, different traversal — that's the seam
 ```
 
-**Q: Would a trie help anywhere in aptkit?**
+Anchor: "Vectors have no total order, so the index can't be a BST — it has to be a navigable graph. That's why the jump is array → graph index, skipping trees."
 
-> No — a trie indexes string *prefixes*, and aptkit never queries by prefix. Its string work is fixed-window chunking and tolerant JSON parsing, not "find keys starting with X." Naming where a structure *doesn't* fit is as much the point as where it does.
-
-Anchor: *aptkit scans because its key is a per-query vector, not an orderable scalar — the index it's missing is a graph (HNSW), not a tree.*
-
----
+**Q: Why not a B-tree on the embeddings?**
+A B-tree indexes by *ordered key range*. A 768-dim vector has no single ordering — "closer in cosine space" isn't a range you can binary-search. B-trees handle the *id* lookups (Postgres does this implicitly for primary keys); proximity search needs a graph index like HNSW.
 
 ## See also
 
-- **05-graphs-and-traversals.md** — HNSW, the actual index structure for vectors; the one real graph in the system.
-- **02-arrays-strings-and-hash-maps.md** — the `Map` hash index aptkit *does* use, and the array scan it doesn't index.
-- **01-complexity-and-cost-models.md** — the `O(n)`-per-query cost that an index removes.
-- `study-database-systems` — how buffr's Postgres builds and queries B-tree / HNSW indexes.
+- `05-graphs-and-traversals.md` — HNSW walked as a graph traversal (greedy frontier)
+- `02-arrays-strings-and-hash-maps.md` — the `Map` (hash) that does aptkit's id lookups instead of a B-tree
+- `06-sorting-searching-and-selection.md` — the flat scan this index would replace
+- **study-database-systems** — HNSW as a Postgres/pgvector index, build params, recall tuning

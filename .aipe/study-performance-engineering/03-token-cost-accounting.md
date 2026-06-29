@@ -1,274 +1,189 @@
 # Token cost accounting
 
-*Industry names: usage ledger / token metering / LLM cost attribution. Type:
-Project-specific (over an industry-standard idea).*
+**Industry name:** token usage metering / LLM cost accounting · **Type:** Industry standard (LLM systems)
+
+The one piece of performance telemetry the repo actually wires: turning per-turn token counts into a summed, priced, provider-neutral ledger.
+
+---
 
 ## Zoom out, then zoom in
 
-With an LLM app the bill is tokens, and tokens are invisible unless you count
-them. The question this file answers: **how does aptkit turn a run into a
-number of tokens and a dollar figure — and where does that accounting stop short
-of being a baseline?** The answer: every model call emits a usage event, the
-runtime sums those events, and a pricing table converts the sum to USD.
+For an LLM system the dominant variable cost is tokens — input you send, output you get back, per model, per call. Everything else (CPU, the linear scan) is rounding error next to the API bill. This is the one cost axis the repo measures end-to-end: the loop emits a usage event per turn, and a ledger sums and prices them.
 
 ```
-  Zoom out — where cost accounting lives
+  Zoom out — where the meter lives
 
-  ┌─ Client (apps/studio) ──────────────────────────────────────┐
-  │  shows durationMs + token usage + estimated $ per replay     │
-  └───────────────────────────┬──────────────────────────────────┘
-                              │  trace[] (CapabilityEvent[])
-  ┌─ Runtime (packages/runtime) ▼────────────────────────────────┐
-  │  loop emits model_usage events  →  summarizeUsage()           │
-  │  →  estimateCost(provider, usage, model)  ★ THIS CONCEPT ★    │ ← we are here
-  └───────────────────────────┬──────────────────────────────────┘
-                              │  per-call token counts
-  ┌─ Provider (packages/providers/*) ▼───────────────────────────┐
-  │  each complete() returns usage:{inputTokens, outputTokens}    │
-  └───────────────────────────────────────────────────────────────┘
-
-  cost is reconstructed from the trace, not the provider's invoice — provider-
-  neutral by construction. the gap: it's per-run, never aggregated into a baseline.
+  ┌─ Runtime loop ────────────────────────────────────────────┐
+  │  runAgentLoop: each turn emits ↓                           │
+  │     trace.emit({ type:'model_usage', inputTokens, ... })  │ ← the meter reading
+  └───────────────────────────┬───────────────────────────────┘
+                              │ CapabilityEvent[] (NDJSON trace)
+  ┌─ Ledger layer ────────────▼───────────────────────────────┐
+  │  ★ summarizeUsage(trace) → estimateCost(provider, model) ★ │ ← we are here
+  └───────────────────────────┬───────────────────────────────┘
+                              │ CostEstimate
+  ┌─ Display layer ───────────▼───────────────────────────────┐
+  │  formatCost() → Studio panel / replay summary             │
+  └────────────────────────────────────────────────────────────┘
 ```
 
-The pattern: **derive cost from the event stream, not from the vendor.** Each
-`complete()` reports its own token counts; the loop records them as trace
-events; a pure reducer sums them; a pricing table prices them. Because it rides
-on the trace, the same accounting works for Anthropic, OpenAI, or a local Gemma
-run — the cost number is computed the same way regardless of who served the
-tokens.
+The reading is taken inside the loop; the accounting lives in `packages/runtime/src/usage-ledger.ts`. The pattern is: meter at the source (per turn), aggregate provider-neutrally (sum a trace), price at the edge (look up per-model rates).
 
 ## The structure pass
 
-Trace the **cost** axis from "tokens spent" to "dollars shown."
+Trace **the cost axis — "how is one run's dollar cost computed?"** across the three layers.
 
 ```
-  One axis (cost) traced from provider to UI
+  Axis: "what is this run's token cost?" — across the meter → ledger seam
 
-  ┌─ provider ─────────────┐  reports    ┌─ runtime ledger ──────┐
-  │ usage:{in,out,estimated}│ ══════════► │ summarizeUsage sums   │
-  └─────────────────────────┘             │ estimateCost prices   │
-                                          └──────────┬────────────┘
-                                            ★ flips here: tokens → USD
-                                                     ▼
-                                          ┌─ studio ──────────────┐
-                                          │ formatCost → "$0.0123"│
-                                          └───────────────────────┘
+  ┌─ loop ──────────────────┐  seam   ┌─ ledger ─────────────────────┐
+  │ raw counts per turn:     │ ══╪══►  │ summed counts + price lookup  │
+  │ inputTokens/outputTokens │ (flips) │ → USD                         │
+  │ tied to ONE provider     │         │ provider-neutral (reduce over │
+  │                          │         │ trace, then price by name)    │
+  └──────────────────────────┘         └───────────────────────────────┘
 ```
 
-- **Layers:** provider (raw counts) → runtime (sum + price) → Studio (format).
-- **Axis:** cost, in two units — tokens upstream of the pricing table, dollars
-  downstream.
-- **Seam:** `estimateCost`. This is where the axis-answer flips from
-  provider-neutral token counts to a USD figure that depends on a *provider +
-  model* pricing lookup. It's also where the accounting is most fragile — the
-  table only knows OpenAI gpt-4.1.
+- **Layers:** loop emits raw per-turn counts → ledger sums them into a `TokenUsageSummary` → `estimateCost` prices by provider/model name.
+- **Axis:** dollar cost. It is a *raw count* at the loop, an *aggregate* at the ledger, a *price* at the edge.
+- **Seam:** the `CapabilityEvent` trace (`model_usage` event). The loop emits without knowing how it's aggregated; the ledger sums without knowing which provider produced it. The provider-coupling flips to provider-neutral across that seam.
 
 ## How it works
 
 #### Move 1 — the mental model
 
-You know how a request's trace is a list of events you can `reduce` over to
-compute anything you want after the fact? Cost here is exactly that — a `reduce`
-over the `model_usage` events in the trace. The tokens were already emitted; the
-ledger is a pure function that folds them up.
+You know how a `reduce` collapses an array of rows into one total. The ledger is exactly that — `trace.reduce(...)` over the event stream, picking out the `model_usage` rows and summing their token fields. The only twist is that pricing is a *separate* step keyed by model name, because the same token count costs different money on different models.
 
 ```
-  Pattern — fold the trace into a usage summary, then price it
+  Pattern — meter → reduce → price
 
-  trace: [step, model_usage(120,40), tool_call, model_usage(900,60), step]
-                      │                              │
-                      └──────── reduce (sum) ────────┘
-                                   ▼
-            usage = { inputTokens:1020, outputTokens:100, turns:2 }
-                                   ▼
-            estimateCost("openai", usage, "gpt-4.1") → { totalCost: 0.00284 }
+  trace: [step, model_usage(in=1200,out=300),
+                tool_call_end, model_usage(in=1500,out=250), ...]
+              │
+              │ reduce: keep only model_usage, sum tokens, count turns
+              ▼
+  TokenUsageSummary { inputTokens: 2700, outputTokens: 550, turns: 2 }
+              │
+              │ estimateCost(provider, model): look up $/M-token rate
+              ▼
+  CostEstimate { inputCost, outputCost, totalCost, estimated: true }
 ```
 
 #### Move 2 — the step-by-step walkthrough
 
-**Step 1 — the loop emits a usage event per call.** Inside `runAgentLoop`, right
-after each `model.complete`, if the response carries usage it's emitted as a
-`model_usage` event — `run-agent-loop.ts:111-122`:
+**Step 1 — meter at the source.** Every turn that returns usage emits one `model_usage` event with the raw counts. This is the reading; it happens inside the loop, once per round-trip:
 
 ```ts
+// packages/runtime/src/run-agent-loop.ts:111-122
 if (response.usage) {
   trace?.emit({
     type: 'model_usage',
     capabilityId,
-    provider: model.id,
+    provider: model.id,                               // ← which provider produced it
     model: response.model ?? model.defaultModel ?? 'unknown',
-    inputTokens: response.usage.inputTokens,
+    inputTokens: response.usage.inputTokens,           // ← the meter reading
     outputTokens: response.usage.outputTokens,
-    estimated: response.usage.estimated,   // ← did the provider COUNT or GUESS?
+    estimated: response.usage.estimated,               // ← did the PROVIDER count, or did we guess?
     timestamp: timestamp(),
   });
 }
 ```
 
-Note `estimated`. Gemma reports real counts from Ollama (`prompt_eval_count` /
-`eval_count`, `gemma-provider.ts:120-125`, `estimated: false`); a provider that
-can't count sets `estimated: true`. That flag rides all the way to the summary
-so a downstream reader knows whether the number is measured or guessed.
+The `estimated` flag is the honest part: if the provider reported real token counts, it is `false`; if aptkit had to approximate (a provider that does not return usage), it is `true`. That flag rides all the way through to the final summary.
 
-**Step 2 — `summarizeUsage` folds the events.** A pure reducer over the trace —
-`usage-ledger.ts:25-42`:
+**Step 2 — aggregate provider-neutrally.** `summarizeUsage` reduces the whole trace into one row. It does not care which provider, which agent, or how many tools ran — it sums every `model_usage` event:
 
 ```ts
-export function summarizeUsage(trace) {
-  return trace.reduce((summary, event) => {
-    if (event.type !== 'model_usage') return summary;   // ignore non-usage events
+// packages/runtime/src/usage-ledger.ts:25-42
+export function summarizeUsage(trace: readonly CapabilityEvent[]): TokenUsageSummary {
+  return trace.reduce<TokenUsageSummary>((summary, event) => {
+    if (event.type !== 'model_usage') return summary;          // ← ignore everything else
     const inputTokens = event.inputTokens ?? 0;
     const outputTokens = event.outputTokens ?? 0;
     return {
-      inputTokens: summary.inputTokens + inputTokens,
+      inputTokens:  summary.inputTokens  + inputTokens,
       outputTokens: summary.outputTokens + outputTokens,
-      totalTokens: summary.totalTokens + inputTokens + outputTokens,
+      totalTokens:  summary.totalTokens  + inputTokens + outputTokens,
       modelName: event.model || summary.modelName,
-      turns: summary.turns + 1,                          // ← one turn per usage event
-      estimated: summary.estimated || event.estimated === true,  // sticky: any guess → estimated
+      turns: summary.turns + 1,                                 // ← turns = count of usage events
+      estimated: summary.estimated || event.estimated === true, // ← sticky: one estimate taints all
     };
   }, { inputTokens: 0, outputTokens: 0, totalTokens: 0, modelName: '', turns: 0, estimated: false });
 }
 ```
 
-The `estimated` flag is *sticky* — `||` means one estimated turn taints the
-whole summary as estimated. That's honest: a sum that's part-measured,
-part-guessed is a guess. `turns` here is literally the count of model
-round-trips, the same unit `01-bounded-loop-cost-ceiling.md` bounds.
+Note `turns` is derived by counting `model_usage` events — the same count `02-bounded-loop-cost-ceiling.md`'s ceiling bounds. The ledger and the loop ceiling are looking at the same number from two ends: the loop *caps* it, the ledger *reports* it.
 
-**Step 3 — `estimateCost` prices the sum.** The token→dollar conversion —
-`usage-ledger.ts:50-68`:
+**Step 3 — price at the edge.** `estimateCost` converts tokens to dollars via a per-model rate table:
 
 ```ts
-const pricing = pricingForModel(provider, modelName);   // table lookup
-if (!pricing) return undefined;                         // ← unknown model → no estimate
-const inputCost  = (usage.inputTokens  / 1_000_000) * pricing.inputUsdPerMillion;
-const outputCost = (usage.outputTokens / 1_000_000) * pricing.outputUsdPerMillion;
-return { currency: 'USD', inputCost, outputCost, totalCost: inputCost + outputCost, ... };
-```
-
-**The boundary condition — and the real weakness — is `pricingForModel`**
-(`:71-78`):
-
-```ts
-export function pricingForModel(provider, modelName) {
-  if (provider !== 'openai') return undefined;          // ← ONLY openai is priced
-  const normalized = modelName.toLowerCase();
-  if (normalized.startsWith('gpt-4.1-nano')) return { inputUsdPerMillion: 0.1, outputUsdPerMillion: 0.4 };
-  if (normalized.startsWith('gpt-4.1-mini')) return { inputUsdPerMillion: 0.4, outputUsdPerMillion: 1.6 };
-  if (normalized.startsWith('gpt-4.1'))      return { inputUsdPerMillion: 2,   outputUsdPerMillion: 8 };
-  return undefined;
+// packages/runtime/src/usage-ledger.ts:50-78
+export function estimateCost(provider, usage, modelName): CostEstimate | undefined {
+  const pricing = pricingForModel(provider, modelName);
+  if (!pricing) return undefined;                              // ← unknown model → no estimate
+  const inputCost  = (usage.inputTokens  / 1_000_000) * pricing.inputUsdPerMillion;
+  const outputCost = (usage.outputTokens / 1_000_000) * pricing.outputUsdPerMillion;
+  return { currency: 'USD', inputCost, outputCost,
+           totalCost: inputCost + outputCost, ...pricing, estimated: true };
 }
+// pricingForModel only knows openai gpt-4.1 family (lines 71-78)
 ```
 
-This table knows *only* OpenAI gpt-4.1. Anthropic — the repo's default cloud
-provider — returns `undefined`, so an Anthropic run reports tokens but **no
-dollar figure**. Gemma is local and genuinely free, so `undefined` is correct
-there. The design choice is the right one (`undefined` over a wrong number — a
-made-up Anthropic price would be worse than none), but the coverage gap is real
-and noted in the project context's open items.
-
-**Step 4 — Studio formats and displays.** Every replay computes
-`modelTurnCount(trace)` and a duration (`vite.config.ts:569-571`), and the
-summary path runs `summarizeUsage` + `estimateCost` and formats with
-`formatCost` (`usage-ledger.ts:81-86`), which shows 4 decimals under a cent and
-2 above. That's where you see "$0.0028" next to a run.
-
-#### Move 2 variant — the load-bearing skeleton
-
-The kernel: **(1) a per-call token report tagged with provider+model, (2) a sum
-over reports, (3) a price lookup keyed on provider+model, (4) an `estimated`
-flag carried end to end.**
-
-- Drop the per-call report → nothing to sum; cost is unknowable.
-- Drop the `estimated` flag → you can't tell a measured bill from a guessed
-  one; you'd trust a fabricated number.
-- Drop the price lookup's `undefined`-on-unknown → you'd invent prices for
-  models you don't know, reporting confident wrong dollars.
-
-Optional hardening: the `formatCost` display rules, the per-provider table
-expansion. The skeleton is report → sum → price → honesty flag.
+**Where it breaks — the pricing table is a stub.** `pricingForModel` returns `undefined` for any provider that is not `openai`, and only knows the `gpt-4.1` family. So a run on Anthropic (`claude-sonnet-4-6`, the repo default) or local Gemma gets **no cost estimate** — `estimateCost` returns `undefined` and the display falls back to `'n/a'` (`formatCost`, line 81-86). The *metering* is complete (token counts flow for every provider); the *pricing* covers one provider. That is the honest gap: usage is fully accounted, cost is only priced for OpenAI. Adding Anthropic pricing is one entry in `pricingForModel` — the seam is built, the table is just short.
 
 #### Move 3 — the principle
 
-Reconstruct cost from the event stream, not the vendor invoice, and it stays
-provider-neutral and available *during* the run, not a month later on a bill.
-The deeper rule: **carry an `estimated` flag through every aggregation so a
-consumer always knows whether a number was counted or guessed** — a measured
-sum and a guessed sum must never look identical. The honest limit on this repo:
-this is per-run accounting, not a *baseline*. Nothing aggregates cost across
-runs, sets a per-answer budget, or alerts on regression. It's the raw material
-for a cost budget that nobody has assembled yet.
+Meter the dominant cost at its source, aggregate it provider-neutrally, and price it at the edge where vendor specifics live. The split matters: counting tokens (mechanism) and pricing them (policy) are different concerns, so a missing price never breaks the count. This repo gets the *measurement* right end-to-end and leaves the *pricing table* partial — which is the correct failure mode, because a wrong price is worse than a missing one, and an accurate token count is useful even with no dollar figure attached.
 
 ## Primary diagram
 
 ```
-  Token cost accounting — trace to dollars, provider-neutral
+  Token cost accounting — full picture
 
-  ┌─ Provider layer ────────────────────────────────────────────┐
-  │  complete() → usage{ inputTokens, outputTokens, estimated }  │
-  └───────────────────────────┬──────────────────────────────────┘
-                              │ emitted per call
-  ┌─ Runtime layer ───────────▼──────────────────────────────────┐
-  │  trace[].filter(model_usage) → summarizeUsage (reduce/sum)   │
-  │     → { inputTokens, outputTokens, turns, estimated(sticky) }│
-  │  → estimateCost(provider, usage, model)                      │
-  │       └ pricingForModel: openai gpt-4.1 ONLY → else undefined│
-  └───────────────────────────┬──────────────────────────────────┘
-                              │ CostEstimate | undefined
-  ┌─ Client layer ────────────▼──────────────────────────────────┐
-  │  formatCost → "$0.0028" / "n/a"  shown per replay            │
-  └───────────────────────────────────────────────────────────────┘
-       measured per run · NOT aggregated into a baseline (the gap)
+  ┌─ runAgentLoop (per turn) ─────────────────────────────────────┐
+  │  await model.complete() → response.usage                       │
+  │  emit model_usage { provider, model, inTok, outTok, estimated }│ ← METER
+  └───────────────────────────┬────────────────────────────────────┘
+                              │  CapabilityEvent[] trace (NDJSON)
+  ┌─ usage-ledger ────────────▼────────────────────────────────────┐
+  │  summarizeUsage(trace)  = reduce, keep model_usage, sum         │ ← AGGREGATE
+  │     → { inputTokens, outputTokens, turns, estimated }           │   (provider-neutral)
+  │  estimateCost(provider, usage, model)                           │ ← PRICE
+  │     → pricingForModel(): openai gpt-4.1 ONLY  (else undefined)  │   (vendor-specific, partial)
+  │  formatCost() → "$0.0042" | "$0.00" | "n/a"                     │ ← DISPLAY
+  └─────────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-Metering tokens off the response is the standard pattern for LLM cost
-attribution — the alternative (reconciling against the provider's billing API)
-is laggy and provider-specific. Deriving from the trace also means cost is
-computable in *replay*: a promoted fixture carries the original usage counts
-(`vite.config.ts:1340-1344`), so even a deterministic re-run reports the cost of
-the live run it was promoted from. Read next:
-`01-bounded-loop-cost-ceiling.md` (what bounds the number of turns this sums
-over) and `04-embedding-batching.md` (the *other* token/IO cost — embeddings —
-which this ledger does not currently price).
+Token accounting is the bedrock observability primitive for any LLM product — it is the per-request cost meter, and without it you cannot set a budget, catch a prompt that doubled its input tokens, or attribute spend to a capability. The `estimated` flag is the mark of an honest implementation: it refuses to claim a real count it had to guess at. The partial pricing table is a known, named limitation (`audit.md` notes OpenAI-only pricing), not a hidden bug — and it is the kind of gap that is one PR away from closed.
+
+This is the only fully-wired *measurement* in the repo. Everything else in `audit.md` is `not yet exercised`. If you wanted to seed the missing latency baseline (`audit.md` red flag #2), this ledger is the template: it already proves the trace stream can carry a measured number from the loop to a summary.
 
 ## Interview defense
 
-**Q: How do you track what an agent run costs?**
-
-Verdict first: derive it from the trace, not the vendor invoice — provider-neutral
-and available in real time. Each model call reports its token counts as a
-`model_usage` event; a pure reducer sums them; a pricing table converts to USD.
-The detail that signals you've shipped this: an `estimated` flag carried end to
-end, sticky under `||`, so a part-guessed sum is reported as guessed — and a
-pricing lookup that returns `undefined` for unknown models rather than inventing
-a price.
+**Q: How do you track LLM cost in this system?**
+The loop emits a `model_usage` trace event per turn with raw input/output token counts and an `estimated` flag. `summarizeUsage` reduces the trace into one provider-neutral total; `estimateCost` prices it by model name. The split means a missing price never breaks the count.
 
 ```
-  sketch while you talk:
-
-  trace → filter(model_usage) → reduce(sum tokens, OR estimated flags)
-        → estimateCost: pricingForModel(provider, model)  ← undefined if unknown
-        → formatCost → "$0.0028"
+  per turn → model_usage(inTok, outTok)
+       │ reduce over trace
+       ▼
+  summary { inputTokens, outputTokens, turns, estimated }
+       │ price by model name
+       ▼
+  CostEstimate (USD)   — or undefined for unpriced models
 ```
+Anchor: "meter at the source, sum neutrally, price at the edge."
 
-One-line anchor: *"cost reconstructed from the event stream, with an honesty
-flag so a guessed dollar never masquerades as a measured one."*
+**Q: What's incomplete about it?**
+The pricing table. `pricingForModel` only knows the OpenAI gpt-4.1 family — Anthropic and Gemma runs get no dollar estimate, just `n/a`. But metering is complete for every provider; only pricing is partial. That's the right failure mode: an accurate token count with no price beats a wrong price.
 
-**Q: What's broken about it today?**
-
-Two honest gaps. One: the pricing table only knows OpenAI gpt-4.1, so an
-Anthropic run — the default cloud provider — reports tokens but no dollars.
-Two: it's per-run, not a baseline. Nothing aggregates across runs or sets a
-per-answer cost budget, so there's no regression signal. The accounting exists;
-the *budget* built on it doesn't yet.
+Anchor: "usage fully metered, cost priced for one provider — the table's short, not the meter."
 
 ## See also
 
-- `audit.md` — lens 2 (baselines), lens 1 (budget), the `estimated`-coverage
-  open item.
-- `01-bounded-loop-cost-ceiling.md` — bounds the turn count this sums over.
-- `04-embedding-batching.md` — the embedding cost this ledger doesn't price.
+- `02-bounded-loop-cost-ceiling.md` — the loop that emits the usage events; same turn-count from the other end
+- `audit.md` — Lens 2 (this is the one real instrumentation), Lens 8 (red flag #2, no latency baseline)
+- `study-ai-engineering` — token budgets, prompt-size cost, eval scoring
+- `study-debugging-observability` — the trace-event stream this rides on

@@ -1,189 +1,166 @@
-# What an LLM actually is
+# What an LLM is
 
-**Subtitle:** The model as a function · text → text · *Industry standard*
+Large language model · the IO model (Industry standard)
+
+A model is a function. Tokens in, tokens out. That's the whole thing. It's not a database you query, not a reasoner that "thinks," not a planner that holds intent across calls. Every bug you'll chase in your first year comes from forgetting that.
 
 ## Zoom out, then zoom in
 
-Before any mechanism, here's where "the model" sits in aptkit. Everything above
-it is your code; the model is one box near the bottom that turns input text into
-output text.
+Here's where the LLM sits in aptkit. Everything above it is your code; the model is one stateless box near the bottom.
 
 ```
-  Zoom out — where the model sits in aptkit
-
-  ┌─ Capability layer ──────────────────────────────────────────┐
-  │  rag-query / query / recommendation agents                  │
-  └───────────────────────────┬─────────────────────────────────┘
-                              │ runAgentLoop
-  ┌─ Runtime layer ───────────▼─────────────────────────────────┐
-  │  ModelProvider.complete(request) → response                 │ ← we are here
-  └───────────────────────────┬─────────────────────────────────┘
-                              │ HTTP / SDK
-  ┌─ Provider / model ────────▼─────────────────────────────────┐
-  │  ★ the LLM ★  (Gemma / Claude / GPT) — predicts next token  │
-  └──────────────────────────────────────────────────────────────┘
+aptkit — where the model lives
+┌─────────────────────────────────────────────┐
+│ Capabilities (analytics / RAG agents)        │  your features
+├─────────────────────────────────────────────┤
+│ Agent loop + structured generation           │  orchestration
+├─────────────────────────────────────────────┤
+│ ★ ModelProvider.complete(request)→response   │  THE IO MODEL ← you are here
+├─────────────────────────────────────────────┤
+│ Adapters: anthropic / openai / gemma / ...   │  vendor glue
+├─────────────────────────────────────────────┤
+│ The model itself (remote API or local Ollama)│  the function
+└─────────────────────────────────────────────┘
 ```
 
-Now zoom in. An LLM is a function. You hand it text, it hands you text. It is not
-a database, not a reasoner, not a planner — those are things your code builds
-*on top of* the function. Most LLM bugs come from treating the model as more than
-it is. aptkit's whole architecture is an answer to "given that the model is just
-this function, what do we wrap around it?"
+The pattern is "the model as a pure function with a typed boundary." The question it answers: *what is the smallest honest shape of an LLM call?* Answer: one request object goes in, one response object comes out, and nothing is remembered between calls. If you've ever written a `fetch()` with `{loading, success, error}` states, you already know this shape — the model is the server on the other end of that fetch, and like any server it has no memory of your last request unless you resend it.
 
 ## Structure pass
 
-**Layers.** Capability → runtime contract → provider → model. The model is the
-innermost layer; the contract `ModelProvider.complete()` is the seam that hides
-it.
+The layers, top to bottom: your feature → orchestration → the `ModelProvider` contract → an adapter → the model. Pick the **state** axis and trace it down.
 
-**Axis — control.** Who decides what happens? Trace it down: the capability
-decides the *task*; the runtime loop decides *how many turns*; the model decides
-only *the next token*. The model has no control over its own invocation. That
-single fact is why aptkit can swap Gemma for Claude without any agent noticing.
+```
+STATE axis — who remembers anything?
+Layer                         remembers context?
+─────────────────────────────────────────────
+Capability / feature          yes (it owns the goal)
+Agent loop                    yes (it accumulates messages)
+ModelProvider.complete()      NO  ←★ seam: state dies here
+The model                     NO  (every call is the first call)
+```
 
-**Seam.** The load-bearing boundary is `ModelProvider` (`model-provider.ts:54`).
-Above it: your typed request/response. Below it: vendor-specific HTTP. The axis
-"who knows about the vendor?" flips exactly here — above, nobody; below,
-everything.
+The seam is at `complete()`. Above it, your code holds the conversation. Below it, there is no conversation — only the exact bytes you put in `request.messages` this call. The model doesn't "know" what it said last turn; your loop reminded it by replaying the transcript. Memory is an illusion you maintain by resending history.
 
 ## How it works
 
-### Move 1 — the mental model
-
-You know how a `fetch()` is just `Request → Response` and you don't care what
-server answers it? The model is that, but the response is *predicted*, not
-retrieved. Same plug, different guarantee: `fetch` returns what exists; the model
-returns what's *likely*.
+**Mental model.** Think of the model as `f(prompt) → next_token`, called in a loop until it emits a stop. aptkit wraps that loop behind one method so you never see the token-by-token grind — you hand it a request, you get a finished response.
 
 ```
-  The LLM as a pure function
-
-      input tokens                    output tokens
-   ┌──────────────┐   ┌───────────┐  ┌──────────────┐
-   │ "What ORM    │──►│   LLM     │─►│ "It depends  │
-   │  should I…"  │   │ (predict  │  │  on…"        │
-   └──────────────┘   │  next     │  └──────────────┘
-                      │  token)   │
-                      └───────────┘
-   no memory · no side effects · same-ish input → same-ish output
+The IO model — one call
+  request                          response
+  ┌──────────────┐                 ┌──────────────────┐
+  │ system?      │                 │ content: blocks[] │
+  │ messages[]   │ ─ complete() ─▶ │ usage?            │
+  │ tools?       │                 │ model?            │
+  │ maxTokens?   │                 └──────────────────┘
+  │ temperature? │
+  │ signal?      │
+  └──────────────┘
 ```
 
-### Move 2 — the contract aptkit wraps around it
-
-**The request shape.** aptkit models the function as one TypeScript type. Here's
-the actual contract — `packages/runtime/src/model-provider.ts:39`:
+**The contract is the IO model, verbatim.** aptkit doesn't describe the function-shape in a comment — it encodes it as a type. Look at the port itself.
 
 ```ts
-export type ModelRequest = {
-  system?: string;                 // standing instructions
-  messages: ModelMessage[];        // the conversation so far
-  tools?: ModelTool[];             // capabilities the model MAY ask to call
-  maxTokens?: number;
-  temperature?: number;
-  signal?: AbortSignal;            // cancellation — the model call is I/O
-};
-```
-
-Read it as "everything the function needs": instructions, history, the menu of
-tools, and the knobs. `signal` is the giveaway that this is I/O, not computation
-— you can abort an in-flight call.
-
-**The response shape.** `model-provider.ts:48`:
-
-```ts
-export type ModelResponse = {
-  content: ModelContentBlock[];    // text blocks AND/OR tool_use blocks
-  usage?: ModelUsage;              // tokens in/out, for the ledger
-  model?: string;
-};
-```
-
-The key surprise: `content` is an array of *blocks*, not a string. A response can
-be `[{type:'text'}]` or `[{type:'tool_use'}]` or both. That's because the model's
-"output text" sometimes encodes a request to call a tool — the runtime parses
-those blocks back out (`run-agent-loop.ts:66`, `toolUsesFromContent`).
-
-**The function itself.** `model-provider.ts:54`:
-
-```ts
+// packages/runtime/src/model-provider.ts:54-58
 export type ModelProvider = {
-  id: string;
-  defaultModel?: string;
-  complete(request: ModelRequest): Promise<ModelResponse>;  // the whole function
+  id: string;                                    // which adapter
+  defaultModel?: string;                         // fallback model id
+  complete(request: ModelRequest): Promise<ModelResponse>;  // f(in)→out
 };
 ```
 
-One method. Everything aptkit does — RAG, agents, evals, fallback — is built on
-this one async call. When the spec says "the model is just a function," this type
-is that sentence in code.
+One method. No `streamTokens`, no `getState`, no `remember`. The entire surface of "talk to an LLM" is `complete(request) → Promise<response>`. That `Promise` is the only async story — same mental model as an `await fetch()`.
 
-### Move 3 — the principle
+**The request is the whole world the model sees.** Everything the model gets to condition on is in this one object — there's no hidden channel.
 
-Model the LLM as the *smallest possible* interface and push everything else into
-your own layers. The model predicts tokens; your code does memory, control flow,
-validation, and side effects. aptkit's `complete()` is the cleanest expression of
-that discipline — and it's exactly why the model is swappable.
+```ts
+// packages/runtime/src/model-provider.ts:39-46  (ModelRequest)
+system?:      string;            // the standing instruction
+messages:     ModelMessage[];    // the replayed transcript (your "memory")
+tools?:       ModelTool[];       // functions the model may ask to call
+maxTokens?:   number;            // output budget
+temperature?: number;            // randomness knob
+signal?:      AbortSignal;       // cancellation — same as fetch's signal
+```
+
+If a fact isn't in `system` or `messages`, the model cannot use it. That's the load-bearing line. "Why did it forget my name?" Because `messages` didn't include the turn where you said it.
+
+**The response is typed blocks, not a string.** Output isn't raw text — it's an array of content blocks, because the model can emit either text or a request to call a tool.
+
+```ts
+// packages/runtime/src/model-provider.ts:48-52, 1-11  (ModelResponse + blocks)
+content: ModelContentBlock[];    // [{type:'text'}] or [{type:'tool_use'}]
+usage?:  { ... };                // token counts (see 06-token-economics)
+// ModelTextBlock    {type:'text', text}
+// ModelToolUseBlock {type:'tool_use', id, name, input}
+```
+
+A `tool_use` block is the model saying "I'd call `getWeather({city})` — you run it." It didn't run anything. It returned a *request to run something*, and your loop decides what to do. Still just IO.
+
+**The principle.** Most LLM bugs come from treating the model as more than a next-token function — as a memory, a database, a will. aptkit's contract makes the function boundary explicit so the category error is hard to make: there's no method to misuse. When something breaks, you ask "what was in the request?" not "what is the model thinking?"
 
 ## Primary diagram
 
-```
-  The LLM function and the contract that hides it
+The full round trip Move 2 walked: your code builds a request, the contract carries it to an adapter, the model returns typed blocks, and nothing persists.
 
-  your code                         aptkit contract            the model
-  ┌──────────────┐  ModelRequest    ┌─────────────────┐  HTTP  ┌──────────┐
-  │ agent / chain│ ───────────────► │ complete(req):  │ ─────► │ predicts │
-  │              │                  │   Promise<resp> │        │ next tok │
-  │              │ ◄─────────────── │                 │ ◄───── │          │
-  └──────────────┘  ModelResponse   └─────────────────┘        └──────────┘
-                    (content blocks: text | tool_use)
-   above the seam: typed, vendor-free   │   below: Gemma/Claude/GPT specifics
 ```
+One complete() round trip
+  YOUR CODE                       ModelProvider              MODEL
+  ─────────                       ─────────────              ─────
+  build request   ── complete(req) ──▶  adapter maps  ──▶  f(prompt)
+   system+messages                       to vendor API       → tokens
+   +tools+temp                                                  │
+        ▲                                                       │
+        │                                                       ▼
+  read content[]  ◀── ModelResponse ──  adapter maps  ◀──  text or
+   text | tool_use     {content,usage}   from vendor        tool_use
+        │
+        ▼
+  (state lives HERE, never below the line)
+```
+
+After the arrow returns, the model remembers nothing. Next call starts cold.
 
 ## Elaborate
 
-The "model as function" framing comes from treating the LLM the way you'd treat
-any external service: a boundary with a contract. The historical mistake was
-embedding vendor SDKs directly in business logic — then a model swap is a rewrite.
-aptkit's `ModelProvider` is the antidote, and it's load-bearing: the fallback
-chain (`06/05`), the context guard, and every agent depend on it. Read
-`08-provider-abstraction.md` next — it walks how this one type makes Gemma,
-Claude, and GPT interchangeable.
+This shape comes from the transformer's autoregressive decoder: predict the next token given all prior tokens, append, repeat. "Chat," "memory," and "agents" are all software conveniences layered on top of that one operation. The contract here is a textbook **port** in hexagonal architecture (see `08-provider-abstraction.md`) — the rest of aptkit depends on this interface, never on a vendor SDK. Read `02-tokenization.md` next to see what "tokens" actually are, then `03-sampling-parameters.md` for how `temperature` shapes the next-token pick.
 
 ## Project exercises
 
-### Add a token-count assertion to the contract's tests
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a unit test that constructs a `ModelRequest`, runs it
-  through a `FixtureModelProvider`, and asserts the returned `ModelResponse.usage`
-  has `inputTokens`/`outputTokens` populated.
-- **Why it earns its place:** proves you understand the function returns metadata,
-  not just text — the seam most candidates miss.
-- **Files to touch:** `packages/runtime/src/model-provider.ts` (no change),
-  a new `packages/runtime/test/model-provider-contract.test.ts`.
-- **Done when:** `node --test` passes asserting usage fields on a fixture response.
+### Make the function boundary visible
+
+- **Exercise ID:** `EX-LLM-01a`
+- **What to build:** A tiny CLI script that constructs a `ModelRequest` by hand (system + one user message, no tools), calls `complete()` on the Gemma provider, and prints the raw `content` blocks plus `usage`. No agent loop, no capability — just the bare function call.
+- **Why it earns its place:** Phase 1 is about internalizing that the model is `f(request)→response`. Calling `complete()` with nothing wrapped around it burns the IO shape into your hands; you see that one request is the model's entire universe.
+- **Files to touch:** read `packages/runtime/src/model-provider.ts`; instantiate from `packages/providers/gemma/src/gemma-provider.ts`; write a new throwaway script under a scratch dir (do not edit repo source).
+- **Done when:** running it prints a `ModelTextBlock`, and adding a second message that references the first proves the model only "remembers" what you replayed.
 - **Estimated effort:** `<1hr`
 
 ## Interview defense
 
-**Q: "What is an LLM, in one sentence, to an engineer?"**
-A function from text to text that predicts likely continuations — no memory, no
-side effects, no guarantees of truth. Everything else (RAG, agents, tools) is
-scaffolding your code builds around that function.
+**Q: Is an LLM stateful?**
 
 ```
-  text ──► [predict next token] ──► text     (that's the whole model)
-   the rest — memory, tools, control — is YOUR layer
+  call 1: messages=[A]        → reply R1   (model sees A)
+  call 2: messages=[A,R1,B]   → reply R2   (model sees A,R1,B — you resent it)
+          └────────────────┘
+           state lives in YOUR array, not the model
 ```
-Anchor: *the model is `complete(req): Promise<resp>` — one method.*
 
-**Q: "Why is `content` an array of blocks instead of a string?"**
-Because a single model turn can be prose, a tool-call request, or both. Modeling
-it as blocks lets the runtime split text from `tool_use` and route each
-(`run-agent-loop.ts:126,131`). A string would force fragile parsing.
-Anchor: *text and tool_use are co-equal content, not one parsed from the other.*
+No. Each `complete()` call is independent; the only "memory" is the transcript you replay in `messages`. Anchor: *the model is amnesiac; your message array is the memory.*
+
+**Q: The model "called a function" — did it?**
+
+```
+  response.content = [{type:'tool_use', name:'getX', input:{...}}]
+                      └── a REQUEST to call, not a call ──┘
+  your loop runs getX(), appends the result, calls complete() again
+```
+
+No. A `tool_use` block is the model *asking* you to run something. Your loop executes it and feeds the result back. The model only ever emits tokens. Anchor: *tool_use is a return value, not a side effect.*
 
 ## See also
 
-- `08-provider-abstraction.md` — the seam in full
-- `04-agents-and-tool-use/02-tool-calling.md` — what a `tool_use` block becomes
-- `06-token-economics.md` — what `usage` feeds
+- [`02-tokenization.md`](./02-tokenization.md) — what the "tokens" in/out actually are.
+- [`03-sampling-parameters.md`](./03-sampling-parameters.md) — how the next-token pick is shaped.
+- [`08-provider-abstraction.md`](./08-provider-abstraction.md) — the contract as a swappable port.

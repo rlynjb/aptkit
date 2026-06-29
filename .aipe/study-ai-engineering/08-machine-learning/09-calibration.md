@@ -1,320 +1,210 @@
 # Calibration
 
-**Subtitle:** when the score is a probability, not just a rank · *Language-agnostic*
+> calibration · probability quality
+
+Blunt version first: aptkit trains no model, so it produces no probabilities to calibrate. There's no classifier, no scorer, no threshold anywhere in `packages/`. This is new ground — study material and a buildable exercise, not a description of shipped aptkit code. I'll flag `not yet exercised in aptkit` at the spots where you might otherwise assume there's running code.
+
+The intuition you already own from contrl: your rep counter fired when a confidence-ish signal crossed a threshold. The question calibration asks is the one you'd eventually have to answer for any such gate — *when the model says 0.8, is it actually right 80% of the time?* If not, your threshold is built on sand. A confusion matrix read at a threshold (see `08-confusion-matrices.md`) only means something if the probability behind that threshold means something.
 
 ## Zoom out, then zoom in
 
-aptkit has no trained model, so the layers diagram below is the *generic*
-supervised pipeline again — but this time the starred box is the **score** that
-falls out of the model's output, not the model itself. Calibration is a property
-of that one box: does the number mean what it says?
+Calibration sits at the Val/Test step, but it's really a post-processing layer between the trained Model and Deploy. The model emits raw scores; calibration corrects them so a score *reads* as a probability.
 
 ```
-  Zoom out — where the score lives in a supervised pipeline (generic)
-
-  ┌─ Data layer ───────────────────────────────────────────────────┐
-  │  labeled rows (X, y)                                            │
-  └───────────────────────────┬─────────────────────────────────────┘
-                              │ featurize
-  ┌─ Feature layer ───────────▼─────────────────────────────────────┐
-  │  numeric vectors X                                              │
-  └───────────────────────────┬─────────────────────────────────────┘
-                              │ fit
-  ┌─ Model layer ─────────────▼─────────────────────────────────────┐
-  │  f(X) → raw score s ∈ ℝ  (or a sigmoid output in [0,1])         │
-  └───────────────────────────┬─────────────────────────────────────┘
-                              │ read the number
-  ┌─ Decision layer ──────────▼─────────────────────────────────────┐
-  │  ★ score s used as: rank · threshold · expected-value input ★   │
-  └──────────────────────────────────────────────────────────────────┘
+Generic supervised-ML pipeline · where calibration sits
+┌────────┐  ┌──────────┐  ┌────────────────────┐  ┌─────────┐  ┌────────┐
+│  Data  │─▶│ Features │─▶│  Train / Val / Test │─▶│  Model  │─▶│ Deploy │
+└────────┘  └──────────┘  └──────────┬─────────┘  └─────────┘  └────────┘
+                                     │
+                          ┌──────────▼───────────┐
+                          │ ★ CALIBRATION         │
+                          │   fit a correction on │
+                          │   VAL, measure on TEST │
+                          │   raw score → true p   │
+                          └───────────────────────┘
+   raw model score ─────────────────────▶ confident-looking but maybe wrong
+   calibrated score ───────────────────▶ 0.8 actually means 80% right
 ```
 
-Now zoom in. Every model emits a number per prediction. You can do two things
-with that number: **sort by it** (ranking) or **read it as a probability**
-(thresholding, expected-value math, combining). Calibration is only about the
-second use. A calibrated model's `p=0.8` predictions are right ~80% of the time.
-A model can rank perfectly and still lie about the number — and most raw models
-do.
+Two things to notice. First, calibration is fit on a held-out validation split and *measured* on test — fit it on training data and you're grading your own homework. Second, it does not change the model's *ranking* of examples; it only re-maps the score axis so the numbers are trustworthy. A model can rank perfectly (great AUC) and still be wildly uncalibrated.
 
 ## Structure pass
 
-**Layers.** Model → raw score → decision. Calibration is a thin transform you
-insert *between* the raw score and the decision layer. It never touches the
-model and never changes the ranking; it only re-maps the number onto the
-probability axis.
+Put predicted probability on one axis and observed frequency on the other. Calibration is entirely about whether those two agree.
 
-**Axis — is-the-score-a-rank-or-a-probability?** Trace what the downstream
-consumer does with the number. If it only ever calls `sort()`, the raw score is
-fine — calibration is wasted work. The moment the consumer writes `if (score >
-0.7)` or `score_a * 0.6 + score_b * 0.4` or `score * value_if_true`, the number
-is being read as a probability, and an uncalibrated number makes those decisions
-wrong even when the ranking is perfect.
+```
+Reliability axis · predicted vs observed
+ observed
+ frequency
+   1.0 ┤                                  ╱  ◀── perfect calibration
+       │                               ╱       (the diagonal y = x)
+   0.8 ┤                            ╱   ●        ● = a bin of predictions
+       │                         ╱       ╲       below line = OVERCONFIDENT
+   0.6 ┤                      ╱        ●          (says 0.8, right 0.6 of time)
+       │                   ╱       ●
+   0.4 ┤                ╱      ●
+       │             ╱     ●                above line = UNDERCONFIDENT
+   0.2 ┤          ╱    ●
+       │       ╱
+   0.0 ┼────┬────┬────┬────┬────┬────▶ predicted probability
+       0   0.2  0.4  0.6  0.8  1.0
+```
 
-**Seam.** The load-bearing boundary is **the calibration map** `g(s) → p` — a
-monotonic function fit on a *held-out* set that turns raw scores into observed
-frequencies. It must be monotonic (so ranking is preserved) and it must be fit on
-data the model never trained on (so it reflects real frequencies, not memorized
-ones). When you fit it on the training scores, it lies for the same reason a
-model overfits.
+The diagonal is the only thing you want. Each dot is a *bin*: take all predictions near, say, 0.8, and ask what fraction were actually positive. On the diagonal means calibrated. Below the diagonal means overconfident — the classic failure of boosted trees and deep nets, which push scores toward 0 and 1. The gap between the dots and the diagonal, weighted by how many predictions land in each bin, is the headline number: Expected Calibration Error.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You already have an uncalibrated score in this repo. `PgVectorStore.search(vector,
-k)` (`/Users/rein/Public/buffr/src/pg-vector-store.ts`) returns
-`Hit = {id, score, meta}`, where `score` is a cosine-similarity-derived retrieval
-score. That number is *perfect for ranking* — `scorePrecisionAtK`
-(`packages/evals/src/precision-at-k.ts`) only needs the sort order, and it never
-reads the magnitude. So today the number being uncalibrated costs you nothing.
-
-The trap is the day someone reads the magnitude. The instant a learned reranker
-or a downstream policy writes `if (hit.score > 0.7) answer()`, that `0.7` is a
-claimed probability — and a cosine-derived score is not one. Calibration is the
-transform that earns you the right to threshold.
+The mental model: **calibration is a thermometer correction.** The model is a thermometer that reads consistently but is off by a varying amount. You don't replace the thermometer; you fit a correction curve so its readings match reality.
 
 ```
-  Pattern — calibration sits between the model and the decision
-
-  raw score s          ┌──────────────┐      calibrated p
-  (good for sort) ────► │  g(s) → p    │ ───► (good for threshold,
-  e.g. cosine 0.83      │  monotonic   │      expected value, combine)
-                        │  fit on held │
-                        │  -out data   │
-                        └──────────────┘
-   ranking unchanged (g is monotonic) · only the number changes
+Pattern · raw score → calibration map → trustworthy probability
+ raw score s ─▶ ┌────────────────────┐ ─▶ calibrated p
+                │ monotonic mapping   │
+                │ g(s) fit on VAL     │
+                │ (Platt or isotonic) │
+                └────────────────────┘
+                ranking PRESERVED  (g is monotonic ↑)
+                only the NUMBER changes, not the order
 ```
 
-You don't change the model. You learn the map from "what the model says" to
-"what actually happens."
+The mapping `g` is monotonic on purpose: it can squash or stretch the score axis but can never reorder two examples. That's why your AUC is untouched and only the meaning of the number improves.
 
-### Move 2 — calibration, one part at a time
+### Move 2 — the steps
 
-**The definition — probability matches frequency.** A model is calibrated if,
-across all predictions where it said `p=0.8`, the fraction that turn out positive
-is ~0.8. Bucket the predictions by their claimed probability and check the
-observed rate in each bucket.
+**Step A — bin and measure (the reliability diagram + ECE).** Sort predictions into bins by predicted probability. For each bin, compute the average predicted prob and the actual positive rate. Plot one against the other; sum the weighted gaps for ECE.
 
 ```
-  Calibrated means: claim ≈ reality, per bucket
-
-  claimed p=0.8 ─► gather all such predictions ─► count positives
-                                                   ▼
-                  100 predictions at p=0.8 ─► 80 positive  ✔ calibrated
-                  100 predictions at p=0.8 ─► 55 positive  �’ overconfident
+Binning · 10 equal-width bins
+predictions ─▶ [0.0–0.1][0.1–0.2]...[0.9–1.0]
+each bin:  avg_pred  vs  actual_positive_rate
+ECE = Σ over bins ( bin_size / N ) × | avg_pred − actual_rate |
 ```
 
-**Why raw scores are uncalibrated.** SVMs return signed distances to a
-hyperplane, not probabilities. Boosted trees push scores toward 0 and 1 to
-minimize loss. Neural nets with a softmax are routinely overconfident. All three
-*rank* well — the highest score is the most-likely-positive — but the number
-itself is on its own arbitrary scale. Cosine similarity is the same story: a
-great sort key, not a probability.
-
-**The reliability diagram — the one picture.** Plot claimed probability (x) against
-observed frequency (y), one point per bucket. A perfectly calibrated model lands
-on the diagonal. A typical model sags below it: it claims high probabilities it
-doesn't earn (overconfident).
-
-```
-  Reliability diagram — diagonal is perfect, sagging curve is overconfident
-
-  observed
-  frequency
-   1.0 ┤                                            ╱ ★ perfect (y = x)
-       │                                        ╱ ·
-   0.8 ┤                                    ╱ ·
-       │                                ╱ ·         ● model: claims 0.8,
-   0.6 ┤                            ╱ ·                observes ~0.55
-       │                        ╱ ·         ●·····
-   0.4 ┤                    ╱ ·       ●·····
-       │                ╱ ·    ●·····
-   0.2 ┤            ╱ ·  ●·····
-       │        ╱ ·●·····
-   0.0 ┼────╱─┬──────┬──────┬──────┬──────┬──────► claimed p
-        0.0  0.2    0.4    0.6    0.8    1.0
-       ╱ = the ideal diagonal   ●····· = the model's sagging curve
-   gap between curve and diagonal = miscalibration
+```python
+# not yet exercised in aptkit — no probabilities are produced anywhere in packages/
+def ece(probs, labels, n_bins=10):
+    edges = linspace(0, 1, n_bins + 1)
+    total = 0.0
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        mask = (probs > lo) & (probs <= hi)
+        if mask.sum() == 0: continue
+        conf = probs[mask].mean()          # avg predicted prob in bin
+        acc  = labels[mask].mean()         # actual positive rate in bin
+        total += (mask.sum() / len(probs)) * abs(conf - acc)
+    return total
 ```
 
-The vertical gap between the curve and the diagonal *is* the calibration error.
-A curve below the diagonal on the right means "when it says 0.8, reality is 0.55"
-— overconfident.
-
-**Fix A — Platt scaling.** Fit a one-parameter logistic regression that maps raw
-scores to probabilities, using a held-out set of `(score, label)` pairs. It's a
-sigmoid squashed to fit the curve. Cheap, smooth, works when the miscalibration
-is roughly sigmoid-shaped (common for SVMs).
+**Step B — fit a correction (Platt scaling).** Fit a one-parameter logistic regression from raw scores to labels on the validation split. Cheap, smooth, great when miscalibration is roughly sigmoidal.
 
 ```
-  Platt scaling — fit a logistic on held-out (score, label) pairs
-
-       raw scores s ─┐
-                     ▼
-            p = 1 / (1 + exp(A·s + B))     A, B fit on held-out data
-                     ▲
-   smooth S-curve · 2 parameters · monotonic in s (ranking preserved)
+Platt scaling · squash with a fitted sigmoid
+raw score s ─▶ p = sigmoid(a·s + b)   (a, b fit on VAL labels)
+              ▲
+        2 parameters, low variance, can underfit weird shapes
 ```
 
-```text
-  # PSEUDOCODE — illustrative only; aptkit has no such code
-  # Inputs: held-out raw scores s[], true labels y[] (0/1)
-
-  A, B = fit_logistic(            # minimize log-loss over the held-out set
-           inputs  = s,           # the model's raw scores
-           targets = y)           # the actual outcomes
-
-  def calibrate(s):               # the map g(s) → p
-      return 1 / (1 + exp(A * s + B))
-  # A is negative when higher score → higher p; monotonic, so sort is safe
+```python
+# not yet exercised in aptkit
+a, b = fit_logistic(val_scores, val_labels)   # 2 params
+calibrated = sigmoid(a * raw_scores + b)
 ```
 
-**Fix B — isotonic regression.** Fit a *monotonic step function* to the held-out
-`(score, label)` pairs — the best non-decreasing fit. No shape assumption, so it
-corrects arbitrary monotonic distortions; the cost is it needs more data and can
-overfit small held-out sets.
+**Step C — fit a correction (isotonic regression).** When the miscalibration isn't a clean sigmoid, fit a non-parametric monotonic step function instead. More flexible, but needs more validation data or it overfits.
 
 ```
-  Isotonic regression — monotonic step fit (no sigmoid assumption)
-
-   p
-   1.0 ┤                              ┌──────────
-       │                       ┌──────┘
-   0.6 ┤                ┌───────┘
-       │         ┌──────┘
-   0.2 ┤ ────────┘
-       └───────────────────────────────────────► raw score s
-   non-decreasing steps · follows the data's shape, not a curve
+Isotonic · monotonic step function, free shape
+p
+1│              ┌────────
+ │         ┌────┘
+ │    ┌────┘
+0│────┘
+ └──────────────────▶ raw score
+  fits any monotonic shape; hungrier for data than Platt
 ```
 
-```text
-  # PSEUDOCODE — illustrative only; aptkit has no such code
-  # Fit the best non-decreasing step function on held-out (s, y)
-
-  steps = fit_isotonic(            # pool-adjacent-violators under monotonic constraint
-            inputs  = s,           # held-out raw scores, sorted
-            targets = y)           # outcomes
-
-  def calibrate(s):                # the map g(s) → p
-      return steps.lookup(s)       # the step value covering s
-  # monotonic by construction → ranking preserved; flexible but data-hungry
+```python
+# not yet exercised in aptkit
+iso = IsotonicRegression(out_of_bounds="clip")
+iso.fit(val_scores, val_labels)
+calibrated = iso.predict(raw_scores)
 ```
-
-**Move 2.5 — the aptkit reality.** Not yet exercised in aptkit — aptkit runs
-pre-trained LLMs, not trained models. The pattern is taught here as study ground.
 
 ### Move 3 — the principle
 
-Calibration matters exactly when a downstream consumer reads the score *as a
-number* — thresholding, expected-value decisions, or combining scores across
-sources. It is irrelevant when you only care about rank order. So the senior
-move is not "always calibrate"; it's *trace what the consumer does with the
-number*, and add the calibration map only at the seam where a rank turns into a
-claimed probability.
+The principle: **a probability is a promise about the future, and calibration is whether you keep it.** Ranking tells you *order*; calibration tells you the *number* is honest. Any decision made at a threshold — fire/don't fire, alert/don't alert — is only as trustworthy as the calibration behind the score.
 
 ## Primary diagram
 
 ```
-  The score's two lives, and where calibration earns its place
-
-  model / retrieval
-  ┌──────────────┐  raw score s
-  │ f(X) → s     │ ──────────────┬──────────────────────────────┐
-  │ (cosine,     │               │                              │
-  │  SVM, tree)  │               ▼                              ▼
-  └──────────────┘        ┌─────────────┐               ┌──────────────┐
-                          │ sort(s)     │               │ g(s) → p     │ ← THE SEAM
-                          │ RANK use    │               │ calibrate    │
-                          └──────┬──────┘               └──────┬───────┘
-                                 ▼                             ▼
-                       precision@k, top-k          if p>0.7 · p·value · combine
-                       (magnitude ignored)         (magnitude IS the decision)
-                       calibration NOT needed       calibration REQUIRED
+Calibration · fit, correct, verify
+        TRAIN split            VAL split              TEST split
+            │                     │                      │
+            ▼                     ▼                      ▼
+     ┌────────────┐       ┌──────────────┐       ┌──────────────┐
+     │ train model│       │ raw scores   │       │ raw scores   │
+     └─────┬──────┘       │ + labels     │       │ + labels     │
+           │              └──────┬───────┘       └──────┬───────┘
+           │ raw scores          │ fit g                │ apply g
+           └────────────────────▶│ (Platt / isotonic)   │
+                                  ▼                      ▼
+                           ┌────────────┐      ┌──────────────────┐
+                           │ mapping g  │─────▶│ calibrated scores │
+                           └────────────┘      └────────┬─────────┘
+                                                        ▼
+                                            reliability diagram + ECE
+                                            (measured on TEST, never VAL)
 ```
+
+Fit on val, verify on test. The mapping `g` is the only artifact that ships alongside the model.
 
 ## Elaborate
 
-The discipline's hard-won lesson: ranking quality and calibration are
-*independent*. You can have a model with great AUC (perfect ranking) that is
-wildly overconfident, and a poorly-ranking model that is perfectly calibrated.
-They're measured by different things — AUC/precision@k for ranking, reliability
-diagrams and Brier score / expected calibration error for the number. The
-classic production bug is shipping a model whose ranking was validated, then
-letting a product manager wire a hard threshold (`score > 0.7`) onto the raw
-number — now every expected-value and gating decision is silently wrong, and the
-offline ranking metric never flagged it because ranking was never the problem.
-Always calibrate on *held-out* data, never on the training scores, for the same
-reason you never report on the training set: the map would memorize, not
-generalize.
+- **Accuracy and calibration are orthogonal.** A model can be 95% accurate and badly calibrated, or 60% accurate and perfectly calibrated. They answer different questions: "how often right?" vs "are the confidence numbers honest?" You need both, separately.
+- **Deep nets and boosted trees are confidently wrong.** Modern deep nets are notoriously overconfident — softmax pushes mass to the extremes. Boosted trees do the same. Linear/logistic models tend to be better calibrated out of the box. If your backbone is deep, assume you need calibration.
+- **ECE hides where the error is.** A single ECE number can look fine while a specific bin (say the high-confidence 0.9–1.0 bin, the one you act on) is badly off. Always look at the diagram, not just the scalar — exactly the way you'd never trust a single accuracy number over the confusion matrix.
+- **Temperature scaling is the deep-net special case.** A one-parameter softmax temperature is the multi-class cousin of Platt scaling — cheap, preserves ranking, and usually enough for neural nets.
+- **Calibration drifts.** It's fit on a data distribution; when the world shifts, the calibration shifts too. Re-measure ECE periodically the way you'd re-measure any production metric.
 
 ## Project exercises
 
-### Build a reliability diagram for buffr retrieval scores
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a script that runs the existing vector retrieval over
-  `/Users/rein/Public/buffr/eval/queries.json`, collects `(Hit.score,
-  is_relevant)` pairs across all queries, buckets them by score, and prints a
-  text reliability table (bucket → mean claimed score, observed relevant
-  frequency, count).
-- **Why it earns its place:** makes the abstract "uncalibrated" concrete on a
-  number from your own repo — you see the cosine score is a fine *sort* key and a
-  bad *probability* on the same data.
-- **Files to touch:** new `/Users/rein/Public/buffr/eval/reliability-diagram.ts`,
-  reading `/Users/rein/Public/buffr/eval/queries.json` and
-  `/Users/rein/Public/buffr/src/pg-vector-store.ts` (using `search()`).
-- **Done when:** the script prints one row per score bucket with claimed-vs-
-  observed columns over the 3-doc corpus, and you can state which buckets are
-  over/underconfident.
-- **Estimated effort:** `1–4hr`
+### EX-ML-09a — Reliability-diagram + ECE scorer
 
-### Write the threshold decision note for a learned reranker
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a design note that specifies, for a hypothetical learned
-  reranker over aptkit retrieval, exactly where a calibration map would be
-  inserted before any `if (score > τ)` gate, and which existing consumers (rank
-  vs threshold) would and would not need it.
-- **Why it earns its place:** forces the core judgment — naming the seam where a
-  rank becomes a claimed probability is the senior decision, not the choice of
-  Platt vs isotonic.
-- **Files to touch:** new `/Users/rein/Public/buffr/docs/reranker-calibration-seam.md`,
-  referencing `/Users/rein/Public/buffr/src/pg-vector-store.ts` and
-  `packages/evals/src/precision-at-k.ts`.
-- **Done when:** the note states which consumers use rank (no calibration) vs the
-  number (calibration required), and pins the held-out-fit rule.
-- **Estimated effort:** `<1hr`
+- **Exercise ID:** EX-ML-09a (sits in the Phase 3 ML-evals track, alongside the confusion-matrix scorer — same family: ways to grade a probabilistic output before it ever drives a decision).
+- **What to build:** A pure scorer that takes arrays of predicted probabilities and binary labels and returns (1) binned reliability data ready to render, (2) an ECE scalar, and (3) the per-bin gaps so a caller can see *where* the miscalibration lives. Add a tiny ASCII reliability-diagram renderer so it's inspectable without a plotting stack.
+- **Why it earns its place:** It makes "is this 0.8 trustworthy?" a measurable, testable quantity instead of a vibe — and it's the natural partner to any LLM-judge or classifier score aptkit might later emit through its evals package.
+- **Files to touch:** Case B (new) — `packages/evals/src/calibration/reliability.ts` (binning + ECE + per-bin gaps), `packages/evals/src/calibration/ascii-diagram.ts` (the text reliability plot), `packages/evals/src/calibration/reliability.test.ts` (assert ECE = 0 for a perfectly calibrated synthetic set, and a known nonzero value for a deliberately overconfident one).
+- **Done when:** Feeding a perfectly calibrated synthetic dataset returns ECE ≈ 0, feeding an overconfident one returns a positive ECE matching a hand-computed value, and the ASCII diagram shows dots below the diagonal for the overconfident case.
+- **Estimated effort:** 1–4hr
 
 ## Interview defense
 
-**Q: "What does it mean for a model to be calibrated, and when do you care?"**
-Calibrated means the claimed probability matches the observed frequency: of 100
-predictions at `p=0.8`, ~80 are positive. You care only when a consumer reads the
-number — thresholding, expected-value decisions, or combining scores. If you only
-sort by the score, calibration is irrelevant because the ranking is unaffected.
+**Q: A model has great AUC but users complain its confidence numbers are meaningless. How is that possible?**
 
 ```
-  rank use  ─► sort(s) ─► top-k        ─► calibration NOT needed
-  number use ─► s > 0.7 / s·value / mix ─► calibration REQUIRED
+AUC = ranking quality        calibration = number honesty
+  ▲ separates + from −          ▲ does 0.8 mean 80%?
+  │ can be perfect              │ can be terrible
+  └── orthogonal ───────────────┘  at the same time
 ```
-*Anchor: calibration matters iff the downstream consumer reads the score as a number.*
 
-**Q: "Your retrieval scores rank fine but a new gate `score > 0.7` behaves
-weirdly. Diagnose."**
-The cosine-derived `Hit.score` is uncalibrated — a great sort key, not a
-probability. `0.7` is a claimed probability the raw score never promised. Build a
-reliability diagram on held-out `(score, label)` pairs; the curve will sag off
-the diagonal. Fix with Platt scaling or isotonic regression fit on held-out data,
-then threshold the *calibrated* `p`, not the raw score. The ranking metrics
-stayed fine because ranking was never the problem.
+AUC only measures whether positives rank above negatives — it's invariant to any monotonic squashing of the score. So a model can rank flawlessly and still emit scores that don't match observed frequencies. Anchor: in contrl the rep gate fired on a threshold; if the underlying confidence had been uncalibrated, "0.8 confidence" would've been a number I couldn't reason about.
+
+**Q: Platt scaling or isotonic regression — how do you choose?**
 
 ```
-  raw cosine s ──(uncalibrated)──► s>0.7 lies
-  reliability diagram off diagonal ─► g(s)→p (Platt/isotonic, held-out)
-  threshold p, not s ─► gate behaves
+miscalibration shape ── sigmoidal ──▶ Platt   (2 params, robust, can underfit)
+                     └─ irregular ──▶ isotonic (free shape, data-hungry, can overfit)
+val data scarce ─────────────────────▶ lean Platt
+val data plenty ─────────────────────▶ isotonic is safe
 ```
-*Anchor: the gate reads a probability the raw score never was; calibrate the map, keep the sort.*
+
+Platt fits a 2-parameter sigmoid — cheap and stable, but it assumes the miscalibration is roughly sigmoidal. Isotonic fits any monotonic shape but needs enough validation data or it overfits the calibration curve itself. Scarce val data → Platt; plenty → isotonic. Anchor: I'd reach for the simpler Platt first, same instinct as preferring a debuggable linear head in transfer learning.
 
 ## See also
 
-- `08-confusion-matrices.md` — what a threshold on the (calibrated) score produces
-- `01-supervised-pipeline.md` — where the score's model layer sits
-- `05-evals-and-observability/` — how aptkit grades rank-order outputs today
+- [Transfer learning](./07-transfer-learning.md)
+- [Confusion matrices](./08-confusion-matrices.md)
+- [Recommender systems](./10-recommender-systems.md)
+- [Cold start](./11-cold-start.md)

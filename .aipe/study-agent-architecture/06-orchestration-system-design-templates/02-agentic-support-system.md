@@ -1,20 +1,24 @@
-# Agentic Support / Task System
+# Template — Agentic Support / Task System
 
-A system-design interview template. Nine bullets; the generic architecture is the model answer's shape, the last two bullets are about aptkit.
+Nine-bullet system-design template. The studied codebase is aptkit; the last two bullets are answered about aptkit.
 
 - **The prompt:** "Design an agent that resolves user requests by taking real actions across tools, and escalates when it can't."
 
 - **Standard architecture:** intent router → single agent with tools (ReAct) → guardrails (input sanitize, action gating, output schema) → human escalation on low confidence or gated actions.
 
 ```
-  Single agent + control envelope
-
-  request → router → ┌─ agent loop (ReAct) ──────────────┐
-                     │  caps · tool policy · output schema│
-                     └──────────────┬─────────────────────┘
-                       low conf / gated action?
-                              ▼
-                       human escalation
+  request ─► intent router (classify)
+                 │
+                 ▼
+          single agent (ReAct loop)
+            • tool allowlist (least-privilege)
+            • iteration cap + forced synthesis
+                 │
+                 ▼
+          output validator (schema)
+                 │ low confidence / gated action?
+                 ▼
+          human escalation (return data, don't act directly)
 ```
 
 - **Data model:** conversation/run history with tool calls and confidence per turn, escalation log, tool registry, action audit trail.
@@ -27,12 +31,6 @@ A system-design interview template. Nine bullets; the generic architecture is th
 
 - **Common failure modes:** prompt injection in user input, agent taking an unsafe action directly, infinite loop on an unsolvable request, hallucinated tool results.
 
-- **Applies to this codebase: partially.** aptkit has most of the *single-agent-with-tools* spine and the strongest part of the control envelope. The router exists (`classifyIntent`, `query/src/intent.ts`). The agent loop exists (`runAgentLoop`). The guardrails are strong on two axes: least-privilege tool policy (`filterToolsForPolicy`) and the loop caps (`maxTurns`/`maxToolCalls`/`maxTokens`), plus output schema validation (`tryParseRecommendations` et al.). The audit trail exists as the `CapabilityEvent` trace + replay artifacts. What's missing: aptkit's agents are **read-only** — they take *no real actions*, so the "resolve by taking actions" and "escalate when it can't" halves don't exist. There's no escalation gate and no human-in-the-loop pause (the loop runs to completion). So aptkit is a strong *advisory* agent (it proposes recommendations, answers questions), not an *action-taking* support agent.
+- **Applies to this codebase:** **Yes — this is aptkit's actual shape.** The query agent has the *router* (`classifyIntent`, `packages/agents/query/src/intent.ts` — [../01-reasoning-patterns/07-routing.md](../01-reasoning-patterns/07-routing.md)). Every agent is a *single ReAct agent with a least-privilege tool allowlist* (`filterToolsForPolicy`, `tool-policy.ts`). The *guardrail envelope* is live: iteration caps, the forced synthesis turn, and output validators ([../04-agent-infrastructure/05-guardrails-and-control.md](../04-agent-infrastructure/05-guardrails-and-control.md)). The *action-safety* property holds by construction — aptkit's agents return validated *data* the host acts on (`Recommendation[]`, an answer string), never triggering side effects directly. The recommendation agent's 13 tools are all read-only. What's partial: there's no in-loop *human escalation gate* (high-stakes outputs are returned for the host to approve, but the loop can't pause and resume), and no confidence-per-turn or audit-trail data model in aptkit (those would live in buffr).
 
-- **How to make it apply:** The gap is action-taking and escalation, and aptkit's read-only design makes the refactor a deliberate, gated one. (1) Add write tools to a capability's policy — but gate them: irreversible/high-stakes actions route to a human approval step, auto-execute only the reversible ones. This needs the human-in-the-loop pause aptkit lacks, which means adopting graph orchestration (`03-multi-agent-orchestration/07-graph-orchestration.md`) so the loop can checkpoint before a gated action and resume after approval. (2) Add a real input guardrail — aptkit relies on read-only tools for injection safety (`04-agent-infrastructure/05-guardrails-and-control.md`); the moment write tools exist, injection becomes a real threat needing a content sanitizer. (3) Add an escalation gate on low confidence — the agents already emit confidence (the diagnostic agent infers it), so the threshold check is small. The control envelope aptkit has (caps, least-privilege, output schema) carries straight over; the new work is the action layer and the human gate.
-
-## See also
-
-- `01-reasoning-patterns/07-routing.md` — the router (have)
-- `04-agent-infrastructure/05-guardrails-and-control.md` — the control envelope (mostly have)
-- `03-multi-agent-orchestration/07-graph-orchestration.md` — the human gate (missing)
+- **How to make it apply (fully):** Add a confidence signal to the agent's output and an escalation gate that routes low-confidence runs to a human — implementable as an output-validator branch today, or as a true pause/resume once graph-style checkpointing exists ([../03-multi-agent-orchestration/07-graph-orchestration.md](../03-multi-agent-orchestration/07-graph-orchestration.md)). Wire the conversation/audit data model in the host (buffr's `agents` schema is the place — it already persists conversations/messages). The agent loop, routing, guardrails, and read-only action-safety are already aptkit's shipped reality; the gaps are the escalation gate and the persistence, both deployment-layer concerns.

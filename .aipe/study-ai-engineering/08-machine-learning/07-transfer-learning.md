@@ -1,291 +1,202 @@
-# Transfer learning
+# Transfer Learning
 
-**Subtitle:** pretrain on the general, fine-tune on the specific · *Language-agnostic*
+> transfer learning · training strategy
+
+Here's the blunt version up front: aptkit trains no model. There is no supervised pipeline, no backbone, no fine-tuning loop anywhere in `packages/`. Everything below is new ground — study material plus exercises you could build, not a tour of shipped code. I'll say `not yet exercised in aptkit` at the moves where it matters so you never confuse the map for the territory.
+
+You actually *have* touched this idea once, even if you didn't name it. In contrl, you never trained a pose detector. You took MediaPipe's pose-landmark model — pretrained on a mountain of human-pose images you'll never see — and built a rep counter on top of its outputs. That's transfer learning at the coarsest grain: someone else paid for the backbone, you spent your budget on the task. This file is about the finer-grained version, where you don't just *consume* the backbone, you crack it open and retrain part of it.
 
 ## Zoom out, then zoom in
 
-aptkit trains no models, so the stack below is the *generic* supervised pipeline
-with one box re-labeled. Transfer learning does not add a new arc — it changes
-where the starred model box *comes from*. Instead of fitting `f` from scratch on
-your small dataset, you start from a model that already learned general
-representations on a huge dataset, and adapt only its top.
+Transfer learning lives at the Train step of the pipeline, but it reaches back into Model initialization. The trick is that your model doesn't start from random weights — it starts from weights borrowed from a different, bigger job.
 
 ```
-  Zoom out — the pipeline, with the model box arriving pre-built
-
-  ┌─ Data layer ───────────────────────────────────────────────────┐
-  │  your SMALL labeled dataset (thousands of rows, not millions)   │
-  └───────────────────────────┬─────────────────────────────────────┘
-                              │ featurize
-  ┌─ Feature layer ───────────▼─────────────────────────────────────┐
-  │  raw input → numeric X   (or: a pretrained encoder produces X)  │
-  └───────────────────────────┬─────────────────────────────────────┘
-                              │
-  ┌─ Model layer ─────────────▼─────────────────────────────────────┐
-  │  ★ PRETRAINED BACKBONE ★  learned on a huge general corpus      │
-  │  ─────────────────────────────────────────────                  │
-  │  + small HEAD you fit on YOUR data                              │
-  └───────────────────────────┬─────────────────────────────────────┘
-                              │ ship
-  ┌─ Serving layer ───────────▼─────────────────────────────────────┐
-  │  backbone + head; same feature/encoder code at inference        │
-  └──────────────────────────────────────────────────────────────────┘
+Generic supervised-ML pipeline · where transfer learning sits
+┌────────┐   ┌──────────┐   ┌──────────────────┐   ┌─────────────┐   ┌────────┐
+│  Data  │──▶│ Features │──▶│ Train / Val / Test│──▶│    Model    │──▶│ Deploy │
+└────────┘   └──────────┘   └─────────┬────────┘   └─────────────┘   └────────┘
+                                      │
+                            ┌─────────▼──────────┐
+                            │ ★ TRANSFER LEARNING │
+                            │  init from a        │
+                            │  PRETRAINED backbone│
+                            │  (not random)       │
+                            └────────────────────┘
+   borrowed ───────────────────────────────────────────▶ kept frozen or lightly tuned
+   yours ──────────────────────────────────────────────▶ trained on YOUR small dataset
 ```
 
-Now zoom in. The intuition: someone already paid the enormous cost of teaching a
-model what text (or images, or audio) *looks like* in general. That knowledge
-lives as learned representations inside the model. You inherit those for free and
-spend your tiny labeled budget only on the last mile — mapping those
-representations to *your* labels. You do not relearn language to classify intent;
-you stand on a model that already learned language.
+The arrow into Train is the whole point: instead of starting Model from random noise and burning a huge labeled dataset to discover edges, textures, and shapes from scratch, you start from a model that already learned those things on millions of examples. Your small dataset only has to teach the *last mile* — the part specific to your task. That's why a 500-image dataset can produce a usable classifier when training from scratch on 500 images would produce garbage.
 
 ## Structure pass
 
-**Layers.** General pretraining (someone else's, on a huge dataset) → inherited
-representations → your small head fitted on your task. The bottom two layers are
-*given*; only the top is yours.
+Lay a deep network out along one axis — input on the left, prediction on the right — and the seams that matter for transfer become obvious.
 
-**Axis — what is learned vs what is inherited.** Trace any weight in the final
-model and ask "who paid for this?" The backbone weights were paid for by the
-pretraining run — millions of examples, GPU-months. The head weights were paid
-for by your few thousand labeled rows. Transfer learning is the discipline of
-keeping that ratio sane: inherit the expensive part, learn only the cheap,
-task-specific part.
+```
+A pretrained network, split for transfer · input → output
+INPUT                                                          OUTPUT
+┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────────┐
+│ early    │  │ mid      │  │ mid      │  │ late     │  │ HEAD         │
+│ layers   │─▶│ layers   │─▶│ layers   │─▶│ layers   │─▶│ (classifier) │
+│          │  │          │  │          │  │          │  │              │
+│ edges,   │  │ textures,│  │ parts,   │  │ task-ish │  │ YOUR classes │
+│ colors   │  │ corners  │  │ motifs   │  │ features │  │              │
+└────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘  └──────┬───────┘
+     │             │             │             │               │
+   GENERAL ◀───────┴─────────────┴─────────────┴────────────▶ SPECIFIC
+   (reuse, freeze)                              (retrain, replace)
+```
 
-**Seam.** The load-bearing boundary is the **frozen-vs-trained line** — the layer
-where you stop updating inherited weights and start updating your own. Above the
-line: weights you fit. Below it: weights you keep. Where you draw that line is the
-single biggest decision in transfer learning, and the next section is built
-around it.
+Two seams. The first seam is the **freeze line** — everything to its left you keep fixed because it learned general visual priors that transfer cleanly. The second seam is the **head** — the final layer(s) that map features to class labels; this almost always gets thrown away and replaced, because the pretrained model's classes are not your classes. The art of transfer learning is deciding where to draw the freeze line: too far left and you waste your data re-learning textures; too far right and you have so few trainable parameters you can't fit your task.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You already use the ultimate transferred model every day: the LLM. A pretrained
-LLM is exactly this pattern at its extreme — pretrained on an enormous general
-corpus, then (by its vendor) lightly fine-tuned to follow instructions. When you
-call `complete()` in aptkit you are *consuming* transfer learning's output: a
-backbone someone else trained, adapted with a small head someone else fit. aptkit
-stops there — it uses the transferred model but never fine-tunes it. That is the
-whole relationship: aptkit is a *user* of transfer learning, not a *doer* of it.
+The mental model: **a pretrained backbone is a feature factory you rent, and the head is the part you own.** You don't rebuild the factory; you re-point its output at your product line.
 
 ```
-  Pattern — pretrain once (expensive), adapt many times (cheap)
-
-   huge general dataset          your small task dataset
-   ┌──────────────────┐          ┌──────────────────┐
-   │ web-scale text /  │          │ a few thousand   │
-   │ a giant corpus    │          │ labeled rows     │
-   └────────┬──────────┘          └────────┬─────────┘
-            │ pretrain (GPU-months,         │ fine-tune (minutes/hours,
-            │ done ONCE by someone else)    │ done by YOU)
-            ▼                               ▼
-   ┌──────────────────┐   reuse    ┌──────────────────┐
-   │ BACKBONE          │ ─────────►│ backbone + small  │ ──► your predictions
-   │ (representations) │  frozen    │ HEAD (yours)      │
-   └──────────────────┘            └──────────────────┘
+Pattern · rent the factory, own the output
+        ┌─────────────────────────────┐
+input ─▶│   FROZEN BACKBONE (rented)   │─▶ features ─▶ ┌──────────────┐
+        │   weights from big dataset   │              │ NEW HEAD     │─▶ your label
+        │   gradients DO NOT flow here │              │ (you own it) │
+        └─────────────────────────────┘              │ gradients ✔  │
+                                                      └──────────────┘
+              ▲                                              ▲
+        no training cost                            cheap to train,
+        (just forward pass)                         small dataset OK
 ```
 
-The same backbone seeds many tasks. You pay the head cost once per task; the
-backbone cost is amortized across everyone who ever reuses it.
+Read it left to right: the input goes through the frozen backbone, which produces a feature vector. That vector is the *only* thing your new head ever sees. Because gradients don't flow into the backbone, training is fast and your tiny dataset only has to fit the head's parameters — orders of magnitude fewer than the full network.
 
-### Move 2 — feature-extraction vs full fine-tune
+### Move 2 — the steps
 
-The seam (frozen-vs-trained line) has two canonical positions. Both are transfer
-learning; they trade data-hunger against accuracy ceiling.
-
-**Feature extraction — freeze the backbone, train only a head.** Run your inputs
-through the frozen pretrained model, take its output vector as fixed features,
-and fit a small classifier on top. The backbone never changes; you only learn the
-head. This is the move when your dataset is small.
+**Step A — replace the head.** The pretrained model ends in a classifier sized for *its* task (say 1000 ImageNet classes). You chop it off and bolt on a fresh head sized for *your* task (say 3 classes).
 
 ```
-  Feature extraction — backbone frozen (║ = no gradient updates)
-
-   input ─► ┌───────────────────┐ ║ embedding ─► ┌──────────┐ ─► ŷ
-            │ PRETRAINED BACKBONE│ ║  (frozen     │ small    │
-            │   ║ FROZEN ║       │ ║   vector)    │ HEAD     │
-            └───────────────────┘ ║              └──────────┘
-                 not trained                      ▲ the only
-                                                    weights you fit
+Head swap · before and after
+BEFORE                              AFTER
+backbone ─▶ [1000-way head]   ───▶  backbone ─▶ [3-way head]  (new, random init)
+            (ImageNet)                          (your classes)
 ```
 
-```text
-# PSEUDOCODE — feature extraction for a learned reranker.
-# The pretrained encoder is nomic-embed-text:v1.5 (768-dim), the SAME model
-# buffr already uses for retrieval (PgVectorStore, dim 768). It is our backbone.
-
-backbone = load_pretrained_encoder("nomic-embed-text:v1.5")  # frozen; no updates
-backbone.freeze()                                            # the SEAM: below = frozen
-
-def featurize(query, doc):
-    qv = backbone.embed(query)        # 768-dim, inherited representation
-    dv = backbone.embed(doc)          # 768-dim, inherited representation
-    return concat(qv, dv, [cosine(qv, dv)])   # frozen features feeding the head
-
-head = LogisticRegression()           # the ONLY thing we train; ~hundreds of weights
-X = [featurize(q, d) for (q, d) in labeled_pairs]   # small dataset
-head.fit(X, labels)                   # minutes, not GPU-months
-
-# serve: rerank candidates from PgVectorStore.search(vector, k) by head.predict_proba
+```python
+# not yet exercised in aptkit — no model, no backbone exists in packages/
+backbone = load_pretrained("mobilenet_v3", weights="imagenet")
+backbone.classifier = NewHead(in_features=backbone.feat_dim, num_classes=3)
 ```
 
-**Full fine-tune — unfreeze (some of) the backbone too.** Continue training the
-backbone's weights on your data, usually at a tiny learning rate, so the inherited
-representations bend slightly toward your task. Higher ceiling, but needs more
-data or it overfits and *forgets* what it knew.
+**Step B — freeze the backbone.** Mark backbone parameters as non-trainable so the optimizer ignores them. Only the head learns.
 
 ```
-  Full fine-tune — seam pushed DOWN; upper backbone now trainable
-
-   input ─► ┌───────────────────┐  embedding ─► ┌──────────┐ ─► ŷ
-            │ lower backbone     │ ║             │ HEAD     │
-            │   ║ FROZEN ║       │ ║             │ (trained)│
-            ├───────────────────┤ ◄── seam      └──────────┘
-            │ upper backbone     │      moved
-            │   (trained, tiny lr)│      here
-            └───────────────────┘
+Freeze · which parameters the optimizer updates
+backbone params ── requires_grad = False ──▶ skipped by optimizer ✘
+head params    ── requires_grad = True  ──▶ updated each step    ✔
 ```
 
-```text
-# PSEUDOCODE — full fine-tune. Same backbone, but gradients now flow into it.
-backbone = load_pretrained_encoder("nomic-embed-text:v1.5")
-freeze(backbone.layers[:N])           # keep the bottom; SEAM is at layer N
-unfreeze(backbone.layers[N:])         # adapt the top — these weights change
-head = MLP()
-
-optimizer = Adam(lr=1e-5)             # TINY lr: nudge, don't overwrite, the backbone
-for epoch in range(few):              # few epochs — more invites forgetting
-    for (q, d, label) in labeled_pairs:
-        z = backbone(q, d); pred = head(z)
-        loss = bce(pred, label)
-        loss.backward(); optimizer.step()   # updates head AND upper backbone
-# Risk if data is small: catastrophic forgetting — the backbone loses generality.
+```python
+# not yet exercised in aptkit
+for p in backbone.parameters():
+    p.requires_grad = False        # freeze
+optimizer = SGD(head.parameters(), lr=1e-3)   # only the head
 ```
 
-The decision rule: **little data → feature extraction; more data + the accuracy
-matters → full fine-tune.** Start frozen; only unfreeze when a frozen head has
-clearly plateaued.
+**Step C — fine-tune (optional, later).** Once the head has stabilized, you *may* unfreeze the late backbone layers and train the whole thing at a much smaller learning rate. This adapts the task-ish late features to your domain without destroying the general early ones.
 
-**Move 2.5 — the aptkit reality.** Not yet exercised in aptkit — aptkit runs
-pre-trained LLMs, not trained models. The pattern is taught here as study ground.
+```
+Two-phase schedule · feature-extract then fine-tune
+phase 1: [FROZEN backbone] + [train head]        lr = 1e-3
+                 │
+                 ▼  unfreeze late layers
+phase 2: [froz][froz][TUNE][TUNE] + [train head] lr = 1e-5  (10–100× smaller)
+```
+
+```python
+# not yet exercised in aptkit
+for p in backbone.late_layers.parameters():
+    p.requires_grad = True
+optimizer = SGD([
+    {"params": backbone.late_layers.parameters(), "lr": 1e-5},
+    {"params": head.parameters(),                 "lr": 1e-3},
+])
+```
 
 ### Move 3 — the principle
 
-Spend your scarce resource — labeled data — only on the part no one else could
-have learned for you. The general structure of language or images is a sunk cost
-someone already paid; inherit it. Draw the frozen-vs-trained seam as high as your
-data budget allows, and lower it only when the evidence (a plateaued frozen head)
-demands it. Transfer learning is leverage: a small head on a giant backbone beats
-a giant model trained from scratch on a small dataset, almost every time.
+The principle: **spend your scarce resource — labeled data — only on what is unique to your problem.** General features are a commodity; someone already paid for them at scale. Transfer learning is the discipline of not re-buying the commodity.
 
 ## Primary diagram
 
-For tabular/retrieval work there is no giant pretrained backbone for your *rows* —
-but there is one for your *text*. buffr already runs it. The reranker design falls
-straight out of treating that embedding model as the frozen feature extractor.
-
 ```
-  Transfer learning in buffr's world — the embedding model IS the backbone
-
-  PRETRAINED (someone else, web-scale)        YOURS (small, on your data)
-  ┌─────────────────────────────────┐        ┌──────────────────────────┐
-  │ nomic-embed-text:v1.5            │ ║      │ learned reranker HEAD     │
-  │ frozen feature extractor, 768-d  │ ║ ────►│ f(qv,dv) → relevance ŷ    │
-  │ (buffr already consumes this in  │ ║      │ fit on (query,doc,label)  │
-  │  PgVectorStore for retrieval)    │ ║      └──────────────────────────┘
-  └─────────────────────────────────┘ ║                 │
-        ▲ inherited representations    ║ THE SEAM        ▼
-        no gradients flow below here ──╜          rerank PgVectorStore.search()
-                                                   → {id,score,meta}[] by ŷ
-   score with scorePrecisionAtK / scoreRecallAtK (packages/evals) — same metric
+Transfer learning · end to end
+                 BIG GENERIC DATASET (someone else's)
+                        │  (expensive, once)
+                        ▼
+                 ┌──────────────┐
+                 │  PRETRAINED  │
+                 │   BACKBONE   │  ◀── you download this
+                 └──────┬───────┘
+                        │  freeze line
+        ┌───────────────┼───────────────┐
+        ▼ FROZEN                         ▼ REPLACED
+ ┌──────────────┐                 ┌──────────────┐
+ │ early + mid  │                 │   NEW HEAD   │
+ │ layers       │── features ────▶│ (your task)  │
+ │ (general)    │                 │              │
+ └──────────────┘                 └──────┬───────┘
+        ▲                                 │
+        │                                 ▼
+ your SMALL dataset ──── trains only ──▶ head (+ optional late layers)
 ```
+
+Top half is the world's work; bottom half is yours. The freeze line is the negotiated boundary between them. Move it left as your dataset grows; move it right when data is precious.
 
 ## Elaborate
 
-The hard-won lesson: from-scratch training is almost never the right first move
-when a relevant pretrained model exists. A reranker trained from scratch on a few
-thousand labeled pairs will lose to a logistic-regression head sitting on frozen
-768-dim embeddings, because those embeddings already encode semantic similarity —
-the thing the reranker most needs. The embeddings are *general* knowledge bought
-at web scale; your head supplies the *specific* knowledge of what "relevant" means
-for your corpus. Two failure modes bracket the practice: freeze too much and the
-head can't express your task; unfreeze too much on too little data and the
-backbone forgets its generality (catastrophic forgetting). The frozen-vs-trained
-seam is where you tune between them, and "start frozen, unfreeze only on evidence"
-is the safe default. Note buffr is already *halfway* here — it consumes the
-pretrained embedding as a frozen feature extractor for *retrieval*; adding a
-learned head on top of those same vectors is the textbook second step.
+- **Domain gap decides the freeze line.** If your images look like the pretraining set (natural photos), freeze aggressively — the features transfer. If your domain is alien (medical scans, spectrograms, pose-landmark vectors), the late features don't transfer and you'll need to unfreeze more. Your contrl case is interesting here: MediaPipe outputs *landmarks*, not pixels, so any model you build downstream is already in a very different feature space than ImageNet — pixel backbones wouldn't help you at all; you'd want a backbone pretrained on pose sequences.
+- **Catastrophic forgetting.** Fine-tune with too high a learning rate and the backbone's general knowledge gets overwritten by your tiny dataset before the head ever stabilizes. The small-lr, head-first schedule in Step C exists precisely to prevent this.
+- **Feature extraction vs fine-tuning are different commitments.** Pure feature extraction (frozen backbone forever) is cheap, fast, and can run the backbone *once* per image to cache features. Fine-tuning is more powerful but needs full backprop and risks forgetting. Start with extraction; only fine-tune if metrics plateau.
+- **The head can be anything.** It doesn't have to be a neural layer. Run the frozen backbone, cache the feature vectors, and train a plain logistic regression or gradient-boosted tree on those features. Often that's enough and it's trivially debuggable.
+- **Pretraining isn't free of bias.** The backbone inherits whatever was over/under-represented in the big dataset. Those blind spots transfer too.
 
 ## Project exercises
 
-### Build a feature-extraction reranker head on frozen buffr embeddings
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a script that, for each query in
-  `/Users/rein/Public/buffr/eval/queries.json`, retrieves candidates via the
-  existing vector store, builds features from the *frozen* `nomic-embed-text:v1.5`
-  embeddings (`[query_vec, doc_vec, cosine]`), and fits a small logistic-regression
-  head to predict relevance. The embedding model stays frozen — you train only the
-  head.
-- **Why it earns its place:** it is transfer learning in its purest, smallest form
-  — frozen backbone, trained head — on a backbone the repo already runs, so you
-  feel the leverage directly.
-- **Files to touch:** new `/Users/rein/Public/buffr/eval/rerank-head.ts`, reading
-  `/Users/rein/Public/buffr/eval/queries.json` and
-  `/Users/rein/Public/buffr/src/pg-vector-store.ts`.
-- **Done when:** the trained head re-sorts candidates and `scorePrecisionAtK`
-  (`packages/evals/src/precision-at-k.ts`) over the reranked order is reported next
-  to the raw-retrieval baseline, frozen-vs-trained boundary stated in a comment.
-- **Estimated effort:** `1–4hr`
+### EX-ML-07a — Layer-freezing config + fine-tune skeleton
 
-### Write the frozen-vs-trained decision note for a learned intent classifier
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a design note for a learned replacement of
-  `packages/agents/query/src/intent.ts` that decides where to draw the
-  frozen-vs-trained seam: feature extraction (frozen embedding → small head) vs
-  full fine-tune, justified by the available labeled-data volume, with the
-  catastrophic-forgetting risk named.
-- **Why it earns its place:** the seam placement is the central transfer-learning
-  judgment; making it *before* code, tied to a data budget, is the senior move.
-- **Files to touch:** new
-  `/Users/rein/Public/buffr/docs/intent-transfer-learning.md`.
-- **Done when:** the note picks feature-extraction-first, states the data
-  threshold at which it would unfreeze, and names which encoder serves as the
-  frozen backbone.
-- **Estimated effort:** `<1hr`
+- **Exercise ID:** EX-ML-07a (lands in the Phase 3 ML-evals track — the first place aptkit would grow a trainable artifact rather than only calling hosted models).
+- **What to build:** A standalone fine-tuning script skeleton that loads a pretrained backbone, swaps the head for an N-class head, reads a declarative freeze config (which layer groups are frozen vs trainable, per phase), and runs a two-phase schedule (feature-extract, then optional fine-tune). No real training data required — wire it against a toy/synthetic tensor so the plumbing is exercised end to end.
+- **Why it earns its place:** It forces you to make the freeze line *explicit and configurable* instead of a magic constant, and it's the minimum viable shape of every transfer-learning job you'll ever defend in an interview.
+- **Files to touch:** Case B (new) — `packages/ml-evals/src/transfer/freeze-config.ts` (the declarative config + validation), `packages/ml-evals/src/transfer/finetune.py` (the script skeleton; Python because the ecosystem is there), `packages/ml-evals/src/transfer/finetune.test.ts` (asserts the config parses and the right param groups are marked trainable).
+- **Done when:** A freeze config like `{ phase1: { freeze: ["backbone.*"], train: ["head"] }, phase2: { train: ["backbone.late", "head"] } }` round-trips through validation, and the skeleton, run against a synthetic input, reports the count of trainable vs frozen parameters per phase matching the config.
+- **Estimated effort:** 1–2 days
 
 ## Interview defense
 
-**Q: "What is transfer learning, and why not just train from scratch?"**
-You start from a model pretrained on a huge general dataset and adapt only the
-top to your small task, inheriting expensive learned representations instead of
-relearning them. From-scratch loses because your labeled budget is tiny relative
-to what the backbone already absorbed — a small head on a giant frozen backbone
-beats a giant model fit on a small dataset.
+**Q: Why not just train from scratch if you have any data at all?**
 
 ```
-  huge general data ─► BACKBONE (inherit) ─╥─► small HEAD (you fit) ─► ŷ
-                          frozen, free       ║   your few labels go here
+from scratch:   500 imgs ─▶ learn edges+textures+task ─▶ overfit ✘
+transfer:       500 imgs ─▶ learn task only ───────────▶ generalizes ✔
+                (edges+textures already learned, free)
 ```
-*Anchor: spend labeled data only on what no one else could have learned for you.*
 
-**Q: "Feature extraction or full fine-tune — how do you choose?"**
-By data volume. Little data: freeze the backbone, train only a head — fewest
-trainable weights, least overfit. More data and accuracy matters: unfreeze the
-upper backbone at a tiny learning rate to bend representations toward the task,
-accepting catastrophic-forgetting risk. Default: start frozen, unfreeze only when
-a frozen head has plateaued.
+Because the early layers need *millions* of examples to learn general features reliably; 500 images can't, so a from-scratch model memorizes noise. Anchor: in contrl I never trained landmark detection — MediaPipe's pretrained pose model supplied that for free, and I only built the rep-counting logic on top.
+
+**Q: How do you decide where to draw the freeze line?**
 
 ```
-  small data ─► FREEZE backbone, train head      (seam high)
-  more  data ─► unfreeze upper backbone, tiny lr  (seam pushed down)
-                 ▲ risk: forgetting if you go too far
+domain close  ──▶ freeze a lot   (features transfer)
+domain far    ──▶ freeze little  (features don't transfer)
+data scarce   ──▶ freeze more    (fewer params to fit)
+data plenty   ──▶ freeze less    (afford to adapt)
 ```
-*Anchor: the frozen-vs-trained seam moves with your data budget, not your ambition.*
+
+Two dials: how similar your domain is to the pretraining domain, and how much labeled data you have. Close domain + scarce data → freeze hard. Far domain + plenty of data → unfreeze and fine-tune. Anchor: a pose-landmark task like contrl is far from ImageNet's pixel domain, so a pixel backbone wouldn't transfer — you'd need a pose-pretrained one.
 
 ## See also
 
-- `01-supervised-pipeline.md` — the arc whose model box this section pre-builds
-- `02-feature-engineering.md` — what a frozen encoder replaces (or feeds)
-- `01-llm-foundations/01-what-an-llm-is.md` — the transferred model aptkit consumes
+- [Confusion matrices](./08-confusion-matrices.md)
+- [Calibration](./09-calibration.md)
+- [Recommender systems](./10-recommender-systems.md)
+- [Cold start](./11-cold-start.md)

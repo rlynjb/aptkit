@@ -1,11 +1,15 @@
-# 04 — Agent Infrastructure
+# D — Agent Infrastructure
 
-**Anchor: single-agent + multi-agent (both).**
+The cross-cutting disciplines that matter more than any single topology — the parts most practitioners underweight and the parts that separate a demo from a shipped system.
 
-The cross-cutting disciplines that matter more than any single topology — the parts most practitioners underweight and the parts that separate a demo from a shipped system. aptkit invests heavily here; this is where the toolkit's real engineering lives.
+Anchor: single-agent + multi-agent (both).
 
-1. `01-context-engineering.md` — `injectProfile` + `schemaSummary`: what fills the window.
-2. `02-agent-memory-tiers.md` — `@aptkit/memory`: built, reuses the retrieval contracts, **not yet wired** into an agent.
-3. `03-tool-calling-and-mcp.md` — `ToolRegistry` + policy + the Gemma tool-call emulation.
-4. `04-agent-evaluation.md` — the replay-centric eval pipeline; trajectory and precision@k.
-5. `05-guardrails-and-control.md` — the control envelope around the loop.
+aptkit exercises most of these in single-agent form: context engineering (`injectProfile`), tool calling under emulation (gemma), agent memory (built, not yet wired), eval (replay-centric), guardrails (the loop's caps + least-privilege policy).
+
+## Files
+
+1. [01-context-engineering.md](01-context-engineering.md) — the discipline RAG and prompt engineering are subsets of. `injectProfile` + prompt packages.
+2. [02-agent-memory-tiers.md](02-agent-memory-tiers.md) — memory as a component. **Built (`@aptkit/memory`), not yet wired into an aptkit agent.**
+3. [03-tool-calling-and-mcp.md](03-tool-calling-and-mcp.md) — the substrate every pattern runs on; gemma emulates it.
+4. [04-agent-evaluation.md](04-agent-evaluation.md) — trajectory, not just output. aptkit's replay-centric backbone.
+5. [05-guardrails-and-control.md](05-guardrails-and-control.md) — the control envelope around the loop. aptkit's caps + least-privilege allowlist.

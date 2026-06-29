@@ -1,98 +1,92 @@
 # Cross-Turn Caching
 
-**Industry standard.** "Prefix caching," "cross-turn cache," "semantic cache." Type label: serving optimization. **In this codebase: not yet exercised** — aptkit has no cross-turn or cross-run cache. Its system prompt is stable per agent (prefix-cache-ready), but no caching layer is wired, and the local Gemma default makes per-token cost effectively zero, so the pressure is mild.
+**Industry term:** cross-turn / cross-run caching (prefix cache, intra-run memoization, semantic cache). *Industry standard.*
 
 ## Zoom out, then zoom in
 
-Single-call caching keys on one request. An agent runs many turns per task, and many tasks repeat sub-steps — so caching for agents has two new scopes: within a run (the agent re-derives the same sub-result) and across runs (a later task's sub-step matches an earlier one). aptkit caches neither yet.
+Single-call caching keys on one request. An agent runs many turns per task, and many tasks repeat sub-steps — so the caching unit shifts from "one request" to "the loop" and "across runs." aptkit does none of this yet.
 
 ```
-  Zoom out — three cache layers (none wired in aptkit)
+  Zoom out — not built; the loop re-pays for repeated sub-steps
 
-  ┌─ prefix cache (provider-side) ──────────────────────────┐
-  │  stable system prompt + tool defs at the front          │ ← aptkit is READY
-  │  (aptkit's system prompt is stable per agent)            │   (not exploited)
-  └──────────────────────────────────────────────────────────┘
-  ┌─ intra-run memoization ─────────────────────────────────┐
-  │  same sub-step within one task → cache by tool+args      │ ← not exercised
-  └──────────────────────────────────────────────────────────┘
-  ┌─ cross-run semantic cache ──────────────────────────────┐
-  │  later task's sub-query ≈ earlier one → embed + reuse    │ ← not exercised
-  └──────────────────────────────────────────────────────────┘
+  ┌─ Runtime layer ─────────────────────────────────────────────┐
+  │  runAgentLoop: every turn = a fresh model.complete call      │ ← we are here
+  │  no prefix cache, no intra-run memo, no cross-run cache       │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-## Structure pass
-
-**Axis: cache scope and staleness risk.** A single-call cache keys one request. An agent cache spans turns and runs — and the staleness risk is sharper, because a stale hit poisons the *whole trajectory*, not one response. Trace it: the agent reasons forward on a stale sub-result, and every downstream turn inherits the error. The seam: single-call caching (one request, one staleness window) vs cross-turn caching (one hit corrupts a multi-turn chain).
+Zoom in: **Not yet exercised in aptkit.** Each turn re-sends the full system prompt and history to `model.complete`; nothing caches the stable prefix, memoizes a repeated tool call within a run, or reuses a semantically-similar sub-result across runs. This file teaches the three layers and names where each would plug in.
 
 ## How it works
 
-### Move 1 — the mental model
+**Use case it would fit:** the rag-query agent re-deriving the same retrieval within a run, or two runs retrieving the same "running goals" passages. Both pay full cost today.
 
-Three layers, cheapest to most useful. You know how an HTTP cache reuses a response keyed on the request, and how keeping a request's stable part stable lets a CDN cache it? Prefix caching is that for the token prefix; intra-run and cross-run caches are that for the agent's sub-steps.
+### Move 1 — the two cache scopes
 
 ```
-  Cross-turn caching — three layers
-
   Single-call cache:  request → hash → hit? return : call
 
-  Agent caches:
-    prefix:    stable system prompt at front → provider caches the prefix
-    intra-run: turn 3 repeats turn 1's tool call → cache by (tool, args)
-    cross-run: task B's sub-query ≈ task A's → embed, reuse if close
+  Cross-turn cache (the agent version):
+  ┌───────────────────────────────────────────────┐
+  │  Agent run (task A)                            │
+  │   turn 1: retrieve "auth flow"  ──┐            │
+  │   turn 3: retrieve "auth flow" ◄──┘ cached     │  intra-run
+  │           (same sub-step, cache hit) in the run│
+  └───────────────────────────────────────────────┘
+  ┌───────────────────────────────────────────────┐
+  │  Agent run (task B, later)                     │
+  │   turn 1: retrieve "auth flow" ◄── semantic    │  cross-run
+  │           cache across runs                    │
+  └───────────────────────────────────────────────┘
 ```
 
-### Move 2 — what aptkit has, and the three caches it could add
+### Move 2 — the walkthrough
 
-**Prefix-cache-ready, not exploited.** aptkit assembles the system prompt *once* in the agent constructor (`rag-query-agent.ts:52-58`) — it's stable across every turn of a run, and the tool definitions are stable too. That's exactly the shape provider prefix-caching rewards: keep the stable system prompt and tool definitions at the front so the prefix is cached across every turn. aptkit doesn't *exploit* this (no provider prefix-cache header is set), but the prompt is structured for it.
+**Layer 1: prompt-prefix caching (provider-side).** The system prompt and tool definitions are stable across every turn — keep them at the front so the provider caches the prefix and only re-processes the growing tail. aptkit's loop *already keeps the system prompt stable* (`run-agent-loop.ts:103` sends the same `system` each turn except the forced-final turn), so the structure is prefix-cache-friendly — but aptkit doesn't *request* provider prefix caching (Anthropic's cache-control, etc.), and Gemma local has no such feature. The bridge: this is the same instinct as keeping the stable part of a request stable so an HTTP cache can reuse it. **Not yet exercised.**
 
-**Intra-run memoization — the would-be add.** Within one rag-query run, if the model searches "auth flow" on turn 1 and again on turn 3 (a real weak-model behavior), the second search re-embeds and re-scans the store. Memoizing by `(tool, args)` for the duration of the run would skip the second call. The hook exists — every tool call goes through `registry.callTool(name, args)` (`tool-registry.ts:50`), a clean place to wrap a per-run memo.
+**Layer 2: intra-run memoization.** Within one task the agent may re-derive the same sub-result — call `search_knowledge_base` with the same query twice. Cache it by tool call + args. aptkit doesn't; a repeated identical search re-runs the embed + cosine scan. Cheap-ish locally, but pure waste. **Not yet exercised.**
 
-**Cross-run semantic cache — the would-be add.** A later question semantically close to an earlier one could reuse the earlier retrieval. aptkit already has the embedder — `OllamaEmbeddingProvider` — so it could embed the sub-query and return a cached result if close enough. Same infra as RAG.
+**Layer 3: cross-run semantic cache.** A later task's sub-step is semantically close to an earlier one — embed the sub-query, return the cached result if close enough. aptkit has the embedder to do this but no cache keyed on it. **Not yet exercised.**
 
-**The staleness tradeoff, sharper for agents.** A stale cross-run cache hit poisons the *whole trajectory*: the agent reasons forward on a stale sub-result and every downstream turn inherits the error. So the rules are strict — gate the semantic cache on freshness (don't cache retrieval results whose underlying data can change mid-task), and never cache a tool call with side effects. aptkit's tools are read-only (no side-effect caching risk) but its corpus could change (so a semantic cache would need freshness gating). The reason aptkit hasn't built this: the local Gemma default makes per-call cost near-zero, so the cache wouldn't pay for its staleness risk yet.
+**The tradeoff that's sharper for agents.** A stale cross-run cache hit poisons the *whole trajectory*, not one response — the agent reasons forward on a stale sub-result and every downstream turn inherits the error. So: gate the semantic cache on freshness (don't cache retrieval whose underlying data can change mid-task), and never cache a tool call with side effects. aptkit's tools are read-only, which makes them cache-safe in principle — the freshness of the indexed corpus is the only gate to worry about.
 
 ### Move 3 — the principle
 
-Prefix caching is the same instinct as keeping a request's stable part stable so an HTTP cache can reuse it — here it's the token prefix the provider caches. The agent-specific danger is that a stale hit corrupts a whole trajectory, not one response, so freshness gating matters more than for single calls. aptkit is prefix-cache-ready by construction (stable system prompt) but defers the actual caches because its local-model cost profile makes them not yet worth the staleness risk.
+Caching for agents has three layers — provider prefix cache (cheapest), intra-run memoization, cross-run semantic cache (most useful) — and the agent-specific danger is that a stale hit poisons the entire trajectory, not one answer. aptkit keeps its prompt prefix stable (cache-friendly) but requests no caching; reach for prefix caching first, and gate any semantic cache on data freshness.
 
 ## Primary diagram
 
 ```
-  Cross-turn caching for aptkit (would-be) — full frame
+  Three cache layers — none exercised in aptkit
 
-  ┌─ Run (task A) ──────────────────────────────────────────┐
-  │  [stable system prompt + tool defs] ◄── PREFIX-cacheable │ (ready)
-  │  turn 1: search "auth flow"  ──┐                         │
-  │  turn 3: search "auth flow" ◄──┘ INTRA-RUN memo hit      │ (would add)
-  └──────────────────────────────────────────────────────────┘
-  ┌─ Run (task B, later) ─────────────────────────────────────┐
-  │  turn 1: search ≈ task A's ◄── CROSS-RUN semantic hit     │ (would add,
-  │          (embed sub-query, reuse if close + fresh)        │  freshness-gated)
-  └─────────────────────────────────────────────────────────────┘
-  staleness: a bad hit poisons the WHOLE trajectory, not one turn
+  prefix cache (provider)   stable system prompt at front → reuse across turns
+                            aptkit: prompt IS stable, but caching not requested ✗
+  intra-run memo            same tool+args within a run → reuse
+                            aptkit: repeated search re-runs ✗
+  cross-run semantic        similar sub-query across runs → reuse (gate on freshness)
+                            aptkit: embedder exists, no cache keyed on it ✗
+
+  danger: a stale hit poisons the WHOLE trajectory, not one response
 ```
 
 ## Elaborate
 
-Caching for agents is where single-call intuitions break: the unit isn't a request, it's a multi-turn trajectory, and a cache hit's blast radius is the whole chain. Prefix caching is the free win (most providers cache a stable prefix automatically), which is why structuring the prompt with the stable part first matters. Intra-run and cross-run caches are real savings on a paid model but carry trajectory-poisoning risk. aptkit's local-first default inverts the usual calculus — with near-zero per-token cost, the caches don't pay for their risk, so deferring them is correct. The moment aptkit runs against a paid provider at volume, prefix caching is the first thing to turn on.
+Cross-turn caching is where agent serving diverges hardest from single-call serving: a single call caches one response, but an agent's repeated sub-steps and an agentic system's repeated tasks mean the savings (and the risks) compound. Prefix caching is the easy win most teams take first — the system prompt and tool schemas are large and stable, so caching them cuts per-turn cost substantially on long loops. The semantic cache is the powerful-but-dangerous one, because a stale hit doesn't just give one wrong answer, it sends the agent reasoning down a wrong path. aptkit's read-only tools and stable prompt make it well-positioned to adopt prefix and intra-run caching cheaply; it just hasn't.
 
 ## Interview defense
 
-**Q: How do you cache for an agent?**
-Three layers, and I'll be honest that aptkit exploits none yet but is built for the first. Prefix caching — my system prompt and tool defs are assembled once and stable across every turn, which is exactly what provider prefix-caching rewards. Then intra-run memoization (cache a repeated tool call by args within a run) and a cross-run semantic cache (embed a sub-query, reuse a close earlier result). I haven't wired the last two because my local-model cost is near-zero, so they wouldn't pay for their staleness risk.
+**Q: Does aptkit cache anything across an agent run?**
+
+No — every turn re-sends the full prompt and re-runs any repeated tool call. The cheapest win available is prefix caching: aptkit already keeps the system prompt stable across turns, so it's cache-friendly, it just doesn't request provider-side caching. The one to be careful with is a cross-run semantic cache — a stale hit poisons the whole trajectory, not one response, so it'd need a freshness gate. aptkit's read-only tools make caching safe in principle.
 
 ```
-  prefix (ready) · intra-run memo (would add) · cross-run semantic (would add)
+  prefix (easy, stable prompt ready) → intra-run memo → semantic (gate on freshness)
+  agent danger: stale hit poisons the trajectory, not one answer
 ```
-*Anchor: a stale agent-cache hit poisons the whole trajectory, not one response — freshness gating matters more here.*
 
-**Q: What's the danger that's worse than for single calls?**
-Blast radius. A stale hit isn't one bad response — the agent reasons forward on it and every downstream turn inherits the error. So I'd gate any semantic cache on freshness and never cache a side-effecting tool call.
+*Anchor: prefix caching first; a semantic cache poisons the whole trajectory if it goes stale.*
 
 ## See also
 
-- `02-agentic-retrieval/01-agentic-rag.md` — the loop these caches would serve
-- `02-fan-out-backpressure.md` — the next serving concern
-- `04-agent-infrastructure/01-context-engineering.md` — the stable prompt assembly
-- `study-ai-engineering/06-production-serving/` — single-call caching mechanics (cross-ref)
+- [../01-reasoning-patterns/02-agent-loop-skeleton.md](../01-reasoning-patterns/02-agent-loop-skeleton.md) — the per-turn calls a prefix cache would cut.
+- Single-call caching and cost mechanics: `.aipe/study-ai-engineering/06-production-serving/`.

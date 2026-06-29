@@ -1,26 +1,16 @@
-# 07 — System-design templates
+# 07 — System design templates (interview reframes)
 
-> Anchor: LLM application engineering. · Curriculum: Phase 3 (no curriculum file
-> in this repo; exercises cite real aptkit/buffr paths instead).
+> Anchor: codebases reframed as interview templates. Curriculum: Phase 5.
 
-Interview reframes, not new code. These templates take systems you'd whiteboard
-in a 45-minute design loop and hold them against the same aptkit codebase the
-concept files cover. Same code, different framing: the concept files ask "how
-does this work"; these ask "could you defend this as a search-ranking system, a
-support chatbot."
+Different from every other sub-section. These files don't explain a pattern
+aptkit uses — they explain an *interview prompt* aptkit exemplifies (or
+could be refactored to exemplify). Same code, interview framing.
 
-The shape here is deliberately different from the concept files. No
-zoom-out, no how-it-works walkthrough. Each file is a prompt, a standard
-architecture, the data model, the components, where it breaks at scale, how you'd
-eval it, the failure modes — then an honest verdict on whether aptkit already is
-this system and the concrete refactor that would let you claim it does.
+Each file uses the fixed nine-bullet template shape (prompt → architecture
+→ data model → key components → scale → eval → failure modes → applies to
+this codebase → how to make it apply). No Zoom-out / How-it-works blocks.
 
-Read the "Applies to this codebase" bullet as the load-bearing one. Most of
-these are `partially`: aptkit has the retrieval layer but not the learned ranker,
-the RAG spine but not the escalation path. Knowing exactly what's missing is the
-defensible answer in the room.
+## Files
 
-## Files (self-contained per template)
-
-1. `01-search-ranking.md` — embed + cosine top-k as the retrieval layer; the learned reranker aptkit doesn't have
-2. `02-tech-support-chatbot.md` — the rag-query agent as the RAG-over-KB + grounded-answer spine; the escalation gate it's missing
+- `01-search-ranking.md` — "Design a search ranking system." Applies `partially` (aptkit has the retrieval layer, no learned ranker/click logs).
+- `02-tech-support-chatbot.md` — "Design a tech support chatbot." Applies `partially` (the RAG-over-KB + intent + escalation shape maps onto the analytics agents).

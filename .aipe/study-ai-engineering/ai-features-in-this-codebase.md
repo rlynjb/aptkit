@@ -1,86 +1,98 @@
 # How aptkit uses AI specifically
 
-aptkit is an LLM application toolkit, so AI is not one feature — it's the whole
-product. What ships are reusable capabilities, each one an instance of the same
-shape: **prompt package + tool policy + agent-loop config + result parser**.
+aptkit is an LLM-application-engineering codebase. Its whole reason to
+exist is to package the reusable parts of an agent system — the model
+interface, the retrieval pipeline, the agent loop, the eval harness — so
+they ship as one npm bundle without app product logic leaking in. Every
+AI feature below is a *capability*: a prompt package + a tool policy + an
+agent-loop config + an output validator.
 
 ## AI features table
 
 ```
-  ┌──────────────────────────┬────────────────────────┬─────────────────────────┐
-  │ Capability               │ Pattern used           │ Why this pattern        │
-  ├──────────────────────────┼────────────────────────┼─────────────────────────┤
-  │ rag-query agent          │ Agentic retrieval      │ model decides WHEN to   │
-  │                          │ (ReAct loop, 1 tool)   │ search; grounded+cited  │
-  ├──────────────────────────┼────────────────────────┼─────────────────────────┤
-  │ query agent              │ Bounded agent loop     │ NL → answer over ~35    │
-  │                          │ over read-only tools   │ read-only tools         │
-  ├──────────────────────────┼────────────────────────┼─────────────────────────┤
-  │ intent classification    │ Heuristic + LLM        │ one-word classify;      │
-  │                          │ (parseIntent fallback) │ keyword shortcut first  │
-  ├──────────────────────────┼────────────────────────┼─────────────────────────┤
-  │ anomaly-monitoring agent │ Single structured pass │ scan metrics → ranked   │
-  │                          │ (generateStructured)   │ anomalies               │
-  ├──────────────────────────┼────────────────────────┼─────────────────────────┤
-  │ diagnostic-investigation │ Bounded agent loop +   │ one anomaly → tested    │
-  │                          │ structured output      │ Diagnosis + confidence  │
-  ├──────────────────────────┼────────────────────────┼─────────────────────────┤
-  │ recommendation agent     │ Agent loop, maxTurns 6 │ anomaly+diagnosis →     │
-  │                          │                        │ ≤3 grounded recs        │
-  ├──────────────────────────┼────────────────────────┼─────────────────────────┤
-  │ rubric-improvement agent │ LLM-as-judge           │ score subject → weakest │
-  │                          │ (RubricJudge)          │ dimension + next action │
-  ├──────────────────────────┼────────────────────────┼─────────────────────────┤
-  │ episodic memory          │ RAG index/query reused │ remember/recall over    │
-  │                          │ as remember/recall     │ same contracts (no agent│
-  │                          │                        │ wires it yet)           │
-  └──────────────────────────┴────────────────────────┴─────────────────────────┘
+  ┌───────────────────────────┬──────────────────────────┬────────────────────────────┐
+  │ Feature                   │ Pattern used             │ Why this pattern           │
+  ├───────────────────────────┼──────────────────────────┼────────────────────────────┤
+  │ RAG query agent           │ Agentic RAG (ReAct loop  │ model decides when to       │
+  │ (rag-query)               │ + search_knowledge_base) │ search; grounded + cited    │
+  ├───────────────────────────┼──────────────────────────┼────────────────────────────┤
+  │ Recommendation agent      │ Bounded agent loop over  │ propose ≤3 grounded actions │
+  │                           │ analytics tools          │ from an anomaly+diagnosis   │
+  ├───────────────────────────┼──────────────────────────┼────────────────────────────┤
+  │ Anomaly monitoring        │ Bounded loop, 10 fixed   │ scan metrics → severity-    │
+  │                           │ ecommerce categories     │ sorted anomalies            │
+  ├───────────────────────────┼──────────────────────────┼────────────────────────────┤
+  │ Diagnostic investigation  │ Hypothesis-test loop     │ test 2–3 hypotheses, return │
+  │                           │                          │ best-supported diagnosis    │
+  ├───────────────────────────┼──────────────────────────┼────────────────────────────┤
+  │ Query agent               │ Free-form Q&A over ~40   │ NL question → grounded      │
+  │                           │ read-only tools          │ plain-text answer           │
+  ├───────────────────────────┼──────────────────────────┼────────────────────────────┤
+  │ Rubric improvement        │ LLM-as-judge + next-step │ score subject, name weakest │
+  │                           │ recommender              │ dimension + next drill      │
+  ├───────────────────────────┼──────────────────────────┼────────────────────────────┤
+  │ Rubric judge (eval)       │ LLM-as-judge (Claude     │ scalable rubric scoring,    │
+  │                           │ judges Gemma)            │ anti-circular by design     │
+  ├───────────────────────────┼──────────────────────────┼────────────────────────────┤
+  │ Episodic memory           │ RAG over conversation    │ recall past turns; reuses   │
+  │                           │ turns (same contracts)   │ the retrieval pipeline      │
+  └───────────────────────────┴──────────────────────────┴────────────────────────────┘
 ```
 
-## Per-feature spec
+## Per-feature specs
 
-### rag-query agent — the capstone
-- **Inputs:** a natural-language `question: string`; optional `profile` (me.md
-  text) injected into the system prompt via `injectProfile`.
-- **Outputs:** plain-text answer, grounded in retrieved chunks, with citations;
-  falls back to "I couldn't find anything…" on empty retrieval.
-- **Model and provider:** any `ModelProvider`; the intended default is a
-  context-window-guarded Gemma (`gemma2:9b`, local Ollama, no cloud call).
-- **Token cost per call:** local Gemma = $0 (no per-token billing). The usage
-  ledger only prices `gpt-4.1-*`; Gemma usage is logged but free.
-- **Failure modes observed:** weak model passing `top_k: 1` (starves multi-part
-  questions → `minTopK` floor); hallucinated `filter` arg wiping results (→
-  `matchesFilter` tolerance); model never calling the tool (→ system prompt
-  "Always call … first"); model never stopping (→ `maxToolCalls: 4`,
-  `maxTurns: 6`, forced synthesis turn).
-- **Eval set:** precision@k / recall@k over a fixed corpus in the Studio RAG page
-  (`apps/studio`, deterministic fake embedder + InMemoryVectorStore); replay
-  artifacts in `artifacts/replays/`.
-- **Files:** `packages/agents/rag-query/src/rag-query-agent.ts`.
+### RAG query agent — the capstone
 
-### query agent
-- **Inputs:** `question: string`, optional `intent`, a `WorkspaceDescriptor`.
-- **Outputs:** plain-prose answer citing key numbers.
-- **Failure modes:** agent loops on tools (→ `maxToolCalls: 6`, `maxTurns: 8`);
-  never synthesizes (→ `buildSynthesisInstruction`).
-- **Files:** `packages/agents/query/src/query-agent.ts`,
-  `packages/agents/query/src/intent.ts`.
+- **Inputs:** `question: string` (+ optional profile text injected into the
+  system prompt).
+- **Outputs:** plain-text answer, citing retrieved chunks; falls back to a
+  fixed answer string if the loop produces nothing.
+- **Model and provider:** any `ModelProvider` (the agent is provider-neutral);
+  the headline pairing is Gemma via Ollama with emulated tool calling.
+- **Token cost per call:** not metered for Gemma (local, no price);
+  metered for OpenAI via `usage-ledger.ts` (gpt-4.1 tiers only).
+- **Failure modes observed:** weak model passing `top_k: 1` on multi-part
+  questions (mitigated by the `minTopK` floor); hallucinated retrieval
+  filters wiping all results (mitigated by hallucination-tolerant
+  `matchesFilter`); runaway tool calls (bounded by `maxTurns: 6`,
+  `maxToolCalls: 4`).
+- **Eval set:** Studio's deterministic in-browser replay
+  (`apps/studio/src/agent-runners.ts`, `runRagQueryFixtureReplay`) scores
+  retrieval with `scorePrecisionAtK` / `scoreRecallAtK`.
+- **File:** `packages/agents/rag-query/src/rag-query-agent.ts`.
 
-### rubric-improvement (LLM-as-judge)
-- **Inputs:** a `subject` string + a `RubricDefinition` (dimensions, verdicts).
-- **Outputs:** per-dimension scores, a verdict, one highest-leverage fix —
-  validated against the rubric's own score ranges.
-- **Anti-circular design:** intended to run Claude (anthropic) as the judge over
-  Gemma's outputs, avoiding self-preference bias.
-- **Files:** `packages/evals/src/rubric-judge.ts`,
-  `packages/agents/rubric-improvement/`.
+### The five analytics agents
 
-## The seam that makes it a toolkit
+All five share the capability shape (`*_CAPABILITY_ID`, a read-only
+`toolPolicy` allowlist, a bounded `runAgentLoop`, a structured-output
+validator). They differ in tools and bounds:
 
-Every capability depends only on `ModelProvider.complete()` and the
-`ToolRegistry` / `VectorStore` / `EmbeddingProvider` contracts — never a vendor
-SDK directly. That's why buffr can supply a `PgVectorStore` and a durable
-`agents` schema (`/Users/rein/Public/buffr/src/pg-vector-store.ts`,
-`/Users/rein/Public/buffr/sql/001_agents_schema.sql`) without aptkit changing a
-line. See `01-llm-foundations/08-provider-abstraction.md` and
-`03-retrieval-and-rag/04-vector-databases.md`.
+- **recommendation** — `maxTurns: 6`, `maxToolCalls: 4`, 13-tool allowlist.
+  `packages/agents/recommendation/src/recommendation-agent.ts`.
+- **anomaly-monitoring** — `maxTurns: 8`, `maxToolCalls: 6`, 4-tool
+  allowlist, 10 fixed anomaly categories
+  (`packages/agents/anomaly-monitoring/src/categories.ts`).
+- **diagnostic-investigation** — `maxTurns: 8`, `maxToolCalls: 6`, 11 tools.
+- **query** — `maxTurns: 8`, `maxToolCalls: 6`, ~40 read-only tools.
+- **rubric-improvement** — `maxTurns: 6`, `maxToolCalls: 3`, 6 tools.
+
+### Episodic memory
+
+- **Inputs:** `remember(turn)` where turn = `{conversationId, question, answer}`;
+  `recall(query, k)`.
+- **Outputs:** `MemoryHit[]` — past exchanges ranked by similarity to the query.
+- **Model/store:** the same `EmbeddingProvider` + `VectorStore` contracts as
+  RAG. No new infrastructure — the strongest evidence the contracts were
+  the right boundary.
+- **Wiring status:** no aptkit agent wires memory yet; buffr's session
+  runtime does. `packages/memory/src/conversation-memory.ts`.
+
+## What aptkit deliberately does NOT do
+
+- No token-by-token LLM streaming (NDJSON streams trace *events*, not tokens).
+- No reranking, hybrid/sparse (BM25) retrieval, query rewriting/HyDE, or GraphRAG.
+- No semantic/prompt caching, no provider rate limiting, circuit breaker, or backoff.
+- No fine-tuning or model training.
+
+These are real gaps, marked `not yet exercised` in the relevant concept
+files and turned into buildable exercises.

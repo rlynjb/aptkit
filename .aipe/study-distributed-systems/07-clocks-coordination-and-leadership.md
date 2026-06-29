@@ -1,259 +1,165 @@
 # 07 — Clocks, Coordination, and Leadership
 
-**Industry names:** wall-clock vs logical clock · ordering events · happens-before · leader election · lease · split-brain — *Industry standard.*
+**Industry names:** physical vs logical clocks · wall-clock skew · happens-before / Lamport clocks · leader election · lease · split-brain. **Type:** Industry standard.
 
 ## Zoom out, then zoom in
 
-This file is half real, half curriculum. The **real** half: the trace orders events
-by a timestamp captured at emit, which is the repo's one genuine "use a clock to
-order events that raced" decision (file 06 introduced it; here's the full why). The
-**curriculum** half: leader election, leases, and split-brain — all `not yet
-exercised`, because there's only ever one writer.
+Leadership, leases, and consensus are **`not yet exercised`** — single writer, no election, no lock. What the repo *does* use is **physical wall-clock timestamps** (`new Date().toISOString()`) for ordering, and the lesson is exactly *why that's safe here* and *exactly when it would stop being safe.*
 
 ```
-  Zoom out — where time is used to order things
+  Zoom out — clocks the repo uses, coordination it doesn't
 
-  ┌─ App: runAgentLoop ─────────────────────────────────────────────────┐
-  │  timestamp() = new Date().toISOString()  ── captured AT EMIT          │ ← the real clock use
-  │  emit({ ..., timestamp })                                            │
-  └──────────────────────────────┬───────────────────────────────────────┘
-                                 │ written into created_at
-  ┌─ Postgres: agents.messages ──▼───────────────────────────────────────┐
-  │  ORDER BY created_at  ← reconstructs emit order despite racing inserts │ ← we are here
-  │                                                                        │
-  │  ┌╌ leader election ╌┐  ┌╌ lease ╌┐  ┌╌ split-brain ╌┐  NOT YET        │
-  │  └╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┘  └╌╌╌╌╌╌╌╌╌┘  └╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┘  (one writer)   │
-  └─────────────────────────────────────────────────────────────────────┘
+  ┌─ App (single process) ──────────────────────────────────────────┐
+  │  timestamp() = new Date().toISOString()  ★ physical clock ★      │ ← we are here
+  │  used for: CapabilityEvent ordering, created_at on messages      │
+  └──────────────────────────────────┬───────────────────────────────┘
+                                     │ writes
+  ┌─ Storage ──────────────────────── ▼─────────────────────────────┐
+  │  agents.messages ORDER BY created_at  (single-clock source)      │
+  │                                                                   │
+  │  ┄┄ not yet exercised: leader election, leases, distributed       │
+  │     locks, split-brain prevention — there's only one writer ┄┄   │
+  └────────────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: in a distributed system, **you cannot trust a clock to order events across
-machines** — two machines' clocks drift, so machine A's "10:00:00.5" might really be
-before machine B's "10:00:00.4". That's why distributed systems use *logical* clocks
-(counters that encode "happened-before") instead of wall time. aptkit gets away with
-*wall* time for one specific reason — all timestamps come from **one machine** — and
-recognizing *why* that's safe here (and when it would stop being safe) is the lesson.
+Zoom in: in a distributed system, **there is no single "now."** Each node's wall clock drifts independently, so a timestamp from node A is not comparable to one from node B — B's clock might be 200ms ahead. **Leader election** and **leases** exist to designate one node as "the decider" so you don't need clocks to agree. The repo dodges all of this by having *one* clock source and *one* writer. That's not a gap to apologize for — it's the correct design for a single-process tool. The skill is knowing it's a property of the topology, not a guarantee.
 
-## Structure pass
+## Structure pass — layers, one axis, the seams
 
-**Layers.** Event creation (one machine's clock) → buffer → ordering at read
-(`ORDER BY created_at`).
+**Layers:** event emission (one process, one clock) → persistence (`created_at` from that clock) → ordering reads (`ORDER BY created_at`).
 
-**Axis — trace `whose clock decides order?` across the system.**
+**The one axis: *how many independent clocks contribute to this order?*** Trace it:
 
 ```
-  Axis — "whose clock stamps this event?" — and is that safe?
+  "how many clocks decide this ordering?"  — traced down
 
-  ┌─ emit in runAgentLoop ─────────────────────┐
-  │  timestamp() — ONE machine's Date.now()     │  → single clock source ✓
-  └──────────────────────┬──────────────────────┘
-       ┌─────────────────▼────────────────────────┐
-       │ written to created_at on insert           │  → still that one machine's time ✓
-       └─────────────────┬────────────────────────┘
-            ┌────────────▼──────────────────────────┐
-            │ (if a SECOND machine emitted events)   │  → two clocks, drift → WRONG order
-            └─────────────────────────────────────────┘     NOT YET EXERCISED
+  ┌──────────────────────────────────────────────┐
+  │ timestamp() in runAgentLoop   ONE clock        │  monotonic-enough within
+  │                               (this process)   │  one process → safe order
+  └────────────────────┬──────────────────────────┘
+       ┌───────────────▼──────────────────────────┐
+       │ created_at on agents.messages  ONE clock   │  still the app's clock →
+       │  (the app stamps it, not the DB)           │  order is meaningful
+       └───────────────┬──────────────────────────┘
+             ┌─────────▼──────────────────────────┐
+             │ TWO+ writer processes (not yet      │  clocks drift → timestamp
+             │  exercised)                          │  order LIES → need logical clocks
+             └─────────────────────────────────────┘
 ```
 
-**Seam.** The safety hinges on a single seam: *all* timestamps originate on one
-machine, so they share one clock and are totally ordered. The instant a second
-machine emits events into the same `agents.messages` table, the wall-clock ordering
-becomes unreliable (clock drift) and you'd need logical clocks. The seam between
-"one clock" and "many clocks" is where wall time stops working — and aptkit is firmly
-on the safe side, which is why the simple approach is correct.
+The answer is "one clock" at every live layer, which is why physical timestamps work. The third row — two writers — is where the single-clock assumption breaks and the canon (logical clocks, leader election) becomes necessary. That's the seam.
+
+**The seam:** the (hypothetical) second-writer boundary. As long as one process stamps all events, wall-clock ordering is sound. Add a second process emitting events with its own clock, and the seam appears: their timestamps are no longer comparable, and `ORDER BY created_at` starts lying.
 
 ## How it works
 
-### Move 1 — the mental model: a timestamp is a position, and positions must come from one ruler
+### Move 1 — the mental model
 
-You measure two lengths with the same ruler and you can compare them. Measure them
-with two *different* rulers that disagree, and the comparison is meaningless. A
-timestamp is a position on a timeline; comparing positions is only valid if they came
-from the *same clock*. Wall-clock ordering works when there's one ruler; it breaks
-when there are two that drift.
+You know `Date.now()` drifts — you've seen two machines disagree on the time, and you've seen a clock jump backward when NTP corrects it. Within one process that doesn't bite, because all your timestamps come from the same clock moving (mostly) forward. Across processes it bites hard: B's "later" timestamp can be earlier than A's in real time.
 
 ```
-  The clock-ordering kernel — one ruler vs two rulers
+  The clock kernel — why one clock orders and two don't
 
-  ONE machine (aptkit today):
-    e1 @ 10:00:00.100   e2 @ 10:00:00.150   e3 @ 10:00:00.200
-    ORDER BY timestamp → e1, e2, e3   ✓  (same ruler → comparable)
+  ONE process (the repo):
+    e0 @ 10:00:00.100  →  e1 @ 10:00:00.140  →  e2 @ 10:00:00.180
+    same clock, increasing → timestamp order = real order ✓
 
-  TWO machines (not yet exercised):
-    machine A clock:  e1 @ 10:00:00.100
-    machine B clock:  e2 @ 10:00:00.090   ← B's clock is 60ms behind A's!
-    ORDER BY timestamp → e2, e1   ✗  (e2 looks earlier but really happened LATER)
+  TWO processes (not yet exercised):
+    proc A: eA @ 10:00:00.300   (A's clock runs 200ms fast)
+    proc B: eB @ 10:00:00.180   (B's clock is correct, eB really happened FIRST)
+    ORDER BY timestamp → eB, eA  ... but if A's clock is fast, this can LIE ✗
 ```
+
+The kernel: **a single monotonic-enough clock totally orders its own events; independent clocks don't, because there's no shared "now."** Collapse to one clock (one process, or one designated node) and the problem vanishes.
 
 ### Move 2 — walking the mechanism
 
-**Step 1 — the clock is read once, at emit, on one machine.** `timestamp()` is the
-whole clock abstraction — a single function, one source:
+**Part 1 — the one clock the repo trusts.** Every `CapabilityEvent` gets its timestamp from one function:
 
-```ts
+```typescript
 // packages/runtime/src/events.ts:30-32
 export function timestamp(): string {
-  return new Date().toISOString();   // ← one machine's wall clock, ISO-8601 (sortable as text)
+  return new Date().toISOString();   // physical wall clock, ISO 8601
 }
 ```
 
-Every `emit` calls this *at the moment the event happens*, inside the single-threaded
-loop. Because it's one machine and one thread, successive calls are monotonic-enough
-in practice and totally ordered. ISO-8601 strings also sort lexicographically in the
-same order as chronologically, so `ORDER BY created_at` on a text/timestamp column
-just works.
+This is a *physical* clock (wall-clock time), not a logical one. It's called all over `runAgentLoop` (`:111`, `:127`, `:147`, `:171`, `:220`) and in the providers (`fallback-provider.ts`, `context-window-guard.ts`). Because every one of those calls happens in the *same process*, they read the *same* clock, advancing forward through the run. So the timestamps totally-order the events of a run — and that order is real, not approximate. This is the safe use of a physical clock: **single source, intra-process ordering.**
 
-**Step 2 — the timestamp travels with the event and becomes the row's position.**
-This is the file-06 fix, viewed as a clock decision. The emit-time stamp is carried
-all the way into `created_at` so the *racing inserts* don't decide order — the
-*clock at emit* does:
-
-```ts
-// buffr/src/supabase-trace-sink.ts:53 + persistMessage:26-30
-const at = event.timestamp;                           // ← emit-time stamp, not insert-time
-// persistMessage:
-const createdAt = extra?.createdAt && extra.createdAt.length > 0 ? extra.createdAt : null;
-//   values (..., coalesce($8::timestamptz, now()))    // ← prefer emit time; fall back to now()
-```
-
-The annotation that matters: `coalesce($8, now())` prefers the *emit* timestamp and
-only falls back to the *server's* `now()` if the event somehow lacked one. That
-preference is the correctness choice — it means order is decided by *when the event
-happened*, not by *when its insert happened to land*. The comment in the file says it
-exactly: "replay order matches emit order rather than the race between concurrent
-flush inserts."
-
-**Step 3 — why wall-clock is enough here (and the line where it isn't).** This is the
-honest boundary. aptkit uses *wall* time, not a *logical* clock (Lamport timestamp,
-vector clock), and that's correct because:
+**Part 2 — the clock crosses to the database, and stays the app's clock.** When `SupabaseTraceSink` persists an event, it writes the *app's* emit timestamp into `created_at` (`supabase-trace-sink.ts:30`, walked in `06`) rather than letting Postgres stamp it. That's a deliberate, correct choice for ordering: the order you care about is *emit order in the app*, and the app's clock is the authority on that. Postgres's `now()` is only the fallback (`coalesce(..., now())`). So even though the data lands in another node, the ordering clock is still the single app clock — the one-clock property is preserved across the boundary.
 
 ```
-  Comparison — wall clock here vs logical clock when you'd need one
+  Layers-and-hops — one clock, carried across the boundary
 
-  condition                         aptkit today          would force logical clocks
-  ────────────────────────────────  ───────────────────   ──────────────────────────────
-  who stamps events?                ONE machine           two+ machines (clock drift)
-  ordering basis                    Date.now() at emit    happens-before counters
-  safe?                             YES (single clock)    wall time WRONG under drift
-  what it'd look like               created_at ISO        per-event sequence/Lamport ts
+  ┌─ App (the one clock) ───┐  event.timestamp (app clock)  ┌─ Postgres ─────┐
+  │ timestamp() →           │ ─────────────────────────────► │ created_at =   │
+  │   new Date().toISOString│                                │  app's stamp,  │
+  │                         │  (DB's now() only as fallback) │  not DB's      │
+  └─────────────────────────┘                                └────────────────┘
+       order authority stays in the app — DB doesn't get to reorder by arrival
 ```
 
-A logical clock (a counter that increments on each event and on each message
-received) encodes *happens-before* without trusting wall time — it's what you reach
-for the moment two machines must agree on order. aptkit doesn't need it because there
-is exactly one event source. Naming this is the signal: "I used wall time *because*
-it's single-source; I'd switch to logical clocks the moment a second writer appeared."
+**Part 3 — happens-before and logical clocks — `not yet exercised`, with the attach point.** The theory that *replaces* wall clocks across nodes is Lamport's **happens-before**: instead of "what time did this happen," you track "did A causally precede B." A **Lamport clock** is a counter each node bumps on every event and includes in every message, so the receiver can advance past it — giving you a consistent *causal* order without synchronized wall clocks. The repo needs none of this because it has one clock. Attach point: the day a second process emits events into the same `agents.messages` (e.g. buffr running two sessions concurrently with their own clocks), `ORDER BY created_at` could misorder causally-related events, and you'd reach for a sequence number assigned at a single point (the DB) or a logical clock.
 
-**Step 4 — leadership: there's only one writer, so there's nothing to elect.**
-Leader election, leases, and split-brain are all `not yet exercised`, and the reason
-is structural:
+**Part 4 — leader election, leases, split-brain — `not yet exercised`, with the attach point.** These exist to answer "who's allowed to act when there are many candidates."
+- **Leader election** — N nodes agree on one "leader" to make decisions (so they don't conflict). The repo has one writer; there's nothing to elect.
+- **Lease** — a *time-bounded* lock: "you're the leader until T, then you must renew or lose it." It's how you make leadership safe against a node that hangs (its lease expires, another takes over). Notice this is the *same missing primitive* as the timeout from `02`, viewed from the coordination side — a lease is a deadline on *authority*.
+- **Split-brain** — the failure leases prevent: two nodes both believing they're leader (after a partition), both writing, corrupting state. The repo can't have split-brain because it can't have two leaders.
 
-```
-  Layers-and-hops — why no leader is needed (and where one would attach)
-
-  ┌─ ONE buffr process ─┐   the ONLY writer    ┌─ Postgres ─┐
-  │  ChatSession.ask()  │ ───────────────────► │  messages  │
-  │  (single writer)    │                      │  chunks    │
-  └─────────────────────┘                      └────────────┘
-       no second writer → no contention → no leader to elect → no split-brain
-
-  IF buffr ran N indexer workers competing to index the same docs:
-  ┌─ worker 1 ─┐  ┌─ worker 2 ─┐  ┌─ worker 3 ─┐
-  │  who indexes which doc?     │  → THEN you need a lease / leader to avoid
-  └─────────────┘  └────────────┘  └────────────┘    double-work and split-brain
-```
-
-A leader exists to make *one* node the decision-maker when *many* could act. With one
-writer, the question never arises. Split-brain — two nodes both believing they're the
-leader and diverging — requires two would-be leaders; there's one. This stays
-curriculum until buffr runs multiple workers that contend for the same write
-authority (e.g., a pool of indexers), at which point a lease (a time-bounded,
-renewable claim on "I am the indexer") is the lightweight answer.
+Attach point for all three: the day buffr runs multiple instances that must coordinate writes (e.g. a leader to own ingestion so two instances don't double-index), you'd need election + leases, and Postgres advisory locks or a coordination service (etcd/ZooKeeper-style) would back them.
 
 ### Move 3 — the principle
 
-Time in distributed systems has two jobs that people conflate: **timeout** (a budget,
-file 02 — "how long until I give up?") and **ordering** (a position — "what happened
-before what?"). For timeouts, any local clock works. For ordering *across machines*,
-wall clocks fail because they drift, so you use logical clocks that encode
-happens-before. aptkit needs ordering but has one clock source, so wall time is a
-valid logical clock *by accident of being single-source*. The principle: **wall-clock
-ordering is correct exactly when all events share one clock; the moment they don't,
-you need a logical clock or a single coordinator.**
+Wall-clock timestamps order events correctly *only within a single clock's authority*. The repo earns the right to use them because it has one process and one writer — so it gets total ordering for free and needs no coordination at all. The instinct to carry forward: **before trusting a timestamp to order distributed events, count the clocks.** One clock, trust it. Two or more, you need either a single sequencing point (let one node assign order) or logical clocks (track causality, not time). Leadership and leases are how you *create* that single authority when no single node is naturally it — and they're a deadline on authority, the coordination-side twin of the request timeout.
 
 ## Primary diagram
 
+Every clock and coordination point, exercised and not.
+
 ```
-  Clocks in aptkit — one clock orders everything; no leader needed
+  Clocks & coordination map
 
-  ┌─ ONE machine, ONE thread: runAgentLoop ─────────────────────────────┐
-  │  timestamp() = Date.now()  ── single clock source, totally ordered ✓ │
-  │  emit({ ..., timestamp })                                            │
-  └──────────────────────────────┬───────────────────────────────────────┘
-                                 │ created_at = coalesce(emit_ts, now())
-  ┌─ Postgres: agents.messages ──▼───────────────────────────────────────┐
-  │  ORDER BY created_at → emit order, immune to insert race ✓            │
-  └─────────────────────────────────────────────────────────────────────┘
-
-  NOT YET (all require ≥2 competing actors):
-  ┌╌ leader election ╌┐ ┌╌ lease ╌┐ ┌╌ split-brain ╌┐ ┌╌ logical/vector clocks ╌┐
-  └╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┘ └╌╌╌╌╌╌╌╌╌┘ └╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┘ └╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┘
-   would attach if buffr ran multiple writers/workers contending for the same data
+  ┌─ App process (ONE clock) ──────────────────────────────────────┐
+  │  timestamp() = new Date().toISOString()  (physical wall clock)  │
+  │   → CapabilityEvent.timestamp (orders a run, intra-process) ✓   │
+  └──────────────────────────────────┬──────────────────────────────┘
+                                     │ app's clock carried across
+  ┌─ Storage ──────────────────────── ▼─────────────────────────────┐
+  │  agents.messages.created_at = app stamp (DB now() = fallback)   │
+  │   ORDER BY created_at → emit order, sound while ONE writer       │
+  │                                                                  │
+  │  ┄┄ NOT YET EXERCISED ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄  │
+  │  2+ writers → clocks drift → need logical clocks / DB sequence  │
+  │  leader election · lease (= deadline on authority) · split-brain│
+  └────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The wall-clock-vs-logical-clock distinction is one of the most clarifying ideas in
-distributed systems, and aptkit is a clean place to see *why* single-source wall time
-is safe. Lamport's "Time, Clocks, and the Ordering of Events" (1978) is the origin:
-the insight that physical time can't order distributed events, so you need a logical
-counter that captures *causality* (if A sends a message that B receives, A's event
-happened-before B's). Vector clocks extend this to detect *concurrent* (causally
-unordered) events. aptkit needs neither because its events form a single sequential
-chain on one machine — but the `created_at`-prefer-emit-time choice is genuinely the
-same *kind* of thinking: don't let the physical mechanism (insert arrival) decide
-logical order; attach the logical position to the event.
+The reason "just use timestamps" fails at scale is clock skew: even with NTP, machine clocks differ by milliseconds to seconds, and they can jump *backward* on correction. Google's Spanner famously attacked this with TrueTime — GPS and atomic clocks giving a bounded uncertainty interval — so it could use physical time for global ordering by *waiting out* the uncertainty. Everyone without an atomic clock budget uses logical clocks (Lamport, vector clocks) or a single sequencer instead.
 
-Leases deserve a mention because they're the pragmatic, real-world face of "leader
-election" most engineers actually touch: a lease is a lock with a TTL — you hold "I'm
-the indexer" for 30 seconds, renew it, and if you die, it expires and someone else
-takes over. It avoids the split-brain trap of a lock with no expiry (holder dies →
-lock held forever). It would be the first coordination primitive buffr reached for if
-it scaled to multiple workers — far before full Raft/Paxos consensus.
+The lease-as-deadline-on-authority framing ties this file to `02`. A request timeout bounds how long you'll *wait* for a node; a lease bounds how long a node is *trusted to lead*. Both convert "this node might be hung forever" into "this node is presumed dead after T." It's the same idea — a clock racing a hang — applied to data on one side and authority on the other. Recognizing them as the same primitive is the kind of connection that signals you actually understand the field, not just the vocabulary.
 
 ## Interview defense
 
-**Q: "You order trace events by timestamp — isn't that unsafe in distributed
-systems?"**
-"It would be if the timestamps came from multiple machines, because clock drift makes
-cross-machine wall-clock ordering unreliable. But here every timestamp comes from one
-machine, one thread — `timestamp()` in `events.ts` — so they share a single clock and
-are totally ordered. That's why I can safely write the emit time into `created_at` and
-`ORDER BY created_at` to recover emit order despite the inserts racing. The instant a
-second machine emitted into the same table, I'd switch to logical clocks — but
-single-source wall time is correct, not lucky."
+**Q: "You order events by a wall-clock timestamp. Isn't that dangerous in a distributed system?"**
+"It's dangerous across nodes, safe here, and I know exactly why. Every timestamp comes from one process's clock — `new Date().toISOString()` at `events.ts:30` — and `SupabaseTraceSink` persists *that* stamp into `created_at`, not the DB's. One clock totally-orders its own events, so `ORDER BY created_at` is sound. It breaks the day a second writer with its own clock emits into the same table — then I'd need a single sequencing point or a logical clock. Counting the clocks is the test."
 
 ```
-  sketch
-
-  ONE clock → timestamp() at emit → created_at → ORDER BY created_at = emit order ✓
-  TWO clocks (drift) → wall time wrong → need Lamport/vector clocks
+  one clock → timestamp orders correctly
+  two clocks → timestamps not comparable → need a sequencer / Lamport clock
 ```
 
-**Q: "Do you need leader election?"** — the honest answer:
-"No, and the reason is structural: there's one writer. Leader election exists to pick
-one decision-maker when many could act; with a single buffr process writing, there's
-no contention to arbitrate and no split-brain to prevent. It'd become relevant if I
-ran multiple indexer workers competing to index the same documents — then I'd reach
-for a *lease* (a TTL'd claim) long before full consensus, because a lease handles the
-'holder died' case that a plain lock can't."
+Anchor: *count the clocks before trusting a timestamp; one clock is safe, two lie.*
 
-*Anchor:* one clock source makes wall-time ordering valid; one writer makes leader
-election unnecessary; both flip the moment a second actor appears.
+**Q: "Why no leader election or locks?"**
+"One writer — nothing to elect, nothing to lock against. I'd flag the connection to `02`: a lease is just a deadline on *authority*, the same way a timeout is a deadline on a *call*. The day buffr runs multiple coordinating instances — say, one must own ingestion so two don't double-index — I'd add election plus leases, backed by Postgres advisory locks or a coordination service. Today it's `not yet exercised`, and adding it now would be coordination overhead for a problem the repo doesn't have."
+
+Anchor: *single writer means no split-brain is possible; a lease is a timeout on leadership.*
 
 ## See also
 
-- `06-queues-streams-ordering-and-backpressure.md` — the racing-inserts problem this clock solves
-- `02-partial-failure-timeouts-and-retries.md` — time's *other* job: timeouts, not ordering
-- `05-replication-partitioning-and-quorums.md` — multiple writers is where leadership attaches
-- **study-database-systems** — `timestamptz`, `now()`, and how Postgres orders rows
-```
+- `02-partial-failure-timeouts-and-retries.md` — the timeout is the deadline-on-a-call twin of the lease
+- `06-queues-streams-ordering-and-backpressure.md` — the timestamp that recovers stream order (sound because one clock)
+- `05-replication-partitioning-and-quorums.md` — failover is what leader election would back
+- `study-database-systems` — Postgres advisory locks, transaction timestamps, MVCC snapshots
+- `study-debugging-observability` — reading the timestamped trace to reconstruct what happened

@@ -1,164 +1,144 @@
 # 09 — Distributed Systems Red-Flags Audit
 
-**Industry name:** coordination & partial-failure risk audit — *Project-specific.*
+**Industry names:** failure-mode review · coordination-risk audit. **Type:** Project-specific.
 
-Ranked by consequence. Each finding names the evidence (`file:line`), the failure it
-causes, and the move. The honest frame first: aptkit is single-process with two real
-network boundaries, so this is a *short* list of *real* risks plus an explicit map of
-what's `not yet exercised`. Nothing here is invented to fill a template.
+This is the ranked risk list — every coordination and partial-failure hazard in aptkit + buffr, ordered by consequence, each with its evidence and its fix. It's the file to scan before touching any of the four seams.
 
-## Zoom out — the risk surface
+## Zoom out — the risk surface in one frame
 
 ```
-  Where coordination risk concentrates (ranked R1–R5)
+  Zoom out — the four seams, colored by risk
 
-  ┌─ aptkit process ────────────────────────────────────────────────────┐
-  │  runAgentLoop (maxTurns ✓, but no per-call deadline)                 │
-  │       │                                                              │
-  │       ▼ complete()                                                   │
-  │  FallbackModelProvider ──► fetch(:11434)  ◄── R1: NO TIMEOUT         │
-  │                                              (hang defeats fallback) │
-  └──────────────────────────────┬───────────────────────────────────────┘
-                                 │ HTTP / TCP
-  ┌─ buffr process ──────────────▼───────────────────────────────────────┐
-  │  indexDocumentRow ──► R3: dual write (orphan on partial commit)       │
-  │  pg.Pool ──────────► R4: no checkout timeout / unbounded wait         │
-  │  SupabaseTraceSink:  R2 (fixed!) ordering ✓ | R5: no backpressure /   │
-  │                      Promise.all-fails-all                            │
-  └─────────────────────────────────────────────────────────────────────┘
+  ┌─ App ───────────────────────────────────────────────────────────┐
+  │  runAgentLoop → FallbackProvider → GemmaProvider → fetch          │
+  │                      ▲ R1 (no deadline anywhere on this path)     │ ← highest
+  └──────────────────────┼───────────────────────────────────────────┘
+                         │ HTTP, no timeout
+  ┌─ buffr ──────────────┼───────────────────────────────────────────┐
+  │  indexDocumentRow:  doc INSERT  ──[R2 orphan window]──► chunks    │ ← second
+  │  model retry (R3, no idem key)   trace ORDER BY ts (R4, sound)    │
+  │  pg.Pool default size (R5)       app_id/kind not shard keys (R6)  │
+  └────────────────────────────────────────────────────────────────────┘
 ```
 
-## Ranked findings
+## Ranked risks
 
-### R1 — Ollama HTTP calls have no per-call timeout (HIGH)
+### R1 — No deadline on the Ollama path (highest consequence)
 
-**Evidence:** `packages/providers/gemma/src/gemma-provider.ts:201-215`,
-`packages/retrieval/src/ollama-embedding-provider.ts:60-75`. Both call `fetch()` with
-only an optional `AbortSignal` — no `AbortSignal.timeout()`, no deadline.
+**Verdict:** A wedged Ollama daemon hangs the entire agent call, and the failover chain — whose job is to survive a bad provider — cannot save you, because it advances only on a *thrown* error.
 
-**Failure it causes:** If the Ollama daemon wedges (model loading, GPU hang, swap
-thrash), `complete()` / `embed()` hangs until the caller aborts or the socket dies.
-Worse, in the `FallbackModelProvider` (`fallback-provider.ts:50-88`) the loop only
-advances *on a thrown error* — a hung provider never throws, so the chain never tries
-the next provider. A *slow* Ollama defeats the entire point of the fallback (surviving
-local-model unavailability), while a *down* Ollama (which throws `ECONNREFUSED`) is
-handled correctly. Slow is the dangerous case and it's unhandled.
+**Evidence:**
+- `packages/providers/gemma/src/gemma-provider.ts:201-215` — `fetch(/api/chat, { …signal? })` arms no `AbortController` and no `setTimeout`; a timeout exists *only* if the caller passes a `signal`.
+- `packages/providers/fallback/src/fallback-provider.ts:50-64` — the loop does `await provider.complete(request)` and advances only in the `catch`. No throw → no advance → the `await` blocks forever.
+- `packages/runtime/src/run-agent-loop.ts:98` — `runAgentLoop` bounds *turns* (`maxTurns=8`), never *time*.
 
-**The move:** Wrap each transport `fetch` in a per-call deadline —
-`AbortSignal.timeout(ms)` combined with the existing caller `signal`. Turns "infinitely
-slow" into "threw," which every layer above (fallback, `maxTurns`) already handles. One-
-function change per transport; the plumbing is already there. → `02`.
+**Failure that bites:** daemon up, TCP connected, request accepted, no response. Indistinguishable from "slow." Everything above the `fetch` blocks.
 
-### R2 — Trace ordering under racing inserts (FIXED — keep it that way)
+**Fix:** arm an `AbortController` with `setTimeout` in `defaultHttpTransport`; on expiry it throws, the chain's `shouldFallback` treats it as retryable, and the chain advances. Add deadline propagation later so total time — not just each hop — is bounded. → `02`
 
-**Evidence:** `buffr/src/supabase-trace-sink.ts:49-93` + `persistMessage:26-30`.
+### R2 — Dual write orphans documents (second; the latent saga)
 
-**What was right:** `emit` is sync and queues writes into `pending[]`; `flush()` drains
-with `Promise.all`, so inserts race. The fix: the event's emit-time ISO `timestamp` is
-written into `created_at` (`coalesce($8::timestamptz, now())`), so replay does
-`ORDER BY created_at` and recovers emit order regardless of which insert wins. This is
-the repo's strongest distributed-systems decision — logical position attached to the
-event, not trusted to the transport.
+**Verdict:** `indexDocumentRow` commits a `documents` row, then upserts chunks in a separate transaction. An embed failure between them leaves a document with zero chunks, and nothing detects or repairs it.
 
-**The watch-item:** this guarantee depends on `timestamp()` being single-source
-(`events.ts:30-32`). The day a second machine emits into `agents.messages`, wall-clock
-ordering breaks (clock drift) and you'd need logical clocks. Not a bug; a boundary to
-remember. → `06`, `07`.
+**Evidence:**
+- `buffr/src/runtime.ts:5-18` — two sequential `await`s with no enclosing transaction; the doc `INSERT` auto-commits before `pipeline.index()` runs.
+- `buffr/src/pg-vector-store.ts:42-58` — chunks upsert has its *own* `BEGIN/COMMIT`, confirming the two writes are separate units.
+- `buffr/sql/001_agents_schema.sql:14-27` — the `chunks → documents` foreign key is explicitly dropped for `VectorStore` contract parity, so the DB can't flag the orphan.
 
-### R3 — `indexDocumentRow` dual write, no atomicity across steps (MEDIUM)
+**Failure that bites:** the embed step calls Ollama (see R1) — exactly the call most likely to fail or hang. When it does, the document is durable, invisible to retrieval, and silently inconsistent.
 
-**Evidence:** `buffr/src/runtime.ts` (`indexDocumentRow`) — commits the `documents`
-row, then calls `pipeline.index()` (embed via Ollama + chunk upsert) in a *separate*
-transaction.
+**Fix:** compensation (`try/catch` → delete/mark), transactional outbox (commit intent atomically + worker drain), or a reconciliation scan for zero-chunk documents. All lean on the idempotent upsert. → `08`
 
-**Failure it causes:** If the embed (R1's hang/fail) throws after the documents row
-commits, you get an orphan — a document with zero chunks: searchable, returns nothing.
-No compensation deletes the orphan; no reconciliation re-indexes it. Acceptable today
-(one local doc, synchronous caller sees the throw).
+### R3 — Model-call retries are not idempotent (third)
 
-**The move:** When indexing leaves the request path, use a transactional outbox — write
-the documents row and an "index me" outbox row in *one* transaction; a worker drains
-the outbox, does embed+upsert, retries on failure. At-least-once + the idempotent
-`on conflict (id)` upsert = effectively-once. → `08`, `03`.
+**Verdict:** A failover advance or forced final turn issues a fresh `provider.complete` with no idempotency key, so a retry after a *lost response* re-does the work — double cost, different output.
 
-### R4 — Connection pool has no checkout timeout or explicit bound (MEDIUM-LOW)
+**Evidence:**
+- `packages/providers/fallback/src/fallback-provider.ts:55,64` — advance issues a new `provider.complete(request)`; `ModelRequest` carries no dedup key.
+- Contrast `buffr/src/pg-vector-store.ts:47` — the DB writes *are* idempotent (`on conflict (id) do update`), so the asymmetry is the point.
 
-**Evidence:** `buffr/src/db.ts:4-6` — `new pg.Pool({ connectionString })` with no
-`max`, no `connectionTimeoutMillis`.
+**Failure that bites:** today, read-only agents (`toolPolicy` allowlists) mean the blast radius is cost and output nondeterminism, not corruption. It becomes a real bug the day a tool gains a side effect.
 
-**Failure it causes:** Default pool size (10). Under concurrent writes, if all
-connections are checked out, a borrower waits with *no timeout* — the same "no
-deadline" hazard as R1, one layer down. A leaked connection (mitigated by the
-`finally { client.release() }` in `pg-vector-store.ts:62`, which is correct) would
-permanently shrink the pool. Low likelihood at single-user scale.
+**Fix:** an idempotency key on `ModelRequest` + a short-lived response cache the chain checks before calling. → `03`
 
-**The move:** Set `connectionTimeoutMillis` so a borrower fails fast instead of
-hanging when the pool is exhausted, and an explicit `max` sized to the workload. The
-`finally release` is already the right defensive line; keep it. → `05`.
+### R4 — Trace ordering depends on a single-clock assumption (low today, sound)
 
-### R5 — Trace sink has no backpressure and fails the whole flush on one bad write (LOW)
+**Verdict:** Event order is recovered by an emit-timestamp, which is *correct* while one process stamps all events, and *silently wrong* the day a second writer with its own clock joins.
 
-**Evidence:** `buffr/src/supabase-trace-sink.ts:87-93` — `pending[]` is unbounded;
-`flush()` uses `Promise.all`.
+**Evidence:**
+- `packages/runtime/src/events.ts:30-32` — `timestamp() = new Date().toISOString()`, a physical wall clock.
+- `buffr/src/supabase-trace-sink.ts:27-36` — `created_at = coalesce($8::timestamptz, now())`, persisting the *app's* emit stamp; `ORDER BY created_at` recovers order under racing inserts.
 
-**Failure it causes:** (a) No backpressure — `emit` is sync and never blocks, so if
-Postgres lags, `pending[]` grows unbounded with memory. (b) Poison message — one
-rejected insert rejects the whole `Promise.all`, failing the entire turn's trace
-persistence (throws out of `ask`). Both are inconsequential at one-agent-run scale
-(tiny per-turn buffer).
+**Failure that bites:** none today — one process, one clock, total order. The risk is *latent*: two concurrent writers with drifting clocks make `ORDER BY created_at` misorder causally-related events.
 
-**The move:** If trace volume grows, switch `Promise.all` → `Promise.allSettled`
-(persist what you can, collect failures) and bound the buffer with periodic flushing
-(flush every N events / T ms). → `06`.
+**Fix (when a second writer appears):** assign order at a single sequencing point (a DB sequence) or use a logical clock. Until then this is correct as written. → `06`, `07`
 
-## Lens inventory — every concept checked
+### R5 — Connection pool is untuned and the target port may not match the pooling mode (low)
 
-| Lens | Verdict | Evidence / note |
-| --- | --- | --- |
-| System map / failure domains | exercised | 4 domains: aptkit, Ollama, buffr, Postgres (`01`) |
-| Timeouts | **gap (R1)** | no per-call deadline on Ollama `fetch` |
-| Retries | exercised | cross-provider fallback chain (`fallback-provider.ts:50-88`) |
-| Failure classification | exercised | `shouldFallback` hook; `isAbortError` re-throw |
-| Backoff / jitter | `not yet exercised` | fallback tries next provider immediately (correct — different endpoint) |
-| Idempotency | exercised | `on conflict (id) do update` (`pg-vector-store.ts:49`) |
-| Idempotency keys (synthetic) | `not yet exercised` | natural keys suffice; no retried HTTP endpoint |
-| Delivery semantics | exercised | chunk=exactly-once; trace=at-least-once (no dedup); memory=at-most-once |
-| Exactly-once delivery | `not yet exercised` | impossible to claim; not built |
-| Consistency / read-your-writes | exercised | holds via single store+writer; breaks on swallowed `remember` (`04`) |
-| Stale replica reads | `not yet exercised` | one Postgres, no replica |
-| Eventual consistency | `not yet exercised` | single copy, nothing to converge |
-| Replication | `not yet exercised` | one node |
-| Partitioning / shard key | partial | `app_id` is a logical partition key, single-node (`05`) |
-| Quorum (R+W>N) | `not yet exercised` | one copy |
-| Connection pool (bounded resource) | **gap (R4)** | no checkout timeout (`db.ts:4-6`) |
-| Queues / streams | exercised | NDJSON trace + `pending[]` write queue (`06`) |
-| Ordering under races | exercised (R2) | `created_at` from emit timestamp |
-| Backpressure | **gap (R5)** | unbounded `pending[]`, sync emit |
-| Poison message handling | **gap (R5)** | `Promise.all` fails whole flush |
-| Wall vs logical clock | exercised | single-source wall time, valid (`07`) |
-| Leader election / lease | `not yet exercised` | one writer |
-| Split-brain | `not yet exercised` | no second would-be leader |
-| Distributed transactions / 2PC | `not yet exercised` | the dual write avoids it (`08`) |
-| Sagas / compensation | partial | `remember` = empty-compensation step; `indexDocumentRow` = uncompensated dual write |
-| Transactional outbox | `not yet exercised` | the fix for R3 if indexing goes async |
-| Reconciliation | `not yet exercised` | no orphan-doc repair job |
+**Verdict:** `createPool` passes only a connection string, so the pool runs at pg defaults (max 10, 30s idle). The configured `DATABASE_URL` points at port **5432** (direct), not Supabase's transaction-mode pooler on **6543** — fine for a single-process laptop runtime, a problem if many short-lived connections ever appear.
 
-## The priority order, one line each
+**Evidence:**
+- `buffr/src/db.ts` — `new pg.Pool({ connectionString })`, no `max`, `idleTimeoutMillis`, or `connectionTimeoutMillis`.
+- `.env` (observed) — `…supabase.co:5432/postgres`, the direct port, not `:6543`.
+
+**Failure that bites:** at single-process scale, none. If buffr ever runs many instances or a serverless fan-out, a 10-connection direct pool against Postgres exhausts connection slots fast; that's the case Supabase's 6543 pooler exists for.
+
+**Fix:** set explicit pool bounds and a `connectionTimeoutMillis` (so acquiring a connection itself has a deadline — the same R1 lesson at the pool); route through `:6543` if connection count grows. → `04`, `study-networking`
+
+### R6 — Partition-key vocabulary on filter columns (informational, not a bug)
+
+**Verdict:** `app_id` and the `kind` tag look like partition keys but are filter columns over a single node. No bug — but mislabeling them as shard keys would lead to wrong scaling decisions later.
+
+**Evidence:**
+- `buffr/sql/001_agents_schema.sql` — `app_id text not null default 'laptop'` on documents/chunks; every row shares one value, all on one primary.
+- `packages/memory` + `context.md` — `kind:'memory'` is a logical partition over a shared collection; `recall` over-fetches then filters client-side (the `minTopK` floor), because the `VectorStore` contract has no metadata predicate.
+
+**Failure that bites:** none functionally. The over-fetch tax is real but small at this corpus size.
+
+**Fix:** none needed; just name them correctly. They become a true shard key / partition only when a routing function or replica set consumes them. → `05`
+
+## Coverage check — every concept walked
 
 ```
-  R1  add per-call timeouts to Ollama fetch ........ unblocks the fallback chain (do first)
-  R4  add pool checkout timeout .................... same hazard, one layer down
-  R3  outbox for indexDocumentRow .................. only when indexing goes async
-  R5  allSettled + bounded buffer .................. only when trace volume grows
-  R2  keep created_at-ordered replay ............... already right; don't regress
+  Concept                        Status in this repo
+  ─────────────────────────────  ─────────────────────────────────────────
+  partial failure / timeouts     EXERCISED (the gap is the finding) — R1, 02
+  retries / backoff / jitter      retries: per-provider once; backoff/jitter: NOT YET — 02
+  circuit breaker                 NOT YET (chain records, never trips) — 02
+  idempotency / upsert            EXERCISED (on conflict id) — R3, 03
+  idempotency keys (model calls)  NOT YET — R3, 03
+  delivery semantics              EXERCISED (at-most/at-least/effective-once) — 03
+  consistency / read-your-writes  EXERCISED (single primary) — 04
+  eventual consistency / converge NOT YET (no replica; upsert is convergence-ready) — 04
+  replication / failover          NOT YET — 05
+  partitioning / shard key        logical (kind tag) yes; physical NOT YET — R6, 05
+  quorums (R+W>N)                  NOT YET (N=1) — 05
+  queues / brokers                NOT YET (no broker) — 06
+  streams / ordering              EXERCISED (NDJSON + emit-timestamp) — R4, 06
+  backpressure / poison msg       NOT YET (synchronous emit) — 06
+  clocks (physical)               EXERCISED (single-clock, sound) — R4, 07
+  logical clocks / happens-before NOT YET — 07
+  leader election / lease         NOT YET (single writer) — 07
+  split-brain                     NOT YET (can't have two leaders) — 07
+  saga / compensation             NOT YET (dual write is the missing saga) — R2, 08
+  transactional outbox            NOT YET — R2, 08
+  reconciliation                  NOT YET — R2, 08
+```
+
+## The one-line verdict per seam
+
+```
+  seam 1 (Ollama HTTP)   → R1: add a deadline. Highest leverage, smallest diff.
+  seam 2 (failover chain)→ R1/R3: advances on throw only; not idempotency-aware.
+  seam 3 (Postgres pool) → R4/R5: sound today; clock + pool assumptions are latent.
+  seam 4 (dual write)    → R2: a saga missing its envelope. Closest real bug.
 ```
 
 ## See also
 
-- `00-overview.md` — the ranked findings in context
+- `00-overview.md` — the map and the reading order
 - `02-partial-failure-timeouts-and-retries.md` — R1 in full
-- `08-sagas-outbox-and-cross-boundary-workflows.md` — R3 in full
-- `06-queues-streams-ordering-and-backpressure.md` — R2/R5 in full
-- **study-debugging-observability** — using the trace to detect these failures in practice
-- **study-system-design** — why the single-node shape was the right scale choice
-```
+- `08-sagas-outbox-and-cross-boundary-workflows.md` — R2 in full
+- `03-idempotency-deduplication-and-delivery-semantics.md` — R3 in full
+- `study-debugging-observability` — how you'd *detect* R1 (hang) and R2 (orphan) in production
+- `study-system-design` — the architectural framing of these same four seams

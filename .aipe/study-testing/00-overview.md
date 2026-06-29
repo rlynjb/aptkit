@@ -1,77 +1,84 @@
-# Overview — Testing in one page
+# Overview — the suite at a glance
 
-One screen, the whole testing story, before you open anything else.
+One page. The shape of aptkit's test suite, the numbers, and the single move
+that makes a non-deterministic system assertable.
+
+## Zoom out — where testing sits
 
 ```
-  aptkit testing — the whole picture
+  The suite across the system
 
-  ┌─ Test runner ────────────────────────────────────────────────┐
-  │  node --test  (built-in, zero test deps — no jest, no vitest) │
-  │  per package: node --test dist/test/*.test.js                 │
-  │  30 source .test.ts files across 14 packages                  │
-  └───────────────────────────────────┬───────────────────────────┘
-                                      │
-        ┌─────────────────────────────┼─────────────────────────────┐
-        ▼                             ▼                             ▼
-  ┌─ UNIT ────────────┐   ┌─ CONTRACT / REPLAY ───┐   ┌─ INTEGRATION ─────┐
-  │ pure functions    │   │ fake providers feed   │   │ real Postgres     │
-  │ scorers, parsers, │   │ recorded responses    │   │ (buffr, separate  │
-  │ vector math,      │   │ through real agents   │   │ repo)             │
-  │ prompt render     │   │ FixtureModelProvider  │   │ --test-concurrency│
-  │                   │   │ promoted fixtures =   │   │ =1, app_id='test' │
-  │                   │   │ correctness baselines │   │ skip if no DB URL │
-  └───────────────────┘   └───────────────────────┘   └───────────────────┘
-        │                             │                             │
-        └────────────── all deterministic ──────────┘   (DB-gated)
-                                      │
-                          ┌───────────▼────────────┐
-                          │ E2E (thin)             │
-                          │ Playwright smoke only  │
-                          │ tests/studio/          │
-                          │ studio-smoke.spec.ts   │
-                          │ no component/unit UI   │
-                          └────────────────────────┘
+  ┌─ Tooling ────────────────────────────────────────────────┐
+  │  node --test (built-in, zero deps) · Playwright (1 smoke) │
+  │  no jest, no vitest, no mock framework                    │
+  └────────────────────────────┬─────────────────────────────┘
+                               │ runs per package
+  ┌─ aptkit packages ──────────▼─────────────────────────────┐
+  │  runtime · tools · context · retrieval · memory ·        │
+  │  prompts · evals · workflows · providers · 6 agents      │
+  │  30 source test files (test/*.test.ts)        ★ HERE      │
+  └────────────────────────────┬─────────────────────────────┘
+                               │ same VectorStore / ModelProvider contracts
+  ┌─ buffr (companion repo) ───▼─────────────────────────────┐
+  │  5 db-gated tests · real Postgres · --test-concurrency=1 │
+  │  PgVectorStore implements aptkit's VectorStore           │
+  └────────────────────────────────────────────────────────────┘
 ```
 
-## The verdict, ranked
+## The numbers (verified)
 
-1. **The injected-contract design makes the whole suite fast and
-   network-free.** Every provider (`GemmaModelProvider({ chat })`,
-   `OllamaEmbeddingProvider({ embed })`, `FallbackModelProvider({ providers })`)
-   takes its expensive I/O as a constructor argument. Tests pass a fake; no
-   `:11434`, no cloud key, no flake. This is the single best thing about the
-   suite. → `01-injectable-transport-seam.md`
+- **30 source test files** — `grep -rl "node:test" packages`, counting
+  `test/*.test.ts` only (not built `dist/` copies).
+- **Runner:** Node's built-in (`node --test dist/test/*.test.js` per package).
+  Zero test dependencies. TDD throughout.
+- **1 e2e:** `tests/studio/studio-smoke.spec.ts` (Playwright, 111 lines, dev
+  server on port 4187).
+- **buffr:** 5 integration tests against real Postgres, env-gated on
+  `DATABASE_URL`, serial (`--test-concurrency=1`).
+- **8 promoted fixtures** across 4 analytics agents
+  (`packages/agents/*/fixtures/promoted/*.json`) — timestamped golden masters.
 
-2. **The biggest coverage gap is the agent loop itself.** `runAgentLoop`
-   (`packages/runtime/src/run-agent-loop.ts`) — the bounded loop that is the
-   spine of every agent — has **no direct unit test**. It's exercised only
-   transitively through agent tests. Its `maxTurns` budget, `forceFinal` last
-   turn, and abort handling are not pinned in isolation. → audit lens 1.
+## The one move
 
-3. **The AI seam is tested at the deterministic boundary, correctly.** Prompt
-   assembly, tool dispatch, output parsing, retry-on-bad-JSON, fixture
-   replay — all the *deterministic* parts of the LLM features have tests. The
-   *probabilistic* part (is the answer good?) hands off to study-ai-engineering
-   via the eval scorers. The line is drawn in the right place. → audit lens 6.
+Everything testable here traces to **dependency inversion on the model
+boundary.** The agents depend on a port, not a vendor SDK:
 
-## What's strong
+```
+  Why the suite is deterministic — the seam
 
-- Error paths are tested as first-class, not afterthoughts: abort signals,
-  dimension mismatch (throws loud), retry-then-give-up, fallback exhaustion,
-  zero-denominator scoring. The boundary conditions get their own `it()`.
-- A real bug became a named regression test (the hallucinated `{textContains}`
-  filter). → `03-regression-test-from-a-real-bug.md`
-- Determinism is engineered, not lucky: fake embedders are keyword-presence
-  hashes, fixtures are recorded byte-for-byte, tool-use ids are a counter not
-  a UUID — so cross-turn uniqueness is testable.
+  ┌─ agent code (under test, runs UNCHANGED) ─┐
+  │  prompt → runAgentLoop → tool → parse     │
+  └────────────────────┬───────────────────────┘
+                       │ ModelProvider.complete()   ← the seam
+        ┌──────────────┴──────────────┐
+        ▼ in test                     ▼ in production
+  FixtureModelProvider          GemmaModelProvider / Anthropic / OpenAI
+  (replays recorded             (real model, real network)
+   ModelResponse[])
+```
 
-## What's missing (honest gaps)
+Swap the adapter at the seam, the assembly above is unchanged. In test it's a
+fake replaying recorded responses; in production it's a real model. Same port.
+That's why `recommendation-agent.test.ts` can assert the *exact* trace event
+sequence and the *exact* assigned id — nothing above the seam is random.
 
-- No direct `runAgentLoop` test (gap #2 above).
-- No UI component/unit tests for Studio — only a repo-level Playwright smoke
-  spec that clicks cards and checks headings render.
-- `rubric-improvement` has no `replay:promoted` script wired into the root
-  pipeline (other agents do), so its trajectory isn't regression-guarded the
-  same way.
-- The one true integration test (real Postgres) lives in buffr and is `skip`ped
-  unless `DATABASE_URL` is set — green CI does not prove the pgvector binding.
+## The verdict (full version in audit.md)
+
+**Strong** where it counts: the load-bearing contracts (`ModelProvider`,
+`EmbeddingProvider`, `VectorStore`) and the deterministic AI boundaries (prompt
+assembly, tool dispatch, output parsing, decode/retry) are all directly tested.
+Error paths — retry, give-up, abort, dimension-mismatch, fallback-exhaustion,
+scorer well-formedness — are tested, not just happy paths. No network, time, or
+randomness in any aptkit test.
+
+**Three gaps, ranked:**
+1. `runAgentLoop` — the orchestration kernel — has no direct unit test (only
+   transitive via 6 agents). Cheap to fix; highest leverage.
+2. No shared `VectorStore` contract test across aptkit's `InMemoryVectorStore`
+   and buffr's `PgVectorStore` — `not yet exercised`.
+3. `rubric-improvement` has no `replay:promoted` script (the other 4 agents do)
+   — its golden-master path is `not yet exercised`.
+
+**Accepted, not a gap:** no Studio UI unit tests. Studio is a manual preview
+harness displaying traces tested upstream; the Playwright smoke guards boot +
+replay. Adding component tests would test the harness, not the product.

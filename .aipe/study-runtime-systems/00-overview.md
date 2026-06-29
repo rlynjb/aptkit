@@ -1,83 +1,74 @@
-# Study — Runtime Systems (aptkit, as-built)
+# Study — Runtime Systems (aptkit)
 
-Where does work execute, what does it own, and what breaks under concurrency or overload? This guide answers that for aptkit specifically — the bounded agent loop, the provider transports, the in-memory vector scan, the NDJSON stream, and the Studio browser app — grounded in real files.
+*The execution model inside the repo: where work runs, what it owns, and what breaks under concurrency or overload.*
 
-## Verdict first — the shape of execution in this repo
+aptkit is a provider-neutral TypeScript monorepo that runs on **one Node process, on one thread, on one event loop**. Everything below hangs off that fact. There are no worker threads, no child processes in the request path, no cluster, no real OS-level parallelism anywhere in the product code. The only `child_process` import in the whole tree is `spawnSync` inside a packaging script (`scripts/pack-core-standalone.mjs:5`) — build-time, not runtime. So when you ask "where does work execute," the honest answer for aptkit is: *right here, on this one stack, one task at a time.*
+
+That sounds like a limitation. It's actually the design. aptkit is a library of agent capabilities (the bounded loop, provider adapters, a from-scratch RAG pipeline, episodic memory) that gets *consumed* by a deployment "body" — buffr — which owns the real process lifecycle and durable storage. aptkit's job is to be a clean set of `async` functions and classes that a host can call. The runtime concerns it actually exercises are narrow and sharp:
+
+- **A bounded `async` loop** (`runAgentLoop`) that drives a model–tool conversation under hard iteration and tool-call budgets, threaded end-to-end with an `AbortSignal`.
+- **`async`/`await` over network I/O** — every model call and embedding call is a `fetch()` to a local Ollama HTTP endpoint, awaited on the event loop.
+- **One synchronous CPU loop that matters** — the cosine-similarity scan in `InMemoryVectorStore.search`, which runs to completion on the event loop and blocks everything else while it does.
+- **NDJSON streaming** out of the Studio dev server, written chunk-by-chunk to an HTTP response.
+
+## The runtime in one diagram
 
 ```
-  aptkit's runtime, in one frame
+  aptkit — one process, one thread, one event loop
 
-  ┌─ Process boundary: ONE Node process (CLI / test / Vite dev server) ─────┐
-  │                                                                          │
-  │   ┌─ libuv event loop ─────────────────────────────────────────────┐   │
-  │   │                                                                  │   │
-  │   │   runAgentLoop ──await──► model.complete() ──await──► tools      │   │
-  │   │   (sequential for-loop)   (HTTP via fetch)            (await)     │   │
-  │   │         │                                                        │   │
-  │   │         └── CPU work runs INLINE on this one thread:             │   │
-  │   │             cosine scan, JSON.parse, sort — no worker offload    │   │
-  │   └──────────────────────────────────────────────────────────────────┘ │
-  │                                                                          │
-  │   No worker_threads · no child_process (except npm pack) · no cluster    │
-  │   No SIGTERM/SIGINT handler · no graceful shutdown · single process      │
-  └──────────────────────────────────────────────────────────────────────────┘
-                              │ NDJSON over HTTP (Studio dev server only)
-                              ▼
-  ┌─ Browser process: apps/studio (React 18, its own event loop) ───────────┐
-  │   fetch() → ReadableStream.getReader() → decodeNdjsonStream (async gen)   │
-  └──────────────────────────────────────────────────────────────────────────┘
+  ┌─ Node process (single) ───────────────────────────────────────┐
+  │                                                                │
+  │   call stack (one)            event loop (libuv underneath)    │
+  │   ┌──────────────┐            ┌─────────────────────────────┐  │
+  │   │ runAgentLoop │            │ macrotask queue             │  │
+  │   │  await ──────┼───────────►│  (fetch callbacks, timers)  │  │
+  │   │              │            ├─────────────────────────────┤  │
+  │   │ cosine scan  │◄── BLOCKS  │ microtask queue             │  │
+  │   │  (sync, O(n·d))│  the loop │  (Promise .then continuations)│ │
+  │   └──────────────┘            └─────────────────────────────┘  │
+  │                                                                │
+  │   no threads · no workers · no child_process in hot path       │
+  └────────────────────────────────┬───────────────────────────────┘
+                                    │  fetch() over HTTP (awaited)
+                          ┌─────────▼──────────┐
+                          │ Ollama :11434      │  local model + embeddings
+                          └────────────────────┘
 ```
 
-The call here: **aptkit is a single-process, single-threaded, async-I/O-bound TypeScript runtime.** Almost everything that takes time is a network `await` (an HTTP call to Ollama or a cloud SDK). The CPU work that exists — cosine similarity, JSON parsing, array sorts — runs inline on the same event-loop thread and is small at current scale. There is no thread pool you wrote, no worker, no OS-level parallelism. The Studio is a separate browser process with its own event loop, reached only over HTTP NDJSON.
+## The ranked findings — what to look at first
 
-## The most consequential mechanisms, ranked
+**1. The bounded agent loop is the load-bearing runtime mechanism, and its budget is the whole point.** `runAgentLoop` (`packages/runtime/src/run-agent-loop.ts:76-202`) is a `for` loop over turns with two hard ceilings — `maxTurns` and `maxToolCalls` — plus a *forced final synthesis turn* that strips the tools away so the model has to answer instead of asking for more data (`run-agent-loop.ts:101-109`). Strip the budget out and a confused local model loops forever calling `search_knowledge_base`. This is the single most important thing to understand in the repo's execution model. → `03-event-loop-and-async-io.md`, `07-backpressure-bounded-work-and-cancellation.md`.
 
-1. **The bounded agent loop (`runAgentLoop`, `packages/runtime/src/run-agent-loop.ts:76`).** A sequential `for` loop with a hard `maxTurns` bound, a `maxToolCalls` budget, a forced final synthesis turn, and `signal.throwIfAborted()` at the top of every iteration. This is the single most important runtime structure in the repo — every agent's execution, cost, and cancellation behavior flows through it. → `02`, `07`.
+**2. Cancellation is threaded correctly and completely; shutdown is not threaded at all.** Every `async` entry point takes an `AbortSignal` and calls `signal?.throwIfAborted()` at each await boundary — the loop (`run-agent-loop.ts:99`), every provider (`gemma-provider.ts:53,63`, `fallback-provider.ts:52`, `context-window-guard.ts:58`), the tool registry (`tool-registry.ts:55`), the embedder (`ollama-embedding-provider.ts:51`), and the NDJSON stream (`ndjson-stream.ts:112,123`). That's textbook cooperative cancellation. But there is **no `SIGTERM`/`SIGINT` handler anywhere** in the product code — graceful shutdown is `not yet exercised` here because aptkit isn't the process owner; buffr is. → `07-backpressure-bounded-work-and-cancellation.md`.
 
-2. **The in-memory cosine scan (`InMemoryVectorStore.search`, `packages/retrieval/src/in-memory-vector-store.ts:25`).** The one place real CPU work happens in the hot path — an `async` method with no `await` inside, doing an O(n·d) loop plus a full sort, blocking the event loop for its whole duration. Fine at corpus sizes of dozens; the first thing that bites under scale. → `03`, `05`.
+**3. There is exactly one synchronous hot loop, and it sits on the event loop with no yield.** `InMemoryVectorStore.search` (`packages/retrieval/src/in-memory-vector-store.ts:25-33`) scans every chunk and computes a full cosine similarity (`O(n·d)`, d = 768) in a tight `for` loop, then sorts. No `await` inside it, so for the duration of the scan nothing else on the event loop runs — not other requests, not timers, not the GC's incremental work. At demo corpus sizes this is microseconds and invisible. It's named here because it's the one place in aptkit where CPU work and the event loop collide, and it's the seam where `PgVectorStore` (in buffr) moves the scan off-process. → `03-event-loop-and-async-io.md`, cross-link `study-performance-engineering`.
 
-3. **The sequential fallback chain (`FallbackModelProvider.complete`, `packages/providers/fallback/src/fallback-provider.ts:47`).** A try/catch `for` loop over providers, each `await`ed in turn, with abort short-circuiting. Combined with Gemma's retry loop and structured-generation's retry, aptkit's failure handling is "retry in sequence, never in parallel." → `02`, `07`.
+## `not yet exercised` in this repo
+
+- **Threads / workers / `worker_threads`** — none. All work is on the main thread.
+- **Multi-process / `cluster` / child processes in the request path** — none (`spawnSync` is build-only).
+- **Real concurrency** — no `Promise.all`, `Promise.race`, or `Promise.allSettled` in product code; awaits are strictly sequential. Concurrent fan-out is `not yet exercised`.
+- **Backpressure / a concurrency limiter / a queue** — none. Nothing bounds *how many* loops run at once; the bounds are *within* one loop.
+- **Graceful shutdown** — no `SIGTERM` handler, no in-flight-request draining.
+- **Shared mutable state across concurrent tasks** — the only mutable instance state (`GemmaModelProvider.toolUseCount`) is safe *only because* there's no real concurrency. → `04-shared-state-races-and-synchronization.md`.
+- **Manual GC tuning / heap-limit configuration / streams with explicit backpressure** — none; relies on V8 defaults and full-buffer reads.
 
 ## Reading order
 
 ```
-  01-runtime-map                          the process / task / resource map as-built
-   ↓
-  02-processes-threads-and-tasks          one process, async tasks, no threads
-   ↓
-  03-event-loop-and-async-io              the libuv loop, await points, the blocking scan
-   ↓
-  04-shared-state-races-and-synchronization   why single-thread JS sidesteps most races
-   ↓
-  05-memory-stack-heap-gc-and-lifetimes   allocation, the buffered-everything choices, GC
-   ↓
-  06-filesystem-streams-and-resource-lifecycle   fs.promises, the NDJSON stream, descriptors
-   ↓
-  07-backpressure-bounded-work-and-cancellation  maxTurns, AbortSignal, the missing pieces
-   ↓
-  08-runtime-systems-red-flags-audit      ranked execution-model risks
+  01-runtime-map                      the process/task/resource map as-built
+  02-processes-threads-and-tasks      why it's one thread, what a "task" is here
+  03-event-loop-and-async-io          the await chain + the one blocking scan
+  04-shared-state-races               why no locks are needed (yet)
+  05-memory-stack-heap-gc             allocation shape, the full-buffer reads
+  06-filesystem-streams-lifecycle     fs reads + NDJSON streaming + handle cleanup
+  07-backpressure-bounded-cancellation  the budget, the signal, the missing shutdown
+  08-runtime-systems-red-flags-audit  ranked execution-model risks
 ```
 
-## `not yet exercised` in this repo
+## Cross-links to neighboring guides
 
-These are real runtime-systems concerns the codebase does not currently touch. Each file says when it would become relevant.
-
-- **OS threads / `worker_threads` / `cluster`** — none anywhere. All CPU work is on the main thread. (`02`, `05`)
-- **`child_process` for real work** — only `spawnSync` in `scripts/pack-core-standalone.mjs:68` to shell out to `npm pack`; never for concurrent or hot-path work. (`02`)
-- **Filesystem streaming** — every file read/write is buffered (`fs.promises.readFile`/`writeFile`); no `createReadStream`/`createWriteStream`. (`06`)
-- **Backpressure on the producer side** — the agent loop has no queue, no concurrency limiter (`p-limit`), no rate limiter. Bounds are on iteration count, not on throughput. (`07`)
-- **Signal handling / graceful shutdown** — no `process.on('SIGTERM'/'SIGINT')`, no drain-then-exit. (`07`)
-- **Locks / atomics / channels / shared-memory concurrency** — none, and on a single thread mostly unnecessary; the one shared-state seam is the `lastSelectedProvider` mutation. (`04`)
-- **Parallel fan-out** — no `Promise.all`/`allSettled`/`race` over independent work anywhere in `packages/`. Embedding, indexing, and provider fallback are all strictly sequential. (`02`, `03`)
-
-## Partition — what lives here vs next door
-
-```
-  study-runtime-systems   HOW code executes inside one machine/runtime (this guide)
-  study-system-design     WHERE components live, how requests cross boundaries
-  study-distributed-systems  coordination across processes under partial failure
-  study-performance-engineering  measuring + optimizing the costs named here
-  study-networking        the HTTP/transport layer the awaits sit on
-```
-
-Cross-links to neighbors appear at the seams inside each file.
+- **`study-performance-engineering`** — the cost of the `O(n·d)` cosine scan, the full-buffer reads, and where batching/limits would go. This guide says *where* work runs; that one says *how fast and how expensive*.
+- **`study-distributed-systems`** — the fallback chain, partial failure across providers, and what happens when aptkit's single process is one node in buffr's larger system.
+- **`study-networking`** — the `fetch()` transport, HTTP semantics against Ollama, timeouts, and retries. This guide treats the network call as "an await that suspends the loop"; that one treats it as a protocol exchange.
+- **`study-system-design`** — *where* components live and how requests cross the aptkit↔buffr boundary, vs. this guide's *how code executes inside one machine*.

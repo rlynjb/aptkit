@@ -1,189 +1,204 @@
-# 02 · Records, Pages, and Storage Layout
+# Records, Pages, and Storage Layout
 
-**Industry name(s):** row/heap storage, tuple layout, page locality. **Type:** Industry standard.
+**Industry name:** physical storage layout / heap tuples / TOAST · *Industry standard*
 
-## Zoom out, then zoom in
+## Zoom out — where the bytes live
 
-You know a DB table as rows and columns — a primary key, some fields, maybe a JSON blob. That mental model is exactly right; this file zooms into what one of those rows *physically is* once it hits disk, and why the shape of a row decides what a query costs.
-
-```
-  Zoom out — where a record lives in the stack
-
-  ┌─ Pipeline (aptkit) ────────────────────────────────────┐
-  │  indexDocument: chunk text → embed → build VectorChunk  │
-  └────────────────────────────┬────────────────────────────┘
-                               │  upsert(chunks)
-  ┌─ Store layer ──────────────▼────────────────────────────┐
-  │  InMemoryVectorStore: VectorChunk as a JS object in a Map│
-  │  PgVectorStore:        ★ a ROW in agents.chunks ★        │ ← we are here
-  └────────────────────────────┬────────────────────────────┘
-                               │
-  ┌─ Disk (Supabase Postgres) ─▼────────────────────────────┐
-  │  heap pages (8 KB) · the vector(768) column · TOAST      │
-  └──────────────────────────────────────────────────────────┘
-```
-
-Zoom in: the concept is **the record** — the unit a store writes and reads — and its **locality**, meaning what data sits next to what on disk. In aptkit a record is a `VectorChunk` object; in buffr it's a tuple in a heap page. The interesting tension: a 768-float embedding is a *big* field, and where Postgres puts it changes the cost of a scan.
-
-## The structure pass
-
-**Layers.** A record exists at three altitudes: the logical record (the `VectorChunk` type both stores agree on), the in-memory representation (a JS object), and the on-disk tuple (Postgres heap page). Same record, three physical forms.
-
-**Axis — trace "how much does it cost to read one record fully?" across the two stores:**
+A row isn't a row to the engine — it's bytes packed into a fixed-size page
+on disk. Before any index or query, that's the substrate. Here's where the
+`chunks` row sits in the stack:
 
 ```
-  One question across the two stores: "cost to read one full record?"
+  Zoom out — from a chunk object to bytes on disk
 
-  ┌─ InMemoryVectorStore ───────────────┐
-  │  VectorChunk is one JS object        │ → pointer deref, O(1), but ALL in RAM
-  └──────────────────────────────────────┘
-  ┌─ PgVectorStore / Postgres ──────────┐
-  │  tuple in a heap page (~8 KB)        │ → fetch page from disk/cache;
-  │  768-float embedding ≈ 3 KB inline   │   big embedding bloats the page
-  └──────────────────────────────────────┘
-
-  the cost flips at the disk boundary — RAM has no page cost; Postgres pays per page
+  ┌─ Contract layer (aptkit) ─────────────────────────────────┐
+  │  VectorChunk { id, vector: number[768], meta }            │
+  └───────────────────────────┬───────────────────────────────┘
+                              │ PgVectorStore serializes
+  ┌─ Logical row (Postgres) ──▼───────────────────────────────┐
+  │  ★ agents.chunks row ★                                    │ ← we are here
+  │  id · document_id · app_id · chunk_index · content ·      │
+  │  embedding vector(768) · embedding_model · meta jsonb     │
+  └───────────────────────────┬───────────────────────────────┘
+                              │ stored as a heap tuple
+  ┌─ Physical layout (engine) ▼───────────────────────────────┐
+  │  8KB heap page  →  tuple  →  big columns TOASTed out-of-row│
+  └────────────────────────────────────────────────────────────┘
 ```
 
-**Seam.** The boundary is the `upsert` call: above it, the pipeline hands over a uniform `VectorChunk`; below it, each store decides physical layout independently. The `meta` field is the seam's pressure point — it's `Record<string, unknown>` in memory and `jsonb` on disk, and the embedding is a typed array in memory and a `vector(768)` column on disk.
+## Zoom in — what this file covers
+
+The question: **what does one `chunks` row physically cost to store, and
+where does the 768-float embedding actually go?** That `vector(768)` column
+is the interesting part — it's far bigger than a normal scalar, and Postgres
+has a specific answer for big columns.
+
+## Structure pass
+
+**Layers.** The logical row (what SQL sees) sits on top of the heap tuple
+(what the engine stores), which sits on the 8KB page (what the disk holds).
+
+**Axis — trace "how big, and stored where?" across the columns.**
+
+```
+  One question across the columns: "size, and inline or out-of-row?"
+
+  id text          → small, inline
+  app_id text      → small, inline
+  chunk_index int  → 4 bytes, inline
+  content text     → ~512 chars, inline-ish (may TOAST if large)
+  embedding        → 768 × 4 bytes ≈ 3KB ← the heavy one
+    vector(768)       big enough to get TOASTed out of the main page
+  meta jsonb       → small, inline
+
+  the embedding column is where the axis-answer flips: everything
+  else is inline; the vector is large enough to leave the row
+```
+
+**Seam.** The seam is the **inline / out-of-row boundary** (Postgres's TOAST
+threshold, ~2KB). The `vector(768)` column at ~3KB crosses it: the row's
+main heap tuple holds a pointer, the actual 3KB of floats lives in a TOAST
+side-table. That's the joint where "one row" stops being one contiguous
+chunk of bytes. *Inference* — buffr never inspects physical layout; this is
+standard Postgres behavior for a column of this size.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-Think of a record like a single rendered list item with a fixed set of fields — except some fields are tiny (an id string) and one field is huge (768 floats ≈ 3 KB). The shape of the record is fixed by the pipeline; the *storage* decision is where that huge field goes.
+You know how a JS object with a big nested array doesn't store the array
+*inside* the object header — it stores a pointer to a separately-allocated
+buffer? A Postgres row with a 3KB embedding does the same thing. The row's
+main tuple is small and lives on the page with its neighbors; the fat vector
+gets pushed to a side-table and referenced by pointer.
 
 ```
-  The record shape — fixed by the pipeline, stored two ways
+  Heap page layout — the chunks row (inferred, standard Postgres)
 
-   VectorChunk (logical)          agents.chunks row (physical)
-   ┌──────────────────┐           ┌────────────────────────────┐
-   │ id      "doc#3"   │           │ id text PK    "doc#3"      │
-   │ vector  [768 nums]│  ───────► │ embedding vector(768) ~3KB │ ◄ the heavy field
-   │ meta    {docId..} │           │ meta jsonb    {...}        │
-   └──────────────────┘           │ + document_id, app_id,     │
-                                   │   chunk_index, content,    │
-                                   │   embedding_model          │
-                                   └────────────────────────────┘
+  ┌─ 8KB heap page ──────────────────────────────────────┐
+  │ page header                                          │
+  │ ┌─ tuple (chunk A) ─────────────────────────────────┐│
+  │ │ xmin/xmax (MVCC) · id · app_id · chunk_index ·    ││
+  │ │ content · embedding→[TOAST ptr] · meta            ││
+  │ └────────────────────────────────────────────────────┘│
+  │ ┌─ tuple (chunk B) ───────────────────┐               │
+  │ │ ...                  embedding→[ptr] │               │
+  │ └──────────────────────────────────────┘               │
+  └───────────────────────────────────────────────────────┘
+              │ TOAST pointer dereferences to
+              ▼
+  ┌─ TOAST side-table ───────────────────────────────────┐
+  │ chunk A's 768 floats (~3KB, possibly compressed)     │
+  │ chunk B's 768 floats                                 │
+  └───────────────────────────────────────────────────────┘
 ```
 
-The kernel: **the id is the locality key.** It's `<docId>#<chunkIndex>` in both stores — that's what makes upsert idempotent and what determines which records cluster together.
+### Move 2 — the moving parts
 
-### Move 2 — the walkthrough
+**The MVCC header on every tuple.** Each heap tuple carries hidden
+`xmin`/`xmax` system columns — the transaction IDs that created and deleted
+it. You never see them in `001_agents_schema.sql`, but they're physically
+there on every row, and they're what makes MVCC work (→ `06`). The
+consequence: a "deleted" or "updated" row isn't gone — it's a dead tuple
+marked by `xmax`, reclaimed later by vacuum.
 
-**The id format is the locality decision.** The pipeline builds chunk ids as `<docId>#<index>`:
+**The vector column's serialization.** aptkit hands the store a
+`number[768]`. buffr serializes it to pgvector's text literal `[0.1,0.2,...]`
+before the `INSERT`:
 
 ```ts
-// packages/retrieval/src/pipeline.ts (indexDocument)
-const chunks = texts.map((text, i) => ({
-  id: `${doc.id}#${i}`,                          // "guide.md#0", "guide.md#1", ...
-  vector: vectors[i]!,
-  meta: { ...(doc.meta ?? {}), docId: doc.id, chunkIndex: i, text },  // text carried IN the row
-}));
-```
-
-Two things matter. First, `id` is a text primary key — in Postgres that's a b-tree on a string, so upsert-by-id is a b-tree lookup (see 03). Second, **the chunk text is duplicated into `meta.text`** so a search hit can cite the passage without a second lookup. That's a deliberate denormalization: the record carries its own citation payload, trading storage for one fewer read.
-
-**In memory: the record is just the object.** No serialization, no page:
-
-```ts
-// packages/retrieval/src/in-memory-vector-store.ts:19-22
-for (const chunk of chunks) {
-  this.assertDimension(chunk.vector, `chunk "${chunk.id}"`);
-  this.chunks.set(chunk.id, chunk);              // the VectorChunk object IS the stored record
+// buffr/src/pg-vector-store.ts:14-17
+function toVectorLiteral(v: number[]): string {
+  return `[${v.join(',')}]`;          // JS array → "[0.1,0.2,...]"
 }
+//  then bound as $6::vector in the INSERT (line 49) — Postgres parses
+//  the literal into pgvector's packed float4[768] on-disk form (~3KB)
 ```
 
-The 768-float vector lives as a JS `number[]` — 768 × 8 bytes ≈ 6 KB per record in V8's heap, all resident. There is no page, no eviction, no cold read. The cost model is "is the process alive and does it have RAM." That's why this store is fine for tests and a few hundred docs and falls over for a real corpus — it's all in memory, always.
+That `::vector` cast is the line where a JS array becomes a fixed-width
+binary vector the HNSW index can operate on. Get the dimension wrong and the
+cast still succeeds but the index is corrupt — which is exactly why both the
+store and the pipeline assert the dimension *before* the write
+(`pg-vector-store.ts:32-36`, `pipeline.ts` `assertWiring`). Fail loud at
+wiring time, never silently store an unsearchable vector.
 
-**On disk: the tuple, the page, and the heavy embedding.** buffr maps the same record onto a row, splitting `meta` into typed columns plus the jsonb:
+**Locality — what's stored next to what.** Chunks of the same document share
+an `id` prefix (`<docId>#<index>`, set in aptkit's `pipeline.ts`
+`indexDocument`) but Postgres stores them in **insertion order on the heap**,
+not clustered by document. There's no `CLUSTER` and no clustered index. The
+consequence: reading all chunks of one document is not a sequential scan of
+adjacent pages — it's scattered. buffr never reads "all chunks of a
+document," though; it only ever does ANN search, so this costs nothing here.
+*Observed*: no `CLUSTER` statement anywhere in `sql/`.
 
-```ts
-// buffr/src/pg-vector-store.ts:43-56
-const docId = typeof c.meta.docId === 'string' ? c.meta.docId : null;
-const chunkIndex = typeof c.meta.chunkIndex === 'number' ? c.meta.chunkIndex : 0;
-const content = typeof c.meta.text === 'string' ? c.meta.text : '';
-await client.query(
-  `insert into agents.chunks (id, document_id, app_id, chunk_index, content, embedding, embedding_model, meta)
-   values ($1, $2, $3, $4, $5, $6::vector, $7, $8)
-   on conflict (id) do update set ...`,         // upsert = insert-or-overwrite by PK
-  [c.id, docId, this.appId, chunkIndex, content, toVectorLiteral(c.vector), this.embeddingModel, c.meta],
-);
-```
-
-Watch the layout decision. The in-memory `meta` blob is *destructured* into real columns — `document_id`, `chunk_index`, `content` — and the leftover `meta` goes into `jsonb`. The vector is serialized to pgvector's text literal `[0.1,0.2,...]` (`toVectorLiteral`, `buffr/src/pg-vector-store.ts:15-17`) then cast `::vector`.
-
-Now the physical reality: Postgres stores tuples in **8 KB heap pages**. A `vector(768)` is roughly 768 × 4 bytes + header ≈ 3.1 KB. So each `agents.chunks` row carries a ~3 KB embedding plus the `content` text plus jsonb. Two consequences:
-
-- **Wide rows mean fewer tuples per page.** A page that would hold dozens of skinny rows holds only a couple of chunk rows once the embedding is inline. A sequential scan reads more pages for the same row count.
-- **TOAST is in play.** Postgres moves oversized field values to a side table (TOAST) when a row exceeds ~2 KB. Whether the `vector(768)` and `content` get TOASTed depends on size; an HNSW index scan reads the embedding repeatedly, so TOAST de-toasting cost is real. This is **`not yet exercised`** — no one has run `EXPLAIN (ANALYZE, BUFFERS)` to see page/TOAST behavior. The mechanism is there; the measurement isn't.
-
-**Layers-and-hops — building a row from a chunk in buffr:**
-
-```
-  Layers-and-hops — one VectorChunk becoming one heap tuple
-
-  ┌─ pipeline (aptkit) ─┐ hop 1: VectorChunk {id,vector,meta}  ┌─ PgVectorStore ─┐
-  │ indexDocument       │ ───────────────────────────────────►│ destructure meta │
-  └─────────────────────┘                                     └────────┬─────────┘
-                                       hop 2: INSERT ... $6::vector     │
-                                                                        ▼
-                                                          ┌─ Postgres heap ──────┐
-                                                          │ tuple in 8KB page    │
-                                                          │ embedding ~3KB inline│
-                                                          │ overflow → TOAST     │
-                                                          └──────────────────────┘
-```
+**The `app_id` column on every row.** Every table carries
+`app_id text not null default 'laptop'` (`001_agents_schema.sql:6,17`). It's
+a tenant key — physically just another small inline column, logically the
+partition that every `search` filters on (`where app_id = $2`,
+`pg-vector-store.ts:74`). Storage cost is trivial; its query role is in `04`.
 
 ### Move 3 — the principle
 
-Where the heaviest field of a record physically lives decides the cost of every scan over it. The pipeline made one record shape; the in-memory store pays for it in RAM, Postgres pays for it in page count and TOAST. The general lesson: a record isn't free-form — its width and its big columns are a storage-cost decision, and you can't reason about query speed without knowing the page layout.
+The cost model of a row is "small columns inline, big columns out-of-row,
+plus an invisible MVCC header on every tuple." The moment a table has a
+column measured in kilobytes — an embedding, a large JSON blob, a document
+body — you've left the world where "a row is one page read" and entered the
+world where one logical row can mean a heap fetch *plus* a TOAST fetch. For a
+vector table, that's the norm, not the exception.
 
 ## Primary diagram
 
 ```
-  Full storage layout — one chunk, two physical forms
+  Storage layout recap — agents.chunks
 
-  VectorChunk (pipeline, logical)
-        id = "guide.md#3"  ·  vector[768]  ·  meta{docId,chunkIndex,text}
-                 │                                   │
-       ┌─────────┘ upsert                            └────────┐
-       ▼ (aptkit)                                             ▼ (buffr)
-  ┌─ InMemoryVectorStore ──────┐         ┌─ Postgres: agents.chunks ──────────────┐
-  │ Map["guide.md#3"] = object │         │ heap page (8 KB)                        │
-  │ vector: number[768] in RAM │         │  ┌ tuple ─────────────────────────────┐│
-  │ ~6 KB V8 heap, resident    │         │  │ id PK · document_id · app_id        ││
-  │ NO page, NO disk           │         │  │ chunk_index · content               ││
-  └────────────────────────────┘         │  │ embedding vector(768) ~3 KB  ──► TOAST?
-                                          │  │ embedding_model · meta jsonb        ││
-                                          │  └─────────────────────────────────────┘│
-                                          └─────────────────────────────────────────┘
+  logical row (SQL)            physical (engine)
+  ─────────────────            ─────────────────
+  id           ─────────────►  ┌─ heap tuple (small, on 8KB page) ─┐
+  app_id       ─────────────►  │ xmin/xmax · id · app_id ·          │
+  chunk_index  ─────────────►  │ chunk_index · content · meta ·     │
+  content      ─────────────►  │ embedding → [TOAST pointer] ───────┼─┐
+  meta jsonb   ─────────────►  └────────────────────────────────────┘ │
+  embedding                                                            │
+   vector(768) ──── ~3KB, exceeds TOAST threshold ────────────────────┘
+                                          ▼
+                              ┌─ TOAST side-table ─┐
+                              │ 768 float4 values  │
+                              └────────────────────┘
 ```
 
 ## Elaborate
 
-Heap storage and 8 KB pages are Postgres fundamentals; the pgvector twist is that an embedding is an unusually wide fixed-size field, so vector tables are "fat-row" tables by nature. The denormalization of `content`/`meta.text` into the row is a RAG idiom — you want the passage text co-located with its vector so a hit can be cited in one read (`toResult` in `search-knowledge-base-tool.ts:108-118` reads `meta.text` directly). buffr's record also adds an `embedding_model` column (`'nomic-embed-text:v1.5'`), recording *which* embedder produced the vector — schema-level provenance so a future re-embed can be detected. Read next: 03 for the index over this `embedding` column, 04 for the scan that reads these pages.
+TOAST (The Oversized-Attribute Storage Technique) is Postgres's answer to a
+fixed 8KB page size: a row can't exceed a page, so any oversized attribute
+gets compressed and/or moved to a side-table transparently. pgvector's
+`vector` type is a variable-length type that rides this machinery. You don't
+configure it and buffr doesn't — it's automatic. The reason it's worth
+knowing: it explains why a vector table's working set on disk is bigger than
+`rows × dimension × 4 bytes` suggests, and why the HNSW index (`03`), which
+holds vectors in its own structure, is what actually makes search fast rather
+than the heap layout.
 
 ## Interview defense
 
-**Q: A `vector(768)` row is fat. Why does that matter for reads?**
+**Q: Your chunks table has a `vector(768)` column. What happens to it physically?**
+At ~3KB it exceeds Postgres's TOAST threshold, so the main heap tuple stores
+a pointer and the actual floats live in a TOAST side-table. The small columns
+(`id`, `app_id`, `chunk_index`) stay inline.
 
 ```
-  skinny rows                    fat rows (embedding inline)
-  ┌──────────────┐               ┌──────────────┐
-  │ r r r r r r  │ many/page     │ R    R       │ few/page → more pages/scan
-  └──────────────┘               └──────────────┘   + TOAST de-toast cost
+  heap tuple [small cols + ptr] ──► TOAST [768 floats]
 ```
 
-Answer: "Each chunk row carries a ~3 KB embedding inline, so far fewer tuples fit in an 8 KB page. A sequential or index scan touches more pages for the same number of rows, and the embedding may spill to TOAST, adding a de-toast read. We haven't measured it — no `EXPLAIN (ANALYZE, BUFFERS)` exists — but the page-width cost is structural to vector tables." Anchor: *fat rows, fewer per page, that's the whole cost.*
+**Q: Are a document's chunks stored together on disk?**
+No. They share an id prefix but land on the heap in insertion order — no
+`CLUSTER`, no clustered index. It doesn't cost buffr anything because it
+never reads chunks by document; it only does ANN search.
 
-**Q: Why is the chunk text stored twice — once as `content`, once in `meta.text`?**
-
-Answer: "Denormalization for citations. The search tool needs the passage text to build a citation in the same read as the score (`search-knowledge-base-tool.ts:111-115`). Storing it on the chunk row avoids a join back to `documents`. We trade storage for one fewer read on the hot retrieval path." Anchor: *co-locate the citation payload with the vector.*
+**Anchor:** "Small columns inline, the 3KB embedding TOASTed out, an MVCC
+header on every tuple you never wrote."
 
 ## See also
 
-- `01-database-systems-map.md` — the contract that fixes the record shape.
-- `03-btree-hash-and-secondary-indexes.md` — the index over the `embedding` column.
-- `04-query-planning-and-execution.md` — the scan that reads these pages.
-- study-data-modeling — normalization and the `meta` jsonb as a modeling choice.
+- `03-btree-hash-and-secondary-indexes.md` — the HNSW index over that embedding column.
+- `06-locks-mvcc-and-concurrency-control.md` — the xmin/xmax header in action.
+- study-data-modeling — the schema design behind these columns.

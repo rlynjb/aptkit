@@ -1,296 +1,172 @@
 # LLM observability
 
-**Subtitle:** Traces, spans, and replay · the `CapabilityEvent` union + Studio NDJSON + the usage ledger · *Industry standard (local trace + Studio; no Langfuse/LangSmith)*
+> Traces / spans / replay (Industry standard)
+
+Observability for an LLM app answers three questions at three time scales. Traces: what happened in *this* request — which steps, which tools, how many tokens? Spans: how long did each *part* take? Replay: can I re-run a saved trace to prove a fix? aptkit has the trace pillar as a real `CapabilityEvent` stream and the replay pillar as the promote-and-replay loop. The span pillar — per-segment latency — is thin: the events carry timestamps but there's no per-span duration roll-up yet. No external vendor (Langfuse/LangSmith); it's local artifacts and NDJSON. Say that plainly.
 
 ## Zoom out, then zoom in
 
-You can't eval what you can't see. Observability is how an agent run becomes
-inspectable — what the model did, how long each step took, what it cost — and in
-aptkit it's the same recording that the eval backbone replays. There are three
-pillars, the same three the field names for any distributed system, specialized
-for LLMs.
+The three pillars stack from "what" to "how long" to "prove it." Traces are the event record of a single run. Spans are the timing breakdown of that run. Replay is the ability to take a saved run and execute it again deterministically — which is what turns a trace from a log into a *verification tool*.
 
 ```
-  Zoom out — the three observability pillars in aptkit
+The three observability pillars in aptkit (LAYERS)
 
-  ┌─ TRACES (per request) ────────────────────────────────────┐
-  │  ★ CapabilityEvent stream: model_usage, step, tool calls ★ │ events.ts
-  ├─ SPANS (sub-steps) ───────────────────────────────────────┤
-  │  tool_call_start / tool_call_end with durationMs per tool  │ run-agent-loop.ts
-  ├─ REPLAY (re-run a saved trace) ───────────────────────────┤
-  │  FixtureModelProvider replays recorded ModelResponse[]     │ fixture-provider.ts
-  └────────────────────────────────────────────────────────────┘
-       surfaced live in Studio over NDJSON; priced by the usage ledger
+  ┌──────────────────────────────────────────────────────────────┐
+  │ REPLAY   re-run a saved trace to verify a fix                  │  ★ strong
+  │   artifact → eval → promote → deterministic replay             │  replay-runner.ts
+  ├──────────────────────────────────────────────────────────────┤
+  │ SPANS    how long did each part take?                          │  thin
+  │   model_usage carries timestamps; no per-span duration roll-up │  ← Case A gap
+  ├──────────────────────────────────────────────────────────────┤
+  │ TRACES   what happened: steps, tool calls, tokens, model       │  ★ strong
+  │   CapabilityEvent union, streamed as NDJSON                    │  ndjson-stream.ts
+  └──────────────────────────────────────────────────────────────┘
+        traces + replay are real; spans (latency) is the open edge
 ```
 
-Now zoom in. The thing to notice is that these aren't three separate systems —
-they're three views of one event stream. The trace is the list of
-`CapabilityEvent`s; the spans are two of those event *types* with a duration; and
-replay is what you get when you record those events and feed the recorded model
-responses back through a fake provider. aptkit has no Langfuse, no LangSmith — it's
-a local trace plus the Studio dashboard, and that's enough because the trace *is*
-the eval artifact.
+Two pillars are load-bearing — the trace stream and the replay loop. The middle pillar exists in raw form (timestamps on events) but isn't aggregated into per-span latency yet.
 
 ## Structure pass
 
-**Layers.** The agent loop emits `CapabilityEvent`s into a `CapabilityTraceSink`
-(`events.ts:26`) → the trace is collected into a replay artifact and/or streamed
-as NDJSON → Studio decodes the stream; the usage ledger sums it into cost.
+One axis: **the lifetime of the observed thing — instant, interval, or rerun**.
 
-**Axis — cost.** Trace where token cost is observed. Each model turn emits a
-`model_usage` event carrying provider, model, input/output tokens, and an
-`estimated` flag (`run-agent-loop.ts:112`). `summarizeUsage` folds every
-`model_usage` event in the trace into one ledger row (`usage-ledger.ts:25`), and
-`estimateCost` prices it — but *only* for OpenAI gpt-4.1 family
-(`usage-ledger.ts:71`); Gemma is local, so it's free. Cost is observed at the
-trace and resolved at the ledger.
+- **Traces (instant events)** — `CapabilityEvent` is a discriminated union: `step`, `tool_call_start`, `tool_call_end`, `model_usage`, `warning`, `error`. Each carries a `capabilityId` and an ISO `timestamp`. Streamed line-by-line as NDJSON (`packages/runtime/src/ndjson-stream.ts`). Token/model cost rolls up via `summarizeUsage` (`packages/runtime/src/usage-ledger.ts:24-42`).
+- **Spans (intervals)** — you *can* derive a tool-call duration from the `tool_call_start`/`tool_call_end` pair, and model latency from `model_usage` timestamps, but aptkit doesn't compute or surface per-span durations today. The raw material is there; the roll-up isn't.
+- **Replay (rerun)** — `listReplayArtifacts` (`replay-runner.ts:31-44`) finds saved runs deterministically; `evaluateReplayArtifact` (47-67) re-grades them; the promote-and-replay scripts turn a verified run into a frozen baseline.
 
-**Seam.** The `CapabilityTraceSink.emit(event)` interface (`events.ts:26`). On one
-side, the agent loop fires events without knowing where they go. On the other, a
-collector might buffer them into an artifact, or Studio might serialize them to
-NDJSON and stream them to a browser. That one seam is why the same run can be both
-recorded for replay *and* watched live, with no change to the loop.
+The seam: events flow out as NDJSON during a live run, get saved as an artifact, and the *same* artifact later drives a deterministic replay. One format, two lives — live observation and offline verification.
 
 ## How it works
 
-### Move 1 — the mental model
-
-This is the same maturity curve you already walked on the backend:
-`console.log` → structured logs → distributed tracing. A bare `console.log` is a
-string you grep. Structured logs are typed records you can query. Distributed
-tracing adds spans with durations and a parent run, so you can see *where the time
-went*. aptkit's `CapabilityEvent` union is the structured-log step, and the
-`tool_call_start`/`end` pair with `durationMs` is the tracing step.
+**Move 1 — the mental model.** A trace is a flight recorder: every step the agent took, time-stamped, appended one line at a time. Replay is taking that recording and re-flying the exact route in a simulator — same inputs, no live engine — to confirm your fix didn't crash anything. The deterministic replay provider (`FixtureModelProvider`) is the simulator.
 
 ```
-  console.log  ─►  structured logs  ─►  distributed tracing
+The replay-as-verification loop (PATTERN)
 
-  "called search"       { type:'tool_call_start',     tool_call_start + tool_call_end
-                          toolName, args, timestamp }   with durationMs (a span)
-       grep                  query/filter                  see where time went
+  LIVE RUN
+    │  emits CapabilityEvent stream (step/tool_call/model_usage/...)
+    ▼  as NDJSON
+  artifacts/replays/*.json ───────── the flight recording
+    │  eval (structural-diff / detection / rubric)
+    ▼
+  promote:replay ───────────────────► fixtures/promoted/*.json (baseline)
+    │  replay:fixtures
+    ▼
+  FixtureModelProvider feeds canned responses, deterministic
+    │
+    ▼
+  {ok, checked, failed}  ── a fix is "verified" when the replay still passes
 ```
 
-The jump that matters is from string to *typed union*: once an event has a `type`
-discriminant and fixed fields, you can sum it (cost), time it (spans), assert on it
-(evals), and render it (Studio) — all from the same record.
+**Move 2 — walk the pillars.**
 
-### Move 2 — the three pillars, concretely
-
-**Pillar 1 — traces (the `CapabilityEvent` union).** A trace is an array of typed
-events. The union has six variants (`events.ts:1`):
-
-```ts
-export type CapabilityEvent =
-  | { type: 'step'; capabilityId; role; content; timestamp }                    // an assistant message
-  | { type: 'tool_call_start'; capabilityId; toolName; args; timestamp }        // span open
-  | { type: 'tool_call_end'; capabilityId; toolName; result?; error?; durationMs; timestamp } // span close
-  | { type: 'model_usage'; capabilityId; provider; model; inputTokens?; outputTokens?; estimated?; timestamp } // cost
-  | { type: 'warning'; capabilityId; message; timestamp }
-  | { type: 'error'; capabilityId; message; timestamp };
-```
-
-Every field is typed and timestamped. That's the whole observability foundation —
-not a logging library, just a discriminated union the loop emits.
+**Traces: a discriminated union streamed as NDJSON.** Each event is one self-describing line, so you can tail a run live or parse it after the fact.
 
 ```
-  Pillar 1 — the trace is a typed event stream
-
-  loop emits ─► [ model_usage, step, tool_call_start, tool_call_end, ... ]
-                     │ each typed + timestamped
-                     ▼
-            sum it (cost) · time it (spans) · assert it (eval) · render it (Studio)
+CapabilityEvent + ndjson-stream.ts            what each line tells you
+  { type: 'step',           capabilityId, ts } ─ agent advanced a step
+  { type: 'tool_call_start',capabilityId, ts } ─ a tool began
+  { type: 'tool_call_end',  capabilityId, ts } ─ a tool finished
+  { type: 'model_usage',    capabilityId, ts } ─ tokens + model for THIS call
+  { type: 'warning'|'error',capabilityId, ts } ─ something went sideways
+       └ streamed one-JSON-object-per-line (NDJSON)
 ```
 
-**Pillar 2 — spans (tool calls with duration).** A span is a sub-step with a
-start, an end, and a duration. The loop opens one before each tool call and closes
-it after, recording `durationMs` (`run-agent-loop.ts:147` and `:171`):
+The union lives across the runtime; the NDJSON encoding is `packages/runtime/src/ndjson-stream.ts`. NDJSON matters because it's append-only and line-delimited — you don't need the whole run in memory to read or write it, and standard tools (`jq`, `grep`) work on it directly.
 
-```ts
-trace?.emit({ type: 'tool_call_start', capabilityId, toolName, args, timestamp: timestamp() }); // :147
-// ... await tools.callTool(...) returns { result, durationMs } ...
-trace?.emit({
-  type: 'tool_call_end', capabilityId, toolName,
-  result: toolCall.result, error: toolCall.error,
-  durationMs: toolCall.durationMs ?? 0,            // how long THIS tool took
-  timestamp: timestamp(),
-});                                                 // :171
-```
-
-Each tool call is one span; the `model_usage` event is the model's "span" carrying
-its token cost. Read the trace top to bottom and you have the run's timeline —
-which tool ran, how long, in what order.
+**Token/cost roll-up via the usage ledger.** Per-request `model_usage` events get summed.
 
 ```
-  Pillar 2 — spans bracket each tool call
-
-  tool_call_start(search) ──[ callTool ]──► tool_call_end(search, durationMs: 42)
-                              │
-                              ▼  the span = the time between start and end
-                       where the run spent its time
+usage-ledger.ts (24-42)                       the cost pillar
+  summarizeUsage(events) =>
+    fold model_usage events ──────────────  total tokens, per model
+                                            (the $ side of a trace)
 ```
 
-**Pillar 3 — replay (re-run a saved trace).** Replay is observability's payoff:
-record a run, then re-run it deterministically — with a different prompt or model,
-or just to check nothing regressed. The `FixtureModelProvider` is the entire
-mechanism (`fixture-provider.ts:3`): it implements `ModelProvider` but, instead of
-calling a model, hands back recorded `ModelResponse[]` in order:
+`packages/runtime/src/usage-ledger.ts:24-42` is the aggregation. This is the per-request token/model/cost view — the "what did this run cost" question.
 
-```ts
-export class FixtureModelProvider implements ModelProvider {
-  constructor(private readonly responses: ModelResponse[]) {}
-  async complete(request: ModelRequest): Promise<ModelResponse> {
-    this.requests.push(request);
-    const response = this.responses[this.index++];
-    if (!response) throw new Error(`fixture model exhausted after ${this.index - 1} responses`);
-    return response;
-  }
-}
-```
-
-Because it satisfies the same `ModelProvider` seam as Gemma or Claude, the agent
-loop can't tell the difference — no network, no tokens, fully deterministic. This
-is the same seam from `01-llm-foundations/08-provider-abstraction.md`, repurposed
-for observability: the abstraction that lets you swap providers is exactly what
-lets you replay a trace.
+**Replay: the same artifact, re-graded deterministically.** Listing is sorted so two runs see files in the same order; evaluation re-checks shape.
 
 ```
-  Pillar 3 — replay swaps the provider, not the loop
-
-  recorded ModelResponse[] ─► FixtureModelProvider.complete() ─► same loop runs
-                                  │ no model, no network, deterministic
-                                  ▼
-                       same trace re-emitted → diff against the baseline
+replay-runner.ts (31-44, 47-67)               deterministic re-verification
+  listReplayArtifacts(dir):
+    readdir → filter .json → .sort()   ─────  stable order (43)
+  evaluateReplayArtifact(artifact):
+    assertCapabilityReplayArtifactShape  ───  re-grade the saved run (48)
+    return { ok, issues, capabilityId,
+             fixture, recommendationCount,
+             anomalyCount, diagnosisPresent }
 ```
 
-**Surfacing it — Studio over NDJSON.** aptkit's "dashboard" is Studio
-(`apps/studio`), which consumes the trace as a stream of newline-delimited JSON.
-The client decodes it with the runtime's NDJSON helper (`apps/studio/src/api.ts:138`):
+`packages/evals/src/replay-runner.ts:43` sorts artifacts so replays are order-stable; `:47-67` re-evaluates one. Paired with the deterministic replay provider (`fixture-provider.ts:11-16`, returns `responses[index++]`, throws when exhausted), the rerun is reproducible to the byte — the foundation of "this fix is verified."
 
-```ts
-for await (const record of decodeNdjsonStream(responseBodyChunks(response.body))) { ... }
-```
-
-Each `CapabilityEvent` is one NDJSON line, so the browser renders steps, tool
-spans, and usage as they arrive — and the same Studio surfaces replay runs. No
-hosted tracing vendor; the trace streams straight to a local UI.
-
-```
-  Surfacing — one event per NDJSON line
-
-  trace events ─► serialize one-per-line ─► HTTP body ─► decodeNdjsonStream ─► Studio renders live
-```
-
-### Move 3 — the principle
-
-Make observability one typed event stream and every other capability falls out of
-it: spans are two event types with a duration, cost is the sum of one event type,
-replay is recording the stream and feeding the model responses back through the
-provider seam, and the dashboard is the stream rendered line by line. You don't
-need a tracing vendor when the trace is a first-class artifact your evals already
-consume. The honest scope: pricing only covers the OpenAI gpt-4.1 family
-(`usage-ledger.ts:71`); Gemma is free and anything else returns no estimate.
+**Move 3 — the principle.** A trace becomes valuable when you can *replay* it. Logs you only read are forensic; traces you can re-execute are a verification harness. aptkit leans into that — one NDJSON artifact format serves both the live "what happened" view and the offline "does it still pass" check. The cost is honest scope: it's local files, not a hosted vendor with a UI, and per-span latency isn't aggregated yet.
 
 ## Primary diagram
 
 ```
-  Observability in aptkit — one event stream, four uses
+aptkit's pillar scorecard
 
-  ┌─ Agent loop (run-agent-loop.ts) ──────────────────────────────────────┐
-  │  emit model_usage (:112) · step (:128) · tool_call_start (:147) /      │
-  │  tool_call_end + durationMs (:171)                                     │
-  └───────────────┬────────────────────────────────────────────────────────┘
-                  │ CapabilityTraceSink.emit (events.ts)
-                  ▼
-        ┌─────────┴───────────┬──────────────────┬─────────────────────┐
-        ▼                     ▼                  ▼                     ▼
-   TRACE (array)        SPANS (durationMs)   COST                  REPLAY
-   typed union          per tool call        summarizeUsage +      FixtureModelProvider
-   = eval artifact      = run timeline       estimateCost          re-runs recorded
-                                             (OpenAI only; Gemma    ModelResponse[]
-                                              free)
-        └──────────────── streamed as NDJSON → Studio renders it live ──────┘
+  TRACES  ████████████  CapabilityEvent union, NDJSON, usage-ledger (real)
+  SPANS   ████░░░░░░░░  timestamps present, no per-span latency roll-up (gap)
+  REPLAY  ████████████  artifact → eval → promote → deterministic replay (real)
+          └ vendor? none — local artifacts + NDJSON, honest scope
 ```
 
 ## Elaborate
 
-The industry vocabulary — traces, spans, metrics — maps cleanly onto aptkit's
-event union: a `tool_call_start`/`end` pair is a span, the trace is the request's
-span tree flattened, and `summarizeUsage`/`estimateCost` is the metrics layer
-(tokens, cost). What's distinctive is that the trace isn't a side-channel for
-debugging — it's the *same JSON* that becomes a replay artifact and gets
-asserted by `assertReplayArtifactShape` (`01-eval-set-types.md`,
-`02-eval-methods.md`). Observability and evals are the same data viewed twice. The
-deliberate non-goal is a hosted tracing backend; the bet is that a local trace plus
-Studio is enough when the trace is already first-class. The cost gap is worth
-naming: only gpt-4.1 pricing is wired in, so a non-OpenAI paid provider would show
-`n/a` until you add its rates. Read `01-llm-foundations/06-token-economics.md` for
-the ledger in depth and `01-llm-foundations/08-provider-abstraction.md` for the
-seam replay rides on.
+The NDJSON choice is the unglamorous-but-right call. A single fat JSON blob per run forces you to buffer the whole trace before you can read any of it and corrupts everything if the process dies mid-write. NDJSON appends one valid line at a time, so a killed process still leaves a readable partial trace, and you can stream-process arbitrarily large runs. It's also why the same file works live and offline — each line stands alone.
+
+The span gap is the honest edge to name. The events carry ISO timestamps and `tool_call_start`/`tool_call_end` come in pairs, so the *data* to compute per-span latency exists. What's missing is the roll-up: nothing subtracts start from end and surfaces "the retrieval tool took 1.2s." That's a derivation over data you already emit — the Case A exercise.
+
+And there's no Langfuse/LangSmith here. That's fine for a local-first toolkit, but it's the right thing to disclose rather than imply a hosted dashboard exists.
 
 ## Project exercises
 
-### Add a latency span summary to the usage ledger
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a function that folds `tool_call_end` events into a per-tool
-  latency summary (total time, slowest tool, call count), alongside the existing
-  token `summarizeUsage` — turning the spans already in the trace into a metric.
-- **Why it earns its place:** the spans carry `durationMs` but nothing aggregates
-  them into "where did the run spend its time"; building that is the metrics
-  pillar the trace already has the data for.
-- **Files to touch:** `packages/runtime/src/usage-ledger.ts` (or a sibling),
-  `packages/runtime/test/`, reading `packages/runtime/src/events.ts`.
-- **Done when:** a trace with three tool calls returns a summary naming the slowest
-  tool and its total time.
+### Add per-span latency to the trace
+
+- **Exercise ID:** `EX-EVAL-04a`
+- **What to build:** A function that pairs `tool_call_start` with its matching `tool_call_end` (and derives model-call latency from `model_usage` timestamps), then surfaces per-span durations in the replay/Studio summary. This fills the span pillar the README's observability section leaves thin (Phase 3, evals/observability).
+- **Why it earns its place:** It turns the existing instant-event trace into a real timing breakdown without changing what's emitted — pure derivation over data you already have. Latency-per-span is the question every production triage starts from.
+- **Files to touch:** `packages/runtime/src/usage-ledger.ts` (sibling summarizer) or a new module; surface in `packages/evals/src/replay-runner.ts` summary fields.
+- **Done when:** a replayed artifact reports a per-tool and per-model-call duration, and a slow tool is visibly attributable.
 - **Estimated effort:** `1–4hr`
 
-### Add pricing for a second provider family
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** extend `pricingForModel` to cover one non-OpenAI paid
-  provider (e.g. an Anthropic model family) so its `model_usage` events produce a
-  real cost estimate instead of `undefined`.
-- **Why it earns its place:** the cost pillar currently prices only gpt-4.1;
-  closing it for a second family shows you understand the ledger is
-  provider-keyed and where the gap is.
-- **Files to touch:** `packages/runtime/src/usage-ledger.ts`,
-  `packages/runtime/test/`.
-- **Done when:** a `model_usage` event from the new family yields a non-`undefined`
-  `CostEstimate` with that family's rates.
-- **Estimated effort:** `<1hr`
+### NDJSON trace viewer
+
+- **Exercise ID:** `EX-EVAL-04b`
+- **What to build:** A tiny CLI that reads an NDJSON artifact and renders a readable timeline (step / tool / usage / error) with the usage-ledger totals at the bottom.
+- **Why it earns its place:** It proves the local-artifact story replaces a hosted vendor UI for the basics, and makes the trace pillar inspectable.
+- **Files to touch:** new script reading `artifacts/replays/*.json`; reuse `usage-ledger.ts:24-42`.
+- **Done when:** running it on a saved artifact prints an ordered event timeline plus token totals.
+- **Estimated effort:** `1–4hr`
 
 ## Interview defense
 
-**Q: "What does observability look like for your agents, without a tracing vendor?"**
-One typed event stream. The loop emits `CapabilityEvent`s — `model_usage` per
-model turn, `tool_call_start`/`end` per tool with a `durationMs`, plus
-step/warning/error — into a `CapabilityTraceSink`. From that one stream I get
-three pillars: the trace (the event array), spans (the tool-call pairs are the run
-timeline), and cost (`summarizeUsage` + `estimateCost`). Studio renders it live by
-decoding the events as NDJSON. No Langfuse — the trace is a first-class local
-artifact.
+**Q: What's in a trace here, and how is it stored?**
 
 ```
-  emit CapabilityEvent[] → trace · spans (durationMs) · cost · NDJSON → Studio
+  CapabilityEvent union: step | tool_call_start/end | model_usage | warning | error
+  each: capabilityId + ISO timestamp → streamed as NDJSON (one object per line)
 ```
-Anchor: *one typed event stream; spans, cost, and replay all fall out of it.*
 
-**Q: "How is your observability connected to your evals?"**
-They're the same data. The trace I emit for observability is the same JSON that
-becomes a replay artifact — `assertReplayArtifactShape` checks its shape, and a
-promoted fixture freezes its answer. Replay itself is observability's payoff: the
-`FixtureModelProvider` satisfies the same `ModelProvider` seam as a real provider,
-so I feed the recorded `ModelResponse[]` back through the loop and re-run
-deterministically — no model, no network. The abstraction that lets me swap
-providers is exactly what lets me replay a trace.
+Anchor: `packages/runtime/src/ndjson-stream.ts` for the encoding; `usage-ledger.ts:24-42` rolls up tokens.
+
+**Q: How does a trace verify a fix?**
 
 ```
-  trace (observe) === replay artifact (eval) ; FixtureModelProvider replays it deterministically
+  live run → artifact → eval → promote → deterministic replay (FixtureModelProvider)
+  fix is "verified" when the replay still passes  {ok, checked, failed}
 ```
-Anchor: *the trace is the eval artifact — observe and assert from the same stream.*
+
+Anchor: `replay-runner.ts:47-67` re-grades; `fixture-provider.ts:11-16` makes the rerun deterministic.
+
+**Q: What's missing from the observability story?**
+
+Anchor: no external vendor (local artifacts + NDJSON), and per-span latency isn't rolled up — timestamps exist (`tool_call_start`/`end`) but nothing computes the duration. Honest gaps.
 
 ## See also
 
-- `01-eval-set-types.md` — the replay artifact this trace becomes
-- `02-eval-methods.md` — `assertReplayArtifactShape` over the trace
-- `01-llm-foundations/06-token-economics.md` — the usage ledger and OpenAI-only pricing
-- `01-llm-foundations/08-provider-abstraction.md` — the `ModelProvider` seam replay rides on
-- `04-agents-and-tool-use/06-error-recovery.md` — the loop that emits these events
+- [01-eval-set-types.md](01-eval-set-types.md) — the golden/regression sets the replay loop produces.
+- [02-eval-methods.md](02-eval-methods.md) — the scorers run against each artifact.
+- [../02-context-and-prompts/03-prompt-chaining.md](../02-context-and-prompts/03-prompt-chaining.md) — the multi-capability run a trace records.

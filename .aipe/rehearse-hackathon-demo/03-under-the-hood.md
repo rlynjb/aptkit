@@ -1,147 +1,163 @@
-# Chapter 03 — Under the Hood   (6:00–8:00, 2 min)
+# Chapter 3 — Under the Hood   (6:00–8:00, 2 minutes)
 
 ## Opening hook
 
-The room just saw a score land. Now they're wondering whether there's anything
-behind it or whether it's a demo trick. You have two minutes to earn
-credibility — and the trap here is going three levels deep and losing them.
-**Go exactly one level deep and stop.** One diagram, three sentences. The
-moment you start explaining cosine similarity math or the agent loop's turn
-budget, you've left the demo behind and the clock is still running.
+The room has seen it work. Now they want one reason to believe you
+built something *structurally* interesting and not just a script that
+prints a hardcoded answer. You have two minutes. That is enough for
+exactly one diagram and three sentences. It is not enough for an
+architecture tour, and if you try to give one you'll lose the room you
+just won.
 
-The one impressive, non-obvious thing in AptKit isn't the RAG result itself —
-it's *why* the same code runs deterministically in a browser and live against a
-local model with zero changes. The answer is two contracts and a tool. That's
-the whole story you tell here.
+Go exactly one level deep and stop. The one non-obvious thing worth
+showing in AptKit is the **two ports** the whole toolkit hangs off —
+the model provider and the vector store — plus the trick that makes a
+tool-less local model behave like a tool-calling one. Show that, earn
+the credibility, get out.
 
 ## The time-budget bar
 
-```
-  ┌──────────────────────────────────────────────────────────┐
-  │ ░░░░░░░░░░░░░░░░░░░░░░░░░░▓▓▓▓▓▓▓▓▓░░░░░░░░░░░░░░░░░░░░░░░ │
-  │ 1:00 ──────────────── 6:00 ──── 8:00 ───────────────── 10:00 │
-  │     UNDER THE HOOD — you own 6:00 to 8:00 (2 min)          │
-  └──────────────────────────────────────────────────────────┘
-```
-
-In two minutes: show one diagram — the two contracts plus emulated
-tool-calling — and explain in three sentences why that boundary is what let
-the demo be both safe and real.
-
-## The chapter-opening diagram — the two contracts
-
-This is the one diagram for this chapter. It's the seam that makes everything
-else possible: the agent talks to two interfaces — a `ModelProvider` and a
-`VectorStore` (via an `EmbeddingProvider`) — and never to a vendor directly.
-Swap what's behind the interface, the agent doesn't notice.
+You own two minutes. One diagram, the two ports, the tool-calling
+trick. Then stop.
 
 ```
-  THE TWO CONTRACTS — same agent, swappable backs
-
-  ┌─ Agent layer (packages/agents/rag-query) ──────────────────────┐
-  │  RagQueryAgent.answer(question)  →  runAgentLoop (bounded)      │
-  │  talks ONLY to two contracts, never a vendor SDK               │
-  └───────┬─────────────────────────────────────────┬─────────────┘
-          │ ModelProvider.complete()                 │ search_knowledge_base
-          │ (the reasoning seam)                      │ tool → VectorStore
-          ▼                                           ▼
-  ┌─ Provider contract ──────────┐        ┌─ Retrieval contracts ──────────┐
-  │ DEMO:   FixtureModelProvider │        │ EmbeddingProvider + VectorStore │
-  │   (recorded Gemma responses) │        │ DEMO: keyword-hash embedder      │
-  │ LIVE:   GemmaModelProvider   │        │   + InMemoryVectorStore (cosine) │
-  │   (local Ollama, emulated    │        │ LIVE: OllamaEmbeddingProvider    │
-  │    tool-calling)             │        │   (nomic, 768-dim) + InMemory    │
-  │ also: Anthropic / OpenAI     │        │ buffr: PgVectorStore (pgvector)  │
-  └──────────────────────────────┘        └──────────────────────────────────┘
-
-  the demo and the live CLI are the SAME agent — only what sits
-  behind the two contracts changed
+  ┌──────────────────────────────────────────────────────┐
+  │ ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░▓▓▓▓▓▓▓▓░░░░░░░░░░░░░░░░░ │
+  │ 6:00 ──────── 8:00 ─────────────────────────── 10:00   │
+  │     UNDER THE HOOD — you own 6:00 to 8:00 (2 min)     │
+  └──────────────────────────────────────────────────────┘
 ```
 
-The thing to make the room see: the deterministic browser demo and the live
-local-model CLI are byte-for-byte the same agent code. Only the two boxes
-behind the contracts swapped. That's the non-obvious win.
+## The one diagram — two ports and emulated tool-calling
 
-## The body — three sentences, then stop
-
-Say these three things, in order, while pointing at the diagram. Resist adding
-a fourth.
+This is the single technical picture. The agent loop in the middle
+talks to two swappable contracts — a model provider port and a vector
+store port. Swap the adapter behind either port and nothing in the
+loop changes. The third piece is the part people don't expect: the
+local Gemma adapter *emulates* tool-calling, because Gemma has no
+native tool API.
 
 ```
-  SAY (out loud), pointing at the diagram
-  ─────────────────────────────────────────────────────────────────
-  1 (the seam):    "The agent only ever talks to two contracts — a
-                    model provider and a vector store. It never knows
-                    which vendor is behind them."
-  2 (the payoff):  "So the browser demo and the live local model are
-                    the exact same agent — I just swapped recorded
-                    responses for a real Gemma, and an in-memory store
-                    for the deterministic one. Nothing in the agent
-                    changed."
-  3 (the twist):   "And Gemma can't natively call tools — so the
-                    provider EMULATES tool-calling: it renders the
-                    tools into the prompt and parses a JSON tool call
-                    back out. That's how a tool-less local model drives
-                    the same loop a frontier model does."
+  THE TWO PORTS + EMULATED TOOL-CALLING
+
+  ┌─ Agent loop (runAgentLoop, @aptkit/runtime) ──────────────────┐
+  │   model decides: answer now, or call search_knowledge_base    │
+  └───────┬───────────────────────────────────────────┬──────────┘
+          │ ModelProvider.complete()                   │ tool call
+          │ (PORT 1)                                   │ → VectorStore
+          ▼                                            ▼ (PORT 2)
+  ┌─ model adapters ────────────┐          ┌─ vector adapters ──────────┐
+  │  Anthropic │ OpenAI │ Gemma │          │ InMemoryVectorStore (now)  │
+  │            │        │ (local│          │ PgVectorStore (buffr, live)│
+  │            │        │ Ollama│          │ same VectorStore contract  │
+  └────────────┴────────┴───┬───┘          └────────────────────────────┘
+                            │
+              ┌─────────────▼──────────────────────────────┐
+              │ Gemma has NO native tools. So the adapter:  │
+              │  out: renders tools into the system prompt, │
+              │       demands a JSON tool call              │
+              │  in:  parses the JSON back into a tool_use  │
+              │       (parse-retry if Gemma botches it)     │
+              └─────────────────────────────────────────────┘
+```
+
+## The three sentences
+
+Said while pointing at the diagram — not read off it.
+
+```
+┃ "The whole toolkit depends on two contracts: a model provider
+┃  and a vector store. The loop never knows which one it's talking
+┃  to — Anthropic, OpenAI, or a local Gemma; in-memory or Postgres
+┃  pgvector — it just calls the contract."
 ```
 
 ```
-  ┃ "Two contracts and a tool. That's the whole trick — swap the
-  ┃  back, the agent doesn't notice, and a local model that can't
-  ┃  call tools gets taught to anyway."
+┃ "That's why the same agent runs in the browser, against a cloud
+┃  model, or fully local with one line changed. Swap the adapter,
+┃  not the loop."
 ```
 
-The emulated tool-calling claim is real and worth landing because it's the
-genuinely non-obvious part: `packages/providers/gemma/src/gemma-provider.ts`
-renders the tool schemas into the system text and demands a single JSON object
-back (`{"tool": "...", "arguments": {...}}`), with a parse-retry nudge when
-Gemma botches the JSON. Frontier models get a native `tools` array; Gemma
-doesn't, so the provider fakes the protocol on both ends.
+```
+┃ "The interesting part: Gemma has no tool-calling. So the local
+┃  adapter fakes it — it renders the tools into the system prompt,
+┃  asks for a JSON tool call, and parses it back. The loop above it
+┃  can't tell the difference."
+```
 
-If a judge wants more — the cosine scan, the `minTopK` floor, the agent loop's
-turn budget — that's a *post-clock* conversation (chapter 06), not this beat.
-One level deep, then stop.
+That last sentence is the one that lands, because it's the
+non-obvious one. It's the load-bearing trick, and naming it signals
+you built the thing rather than wired a library.
 
-## The IF-IT-BREAKS box
+The real code: the ports are `ModelProvider` (`@aptkit/runtime`) and
+`VectorStore` (`@aptkit/retrieval`); the emulation is
+`GemmaModelProvider` in `packages/providers/gemma/src/gemma-provider.ts`
+— it renders tools into system text on the way out and runs
+`parseAgentJson` with a corrective retry on the way back.
+
+## Strong vs weak — going one level deep
+
+```
+  WEAK under-the-hood                STRONG under-the-hood
+  ─────────────────────────────      ──────────────────────────────
+  walks all 16 packages, the         ONE diagram: two ports + the
+  build chain, the npm bundling,     Gemma tool-call trick. Three
+  the monorepo layout, the CI…       sentences. Done in 90 seconds.
+
+  five diagrams, each half-          one diagram the room can hold;
+  explained                          the surprising part named
+
+  room loses the thread; the         room thinks "okay, this person
+  wow from the demo evaporates        actually built it" and the wow
+                                       from the demo is still warm
+```
+
+## IF IT BREAKS
+
+This chapter has no live on-screen beat — it's one diagram on a
+slide. The only failure mode is going long.
 
 ```
 ╔══════════════════════════════════════════════════════════════════╗
-║ IF IT BREAKS                                                       ║
-║ This chapter has no live screen — it's one diagram you can put on  ║
-║ a slide. If the slide won't show → draw the two boxes on a         ║
-║ whiteboard or in the air with your hands: "model contract here,    ║
-║ vector contract here, agent in the middle talks to both." The      ║
-║ three sentences carry it with no visual at all.                    ║
+║ IF IT BREAKS (running long)                                        ║
+║ You hit 7:30 still talking → stop mid-sentence on the third        ║
+║ sentence, say "and that local-model trick is the part I'd love to  ║
+║ dig into in Q&A," and move to the close. Do not finish the         ║
+║ explanation at the cost of the close.                              ║
 ╚══════════════════════════════════════════════════════════════════╝
 ```
 
-## The "tighten it" treatment
+## Tighten it
 
-Running long? Drop sentence 3 (emulated tool-calling) and stop after the
-payoff — the swappable-contracts point is the load-bearing one; the Gemma
-tool-emulation twist is the bonus that impresses an AI judge. **Floor: you must
-say sentence 1 and 2 (the seam and the payoff).** Without them the demo looks
-like a single hardcoded page instead of a real agent on a real boundary.
+If the slot is tight, cut this to **one sentence and the diagram**:
+"Everything hangs off two swappable contracts — model provider and
+vector store — and the local Gemma adapter fakes tool-calling so the
+loop doesn't care it's a local model." The floor: the two-ports idea
+plus the emulation trick, in one breath, with the diagram up. If you
+have to cut the whole chapter to protect the close, cut it — this is a
+ceiling, not a floor.
 
-## The one-page run sheet
+## One-page run sheet — UNDER THE HOOD
 
 ```
-  ┌─ UNDER THE HOOD — 6:00 to 8:00 ──────────────────────────────────┐
-  │ ONE diagram: two contracts (ModelProvider + VectorStore via       │
-  │   EmbeddingProvider) + emulated tool-calling.                     │
-  │                                                                   │
-  │ SAY, in order (point at the diagram):                             │
-  │   1. seam: "the agent only talks to two contracts, never a vendor"│
-  │   2. payoff: "browser demo and live Gemma are the SAME agent —    │
-  │      I just swapped what's behind the contracts"                  │
-  │   3. twist: "Gemma can't call tools natively — the provider       │
-  │      emulates it: renders tools into the prompt, parses JSON back"│
-  │                                                                   │
-  │ NAIL THIS LINE:                                                   │
-  │   "Two contracts and a tool. That's the whole trick."             │
-  │                                                                   │
-  │ ONE LEVEL DEEP, THEN STOP. Cosine / turn budget = ch06, post-clock.│
-  │ IF IT BREAKS: draw two boxes in the air; sentences carry it.      │
-  │ TIGHTEN: drop sentence 3. Floor: keep seam + payoff.              │
-  └───────────────────────────────────────────────────────────────────┘
+  ┌──────────────────────────────────────────────────────────────┐
+  │ UNDER THE HOOD         6:00–8:00          (no money shot)      │
+  │                                                                │
+  │ ONE DIAGRAM up: two ports + Gemma emulated tool-calling        │
+  │                                                                │
+  │ THREE SENTENCES (point, don't read):                           │
+  │  • "Two contracts: a model provider and a vector store. The   │
+  │     loop never knows which adapter it's talking to."          │
+  │  • "Same agent: browser, cloud, or fully local — swap the     │
+  │     adapter, not the loop."                                   │
+  │  • "Gemma has no tool-calling, so the adapter fakes it —      │
+  │     renders tools into the prompt, parses JSON back. The loop │
+  │     can't tell." ← the one that lands                         │
+  │                                                                │
+  │ NAIL: the Gemma-fakes-tool-calling sentence                    │
+  │ IF LONG: stop on sentence 3, "love to dig into that in Q&A,"   │
+  │          move to close                                        │
+  │ TIGHTEN: collapse to one sentence + diagram; cut whole chapter │
+  │          before you cut the close                             │
+  └──────────────────────────────────────────────────────────────┘
 ```

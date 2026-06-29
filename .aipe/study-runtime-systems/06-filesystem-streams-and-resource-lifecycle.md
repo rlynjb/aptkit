@@ -1,203 +1,185 @@
-# Filesystem, Streams, and Resource Lifecycle — handles, cleanup, and the one real stream
+# Filesystem, Streams, and Resource Lifecycle
 
-**Industry name(s):** file descriptors / resource lifecycle · streaming vs buffered I/O · `try/finally` cleanup · **Type:** Industry standard
+**Subtitle:** file descriptors / streaming I/O / resource cleanup (the `finally` close) — *the resource lifecycle* (Industry standard).
 
 ## Zoom out, then zoom in
 
-aptkit touches the filesystem in exactly one mode — buffered, whole-file reads and writes via `fs.promises` — and it has exactly one true stream: the NDJSON trace pipe between the Studio dev server and the browser. This file separates those two: the "read it all into memory" pattern (everywhere) and the "process it as it arrives" pattern (NDJSON only).
+The core packages of aptkit touch **no filesystem and no OS handles at all** — they're pure async functions over in-memory data and a `fetch`. Files, streams, and descriptors show up in exactly one place: the **Studio dev server** (`apps/studio/vite.config.ts`), which reads replay artifacts off disk and streams NDJSON traces back over HTTP. So this file is really about Studio's resource handling — and it's the one place in the repo that demonstrates streaming output and `finally`-guarded cleanup.
 
 ```
-  Zoom out — aptkit's I/O resources and who holds them
+  Zoom out — where resources are held in the runtime
 
-  ┌─ Build/eval scripts (Node) ───────────────────────────────────────┐
-  │   fs.promises.readFile/writeFile/readdir — buffered, fd auto-closed │
-  │   scripts/*.mjs · packages/evals/replay-runner.ts                  │
-  └──────────────────────────────────┬─────────────────────────────────┘
-  ┌─ Studio dev server (Node, Vite) ──▼─────────────────────────────────┐
-  │   reads fixtures (buffered) → runs replay → ★ NDJSON STREAM ★ ──────┐│ ← we are here
-  │   res.write(encodeNdjsonRecord(event)) per trace event              ││
-  └──────────────────────────────────┬──────────────────────────────────┘
-                                      │ HTTP, application/x-ndjson
-  ┌─ Browser (apps/studio) ───────────▼─────────────────────────────────┐
-  │   fetch → response.body.getReader() → decodeNdjsonStream (async gen) │
-  └──────────────────────────────────────────────────────────────────────┘
+  ┌─ Core packages (runtime, retrieval, providers…) ─┐
+  │  NO fs, NO descriptors, NO streams — pure async   │
+  │  the only OS resource: a fetch socket per call    │
+  └───────────────────────┬───────────────────────────┘
+  ┌─ Studio dev server (apps/studio/vite.config.ts) ─▼┐
+  │  ★ reads artifacts/replays/*.json (file handles) ★ │ ← THIS CONCEPT
+  │  ★ streams NDJSON out (res.write / res.end) ★      │   lives here
+  └────────────────────────────────────────────────────┘
 ```
 
-**Zoom in.** Resource lifecycle is about acquiring a handle (a file descriptor, a stream reader, a socket), using it, and releasing it — ideally even when something throws. aptkit's filesystem story is the easy version: `fs.promises` opens, reads/writes, and closes the descriptor for you in one call, so there's nothing to leak. The genuinely interesting resource is the stream reader on the browser side, which *does* hold a lock that must be released — and the code does it correctly in a `finally`. That's the lifecycle worth studying.
+**Zoom in.** Two resource stories. The *input* side: Studio reads replay artifact and fixture files with `node:fs/promises` — `readdir` to list, `readFile` to load, whole-file reads that open and auto-close a descriptor per call. The *output* side: Studio streams trace events to the client as NDJSON, writing chunk-by-chunk with `res.write` and closing the response in a `finally`. The lifecycle question — *who opens the handle, who's responsible for closing it, and what happens on error* — has a clean answer here, and it's worth seeing because it's the repo's only example of explicit resource cleanup.
 
-## Structure pass
+## The structure pass
 
-Trace the **state/ownership** axis on resources — who holds the handle, and when is it released?
+Trace the axis **"who owns this resource and who closes it?"** across the two I/O directions.
 
 ```
-  Axis: "who holds this handle, and when is it freed?" — per resource
+  One axis — "who closes it?" — by resource
 
-  ┌──────────────────────────────────────────────────────────┐
-  │ fs.promises.readFile(path)                                 │  → fd opened + closed
-  │   (scripts/*.mjs, replay-runner.ts)                        │     inside the one call
-  └───────────────────┬────────────────────────────────────────┘
-      ┌───────────────▼────────────────────────────────────────┐
-      │ server NDJSON response (vite.config.ts)                  │  → res held open across
-      │   res.write per event, res.end at the finish             │     many writes, ended once
-      └───────────────┬────────────────────────────────────────┘
-          ┌───────────▼────────────────────────────────────────┐
-          │ browser ReadableStream reader (api.ts:170)           │  → lock held across reads,
-          │   reader.read() loop, reader.releaseLock() in finally │     released in finally
-          └────────────────────────────────────────────────────┘
+  ┌─ fetch socket (core, every model/embed call) ─┐  owner: fetch/libuv
+  │  gemma-provider, ollama-embedding-provider     │  → auto-closed after body read
+  └──────────────┬──────────────────────────────────┘
+  ┌─ file descriptor (Studio, readFile/readdir) ──┐  owner: fs.promises
+  │  vite.config.ts                                │  → auto-closed (whole-file read)
+  └──────────────┬──────────────────────────────────┘
+  ┌─ HTTP response stream (Studio, res.write) ────┐  owner: the HANDLER
+  │  streamReplayResponse                          │  → MUST close in finally
+  └───────────────────────────────────────────────┘
 ```
 
-The seam: **the boundary between a handle that lives inside one call and one that lives across many operations.** `readFile` is the first kind — acquire-use-release is atomic, no leak surface. The HTTP response and the stream reader are the second kind — held open across a loop, which means cleanup has to be explicit and exception-safe. The reader's `try/finally` (`api.ts:171-179`) is the one place aptkit does manual resource cleanup, and it's the pattern to point at.
+The seam is between the **auto-closed** resources (sockets, file reads — the runtime manages them) and the **manually-closed** one (the HTTP response stream, which the handler must `res.end()` itself). The axis-answer flips from "the platform closes it for you" to "you must close it, including on error." That flip is exactly where resource leaks live in real systems — a stream you forgot to close on an error path — and Studio handles it correctly with a `finally`. → that `finally` is the load-bearing line of this whole file.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know the `fetch` loading-state lifecycle: start, in-flight, done (or error) — and in every branch you stop the spinner. Resource lifecycle is the same discipline applied to handles: acquire, use, release — and *release on the error path too*. The leak shape is forgetting the error path: a handle acquired, an exception thrown mid-use, and the release line skipped.
+You know this from any `fetch` you've written: you don't manually close the socket — the browser/runtime does it once you've read the body. But you also know the other shape: a `WritableStream` or a Node response where *you* decide when it's done by calling `.end()`. The rule that ties them together: **every acquired resource needs a guaranteed release, and "guaranteed" means it runs even when the body throws.** That's what `try/finally` is for.
 
 ```
-  Resource lifecycle — release must cover the throw
+  The resource-lifecycle kernel — acquire, use, ALWAYS release
 
-  acquire handle ──► use it ──► release   ← happy path: fine
-                       │
-                       └─ throws here ──► release SKIPPED ──► LEAK
-                                          unless release is in a finally
+  acquire ──► use ──┬─► success ──► release ─┐
+                    │                         ├─► resource freed
+                    └─► error  ──► release ───┘   (finally guarantees this)
 
-  the fix: try { use } finally { release }   ← release runs either way
+  drop the "release on error" branch → leaked handle on every failure
 ```
 
-The strategy: **prefer APIs that bundle acquire-use-release into one call (`fs.promises.readFile`) so there's no handle to leak, and where a handle must be held across a loop, put the release in a `finally`.**
+Named by what breaks if removed:
+- **The release step** — skip it and the descriptor/stream stays open; do it in a loop and you exhaust the fd table or leave a client hanging on a never-closed response.
+- **The "release on error too" guarantee (`finally`)** — without it, the happy path frees the resource but any thrown error leaks it. This is the single most common resource bug, and the one `finally` exists to kill.
 
-### Move 2 — the two I/O patterns
+### Move 2 — the two directions, walked
 
-**Buffered file I/O — the whole-file pattern, everywhere.** Every filesystem touch in the repo is `fs.promises`, reading or writing the entire file in one call. Examples: `scripts/pack-core-standalone.mjs:1` (`cp, mkdir, mkdtemp, readFile, writeFile`), `scripts/replay-model-recommendation.mjs:1`, `packages/evals/src/replay-runner.ts:1` (`readdir, readFile`), and `apps/studio/vite.config.ts:1`. The shape:
+**Input: whole-file reads, auto-closed.** Studio lists and loads replay artifacts and fixtures from disk:
 
 ```ts
-// conceptually, everywhere:
-const text = await fs.readFile(path, 'utf8');   // opens fd, reads all, closes fd
-const data = JSON.parse(text);                  // parse the whole thing
+// apps/studio/vite.config.ts:1 (import) and :943, :953
+import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
+// ...
+entries = await readdir(dir, { withFileTypes: true });   // list the directory
+// ...
+const artifact = JSON.parse(await readFile(path, 'utf8')); // read one file whole
 ```
 
-There are **no** `fs.createReadStream` or `fs.createWriteStream` calls anywhere. Is that a problem? No — and naming why matters. These files are replay artifacts and fixtures, JSON documents of a few KB. JSON parsing needs the whole document in memory regardless, so streaming the read would buy nothing — you'd reassemble it to parse it anyway. And `fs.promises.readFile` opens *and closes* the descriptor inside the one call, so there's no handle held open, no leak surface, no cleanup to get wrong. Buffered whole-file I/O is the correct call for small JSON; it would be the *wrong* call for a multi-gigabyte log, which aptkit doesn't have.
+`fs.promises.readFile` opens a descriptor, reads the *entire* file into a string, and closes the descriptor — all in one call. You never hold a long-lived fd; there's nothing to leak because the read is atomic from your side. The tradeoff is the same as the HTTP full-buffer reads in `05`: the whole file lands in memory at once. For replay artifacts (JSON in the KB range) that's fine. `createReadStream` (incremental, descriptor held open across reads, manual close) is `not yet exercised` — and unnecessary at these file sizes. The `readdir`/`readFile` pattern repeats for every fixture loader (`vite.config.ts:991, 1037, 1083, 1129`).
 
-```
-  Why buffered beats streaming here
-
-  small JSON fixture (KBs):
-    readFile (buffered) → parse        ← simple, fd auto-closed, no leak
-    createReadStream → reassemble → parse  ← more code, same memory, no win
-
-  the crossover where streaming wins: files too big to hold in memory
-  → aptkit has none of those (it's a library over small artifacts)
-```
-
-**The NDJSON stream — the one real streaming pipe.** This is the exception, and it's a proper stream end to end. The server side (in `apps/studio/vite.config.ts`'s `streamReplayResponse`) sets `content-type: application/x-ndjson` plus `x-accel-buffering: no` (to disable proxy buffering so events flush immediately), then writes one NDJSON record per trace event as the agent run produces it — using `encodeNdjsonRecord` from `@aptkit/runtime` (`ndjson-stream.ts:31`). Events flow to the browser *as they happen*, not after the run completes.
-
-The browser side consumes it as a true stream, `api.ts:138`:
+**Output: NDJSON streamed chunk-by-chunk, closed in `finally`.** This is the interesting one. Studio streams trace events to the browser as they happen, rather than buffering the whole run and sending it at the end:
 
 ```ts
-for await (const record of decodeNdjsonStream(responseBodyChunks(response.body))) {
-  // ... handle each record as it arrives: event | result | error
+// apps/studio/vite.config.ts:888-919  (streamReplayResponse)
+res.setHeader('content-type', 'application/x-ndjson; charset=utf-8');
+res.setHeader('cache-control', 'no-cache');
+res.setHeader('x-accel-buffering', 'no');          // tell proxies: don't buffer
+try {
+  const body = await readJsonBody(req);
+  const result = await run(body, (event) => {
+    res.write(encodeNdjsonRecord({ type: 'event', event }));   // one line per event
+  });
+  res.write(encodeNdjsonRecord({ type: 'result', result }));   // final result line
+} catch (error) {
+  res.write(encodeNdjsonRecord({ type: 'error', error: ... })); // error as a line
+} finally {
+  res.end();                                                    // ← ALWAYS close
 }
 ```
 
-And the resource-lifecycle heart — adapting the browser `ReadableStream` to an async iterable, with correct cleanup (`api.ts:169`):
+Walk the lifecycle one move at a time:
+
+```
+  Layers-and-hops — the NDJSON stream's lifecycle
+
+  ┌─ Studio handler (server) ─┐   hop 1: set headers, open response
+  │  streamReplayResponse      │ ─────────────────────────────────►┐
+  │                            │   hop 2: per trace event,          │
+  │  run(body, onEvent) ───────┼── res.write(one NDJSON line) ─────►│ ┌─ Browser ─┐
+  │   (the agent loop emits)   │   hop 3: result line               │ │ client    │
+  │                            │ ─────────────────────────────────►│ │ reads      │
+  │  finally: res.end() ───────┼── hop 4: close the stream ────────►│ │ line by   │
+  └────────────────────────────┘                                   └─┤ line      │
+        ▲ closes even if run() throws (error written as a line first)│ └───────────┘
+```
+
+- **Acquire** — the response is "opened" by setting headers; the client now expects a stream.
+- **Use** — the agent run is passed an `onEvent` callback; each `CapabilityEvent` it emits (`run-agent-loop.ts:112-179` emits `step`, `tool_call_start`, etc.) is encoded with `encodeNdjsonRecord` (`ndjson-stream.ts:31-33`) and written as one line. The encoding lives in the runtime; the *transport* (the `res.write`) lives in Studio — a clean split noted right in the code comment (`vite.config.ts:900`).
+- **Release on error** — a thrown error is caught and written as an `{ type: 'error' }` line, so the client learns *why* the stream ended instead of seeing a truncated connection.
+- **Release always** — `res.end()` in the `finally` closes the stream on *every* path: success, error, or anything else. This is the line that prevents a leaked, half-open response — a client hanging forever on a request that errored.
+
+**The request body read — a hand-rolled stream consumer.** The incoming request is itself a stream, consumed manually:
 
 ```ts
-async function* responseBodyChunks(body: ReadableStream<Uint8Array>): AsyncGenerator<Uint8Array> {
-  const reader = body.getReader();          // ← acquire: locks the stream
-  try {
-    while (true) {
-      const { done, value } = await reader.read();   // ← use: pull chunks
-      if (done) return;
-      if (value) yield value;
-    }
-  } finally {
-    reader.releaseLock();                    // ← release: ALWAYS, even on throw/early-return
-  }
-}
+// apps/studio/vite.config.ts:921-937  (readJsonBody)
+req.setEncoding('utf8');
+req.on('data', (chunk) => { raw += chunk; });   // accumulate chunks
+req.on('end', () => { ... resolve(JSON.parse(raw)); });
+req.on('error', reject);                         // ← stream error path wired
 ```
 
-This is the textbook lifecycle. `getReader()` locks the stream (only one reader allowed). The `while` loop pulls chunks. The `finally` releases the lock — so if the consumer throws, or the generator is abandoned early (a `break` upstream), the lock is still released and the stream isn't left locked. That `finally` is the single most important resource-cleanup line in the repo.
-
-```
-  The NDJSON stream — server to browser, chunk by chunk
-
-  ┌─ Studio server (Node) ──────────────┐  HTTP, application/x-ndjson
-  │  per trace event:                    │  ┌────────────────────────┐
-  │    res.write(encodeNdjsonRecord(ev))  │ ─►│ chunk: {"type":"event"}│
-  │  at end: res.write({result}); res.end │  │ chunk: {"type":"event"}│
-  └───────────────────────────────────────┘  │ chunk: {"type":"result"}│
-                                              └───────────┬─────────────┘
-  ┌─ Browser (apps/studio) ──────────────────────────────▼─────────────┐
-  │  reader = body.getReader()        ← acquire (lock)                  │
-  │  while: reader.read() → yield chunk → decodeNdjsonStream buffers,    │
-  │         yields one complete line at a time → onEvent(event)         │
-  │  finally: reader.releaseLock()    ← release (always)                │
-  └──────────────────────────────────────────────────────────────────────┘
-```
-
-Note the partial-line handling lives in `decodeNdjsonStream` (`ndjson-stream.ts:108`, walked in `05`): a chunk can split a JSON line in half, so the decoder buffers the tail until the newline arrives. The reader doesn't care about line boundaries; the decoder does. Clean separation of concerns — the reader owns the *handle* lifecycle, the decoder owns the *line* lifecycle.
-
-**Sockets and the dev server.** The only listening socket is the Vite dev server's, owned by Vite, not aptkit code. Outbound HTTP (`fetch` to Ollama/cloud) uses connections managed by the runtime's `fetch` implementation — aptkit holds no socket handles directly, opens no servers in the library. No connection pool to manage, no descriptors to leak. (`study-networking` covers the transport side.)
+This is the classic Node readable-stream pattern: accumulate `data` chunks, resolve on `end`, reject on `error`. The `error` listener is the resource-hygiene detail — without it, a stream error would go unhandled. It buffers the whole body (consistent with the whole-file/whole-response philosophy), which is right for small JSON request bodies.
 
 ### Move 3 — the principle
 
-Resource lifecycle is the discipline of guaranteeing release on every exit path, and the cleanest way to honor it is to never hold a raw handle longer than one call — let the API acquire and release atomically. aptkit does that everywhere it can (`fs.promises.readFile` is acquire-use-release in one line) and reaches for explicit `try/finally` only at the one place a handle genuinely spans a loop (the stream reader). The lesson: buffered whole-file I/O isn't a shortcut to apologize for — it's the right tool when files are small, because it eliminates the leak surface entirely. Streaming earns its complexity only when the data doesn't fit in memory or needs to flow incrementally — which in aptkit is exactly one pipe, the live trace, and there the lifecycle is handled correctly.
+Resource safety is "acquire, use, *always* release" — and "always" is carried by `finally`, not by the happy path. aptkit's core dodges the problem entirely by holding no handles (sockets auto-close, no files), which is the cleanest possible answer for a library. Studio, which *does* hold a streaming response open, gets the lifecycle right: it writes errors as data instead of dropping the connection, and it closes in a `finally` so no failure path leaks the stream. The transferable lesson: the moment you hold a resource the runtime won't auto-release — a stream, a long-lived fd, a DB connection — the `finally` that releases it is mandatory, and it's where leaks hide when it's missing.
 
 ## Primary diagram
 
-The complete I/O picture: buffered whole-file reads with no held handles, one streaming pipe with explicit reader cleanup.
-
 ```
-  aptkit filesystem + stream resources — complete
+  Filesystem, streams, and resource lifecycle in aptkit — complete
 
-  ┌─ BUFFERED FILE I/O (everywhere) ─────────────────────────────────────┐
-  │  fs.promises.readFile/writeFile/readdir                               │
-  │  acquire fd ─ read/write whole ─ close fd  ← all in one call, no leak │
-  │  correct because: small JSON artifacts, parse needs whole doc anyway  │
-  │  ✗ no createReadStream / createWriteStream anywhere                    │
-  └────────────────────────────────────────────────────────────────────────┘
-  ┌─ THE ONE STREAM: NDJSON trace pipe (Studio only) ─────────────────────┐
-  │  server: res.write(encodeNdjsonRecord(event)) per event, x-accel: no  │
-  │     │ HTTP application/x-ndjson, flushed as events happen              │
-  │  browser: reader = body.getReader()      ← acquire (lock)             │
-  │           loop reader.read() → decodeNdjsonStream → onEvent           │
-  │           finally reader.releaseLock()    ← release on every exit     │
-  └────────────────────────────────────────────────────────────────────────┘
+  ┌─ Core packages ──────────────────────────────────────────────┐
+  │  NO files, NO descriptors. Only fetch sockets (auto-closed     │
+  │  after res.json/res.text). Nothing to leak.                    │
+  └────────────────────────────────────────────────────────────────┘
+
+  ┌─ Studio dev server (apps/studio/vite.config.ts) ──────────────┐
+  │                                                                │
+  │  INPUT (auto-closed)                                           │
+  │   readdir → list artifacts/replays                             │
+  │   readFile(path, 'utf8') → whole file, fd opened+closed        │
+  │                                                                │
+  │  OUTPUT (handler-owned — MUST close)                           │
+  │   set NDJSON headers ──► res.write(event line) ─┐              │
+  │                          res.write(result line) ├─► to browser │
+  │                          catch → write error line│             │
+  │                          finally → res.end() ◄───┘ ALWAYS      │
+  │                                                                │
+  │  REQUEST (manual stream consume)                               │
+  │   req.on('data') accumulate · on('end') parse · on('error')    │
+  └────────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The "always read the whole file" instinct gets a bad name from systems that apply it to huge data and run out of memory — but for configuration, fixtures, and small documents it's simply correct, and it sidesteps the entire descriptor-leak problem that streaming APIs introduce (a `createReadStream` you forget to close, or that errors before `'end'`, leaks an fd). The `ReadableStream` + `getReader` + `releaseLock` pattern aptkit uses on the browser side is the Web Streams API, the same primitive that powers `fetch` body consumption and `TransformStream`s; the `try/finally` around `releaseLock` is the canonical way to make a locked stream exception-safe. If aptkit ever needed to stream large files (say, indexing a huge corpus from disk), the move would be `fs.createReadStream` piped through a line splitter into the same `decodeNdjsonStream` — the decoder already accepts any `AsyncIterable<string | Uint8Array>`, so it'd drop in. See `05` for the memory side of buffering, and `study-networking` for the HTTP transport the NDJSON rides on.
+The `finally`-guarded `res.end()` is the runtime-systems version of a lesson every backend engineer learns the hard way: open file descriptors and half-open connections don't clean themselves up, and the error path is where you forget to release them. Streaming NDJSON (newline-delimited JSON, one object per line) is the pragmatic choice for trace output because the client can parse incrementally — it doesn't wait for the whole run to finish, which matters when an agent loop takes several seconds. aptkit's runtime even ships the decoder for it (`decodeNdjsonStream`, `ndjson-stream.ts:103-135`) with partial-line buffering across chunk boundaries, so a record split across two network chunks still parses. The core deliberately holds no other resources, which is why a library is so much easier to reason about than a service: no connection pools to drain, no file handles to track, no descriptors to exhaust. Those concerns move to buffr, the process owner. → `07-backpressure-bounded-work-and-cancellation.md` for shutdown, where releasing in-flight resources cleanly would matter.
 
 ## Interview defense
 
-**Q: aptkit reads every file fully into memory — isn't that a problem?**
+**Q: aptkit streams trace events to the browser — how does it avoid leaking the response stream?**
+The handler closes the response in a `finally` (`vite.config.ts:917`), so `res.end()` runs on every path — success, error, anything. Errors are written *as an NDJSON line* before the close, so the client learns why the stream ended instead of seeing a dropped connection. That `finally` is the load-bearing line; without it, any thrown error mid-stream leaks a half-open response.
 
 ```
-  files are small JSON (fixtures, replay artifacts) — KBs
-  JSON.parse needs the whole doc anyway → streaming the read buys nothing
-  fs.promises.readFile opens AND closes the fd in one call → no leak surface
-  buffered is correct here; streaming earns its keep only for data too big
-  to hold in memory, which the repo doesn't have
+  acquire (headers) → write events → catch (error as a line) → finally res.end()
 ```
+*Anchor: "always release" means release on the error path too — that's what `finally` guarantees.*
 
-Anchor: "Buffered whole-file reads are the right call for small JSON — they eliminate the descriptor-leak surface entirely; streaming would be more code for the same memory and no win."
-
-**Q: Show me where aptkit manages a resource that must be released even on error.**
-
-```
-  api.ts:169 responseBodyChunks — the browser NDJSON stream reader
-    reader = body.getReader()   ← acquire (locks the stream)
-    try { loop read() → yield } finally { reader.releaseLock() }
-  the finally guarantees the lock is freed on throw OR early break,
-  so the stream is never left locked
-```
-
-Anchor: "The one held-across-a-loop handle is the stream reader, and its `releaseLock` is in a `finally` — released on every exit path."
+**Q: Does aptkit's core hold any file handles or descriptors?**
+No. The core packages are pure async functions over in-memory data plus a `fetch`; the socket auto-closes after the body read. Files only appear in the Studio dev server, read whole with `fs.promises.readFile` (open + read + close in one call). There's nothing long-lived to leak. Incremental `createReadStream` reads are `not yet exercised` — unnecessary at these file sizes.
 
 ## See also
 
-- `05-memory-stack-heap-gc-and-lifetimes.md` — the memory side of buffered reads and the streaming NDJSON buffer
-- `03-event-loop-and-async-io.md` — the async-generator stream decode and its await points
-- `study-networking` — the HTTP transport the NDJSON stream rides on
+- `05-memory-stack-heap-gc-and-lifetimes.md` — the whole-file/whole-body read tradeoff
+- `03-event-loop-and-async-io.md` — the stream writes happen on the event loop
+- `07-backpressure-bounded-work-and-cancellation.md` — releasing resources on shutdown
+- `study-networking` — the NDJSON transport and HTTP streaming semantics

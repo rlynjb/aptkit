@@ -1,139 +1,138 @@
 # DNS, Routing, and Addressing
 
-**Industry name:** name resolution / addressing / origin routing · *Industry standard*
+**Name resolution · host addressing · edge & proxy layers** — *Industry standard*
 
-## Zoom out, then zoom in
+## Zoom out — where addressing lives
 
-Before a byte can travel, the code has to answer "to which address?" Here's where that question gets asked in this system — and the surprise is how often the answer is "no lookup needed."
-
-```
-  Zoom out — where addressing happens
-
-  ┌─ Service layer ────────────────────────────────────────────┐
-  │  GemmaModelProvider                                        │
-  │    host = 'http://localhost:11434'   ← ★ literal address ★ │
-  │  OllamaEmbeddingProvider                                   │
-  │    host = 'http://localhost:11434'   ← ★ literal address ★ │
-  └───────────────────────────┬────────────────────────────────┘
-                              │ resolves to 127.0.0.1 — loopback,
-                              │ no DNS query leaves the machine
-  ┌─ Provider layer ─────────▼─────────────────────────────────┐
-  │  Anthropic/OpenAI SDK  →  api.anthropic.com / api.openai.com│
-  │    DNS happens HERE, inside the SDK (not aptkit's code)     │
-  └────────────────────────────────────────────────────────────┘
-```
-
-**Zoom in.** DNS is the phonebook step: turn a human name (`api.openai.com`) into an IP the OS can route to. Routing and proxies decide the path those packets take. In aptkit, the foreground answer is `localhost` — a name the OS resolves to `127.0.0.1` without any network query — so the interesting DNS lives entirely inside dependencies. The pattern to learn: **the address is configuration, and where the address is a literal loopback, the whole resolution+routing+proxy stack collapses to nothing.**
-
-## Structure pass
-
-**Layers:** the address is decided in the Service layer (the provider constructors), used at the wire in the transport, and — for cloud — re-decided inside the Provider SDK.
-
-**Axis — "who resolves the name, and does a query leave the box?"** Trace it:
+Every `fetch` has to answer one question before a single byte moves: *what machine, at what address?* In AdvntrCue that meant a hostname (`api.openai.com`) that DNS turned into an IP, routed across the internet. aptkit answers that question with a constant string — `localhost` — and the answer never leaves the box. Here's where addressing sits.
 
 ```
-  Axis — name resolution — across the addressing surfaces
+  Zoom out — addressing in the provider layer
 
-  surface                     name              who resolves       query leaves box?
-  ─────────────────────────────────────────────────────────────────────────────────
-  Gemma / Ollama embed        localhost:11434   OS, instantly      NO (loopback)
-  Anthropic SDK               api.anthropic.com SDK → OS → resolver YES (DNS over UDP/53)
-  OpenAI SDK                  api.openai.com    SDK → OS → resolver YES
-  buffr → Supabase            host in DATABASE_URL  pg → OS         YES
-  Studio (Pages, prod)        <user>.github.io  browser → OS       YES (user side)
+  ┌─ Provider/adapter layer ──────────────────────────────────┐
+  │  defaultHttpTransport(host)                                │
+  │     host = 'http://localhost:11434'  ← ★ THE ADDRESS ★     │ ← we are here
+  │     fetch(`${host}/api/chat`)                              │
+  └──────────────────────────┬─────────────────────────────────┘
+                             │  resolve "localhost" → 127.0.0.1 / ::1
+  ┌─ OS resolver / loopback ─▼─────────────────────────────────┐
+  │  no DNS server hit — /etc/hosts or built-in loopback        │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-**Seam:** the boundary between "loopback literal" and "real hostname" is where DNS becomes real. aptkit's own code sits entirely on the loopback side; cross into a dependency and a resolver gets involved.
+## Zoom in — the concept
+
+**DNS** maps a name to an address; **routing** picks the path to that address; **addressing** is the literal `host:port` a socket targets. The whole point of this topic is the journey from "I want to talk to *that service*" to "I have a socket to *this IP*." In aptkit that journey is trivial — and understanding *why* it's trivial is the lesson.
+
+## Structure pass — the skeleton
+
+**Layers:** application address string → OS resolver → routing → physical hop. aptkit only touches the first; the rest collapse because the target is loopback.
+
+**Axis traced — "how far does the packet travel?"**
+
+```
+  One question across the addressing layers: "how far does it travel?"
+
+  ┌────────────────────────────────────┐
+  │ host = 'http://localhost:11434'     │  → application names the box
+  └────────────────────────────────────┘
+      ┌────────────────────────────────┐
+      │ resolve 'localhost'             │  → 127.0.0.1 / ::1 (no DNS query)
+      └────────────────────────────────┘
+          ┌────────────────────────────┐
+          │ route                        │  → loopback interface, 0 network hops
+          └────────────────────────────┘
+              ┌────────────────────────┐
+              │ deliver to Ollama       │  → same machine, never on a NIC
+              └────────────────────────┘
+
+  the packet never leaves the host — every routing concern is N/A
+```
+
+**Seam — the `host` option.** `host` is a constructor option (`gemma-provider.ts:48`, `ollama-embedding-provider.ts:47`), defaulting to `http://localhost:11434`. That's the one knob that *could* point at a remote Ollama and turn this into a real DNS/routing problem. Today it doesn't.
 
 ## How it works
 
-#### Move 1 — the mental model
+### Move 1 — the mental model
 
-You've typed `localhost:3000` into a browser a thousand times and never thought about DNS — because there isn't any. `localhost` is a name the OS maps to `127.0.0.1` from a local file (`/etc/hosts`), instantly, with no packet sent. aptkit's two real sockets both target exactly that.
+You know how `localhost` in a dev server "just works" with no DNS setup? Same primitive here. The address is a literal in the adapter, and `localhost` is special-cased by the OS to the loopback interface — no nameserver, no route table that matters.
 
 ```
-  The pattern — resolution as a fork
+  The loopback-address pattern
 
-  name string
-      │
-      ├─ is it loopback/literal? ──► OS-local map ──► 127.0.0.1  (no query)
-      │
-      └─ is it a real hostname? ──► resolver ──► A/AAAA record ──► routable IP
-                                    (UDP :53, cached, can fail/be slow)
+   host string ──► OS resolver ──► loopback ──► same process box
+   'localhost'      special-cased    127.0.0.1     Ollama daemon
+                    (no DNS query)    / ::1
+        │
+        └─ overridable: pass host:'http://10.0.0.5:11434' → real DNS/route
 ```
 
-The kernel of DNS: a name goes to a resolver, which returns an IP (an A record for IPv4, AAAA for IPv6), usually cached with a TTL. Strip the resolver and a real hostname can't be reached at all. Strip it for `localhost` and nothing changes — because that branch never runs.
+### Move 2 — walking it
 
-#### Move 2 — walking the addressing in this repo
-
-**Both Ollama clients hardcode the loopback host as a default.** The address is a constructor default you can override, but in practice it's `localhost:11434` (`packages/providers/gemma/src/gemma-provider.ts:48`, `packages/retrieval/src/ollama-embedding-provider.ts:47`):
+**The address is a default string, normalized once.** Both transports take a `host` and strip a trailing slash before building the URL.
 
 ```ts
-// gemma-provider.ts:48
+// packages/providers/gemma/src/gemma-provider.ts:48 + 201-202
 this.chat = options.chat ?? defaultHttpTransport(options.host ?? 'http://localhost:11434');
-//                                                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-// ollama-embedding-provider.ts:47
-options.embed ?? defaultHttpTransport(options.host ?? 'http://localhost:11434');
+// ...
+const base = host.replace(/\/$/, '');     // 'http://localhost:11434' → same, no trailing /
+const res = await fetch(`${base}/api/chat`, { ... });
 ```
 
-The `host` is a string, parsed by `fetch`'s URL handling. Because it's loopback, the OS short-circuits resolution — no DNS query, no resolver dependency, no routing across a network. That's why these calls have no DNS-failure mode: the only way `localhost` fails to resolve is a broken `/etc/hosts`.
+`host` is `http://localhost:11434` unless a caller overrides it. The embedding provider mirrors this exactly (`ollama-embedding-provider.ts:47, 61`). There's no service-discovery, no environment-based host selection in aptkit itself — though buffr reads `OLLAMA_HOST` from env (`buffr/src/config.ts:14`, also defaulting to `http://localhost:11434`) and would pass it down.
 
-**Cloud addressing is the SDK's secret.** `AnthropicModelProvider` and `OpenAIModelProvider` never name a host — they construct the vendor client and let it own the base URL, DNS, and routing (`packages/providers/anthropic/src/...:25`, `packages/providers/openai/src/openai-provider.ts:30`). So aptkit's code has *no* line where `api.anthropic.com` appears; the resolution is real but invisible to this repo.
+**`localhost` resolution skips DNS.** When the OS sees `localhost`, it resolves to `127.0.0.1` (IPv4) or `::1` (IPv6) from `/etc/hosts` or a built-in rule — no UDP query to a nameserver on port 53. Concretely: if you unplug your network cable, these calls still work, because nothing is routed off the box. That's the defining consequence of loopback addressing.
 
-```
-  Layers-and-hops — addressing crosses into the SDK
+**Port is fixed in the address.** `11434` is Ollama's default chat port, baked into the host string. There's no port discovery, no SRV record, no negotiation — the port is part of the constant.
 
-  ┌─ aptkit ──────────────────┐  hop: complete()  ┌─ vendor SDK ───────────┐
-  │  new Anthropic({ apiKey })│ ─────────────────►│ baseURL → DNS → TLS →  │
-  │  (no host named)          │                   │ api.anthropic.com      │
-  └───────────────────────────┘                   └────────────────────────┘
-        addressing decided here is NONE; it's all on the SDK side
-```
+**No proxy / edge layer in front.** There's no reverse proxy, CDN, or load balancer between aptkit and Ollama; the `fetch` hits the daemon directly. The only "edge" anywhere in the system is GitHub Pages serving Studio's static build (HTTPS, a real hostname, DNS resolved by the *browser* — not by aptkit code). That edge serves *assets*, not API traffic.
 
-**buffr's address is a connection string.** `createPool(databaseUrl)` (`buffr/src/db.ts:4`) takes a full `DATABASE_URL` — host, port, db, credentials packed into one URI. The `pg` driver parses it and resolves the host. aptkit never sees this; it's buffr's boundary.
+### Move 3 — the principle
 
-**Studio in production routes through GitHub Pages.** The deploy workflow (`.github/workflows/deploy-studio-pages.yml`) builds with `base: '/aptkit/'` (`apps/studio/vite.config.ts:196`) and ships the static bundle via `actions/deploy-pages@v4`. The origin routing — GitHub's CDN, the `<user>.github.io/aptkit/` path — is GitHub infrastructure configured by the workflow, not code aptkit executes. There's no reverse proxy, no load balancer, no edge logic the repo owns.
-
-#### Move 3 — the principle
-
-The principle: **the address is just configuration, and loopback is the address that needs no resolution.** A system that talks only to `localhost` has no DNS-failure surface, no split-horizon DNS to misconfigure, no resolver timeout to tune. The cost is that you've pushed every real-hostname concern (DNS caching, failover, geo-routing) into dependencies — which is fine until one of them resolves slowly and your missing timeout (file `07`) turns that into a hang.
+When your target is loopback, DNS and routing aren't "simple" — they're *absent*, and that absence buys you determinism: no resolution latency, no DNS cache poisoning, no split-horizon surprises, no route flaps. The cost is the obvious one: it only works when the dependency is on the same machine. The moment `host` points off-box, every DNS and routing concern you skipped comes back at once — and aptkit has no code to handle them, because it never needed any.
 
 ## Primary diagram
 
-```
-  Addressing recap — loopback vs real-hostname fork
+The full addressing path, with the override that would change everything.
 
-  aptkit code          │  loopback side (no DNS)
-  ─────────────────────┼──────────────────────────────────────────
-  Gemma/embed host ────┼──► localhost:11434 → 127.0.0.1  (OS map)
-                       │
-  dependency side      │  real-hostname side (DNS over :53)
-  ─────────────────────┼──────────────────────────────────────────
-  Anthropic/OpenAI SDK ┼──► api.*.com        (SDK resolves)
-  buffr pg.Pool ───────┼──► DATABASE_URL host (pg resolves)
-  Studio Pages (prod) ─┼──► <user>.github.io  (browser resolves)
+```
+  aptkit addressing — loopback today, the one knob that changes it
+
+  ┌─ aptkit code ──────────────────────────────────────────────┐
+  │  options.host ?? 'http://localhost:11434'                   │
+  │       │                                                     │
+  │       ├── default ──► 'localhost' ──► loopback ──► 0 hops   │
+  │       │                (no DNS, no NIC)                     │
+  │       │                                                     │
+  │       └── override ─► 'http://host.example:11434'           │
+  │                        │                                     │
+  │                        ▼  ← real DNS query (UDP :53)        │
+  │                       resolve → IP → route → network hops   │
+  │                       (no aptkit code handles this path)    │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-DNS is the oldest distributed database on the internet, and its failure modes (stale cache, slow resolver, split horizon) cause outages out of all proportion to how little code touches it. aptkit dodges all of that for its own sockets by using loopback. When this repo grows a remote inference endpoint — swapping the Ollama `host` for a real hostname — DNS resolution, its caching, and its failure modes all become live, and the missing timeout in `07` becomes a much sharper problem because a slow resolver now sits in front of every call. See `study-distributed-systems` for how name-resolution failure propagates through the fallback chain.
+DNS, routing, edge layers, and proxies are a deep topic precisely because the internet is a hostile, lossy, multi-hop network. Loopback sidesteps all of it. aptkit's choice to keep the LLM dependency on `localhost` is the same instinct as contrl keeping ML in the hot path on-device: when you can avoid the network entirely, the hardest distributed-systems problems evaporate. The `host` override is the escape hatch for the day you want a shared Ollama box on a LAN — at which point this file stops being mostly `not yet exercised`.
 
 ## Interview defense
 
-**Q: "How does your system handle DNS resolution and failover?"**
-Be honest and precise: "My own code talks only to `localhost`, so there's no DNS in aptkit's sockets — loopback resolves from the OS map with no query. DNS for the cloud providers is owned by their SDKs; the database host resolution is owned by the `pg` driver in the companion repo. I haven't had to tune resolver timeouts because I never resolve a real hostname myself." Then name the upgrade: "The moment I point the Ollama `host` at a remote box, DNS becomes real and I'd want a connect timeout in front of it."
+**Q: How does your system do service discovery / DNS?**
+Honest answer: it doesn't need to. The only dependency is a local Ollama daemon at a constant `http://localhost:11434`, so there's no DNS query and no routing — it's the loopback interface. The host is an overridable constructor option, so pointing at a remote Ollama is a one-line change, but then I'd be taking on DNS resolution, routing, and TLS that the code doesn't currently handle.
 
 ```
-  sketch: the fork — most of my arrows go left (loopback)
-
-  name ──► [loopback?] ──yes──► 127.0.0.1   (where I live)
-                    └───no────► resolver     (where deps live)
+  'localhost' → loopback → 0 network hops   (no nameserver touched)
+       └── override host → real DNS/route (uncovered path)
 ```
+Anchor: *"loopback by default; the host string is the only addressing knob."*
 
-Anchor: *loopback is the address that needs no phonebook.*
+**Q: What breaks if DNS is slow?**
+Nothing, today — there's no DNS in the path. If `host` pointed off-box, a slow resolver would block the `await fetch` with no timeout to bound it (see `07`), so a DNS stall would become an indefinite hang.
 
 ## See also
 
-- `01-network-map.md` — the five hops these addresses sit on
 - `03-tcp-udp-connections-and-sockets.md` — what happens after the address resolves
-- `04-tls-and-trust-establishment.md` — why the loopback hop skips TLS too
+- `04-tls-and-trust-establishment.md` — why loopback means no TLS
+- `07-timeouts-retries-pooling-and-backpressure.md` — why an off-box host would hang
+- `00-overview.md` — DNS listed under `not yet exercised`

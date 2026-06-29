@@ -1,177 +1,148 @@
 # Stacks, Queues, Deques & Heaps
 
-**Industry name(s):** LIFO stack · FIFO queue · double-ended queue · binary heap / priority queue — *Industry standard*
-
-> **Status in aptkit: `not yet exercised` as explicit structures.** No `Stack`, `Queue`, `Deque`, or `Heap` class runs anywhere in aptkit's source. You've built `BinaryHeap.ts` and `PriorityQueue.ts` from scratch — this file is mostly curriculum, with **one real seam**: the top-k selection in `search` is precisely the problem a heap solves, and the repo solves it with a full sort instead. That seam is the lesson.
-
----
+**LIFO/FIFO ordering disciplines · double-ended queues · binary heaps & priority queues** — Industry standard. **Status in aptkit: `not yet exercised`.**
 
 ## Zoom out, then zoom in
 
-These ordering disciplines don't appear as data structures in aptkit — but the *problem one of them solves* is sitting in the hottest path. Here's where a heap *would* live if the corpus grew.
+Be honest up front: aptkit runs none of these as an explicit structure. There's no stack, no queue, no heap, no priority queue in the code. This file teaches the family, shows the one place a priority queue would be a *latent fit*, and points at where you've already built it (`reincodes`, `BinaryHeap.ts`/`PriorityQueue.ts`).
 
 ```
-  Zoom out — the one place an ordering discipline is latent
+  Zoom out — where ordering disciplines would sit (none active)
 
-  ┌─ Retrieval layer ───────────────────────────────────────────┐
-  │  InMemoryVectorStore.search:                                │
-  │    hits.sort(...)        ← FULL sort: O(n log n)            │
-  │    .slice(0, k)          ← then keep top-k                  │
-  │                                                              │
-  │    ★ a MIN-HEAP of size k would do this in O(n log k) ★      │
-  │       (the curriculum seam — not what the repo does)        │
-  └──────────────────────────────────────────────────────────────┘
-
-  ┌─ everywhere else ───────────────────────────────────────────┐
-  │  no stack, no queue, no deque, no priority queue            │
-  │  the agent loop is a flat counted for-loop, not a work queue│
-  └──────────────────────────────────────────────────────────────┘
+  ┌─ Service layer — packages/runtime ───────────────────────────┐
+  │  agent loop: messages[] grows append-only                    │
+  │    NOT a queue — no dequeue, never drained                   │ ← looks like a
+  │  call stack: parseAgentJson recursion is shallow             │   queue, isn't
+  └───────────────────────────────┬───────────────────────────────┘
+                                   │
+  ┌─ Storage layer — packages/retrieval ─────────────────────────┐
+  │  top-k selection: full sort + slice(k)                       │ ← a HEAP would
+  │    in-memory-vector-store.ts:31  hits.sort(...).slice(k)     │   fit here ★
+  │  the priority queue is the latent fit for top-k              │   (not used)
+  └───────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: a heap is a priority-ordered structure where the min (or max) is always at the root, `O(log n)` to insert or extract. The top-k retrieval problem — "give me the k highest-scoring chunks" — is the textbook use case. aptkit chooses a full sort instead, and that choice is correct *for now* for a reason worth understanding.
-
----
+Zoom in: these are all *ordering disciplines* — rules for which element comes out next. A stack pops the most-recently-pushed (LIFO). A queue pops the oldest (FIFO). A deque does both ends. A heap pops the min or max in `O(log n)`. The priority queue is a heap with a "smallest key first" contract. The latent fit in aptkit is the heap, for top-k — covered as a real alternative in file 06.
 
 ## Structure pass
 
-**Layers (curriculum):** stack (LIFO, call-stack/undo), queue (FIFO, work scheduling), deque (both ends), heap (priority extraction).
-
-**Axis — ordering discipline:** trace "what determines what comes out next?"
-
 ```
-  One axis — "what comes out next?" — across the four structures
+  layers:  the discipline  →  the structure  →  the pop cost
+  axis held constant: "which element comes out next, and what does it cost?"
 
-  stack  → the LAST thing in        (LIFO)   — recursion, undo
-  queue  → the FIRST thing in       (FIFO)   — BFS frontier, job queue
-  deque  → either end, your choice            — sliding-window maxima
-  heap   → the HIGHEST PRIORITY one (by key) — top-k, Dijkstra, scheduling
+  ┌─ stack (LIFO) ──────────────┐   pop = newest;  push/pop O(1)
+  │  recursion's call stack      │   → reverse-order processing
+  └──────────────┬───────────────┘
+                 │  seam: pop order flips newest → oldest
+  ┌─ queue (FIFO) ──────────────┐   pop = oldest;  enqueue/dequeue O(1)
+  │  BFS frontier, task buffers  │   → fairness, breadth-first
+  └──────────────┬───────────────┘
+                 │  seam: pop order flips oldest → BEST (by priority)
+  ┌─ heap / priority queue ─────┐   pop = min/max;  push/pop O(log n)
+  │  top-k, Dijkstra frontier    │   → ordering by key, not arrival
+  └──────────────────────────────┘
 ```
 
-**Seam — full-sort vs heap-select at the top-k boundary.** aptkit's `search` answers "what comes out next?" with "sort everything, take the front k." A heap answers it with "maintain only the k best." The axis-answer (how ordering is achieved) flips across that seam — and it's the only place in aptkit where one of these structures is even relevant.
-
----
+The seam that matters for aptkit is the bottom one. aptkit's top-k uses a full sort (`O(n log n)`) then takes `k`. A heap pops the top-k in `O(n log k)` — strictly better when `k ≪ n`. aptkit doesn't reach for it; file 06 explains why the full sort is still the right call *today* and when it stops being.
 
 ## How it works
 
-### Move 1 — the mental model (the heap, and the seam)
+### Move 1 — the mental model
 
-You built `BinaryHeap.ts` with `heapifyUp`/`heapifyDown` and a `PriorityQueue.ts` on top of it — so the mechanism is yours already. The shape: a binary heap is an array where each parent is `≤` (min-heap) or `≥` (max-heap) its children, so the extreme element is always at index 0. Top-k via a heap is "keep a min-heap of size k; for each new score, if it beats the heap's min, evict the min and insert."
+A heap is a binary tree kept in an array where every parent is `≤` its children (a min-heap). That one invariant means the smallest element is always at index 0 — `O(1)` to peek, `O(log n)` to remove (bubble the last element down to restore the invariant). A priority queue is just a heap with a friendly API: `enqueue(item, priority)` / `dequeue()` returns lowest priority.
 
 ```
-  Pattern — top-k via a bounded min-heap (the seam aptkit does NOT take)
+  min-heap — parent ≤ children, smallest at the root
 
-  maintain heap of size k=3, min at root:
+           [3]              array: [3, 5, 8, 9, 7]
+          ╱   ╲              index:  0  1  2  3  4
+        [5]   [8]            parent(i) = (i-1)/2
+       ╱  ╲                  child(i)  = 2i+1, 2i+2
+     [9]  [7]
 
-  scores stream in: 0.9  0.3  0.7  0.8  0.2  0.95 …
-  heap (min at top):
-    [0.9]              insert 0.9
-    [0.3, 0.9]         insert 0.3
-    [0.3, 0.9, 0.7]    insert 0.7      ← heap full (size 3)
-    0.8 > min(0.3)?    yes → evict 0.3, insert 0.8 → [0.7,0.9,0.8]
-    0.2 > min(0.7)?    no  → skip
-    0.95 > min(0.7)?   yes → evict 0.7, insert 0.95 → [0.8,0.9,0.95]
-
-  result: the 3 highest, in O(n log k) — never sorted the rest
+  pop min:  return [3], move [7] to root, bubble down → O(log n)
+  the visited/sorted illusion: you NEVER fully sort — you only
+  maintain "min at root," which is the whole trick
 ```
 
-Versus what aptkit *actually* does: sort all `n` then slice — `O(n log n)`, simpler code, exact ties handled by sort stability. The heap is the asymptotic win when `k << n`; the sort wins on simplicity when `n` is small.
+You built exactly this in `reincodes/BinaryHeap.ts` (heapifyUp/heapifyDown) and wrapped it as `PriorityQueue.ts` with a value→index lookup for `updatePriority` — the structure Dijkstra's animation drains. So this is review for you; the aptkit-relevant point is *where it would slot in here* and why it doesn't.
 
-### Move 2 — the walkthrough
+### Move 2 — where a heap would fit aptkit (and why it doesn't, yet)
 
-#### The repo's choice: full sort + slice, not a heap
-
-Here's the actual top-k in aptkit, and it's deliberately *not* a heap:
+**The top-k selection — a priority queue is the latent fit.** Look at `in-memory-vector-store.ts:31`:
 
 ```ts
-// packages/retrieval/src/in-memory-vector-store.ts:31-32
-hits.sort((a, b) => b.score - a.score);   // sort ALL n hits: O(n log n)
-return hits.slice(0, Math.max(0, k));     // keep top-k: O(k)
+  hits.sort((a, b) => b.score - a.score);   // ← O(n log n): sorts ALL n hits
+  return hits.slice(0, Math.max(0, k));     // ← then throws away all but k
 ```
 
-Why the full sort and not your `PriorityQueue.ts`? Three reasons, all honest tradeoffs:
-
-1. **`n` is tiny.** The in-memory store holds a handful of docs. `O(n log n)` and `O(n log k)` are indistinguishable at `n = 50`. The heap's win only shows up when `k << n` with large `n`.
-2. **The full sorted list is sometimes useful.** `recall` over-fetches `max(k*4, 20)` then filters by `kind` (`conversation-memory.ts:94`) — it wants *more* than k from the sort, so a size-k heap would be the wrong tool there anyway.
-3. **Simplicity is correctness.** `Array.sort` is one line, battle-tested, and stable. A hand-rolled bounded heap is more code to get wrong — and you'd only reach for it under a measured latency need.
-
-The boundary condition where this flips: once `n` is large (tens of thousands of chunks) *and* you only need a small `k`, the full sort wastes work ordering chunks you'll throw away. That's the point where you'd reach for either a heap-based partial sort or — better — an index that never scans all `n` (file **04**, **05**).
-
-#### Why there's no queue in the agent loop
-
-A natural instinct: "isn't the agent loop a work queue?" No — and naming why teaches the queue concept by contrast. `runAgentLoop` (`run-agent-loop.ts:98`) is a flat counted `for` loop with a fixed bound. There's no frontier of pending work to dequeue, no FIFO ordering of tasks. Each turn is: call model, maybe execute the tools it asked for *immediately* (`run-agent-loop.ts:139-187`), append results, repeat. Tools are processed in the order the model returned them — an array iteration, not a queue with enqueue/dequeue discipline. If aptkit ever did *speculative multi-step planning* with a backlog of pending sub-tasks, a queue (or priority queue, by expected value) would enter. It doesn't, so it hasn't.
+This sorts every hit to keep `k` of them — wasted work when `k ≪ n`. The heap version keeps a **bounded min-heap of size k**: scan all `n` scores, push each, and whenever the heap exceeds `k`, pop the smallest. At the end the heap holds the top-k. Cost: `O(n log k)` instead of `O(n log n)`.
 
 ```
-  Contrast — what aptkit has vs what a work-queue would be
+  bounded top-k heap — the algorithm aptkit could use but doesn't
 
-  aptkit (flat loop):           a work-queue agent (NOT aptkit):
-  for turn in 0..maxTurns:        queue = [root_task]
-    resp = model.complete()       while queue not empty:
-    for tool in resp.tools:         task = queue.dequeue()  ← FIFO/priority
-      run immediately               subtasks = expand(task)
-                                     queue.enqueue(subtasks) ← frontier grows
+  keep a MIN-heap of size k (smallest of the kept-so-far at root)
+
+  for each score s in the n hits:
+    if heap.size < k:        push s
+    else if s > heap.peek(): pop min, push s   // s beats the worst kept
+    else:                    discard s          // s can't make top-k
+
+  result: heap holds the k largest, cost O(n log k)
+  vs aptkit's O(n log n) full sort — better when k ≪ n
 ```
+
+Walk the boundary condition: when `k` approaches `n`, `log k ≈ log n` and the heap wins nothing — you've added complexity for no gain. aptkit's `k` defaults to 5 and `n` is small (in-memory, a handful of docs), so `O(n log n)` on a tiny `n` is *faster in practice* than maintaining a heap — fewer allocations, native `.sort()`, no per-element heap ops. **That's why aptkit uses the sort: at this `n`, the simpler structure wins.** The heap becomes correct exactly when `n` is large and `k` stays small — and at *that* point you'd reach for buffr's HNSW index instead, which sidesteps the whole scan (file 06).
+
+**The agent loop's `messages[]` is not a queue.** Worth naming to kill a tempting misread. `run-agent-loop.ts:94` builds `messages: ModelMessage[]` and only ever `.push()`es to it — it's an append-only log, never dequeued. The conversation grows; nothing is consumed FIFO. Calling it a queue would be wrong: there's no drain end. It's an accumulating array (file 02), full stop.
+
+**There is no queue, no deque, no work buffer.** aptkit is request-scoped and synchronous — one agent loop, one retrieval, return. No background workers, no task scheduling, no fan-out frontier. A queue shows up when you have producers and consumers decoupled in time; aptkit has neither. `not yet exercised`, and honestly so.
 
 ### Move 3 — the principle
 
-**A full sort is a heap you didn't bother to bound — and at small `n` that's the right call.** The top-k problem always *can* use a heap; whether it *should* depends on whether `k << n` and whether `n` is large enough for the asymptotic gap to beat the simplicity of `sort().slice()`. aptkit picks simplicity because its `n` is small and it sometimes wants more than `k` anyway. Knowing *when* the heap earns its place — not reflexively reaching for it — is the senior move.
-
----
+The ordering discipline you pick *is* the algorithm — a BFS is a queue, a top-k is a heap, a backtracker is a stack. aptkit's top-k uses a full sort because at a small `n` the simpler structure beats the asymptotically-better one. The lesson isn't "always use a heap"; it's "the heap wins only when `k ≪ n` *and* `n` is large enough for the constant to pay off."
 
 ## Primary diagram
 
-The seam in one frame: what aptkit does, and the heap it could grow into.
-
 ```
-  Top-k selection — aptkit's choice vs the heap alternative
+  stacks/queues/heaps in aptkit — one frame (mostly negative space)
 
-  CURRENT (aptkit, small n):
-    all hits ──► Array.sort (O(n log n)) ──► slice(0,k) ──► top-k
-    + simple, exact, stable; sometimes over-fetches >k (recall)
-    − orders n-k chunks it discards
+  EXERCISED?   structure        where it would go            verdict
+  ──────────────────────────────────────────────────────────────────
+  stack        recursion stack  parseAgentJson (shallow)     incidental
+  queue        —                no producer/consumer split   not exercised
+  deque        —                —                            not exercised
+  heap / PQ    bounded top-k    in-memory-vector-store:31  ★ LATENT FIT
+                                (aptkit uses full sort; heap
+                                 wins only when k ≪ n, large n)
 
-  CURRICULUM SEAM (large n, k << n):
-    stream hits ──► size-k min-heap ──► drain ──► top-k
-    + O(n log k), never fully sorts
-    − more code; only helps when k << n AND n large
-
-  BETTER AT SCALE (file 04/05):
-    don't scan n at all ──► ANN index (HNSW) ──► ~O(log n) candidates
-    the real production answer (buffr's PgVectorStore)
+  you've BUILT these: reincodes/BinaryHeap.ts, PriorityQueue.ts
+  aptkit doesn't run them — drill target, not repo evidence
 ```
-
----
 
 ## Elaborate
 
-The binary heap was invented for heapsort (1964) and is the backbone of priority queues — Dijkstra's algorithm, event-simulation schedulers, top-k streaming, Huffman coding. The "bounded min-heap for top-k" pattern is one of the most common real-world heap uses: log aggregators, search rankers, and recommendation systems all keep a size-k heap to find the best results over a large stream without sorting it. Your `PriorityQueue.ts` with `updatePriority` is exactly the variant Dijkstra needs (decrease-key) — a step beyond what top-k requires.
-
-aptkit hasn't reached for any of this because its retrieval set is small and its loop is flat. The honest framing: the heap is a *latent* structure here — the problem exists (top-k), the structure that solves it optimally is one you've built, and the repo correctly declines to use it until the input size justifies it. That's not a gap in your knowledge; it's a gap in the repo's *need*.
-
----
+The heap (Williams, 1964, for heapsort) is the canonical answer to "I need the best `k`, not all `n` sorted." Its reach in real systems is everywhere top-k or scheduling matters: Dijkstra's frontier (which your `PriorityQueue.ts` powers), k-nearest-neighbor, event simulation, OS run-queues, rate-limiter timers. aptkit's omission is correct for its scale — but the *next* version of the lesson is HNSW, which is a graph layered with priority-queue-driven greedy search (file 05): the search frontier in HNSW *is* a priority queue. So the heap you built isn't absent from the production story — it's hiding inside the ANN index in buffr.
 
 ## Interview defense
 
-**Q: aptkit does top-k retrieval. Why a full sort and not a heap?**
-
-> Because `n` is small. The full sort is `O(n log n)`, a size-k min-heap is `O(n log k)` — but with a few dozen chunks they're indistinguishable, and the sort is one stable, correct line versus a hand-rolled heap. There's also a case where the heap is the *wrong* tool: `recall` over-fetches `max(k*4, 20)` from the sort to filter by metadata afterward, so it wants more than k. I'd switch to a bounded heap only when `n` is large, `k << n`, and a profile shows the sort costing real latency — and even then I'd prefer an ANN index that never scans all `n`.
+**Q: aptkit sorts all hits then slices k. When would you use a heap instead?**
+A bounded min-heap of size `k` gets top-k in `O(n log k)` vs the full sort's `O(n log n)` — strictly better when `k ≪ n`. But it's only worth it when `n` is large; at aptkit's small in-memory `n` with `k=5`, the native `.sort()` is faster in practice (fewer allocations, no per-element heap ops). And once `n` is genuinely large, you don't reach for a heap — you reach for an ANN index like buffr's HNSW that avoids scanning all `n` at all.
 
 ```
-  sort+slice: O(n log n), simple, exact   ← aptkit (small n)
-  size-k heap: O(n log k), k<<n large n
-  ANN index:  ~O(log n), no full scan     ← production (buffr HNSW)
+  full sort   O(n log n)   simple, wins at small n   ← aptkit
+  size-k heap O(n log k)   wins when k ≪ n, large n
+  ANN index   O(log n)     wins at huge n            ← buffr (HNSW)
 ```
 
-**Q: Is the agent loop a queue?**
+Anchor: "The sort isn't a mistake — at this `n` the simpler structure wins; the heap is the *middle* answer between full sort and an index."
 
-> No — it's a flat counted `for` loop with a fixed turn bound, not a frontier you enqueue/dequeue. Tools requested in a turn run immediately in array order. A queue would enter only if the agent did speculative multi-step planning with a backlog of pending sub-tasks; aptkit's loop is single-track, so there's no work queue.
-
-Anchor: *the top-k heap is latent in aptkit — the problem is there, the structure is correct to defer until `k << n` at large `n`.*
-
----
+**Q: Is the agent loop's message list a queue?**
+No — it's append-only, never dequeued. A queue has a drain end (FIFO consume); `messages[]` only grows as the conversation accumulates. Calling it a queue would miss that there's no consumer. It's an accumulating array.
 
 ## See also
 
-- **06-sorting-searching-and-selection.md** — the full sort aptkit uses instead of a heap, and partial-selection alternatives.
-- **02-arrays-strings-and-hash-maps.md** — the hit array the sort operates on.
-- **05-graphs-and-traversals.md** — HNSW, the structure that removes the need to rank all `n` at all.
-- **08-dsa-foundations-practice-map.md** — where heap practice lands in the plan.
+- `06-sorting-searching-and-selection.md` — the top-k the heap would optimize, and why the sort wins today
+- `05-graphs-and-traversals.md` — HNSW's greedy search frontier is a priority queue
+- `02-arrays-strings-and-hash-maps.md` — the accumulating `messages[]` array (not a queue)
+- `08-dsa-foundations-practice-map.md` — heap/PQ as a "keep sharp" drill, not repo evidence

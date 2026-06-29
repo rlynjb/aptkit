@@ -1,233 +1,274 @@
 # 05 — Eval-driven prompt iteration
 
-**Industry name:** eval-driven development / LLM evals — *Industry standard*
+**Subtitle:** eval-driven iteration — golden set, regression suite, score
+before vibes (Industry standard)
 
 ## Zoom out, then zoom in
 
-Here's the dividing line between a junior and a senior prompt engineer: a junior
-iterates by vibes — "the response feels better now." A senior iterates against an
-eval set. I once watched a prompt sit at 4/5 on a rubric for six months before we
-realized the rubric was measuring the wrong thing the whole time. The fix isn't
-"trust the model less" — it's *write the eval before you touch the prompt*, so
-every change is scored, diffed, and gated against regressions.
-
-aptkit has the eval machinery wired as a real backbone.
+This is the concept that separates a senior from a junior more sharply than
+any other. A junior iterates a prompt by vibes — "the response feels better
+now." A senior iterates against an eval set with a number. aptkit is built
+around this: its entire backbone is live run → artifact → eval → promote to
+fixture → deterministic replay. The eval layer is not a side feature; it's
+the loop that gates every prompt change.
 
 ```
-  Zoom out — the eval loop around the prompt
+  Zoom out — the eval layer closing the loop
 
-  ┌─ Prompt change (the thing under test) ────────────────────┐
-  │  edit PromptPackage.system in prompts/src/*.ts             │
-  └───────────────────────────┬────────────────────────────────┘
-  ┌─ Run → artifact ──────────▼────────────────────────────────┐
-  │  live/replay run → artifacts/replays/*.json {output, eval} │
-  └───────────────────────────┬────────────────────────────────┘
-  ┌─ Score (this concept) ────▼────────────────────────────────┐
-  │  ★ evals/structural-diff.ts — shape assertions ★           │ ← we are here
-  │  ★ evals/detection-scorer.ts — required categories/scopes ★ │
-  │  ★ evals/rubric-judge.ts — Claude judges meaning ★         │
-  │  ★ evals/precision-at-k.ts — retrieval precision/recall ★  │
-  │  evals/replay-runner.ts — batch eval → summary             │
-  └───────────────────────────┬────────────────────────────────┘
-  ┌─ Gate ────────────────────▼────────────────────────────────┐
-  │  keep change if score up AND no regression on golden set    │
-  └──────────────────────────────────────────────────────────────┘
+  ┌─ Runtime ───────────────────────────────────────────────────┐
+  │  agent run → output + trace                                  │
+  └───────────────────────────┬──────────────────────────────────┘
+                              │ artifact (JSON on disk)
+  ┌─ ★ Eval layer ★ ──────────▼───────────────────────────────────┐
+  │  ★ rubric-judge (Claude judges Gemma)                         │ ← we are here
+  │  ★ precision@k / recall@k (retrieval)                         │
+  │  ★ structural-diff, detection-scorer, replay-runner           │
+  └───────────────────────────┬──────────────────────────────────┘
+                              │ promote passing run → fixture
+  ┌─ Regression layer ────────▼───────────────────────────────────┐
+  │  FixtureModelProvider replays recorded responses, forever      │
+  └────────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: the repo gives you three *kinds* of scorer, and the kind you pick is the
-whole game. Rule-based (`structural-diff`, `detection-scorer`, `precision-at-k`)
-for things with a checkable answer; LLM-as-judge (`rubric-judge`) for things that
-need judgment. Mixing them up is how you get a 4/5 that means nothing.
+Zooming in: eval-driven iteration is the loop *change prompt → run evals →
+diff scores → keep the change only if it improved without regressing*. The
+golden set is your hand-curated truth; the regression suite is every
+production failure added back as a permanent test. You write the eval
+*before* you iterate the prompt, because otherwise you're optimizing a
+target you can't see.
 
-## The structure pass
+## Structure pass
 
-**Layers:** the golden set (curated cases) → the run (prompt produces output) →
-the scorer (rule-based or judge) → the gate (keep/reject the change).
+**Layers.** Runtime (produces an artifact) → eval (scores it) → regression
+(freezes a passing artifact as a replayable fixture).
 
-**Axis — is the correctness *checkable by a rule* or does it need *judgment*?**
-This axis decides which scorer is valid:
+**Axis — what decides whether a prompt change ships?** Trace it:
 
 ```
-  Axis: "can a rule check this, or does it need a judge?"
+  Axis: "what authority approves a prompt change?"
 
-  ┌─ Deterministic correctness ─┐  seam  ┌─ Subjective quality ──────┐
-  │ shape, required fields,     │ ══╪══► │ "is this answer good?"    │
-  │ precision@k, detection      │ flips  │ rubric-judge (LLM judges)  │
-  │ → structural-diff,          │        │ → rubric-judge.ts          │
-  │   detection-scorer,         │        │                            │
-  │   precision-at-k            │        │                            │
-  └─────────────────────────────┘        └────────────────────────────┘
-   cheap, exact, no model call            costs a model call, can drift
+  junior loop      → the engineer's gut ("feels better")     ✗
+  golden set       → a score on hand-curated cases           ✓
+  regression suite → no drop on any past-failure case        ✓
+  promoted fixture → deterministic replay matches baseline   ✓
 ```
 
-**Seam:** the boundary between rule-scored and judge-scored. It's load-bearing
-because picking the wrong side breaks the eval: score a free-form answer with a
-shape assertion and you measure formatting, not correctness; score retrieval
-quality with an LLM judge and you've made a deterministic metric expensive and
-noisy. The repo keeps them separate by file. **What breaks if you blur the seam:**
-the six-months-at-4/5 problem — a judge rubric that's actually measuring the
-wrong dimension, with no rule-based ground truth to catch it.
+**Seam.** The load-bearing boundary is *judge model vs subject model*. The
+rubric judge is Claude scoring Gemma's output — the trust flips across that
+seam: you trust the judge's score more than you trust the subject's
+self-report. That asymmetry is the whole point of LLM-as-judge.
 
 ## How it works
 
-### Move 1 — the mental model
+You already trust a test suite over your own reading of a diff — you don't
+merge because the code "looks right," you merge because the tests pass.
+Eval-driven prompt iteration is that exact reflex applied to prompts. Let's
+walk the kernel.
 
-You already write tests before you trust a refactor — red, green, refactor. An
-eval set is a test suite for a prompt. The twist: LLM output isn't deterministic,
-so some assertions are exact (the JSON has these fields) and some are graded (the
-answer is reasonable). You write both kinds *first*, then iterate the prompt
-against them.
-
-```
-  Pattern — the eval-driven iteration loop
-
-   write eval (golden set + regression cases)
-        │
-        ▼
-   change prompt ──► run ──► score ──► diff vs baseline
-        ▲                                  │
-        │                          score up & no regression?
-        └──────── reject ◄── no ──┤
-                  keep    ◄── yes ─┘
-```
-
-### Move 2 — walking the scorers
-
-**Scorer 1 — shape assertions (`structural-diff.ts`).** The cheapest gate:
-does the output have the required structure? The replay-artifact assertions
-(`evals/assertions.ts`) and `structural-diff` check the artifact shape — fields
-present, types right. **What breaks without it:** a prompt edit that changes the
-output shape ships and breaks the consumer before any quality question is even
-asked.
-
-**Scorer 2 — detection scoring (`detection-scorer.ts:1`).** For the
-anomaly-monitoring agent, correctness means "did it find the anomalies it
-should?" `DetectionExpectations` (`detection-scorer.ts:13`) declares
-`minCount`, `requiredCategories`, `requiredScopes`, `requiredSeverities`. The
-scorer checks the detected set against those. This is a *recall-style* gate on a
-classifier-shaped task. **What breaks without it:** a "more concise" prompt edit
-that quietly drops a critical anomaly category — the exact regression the spec
-warns about.
-
-**Scorer 3 — precision@k / recall@k (`precision-at-k.ts`).** For retrieval, the
-correctness question is ranked: of the top-k chunks, how many are relevant
-(precision), and of all relevant chunks, how many made the top-k (recall)?
+### The kernel — change, score, gate
 
 ```
-  Inline annotation — precision-at-k.ts:47 scorePrecisionAtK
+  Eval-driven iteration — the load-bearing loop
 
-  if (k <= 0) return NOT_WELL_FORMED;            ← ok:false when metric undefined
-  const total = Math.min(k, retrievedIds.length); ← short result list not penalized
-  const matched = countDistinctHits(..., k);      ← DISTINCT relevant in top-k
+  ┌──────────────────────────────────────────────────────┐
+  │  1. WRITE THE EVAL FIRST (golden + regression cases)  │
+  │  ┌────────────────────────────────────────────────┐  │
+  │  │ 2. change the prompt                             │  │
+  │  │ 3. run the eval set → scores                     │  │
+  │  │ 4. diff vs baseline                              │  │
+  │  │      improved AND no regression? ── yes ─► keep  │  │
+  │  │                                    └─ no ─► revert│  │
+  │  └────────────────────────────────────────────────┘  │
+  └──────────────────────────────────────────────────────┘
+```
+
+Each part by what breaks without it:
+
+- **Eval written first.** Drop it and you iterate toward a target you're
+  inventing as you go — the "4/5 rubric that measured the wrong thing for
+  six months" failure.
+- **Run on a *set*, not one case.** Drop it and you overfit to the one
+  example you're staring at.
+- **Diff vs baseline.** Drop it and you can't tell improvement from noise.
+- **No-regression gate.** Drop it and you ship the "better average, worse
+  critical edge case" change — the most dangerous one, because the average
+  looks good.
+
+### Step 1 — the golden set lives as fixtures
+
+aptkit's golden cases are recorded `ModelResponse[]` replayed deterministically
+by a `FixtureModelProvider` (per the project's data model). A passing live
+run gets *promoted* to a timestamped fixture — an auto-generated correctness
+baseline. The must-not-change rule is explicit: editing a promoted fixture
+changes test meaning, so they're regenerated via `promote:replay`, never
+hand-edited. That's the golden set as a frozen, version-controlled artifact.
+
+### Step 2 — the rubric judge (LLM-as-judge), done carefully
+
+When the output is open-ended prose you can't string-match, you score it
+with another model. aptkit's `RubricJudge` is the careful version — it
+doesn't ask "is this good?", it scores defined dimensions on defined scales
+with an allowlisted verdict:
+
+```ts
+// packages/evals/src/rubric-judge.ts:143 (buildRubricJudgeSystemPrompt)
+'You are a rubric judge for: ' + rubric.title,
+'Score the subject against the rubric. Score meaning and evidence, not style',
+'  preferences unless the rubric asks for style.',
+'Never rewrite the subject. Return one highest-leverage fix, not a list.',
+'Allowed verdicts:', verdicts,
+'Output JSON only. ... Use exactly this shape:', JSON.stringify(outputShape),
+```
+
+Three production-grade moves in that prompt: "score meaning and evidence,
+not style" (judges drift toward rewarding verbose, pretty output — this
+fights it), "never rewrite the subject" (a judge that rewrites stops being a
+judge), and a *structured* judgment with a validated score range
+(`createRubricJudgmentValidator`, concept 2). The judge's output is itself a
+structured-output contract. And it's run through `generateStructured`
+(`rubric-judge.ts:93`) so a malformed judgment retries instead of crashing
+the eval.
+
+```
+  Layers-and-hops — LLM-as-judge, trust flipping across the seam
+
+  ┌─ Subject ────────┐ hop 1: output text  ┌─ Judge (Claude) ────┐
+  │ Gemma agent run   │ ──────────────────► │ RubricJudge          │
+  │ (best-effort)     │                     │ scores dims + verdict│
+  └───────────────────┘ hop 2: rubric +     └──────────┬───────────┘
+                          calibration examples          │ hop 3: validated
+                                                         ▼ RubricJudgment JSON
+                                              ┌─ Eval result ──────┐
+                                              │ score + one fix     │
+                                              └─────────────────────┘
+```
+
+The calibration examples in the rubric anchor the scoring scale and carry an
+explicit instruction not to repeat them (`rubric-judge.ts:126`) — that's
+few-shot used to calibrate a *judge*, the one place few-shot examples
+genuinely enter a prompt in this repo (see concept 8).
+
+### Step 3 — deterministic retrieval scorers for the gate
+
+Not every eval needs a model. For retrieval changes, aptkit uses pure
+arithmetic scorers — precision@k and recall@k:
+
+```ts
+// packages/evals/src/precision-at-k.ts:47
+export function scorePrecisionAtK(retrievedIds, relevantIds, k): RetrievalScoreResult {
+  if (k <= 0) return NOT_WELL_FORMED;
+  const total = Math.min(k, retrievedIds.length);
+  const matched = countDistinctHits(retrievedIds, relevantIds, k);
   return { ok: true, score: matched / total, matched, total };
+}
 ```
 
-The `ok` flag (`:13`) is the careful bit: it separates "well-formed but scored 0"
-from "metric undefined (k≤0 or empty)". A real score of 0 still has `ok: true`.
-This is how you gate a *retrieval* prompt or chunking change — change the prompt
-that builds the query, re-score precision@k, keep it only if precision holds.
+These gate prompt-and-retrieval changes with a number you can diff across
+versions: tweak the retrieval prompt or `top_k`, re-score, keep the change
+only if precision held. Note the careful `ok` semantics — `ok:false` means
+the metric is *undefined* (k≤0, empty input), not "bad score." A real 0 is
+still `ok:true`. That distinction stops a malformed eval from masquerading
+as a failing one.
 
-**Scorer 4 — LLM-as-judge (`rubric-judge.ts`).** When correctness needs judgment
-("is this recommendation grounded and actionable?"), `RubricJudge.judge`
-(`rubric-judge.ts:89`) runs a *structured* judging prompt — Claude scores the
-subject against a `RubricDefinition` (dimensions with scales, allowed verdicts,
-optional calibration examples). It's `generateStructured` under the hood
-(`:93`), so the judgment itself is schema-validated (concept 02). **When
-LLM-as-judge is appropriate:** subjective quality you can't rule-check, *and*
-you've calibrated the rubric against known-good examples
-(`calibrationExamples`, `rubric-judge.ts:26`). **When it's a trap:** when a rule
-would do — you've added cost and drift for nothing.
+### Step 4 — the no-regression gate via replay
 
-```
-  Inline annotation — rubric-judge.ts:146 the judging instruction
+The `replay-runner` batches recorded artifacts through the evals and
+produces a `ReplayArtifactEvalSummary`. That's the no-regression gate: every
+promoted fixture is re-scored on every change, so a prompt edit that fixes
+case A but breaks case B shows up as a drop on B. The structural-diff and
+detection-scorer assertions catch shape regressions deterministically. This
+is the suite that turns "I think it's better" into "scores up on the golden
+set, no drop on any regression case."
 
-  "Score the subject against the rubric. Score meaning and evidence,
-   not style preferences unless the rubric asks for style."  ← anti-style-bias
-  "Never rewrite the subject. Return one highest-leverage fix, not a list."
-  // calibration examples (:126): "Use these only to anchor the scoring
-  //   scale; do not repeat them."  ← stops the judge parroting examples
-```
+### The principle
 
-**Scorer 5 — the batch runner (`replay-runner.ts`).** Wraps the above into a
-batch eval over recorded artifacts → a `ReplayArtifactEvalSummary`. That's the
-"run the whole golden set" step. Combined with the fixture-replay backbone (see
-`../study-testing/`), a production failure becomes a promoted fixture that lives
-in the regression suite *forever* — the spec's "regression suite" made real.
-
-### Move 3 — the principle
-
-**Write the eval before you iterate the prompt, and never let an average hide a
-regression.** A prompt change that lifts the mean score while tanking one
-critical edge case is a net loss you can't see without per-case diffs. The
-machinery exists so iteration stops being vibes: every change is scored against a
-fixed set, rule-checked where possible, judged only where necessary, and gated on
-*no regression*, not just *higher average*.
+**Skipping evals isn't faster — it's slower, because you iterate in
+circles.** Vibes can't distinguish a real improvement from noise, and they
+can't catch the better-average-worse-edge-case change. Write the eval first,
+score every change against a set, gate on no-regression. The discipline is
+non-negotiable for production prompt work, and it's the literal architecture
+of this repo.
 
 ## Primary diagram
 
-The full eval backbone, scorer types separated by the seam.
+The full eval-driven loop, every stage labelled.
 
 ```
-  Eval-driven iteration — the full backbone
+  Eval-driven prompt iteration in aptkit
 
-  GOLDEN SET (curated cases + promoted regressions)
-        │  run prompt
-        ▼
-  ARTIFACT {output, trace}  artifacts/replays/*.json
-        │
-        ▼  pick scorer by the seam
-  ┌─ RULE-BASED (cheap, exact) ─┐   ┌─ JUDGE (costly, subjective) ─┐
-  │ structural-diff (shape)     │   │ rubric-judge (Claude scores   │
-  │ detection-scorer (recall)   │   │   meaning, calibrated,        │
-  │ precision-at-k (retrieval)  │   │   schema-validated output)    │
-  └─────────────┬───────────────┘   └──────────────┬───────────────┘
-                └─────────► replay-runner ◄─────────┘
-                           batch → ReplayArtifactEvalSummary
-                                    │
-                                    ▼
-                  GATE: score up AND no regression → keep
+  ┌─ Author ────────────────────────────────────────────────────┐
+  │  WRITE EVAL FIRST: golden cases + past-failure regressions    │
+  └────────────────────────────┬──────────────────────────────────┘
+                              │ change the prompt
+  ┌─ Run ─────────────────────▼───────────────────────────────────┐
+  │  live run → artifact { capabilityId, provider, output, trace } │
+  └────────────────────────────┬──────────────────────────────────┘
+                              │ score
+  ┌─ Eval ────────────────────▼───────────────────────────────────┐
+  │  rubric-judge (Claude→Gemma) | precision@k/recall@k | diff     │
+  │  → ReplayArtifactEvalSummary (a number per case)              │
+  └────────────────────────────┬──────────────────────────────────┘
+                              │ improved + no regression?
+  ┌─ Gate ────────────────────▼───────────────────────────────────┐
+  │  yes → promote run to fixture (frozen baseline, replay forever)│
+  │  no  → revert the prompt change                                │
+  └────────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-Hamel Husain's writing on evals is the canonical reference here, and his core
-claim is exactly this repo's structure: most teams over-invest in the LLM-judge
-and under-invest in cheap rule-based checks and a real golden set. The
-rubric-judge's anti-style-bias instruction (`:146`) and "don't repeat the
-calibration examples" guard (`:126`) are direct counters to the two classic
-LLM-judge failure modes — judging on style instead of substance, and parroting
-the calibration set. The deeper discipline: an eval is a measuring instrument,
-and a miscalibrated instrument (the 4/5 that meant nothing) is worse than none
-because it gives false confidence. The honest gap in this repo: the evals exist
-and run, but there's no *gate keyed on model version* — so a model upgrade that
-regresses the golden set isn't automatically blocked (cross-link concept 03).
+Hamel Husain's writing on evals is the canonical reference here — the
+insistence that you cannot improve what you don't measure, that LLM-as-judge
+must be calibrated and constrained, and that the regression suite is built
+from real failures, not imagined ones. aptkit's rubric judge reads like a
+direct application: defined dimensions, a no-rewrite rule, calibration
+examples, a validated structured verdict.
+
+The deeper architectural point is that aptkit makes evals *cheap to run* by
+recording real runs as fixtures and replaying them deterministically with
+`FixtureModelProvider`. That's what makes the gate practical — you re-score
+the whole golden set on every change without re-paying for model calls. The
+full replay-centric testing backbone is walked in **study-testing**; this
+concept is the prompt-iteration view of it.
 
 ## Interview defense
 
-**Q: How do you iterate a prompt without flying blind?** Write a golden set
-first (20–50 hand-curated cases with expected outputs), add every production
-failure back as a permanent regression case, then for each prompt change: run,
-score, diff against baseline, keep only if the score improved *with no
-regression*. Pick rule-based scorers for checkable correctness, LLM-judge only
-for subjective quality you've calibrated.
+**Q: How do you know a prompt change is actually better?**
+
+You don't read the output and decide — you score it against an eval set. A
+golden set of hand-curated cases for the target behavior, plus a regression
+suite of every past production failure. Change the prompt, run the set, diff
+the scores, keep the change only if it improved *without* regressing any
+case. Write the eval before touching the prompt, or you're optimizing an
+invisible target.
 
 ```
-  rule-based ──┊── LLM-judge
-  shape/recall ┊  meaning/quality
-  /precision   ┊  (calibrated)
-               ┊  pick the wrong side → measure the wrong thing
+  vibes:  read output → "feels better" → ship → regress in prod
+  evals:  score set → diff → no-regression gate → ship with a number
 ```
-*Anchor: `precision-at-k.ts:47`, `rubric-judge.ts:89`, `detection-scorer.ts:13`.*
 
-**Q: The part people forget?** The **regression case from a real bug**. Averages
-improve while a critical edge case silently breaks; the only defense is a fixed
-golden set where every past failure is pinned forever. In this repo that's the
-fixture-promotion path — a real failure becomes a permanent deterministic case.
+Anchor: "aptkit's backbone is run → artifact → eval → promote → replay. The
+rubric judge scores defined dimensions, not 'is this good,' and runs through
+`generateStructured` so a bad judgment retries."
+
+**Q: When is LLM-as-judge appropriate, and how do you keep it honest?**
+
+When the output is open-ended prose you can't deterministically string-match.
+Keep it honest by scoring defined dimensions on defined scales (not a vibe
+score), forbidding the judge from rewriting the subject, anchoring with
+calibration examples, and validating the verdict against an allowlist. For
+anything you *can* score arithmetically — like retrieval — use a
+deterministic scorer (precision@k) instead.
+
+Anchor: "Claude judges Gemma in aptkit; `rubric-judge.ts:147` says 'score
+meaning and evidence, not style' and 'never rewrite the subject.'"
 
 ## See also
 
-- `02-structured-outputs.md` — the rubric judge's output is itself schema-validated.
-- `03-prompts-as-code.md` — the eval gate should key on prompt version × model.
-- `../study-testing/` — `02-fixture-replay-golden-master.md`,
-  `04-deterministic-eval-scorers.md` for the testing-side depth.
-- `../study-ai-engineering/` — the evals section of the AI-engineering guide.
+- [02-structured-outputs.md](02-structured-outputs.md) — the judge's verdict
+  is itself a validated structured output
+- [03-prompts-as-code.md](03-prompts-as-code.md) — versioning is only useful
+  with evals to compare versions
+- [08-few-shot.md](08-few-shot.md) — calibration examples are where few-shot
+  genuinely enters a prompt here
+- study-testing — the full replay-centric eval backbone

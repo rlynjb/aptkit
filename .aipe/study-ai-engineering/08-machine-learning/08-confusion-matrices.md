@@ -1,368 +1,235 @@
-# Reading a confusion matrix
+# Confusion matrices
 
-**Subtitle:** rows = true, cols = predicted, diagonal = correct · *Industry standard*
+> Industry name: **confusion matrix** · type: classifier evaluation primitive · **the one file in this sub-section that touches real aptkit code**
+
+Every other file here is new ground — aptkit trains no model. This one is different. The confusion matrix is the parent of a metric aptkit already ships: `scorePrecisionAtK`. So we'll teach the matrix straight, then show you the real `precision-at-k.ts` and prove that precision@k is the ranked-retrieval cousin of classifier precision. Same instinct, different denominator.
 
 ## Zoom out, then zoom in
 
-aptkit has no trained classifier, so the layers diagram below is the *generic*
-supervised pipeline. The confusion matrix lives entirely inside the starred
-EVAL box — it is the lens you put on the test set after `f` predicts. Everything
-above it produces the predictions; the matrix only reads them.
+★ A classifier emits a prediction; the confusion matrix is where you find out what that prediction was *worth*. It sits at the very end of the pipeline — after the model has scored every example — and it's the only place per-class truth lives. Accuracy is a single number that hides the matrix; the matrix is the number with its lies removed.
 
 ```
-  Zoom out — where the confusion matrix sits (generic; aptkit has none)
-
-  ┌─ Data layer ───────────────────────────────────────────────────┐
-  │  labeled rows: (input, TRUE class y)                           │
-  └───────────────────────────┬─────────────────────────────────────┘
-                              │ featurize + fit (files 01–04)
-  ┌─ Model layer ─────────────▼─────────────────────────────────────┐
-  │  fitted classifier: f(X) → ŷ  (predicted class)                │
-  └───────────────────────────┬─────────────────────────────────────┘
-                              │ run on held-out test
-  ┌─ Eval layer ──────────────▼─────────────────────────────────────┐
-  │  ★ confusion matrix: tally (y, ŷ) pairs into a grid ★          │
-  │     ↳ derive precision / recall / F1 per class                 │
-  └──────────────────────────────────────────────────────────────────┘
+Generic supervised-ML pipeline — where the confusion matrix lives
+┌──────────┐   ┌───────────┐   ┌──────────────┐   ┌────────┐   ┌─────────────────────┐
+│  Data    │ → │ Features  │ → │ Train/Val/   │ → │ Model  │ → │ EVALUATION          │
+│ (labeled │   │ (engineer)│   │ Test (split) │   │ (fit)  │   │  ★ confusion matrix │
+│  rows)   │   │           │   │              │   │        │   │  → precision/recall │
+└──────────┘   └───────────┘   └──────────────┘   └────────┘   └─────────────────────┘
+                                                                          │
+                                                                          ▼
+                                                          per-class precision · recall · F1
 ```
 
-Now zoom in. A confusion matrix is not a metric — it is the *raw tally* every
-metric is computed from. You run the fitted model on the test set, and for each
-example you get a pair: the true class and the predicted class. The matrix is
-just a grid counting how often each `(true, predicted)` pair happened. Accuracy,
-precision, recall, F1 — all of them are arithmetic on this one grid. Learn to
-read the grid and the metrics stop being formulas to memorize.
+The matrix is downstream of everything. A great model with a misread matrix ships a bad decision threshold; a mediocre model with a well-read matrix ships honestly.
 
 ## Structure pass
 
-**Layers.** Predictions → tally grid → per-class rates → single summary number.
-Each layer throws away detail: the grid loses example identity, the rates
-collapse a row/column to a fraction, the summary collapses all classes to one
-scalar. Read in the *other* direction when debugging — start from the bad
-number and walk back to the cell.
+One axis: **predicted vs actual**, crossed. For binary classification that's a 2×2 grid; for N classes it's N×N. The seams:
 
-**Axis — where does an error land in the matrix?** Every mistake is an
-off-diagonal cell. The grid tells you not just *that* you were wrong but *how*:
-"true class A predicted as B" is a specific cell. A model with 90% accuracy can
-be useless if all its errors cluster in one cell — the matrix shows that;
-accuracy alone hides it.
-
-**Seam.** The load-bearing boundary is the **convention**: rows are the truth,
-columns are the prediction, the diagonal is correct. Swap the axes and every
-formula below inverts (precision becomes recall). aptkit's nearest real artifact
-— `scoreDetections` — encodes the same seam without drawing a grid: it returns
-`matched` (diagonal), `missed` (a column of misses), `unexpected` (a row of
-false alarms).
+- **Rows = actual class** (ground truth). **Columns = predicted class** (what the model said).
+- **Diagonal = correct** (predicted == actual). **Off-diagonal = errors**, and *which* off-diagonal cell tells you the *kind* of error.
+- The four named cells of the binary case — **TP, FP, FN, TN** — are the atoms every downstream metric is built from. Precision and recall are just two different ratios over those atoms.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You already have a confusion matrix in this repo — it's just not drawn as a
-grid. `scoreDetections` (`packages/evals/src/detection-scorer.ts`) compares a set
-of *expected* items against a set of *got* items and returns three buckets:
+The matrix is a **sorting tray**. Every test example drops into exactly one cell, sorted by (what it really was, what you guessed). Once everything is sorted, you read ratios off the tray.
 
 ```
-  scoreDetections → {matched, missed, unexpected}   (the confusion, un-gridded)
+Binary confusion matrix — the sorting tray
+                    PREDICTED
+                 │  Positive  │  Negative  │
+        ─────────┼────────────┼────────────┤
+  A   Positive   │    TP      │    FN      │  ← actual positives
+  C              │ (caught)   │ (missed)   │
+  T   ───────────┼────────────┼────────────┤
+  U   Negative   │    FP      │    TN      │  ← actual negatives
+  A              │ (false     │ (correct   │
+  L              │  alarm)    │  reject)   │
+        ─────────┴────────────┴────────────┘
+                 ↑ flagged    ↑ not flagged
 
-  expected (truth)        got (prediction)
-  ┌──────────┐            ┌──────────┐
-  │  A B C   │            │  A   C D │
-  └────┬─────┘            └────┬─────┘
-       │                       │
-       ▼                       ▼
-   matched   = A, C   → on the diagonal   (true positives)
-   missed    = B      → truth, not got    (false negatives)
-   unexpected= D      → got, not truth    (false positives)
+  precision = TP / (TP + FP)   "of what I flagged, how much was right"
+  recall    = TP / (TP + FN)   "of what was really there, how much did I catch"
+  F1        = 2·P·R / (P + R)  "harmonic mean — punishes a lopsided pair"
 ```
 
-That is a confusion matrix with the boring cell deleted. `matched` ≈ true
-positives, `missed` ≈ false negatives, `unexpected` ≈ false positives. The only
-thing missing is the true-negative cell — and for set-style detection there's no
-finite "everything you correctly left out," so you drop it. Hold that mapping;
-the rest of this file just gives the buckets a grid and a vocabulary.
+Precision lives in the **left column** (everything you flagged positive). Recall lives in the **top row** (everything that truly was positive). They share TP and pull in opposite directions: flag more aggressively and recall climbs while precision usually drops.
 
-### Move 2 — building and reading the matrix
+### Move 2 — step by step, and the aptkit bridge
 
-**The 2x2 case — one class vs the rest.** Start with a binary classifier: a
-learned reranker deciding *relevant* (positive) or *not* (negative) for each
-candidate document. Run it on the test set, tally every `(true, predicted)` pair
-into a 2x2 grid. Rows are truth, columns are prediction:
+**Part A — reading per-class precision/recall off an N×N matrix.** For multi-class, you read one class at a time by collapsing to "this class vs everything else." For class *i*: precision = matrix[i][i] / (sum of column i); recall = matrix[i][i] / (sum of row i).
 
 ```
-  Confusion matrix — learned reranker, "is this doc relevant?"  (N = 100)
+3-class matrix — reading class "squat" (per-class collapse)
+                  PREDICTED
+              │ squat │ lunge │ idle │  row sum
+   ───────────┼───────┼───────┼──────┤
+A   squat     │  40 ★ │   5   │   5  │   50   ← recall denom (row)
+C   lunge     │   8   │  30   │   2  │   40
+T   idle      │  12   │   3   │  85  │  100
+U   ───────────┼───────┼───────┼──────┤
+A   col sum    │  60 ↑ │  38   │  92  │
+L              precision denom (col)
 
-                      PREDICTED
-                  relevant   not
-              ┌───────────┬───────────┐
-   T  relevant│  TP = 40  │  FN = 10  │   row sum = 50 actually-relevant
-   R          ├───────────┼───────────┤
-   U  not     │  FP = 15  │  TN = 35  │   row sum = 50 actually-not
-   E          └───────────┴───────────┘
-                  ▲
-                  diagonal (TP, TN) = 75 correct → accuracy = 75/100 = 0.75
+  squat precision = 40 / 60 = 0.67   (20 non-squats sneaked into the squat column)
+  squat recall    = 40 / 50 = 0.80   (10 real squats leaked to lunge/idle)
+  squat F1        = 2·0.67·0.80 / (0.67+0.80) ≈ 0.73
 ```
 
-Read the cells out loud, always *true-then-predicted*:
-- **TP = 40** — truly relevant, called relevant. Correct.
-- **FN = 10** — truly relevant, called not. A *miss* (you let a good doc slip).
-- **FP = 15** — truly not, called relevant. A *false alarm* (you surfaced junk).
-- **TN = 35** — truly not, called not. Correct.
+The off-diagonal *direction* is diagnostic: 12 idles predicted as squats means your "squat" boundary is grabbing rest poses — a threshold or feature problem, not a global "accuracy" problem.
 
-**Derive precision.** Precision answers "when the model said *relevant*, how
-often was it right?" That is the *predicted-relevant column*: TP over the whole
-column.
+**Part B — the bridge: precision@k is classifier precision over a ranked list.** A ranked retriever doesn't emit TP/FP per row; it emits an *ordered* list and you keep the top *k*. But the question is identical: *of the k things I surfaced, how many were right?* That's precision with the denominator pinned to k. aptkit ships exactly this. Real code:
 
-```
-  Precision — read DOWN the predicted-positive column
+```ts
+// packages/evals/src/precision-at-k.ts  — Case A: this metric EXISTS in aptkit
 
-                  PREDICTED relevant
-              ┌───────────┐
-   relevant   │  TP = 40  │ ┐
-              ├───────────┤ ├─ everything the model CALLED relevant
-   not        │  FP = 15  │ ┘
-              └───────────┘
-   precision = TP / (TP + FP) = 40 / (40 + 15) = 40/55 = 0.73
-```
+// scorePrecisionAtK, lines 47-57
+export function scorePrecisionAtK(
+  retrievedIds: readonly string[],
+  relevantIds: ReadonlySet<string>,
+  k: number,
+): RetrievalScoreResult {
+  if (k <= 0) return { ...NOT_WELL_FORMED };
+  const total = Math.min(k, retrievedIds.length); // ← denominator = what you FLAGGED (top-k)
+  if (total === 0) return { ...NOT_WELL_FORMED };
+  const matched = countDistinctHits(retrievedIds, relevantIds, k); // ← TP among the flagged
+  return { ok: true, score: matched / total, matched, total }; // ← matched/total == TP/(TP+FP)
+}
 
-**Derive recall.** Recall answers "of the truly relevant docs, how many did we
-catch?" That is the *actually-relevant row*: TP over the whole row.
-
-```
-  Recall — read ACROSS the actually-positive row
-
-                  relevant    not
-              ┌───────────┬───────────┐
-   relevant   │  TP = 40  │  FN = 10  │  ← everything that IS relevant
-              └───────────┴───────────┘
-   recall = TP / (TP + FN) = 40 / (40 + 10) = 40/50 = 0.80
-```
-
-Precision walks a column, recall walks a row, and they share the TP corner.
-That shared corner is why you can't read one without fixing the other —
-push the threshold to call everything relevant and recall hits 1.0 while
-precision collapses.
-
-**Derive F1.** Precision and recall trade off, so you fold them into one number
-with the *harmonic* mean — harmonic, not arithmetic, so a model can't game it by
-being great at one and terrible at the other.
-
-```
-  F1 — harmonic mean punishes imbalance
-
-   F1 = 2 · (precision · recall) / (precision + recall)
-      = 2 · (0.73 · 0.80) / (0.73 + 0.80)
-      = 2 · 0.584 / 1.53
-      = 1.168 / 1.53
-      = 0.76
-
-   arithmetic mean would be 0.765 — close here because P and R are close.
-   if P = 0.95, R = 0.10:  arithmetic = 0.525   F1 = 0.18  ◄ harmonic exposes it
+// scoreRecallAtK, lines 68-78
+export function scoreRecallAtK(
+  retrievedIds: readonly string[],
+  relevantIds: ReadonlySet<string>,
+  k: number,
+): RetrievalScoreResult {
+  if (k <= 0) return { ...NOT_WELL_FORMED };
+  const total = relevantIds.size; // ← denominator = ALL that was truly relevant (TP+FN)
+  if (total === 0) return { ...NOT_WELL_FORMED };
+  const matched = countDistinctHits(retrievedIds, relevantIds, k);
+  return { ok: true, score: matched / total, matched, total }; // ← matched/total == TP/(TP+FN)
+}
 ```
 
-**The multiclass case — the 3-intent classifier.** aptkit's `intent.ts`
-(`packages/agents/query/src/intent.ts`) sorts a query into three classes:
-`monitoring`, `diagnostic`, `recommendation`. A learned version of that
-classifier produces a 3x3 matrix — same rule, rows = true, cols = predicted,
-diagonal = correct. Suppose 90 labeled test queries, 30 per true class:
+Line up the denominators with the tray above and the equivalence is exact:
 
 ```
-  Confusion matrix — learned 3-class intent classifier  (N = 90)
+The bridge — same atoms, swapped denominator
+   classifier precision        precision@k (precision-at-k.ts:53,56)
+   ┌────────────────────┐      ┌──────────────────────────────────┐
+   │ TP / (TP + FP)      │  ≡   │ matched / min(k, retrieved.len)   │
+   │ "of flagged, right" │      │ "of top-k surfaced, relevant"     │
+   └────────────────────┘      └──────────────────────────────────┘
 
-                          PREDICTED
-                  monitor  diag   recommend │ row sum (true count)
-              ┌─────────┬───────┬───────────┤
-   monitor    │   25 ★  │   3   │     2     │   30
-   T          ├─────────┼───────┼───────────┤
-   R diag     │    4    │  22 ★ │     4     │   30
-   U          ├─────────┼───────┼───────────┤
-   E recommend│    1    │   6   │    23 ★   │   30
-              └─────────┴───────┴───────────┘
-   col sum:       30       31        29        = 90
-   diagonal (★) = 25 + 22 + 23 = 70 correct → accuracy = 70/90 = 0.78
+   classifier recall            recall@k (precision-at-k.ts:74,76)
+   ┌────────────────────┐      ┌──────────────────────────────────┐
+   │ TP / (TP + FN)      │  ≡   │ matched / |relevantIds|           │
+   │ "of real, caught"   │      │ "of all relevant, surfaced"       │
+   └────────────────────┘      └──────────────────────────────────┘
+
+   matched  == TP         (countDistinctHits, lines 27-34)
+   min(k,…)  == TP + FP    (the top-k window IS the flagged set)
+   |relevant|== TP + FN    (the full relevant set IS the actual positives)
 ```
 
-The diagonal is still "correct." Every off-diagonal cell now names a *specific*
-confusion — e.g. 6 `recommendation` queries got predicted as `diagnostic` (true
-row `recommend`, predicted column `diag`). That single cell is the most
-actionable thing in the grid: it tells you exactly which two classes the model
-muddles.
+aptkit's `total = Math.min(k, retrievedIds.length)` is precision's "don't penalize a short list" guard — the same reason you never divide precision by a denominator that includes rows you never flagged. And `ok: false` on a zero denominator is the matrix's own degenerate case: an empty column has no precision to report.
 
-**Per-class precision/recall — one class at a time.** For each class, collapse
-the 3x3 into a 2x2 "this class vs the rest." Take `diagnostic`:
-
-```
-  Per-class for "diagnostic" — its column and its row
-
-   precision_diag = diagonal cell / its COLUMN sum
-                  = 22 / (3 + 22 + 6) = 22 / 31 = 0.71
-                    (of everything CALLED diagnostic, 71% truly were)
-
-   recall_diag    = diagonal cell / its ROW sum
-                  = 22 / (4 + 22 + 4) = 22 / 30 = 0.73
-                    (of everything that IS diagnostic, 73% were caught)
-```
-
-Do it for all three:
-
-```
-  class         precision           recall
-  monitor       25/30 = 0.83        25/30 = 0.83
-  diagnostic    22/31 = 0.71        22/30 = 0.73
-  recommend     23/29 = 0.79        23/30 = 0.77
-```
-
-**Macro vs micro average.** You now have three precisions; collapse them to one
-number two different ways, and the choice is a *political* one about which class
-counts.
-
-```
-  Macro — average the per-class rates, every class equal weight
-
-   macro-precision = (0.83 + 0.71 + 0.79) / 3 = 0.78
-   macro-recall    = (0.83 + 0.73 + 0.77) / 3 = 0.78
-   macro-F1        = harmonic(0.78, 0.78)     ≈ 0.78
-     ↳ a tiny rare class counts as much as a huge common one
-
-  Micro — pool all cells first, every EXAMPLE equal weight
-
-   micro = total diagonal / total examples = 70 / 90 = 0.78
-     ↳ for single-label multiclass, micro-precision = micro-recall = accuracy
-     ↳ dominated by whichever class has the most examples
-```
-
-Here the classes are balanced (30 each) so macro ≈ micro. The numbers diverge
-the moment classes are imbalanced — which is the whole point of file 05. Reach
-for macro when small classes matter (a rare `recommendation` intent you can't
-afford to miss); reach for micro when you only care about aggregate hit rate.
-
-**Move 2.5 — the aptkit reality.** Not yet exercised in aptkit — aptkit runs
-pre-trained LLMs, not trained models. The pattern is taught here as study
-ground. The closest real artifacts are `scoreDetections`
-(`packages/evals/src/detection-scorer.ts`), whose `matched`/`missed`/`unexpected`
-*is* a confusion split into TP/FN/FP, and `scorePrecisionAtK`/`scoreRecallAtK`
-(`packages/evals/src/precision-at-k.ts`), the ranked-retrieval cousins of the
-precision/recall you just derived.
+So: the *confusion matrix itself* is **not yet exercised in aptkit** — there is no learned classifier emitting per-class cells. But its two most-used ratios already live in `precision-at-k.ts`, evaluating ranked retrieval. The exercise below closes the gap by giving aptkit a real confusion-matrix scorer alongside the precision@k one.
 
 ### Move 3 — the principle
 
-A confusion matrix is the *evidence*; every metric is a *summary* of it.
-Summaries lie by omission — accuracy hides which class fails, a single F1 hides
-which two classes the model confuses. Always look at the grid before you trust
-the scalar, and when a number is bad, walk back to the off-diagonal cell that
-produced it. The cell tells you what to fix; the scalar only tells you that
-something is broken.
+**Never report a single accuracy number for a multi-class or imbalanced problem.** The matrix is the source of truth; precision, recall, and F1 are *views* of it. Pick the view that matches the cost of the error you actually fear — and notice that aptkit already chose its view (precision@k vs recall@k) for retrieval. A classifier deserves the same deliberate choice.
 
 ## Primary diagram
 
 ```
-  From predictions to one number — and what each step discards
+From matrix to decision — the full read
+   ┌─────────────────────────────────────────────────────────────┐
+   │ 1. Build N×N tray: sort every test example by (actual, pred)  │
+   └───────────────────────────┬─────────────────────────────────┘
+                               ▼
+   ┌─────────────────────────────────────────────────────────────┐
+   │ 2. Per class i:  precision = M[i][i]/colSum(i)                 │
+   │                  recall    = M[i][i]/rowSum(i)                 │
+   │                  F1        = 2PR/(P+R)                         │
+   └───────────────────────────┬─────────────────────────────────┘
+                               ▼
+   ┌─────────────────────────────────────────────────────────────┐
+   │ 3. Aggregate:  macro-F1 = mean of per-class F1 (each class    │
+   │                equal weight → exposes the rare-class failure) │
+   └───────────────────────────┬─────────────────────────────────┘
+                               ▼
+   ┌─────────────────────────────────────────────────────────────┐
+   │ 4. Read the OFF-DIAGONAL: which class is eating which?        │
+   │    → that cell names the fix (threshold / feature / data)     │
+   └───────────────────────────────────────────────────────────────┘
 
-  test predictions            tally                 collapse           collapse
-  (y, ŷ) pairs                grid                  per class          to scalar
-  ┌──────────────┐    ┌──────────────────┐    ┌──────────────┐    ┌──────────┐
-  │ (mon, mon)   │    │      PREDICTED   │    │ prec_mon=.83 │    │ macro-F1 │
-  │ (diag, rec)  │──► │ T ┌──┬──┬──┐     │──► │ prec_diag=.71│──► │  = 0.78  │
-  │ (rec, diag)  │    │ R │25│ 3│ 2│     │    │ rec_diag =.73│    └──────────┘
-  │     …        │    │ U ├──┼──┼──┤     │    │     …        │    │     OR
-  └──────────────┘    │ E │ 4│22│ 4│ ★   │    └──────────────┘    ┌──────────┐
-                      │   ├──┼──┼──┤     │                        │ micro    │
-   rows = TRUTH       │   │ 1│ 6│23│     │     diagonal = correct │ = 70/90  │
-   cols = PREDICTED   └──────────────────┘     ★ = right answers  │ = 0.78   │
-                                                                  └──────────┘
-   each → loses        the grid keeps          a fraction per      one weighting
-   example identity    full error structure    row & column        choice of "fair"
+   aptkit today: step 2's precision/recall already shipped for RANKED lists
+   in precision-at-k.ts. The N×N tray (steps 1,3,4) is the new ground.
 ```
 
 ## Elaborate
 
-The hard-won lesson is that the matrix is a *debugging* tool, not a reporting
-tool. Teams ship the macro-F1 to a dashboard and never look at the grid — then
-miss that 80% of their errors are one class predicted as its neighbor, a fix a
-single feature could make. The discipline: when a metric moves, open the matrix
-and find the cell that moved with it. The same instinct already exists in this
-repo's eval layer — `scoreDetections` hands you `missed` and `unexpected`
-separately precisely so you can see *which kind* of error grew, not just that
-the score dropped. A confusion matrix is that idea generalized to N classes.
-File 05 (class imbalance) is why macro and micro diverge; file 09 (calibration)
-is the next question after "is it right?" — namely "does its *confidence* mean
-anything?"
+A few things that bite people:
+
+- **Macro vs micro.** Macro-F1 averages per-class F1 with equal weight, so a rare class can't hide behind a common one — this is the metric you want the moment classes are imbalanced (see `05-class-imbalance.md`). Micro-F1 pools all TP/FP/FN first and effectively reweights by frequency, so it tracks accuracy and *re-hides* the rare class. Default to macro when you care about every class.
+- **The matrix is threshold-dependent.** A 2×2 matrix is a snapshot at one decision threshold. Move the threshold and every cell moves. That's why calibration (`09-calibration.md`) and threshold tuning matter: the matrix you report should be at the threshold you'll actually deploy.
+- **aptkit's `RetrievalScoreResult.ok` is the lesson generalized.** It separates "metric is undefined" (zero denominator) from "metric is 0" (you flagged things, none were right). A confusion-matrix scorer needs the same discipline: an empty column is *undefined* precision, not *zero* precision. Most naive implementations collapse the two and report 0, which silently poisons macro-F1.
+- **In contrl terms** (prose only — different repo): the rep counter's "is this frame a squat-bottom?" decision is exactly a per-class confusion problem. A false positive double-counts a rep; a false negative drops one. Reading *that* matrix per movement is how you'd find which pose the on-device classifier confuses, rather than trusting one accuracy figure across all movements.
 
 ## Project exercises
 
-### Build a confusion matrix from scoreDetections output
+### Per-class F1 + confusion-matrix scorer (Phase 3 ML evals)
 
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a small function that takes the `{matched, missed,
-  unexpected}` result from `scoreDetections` and renders it as a labeled 2x2-ish
-  grid (TP/FN/FP, with TN marked N/A), then prints derived precision, recall,
-  and F1.
-- **Why it earns its place:** makes the matched/missed/unexpected → TP/FN/FP
-  mapping concrete in code, which is the exact bridge interviewers probe.
-- **Files to touch:** `packages/evals/src/detection-scorer.ts` (read only, no
-  change), new `packages/evals/test/confusion-from-detections.test.ts`.
-- **Done when:** `node --test` passes asserting precision/recall/F1 computed from
-  a fixed `{matched, missed, unexpected}` example match hand-calculated values.
-- **Estimated effort:** `<1hr`
-
-### Score a 3-class intent classifier into a 3x3 matrix
-
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a script that runs `parseIntent`
-  (`packages/agents/query/src/intent.ts`) over a small hand-labeled set of
-  queries tagged with one of `monitoring`/`diagnostic`/`recommendation`, tallies
-  `(true, predicted)` into a 3x3 grid, and reports per-class precision/recall
-  plus macro-F1 and micro accuracy.
-- **Why it earns its place:** exercises the full multiclass path — building the
-  grid, collapsing per class, and choosing macro vs micro — against a real
-  aptkit classifier instead of a toy.
-- **Files to touch:** `packages/agents/query/src/intent.ts` (read only), new
-  `/Users/rein/Public/buffr/eval/intent-confusion.ts` and a small
-  `/Users/rein/Public/buffr/eval/intent-labels.json` of `{query, true}` rows.
-- **Done when:** the script prints a 3x3 grid whose diagonal sum / total equals
-  the printed micro accuracy, and macro-F1 is the harmonic mean of averaged
-  per-class precision/recall.
+- **Exercise ID:** `EX-ML-08a`
+- **What to build:** A `scoreConfusionMatrix(predicted, actual, classes)` function that returns the N×N matrix plus per-class precision/recall/F1 and macro-F1, mirroring the `RetrievalScoreResult` shape (`ok`/`score`/per-cell counts) so it sits naturally beside `scorePrecisionAtK`.
+- **Why it earns its place:** It turns the precision@k bridge into a first-class classifier scorer and gives aptkit the one ML-eval primitive every downstream concept (imbalance, calibration, drift) reads from. It's the smallest real step from "ranked retrieval metric" to "learned classifier metric."
+- **Files to touch:** Case B (new): `packages/evals/src/confusion-matrix.ts`; export it from `packages/evals/src/index.ts`; test in `packages/evals/src/confusion-matrix.test.ts`. Reuse `RetrievalScoreResult`'s `ok` convention from the existing `precision-at-k.ts`.
+- **Done when:** A 3-class fixture produces correct per-class precision/recall/F1 and macro-F1; an empty column yields `ok: false` (undefined, not 0); macro-F1 excludes undefined classes rather than treating them as 0.
 - **Estimated effort:** `1–4hr`
+
+### Ranked-classifier eval: precision@k *per class* (Phase 3 ML evals)
+
+- **Exercise ID:** `EX-ML-08b`
+- **What to build:** A thin adapter that takes a multi-class ranker's top-k output and computes per-class precision@k/recall@k by calling the *existing* `scorePrecisionAtK`/`scoreRecallAtK` once per class, then macro-averages — proving the two scorers compose into a confusion-style report without rewriting them.
+- **Why it earns its place:** It demonstrates you understand the bridge isn't a coincidence: the shipped retrieval scorers *are* per-class classifier scorers when you partition by class. Cheap, and it documents the equivalence in code.
+- **Files to touch:** Case B (new): `packages/evals/src/per-class-precision-at-k.ts`, importing `scorePrecisionAtK`/`scoreRecallAtK` from the existing `precision-at-k.ts`.
+- **Done when:** Per-class scores match the diagonal/row/column ratios of `scoreConfusionMatrix` from `EX-ML-08a` on the same fixture.
+- **Estimated effort:** `<1hr`
 
 ## Interview defense
 
-**Q: "Walk me through reading a confusion matrix and getting precision and
-recall out of it."**
-Rows are the true class, columns are the predicted class, the diagonal is
-correct. For one class: precision is the diagonal cell over its *column* sum
-("when I said this class, how often right?"); recall is the diagonal cell over
-its *row* sum ("of all that truly are this class, how many did I catch?").
-Precision walks a column, recall walks a row, they share the TP corner.
+**Q: Your model reports 94% accuracy. Why won't I let you ship on that number?**
 
 ```
-              PREDICTED pos
-          ┌───────────┐
-   pos    │  TP       │ recall = TP / row    (walk →)
-          │  FN       │
-          └───────────┘
-   precision = TP / col (walk ▼)   ── they meet at TP
+   accuracy 94%  ──hides──▶  ┌─────────────────────────┐
+                             │ rare class recall = 0.10 │  ← the matrix shows it
+                             └─────────────────────────┘
 ```
-*Anchor: rows = true, cols = predicted; precision is a column, recall is a row.*
 
-**Q: "Macro vs micro F1 — when does it matter and which do you pick?"**
-Macro averages the per-class scores so every class counts equally; micro pools
-all cells so every *example* counts equally (for single-label multiclass, micro
-= accuracy). They agree when classes are balanced and diverge under imbalance.
-Pick macro when a rare class matters as much as a common one; pick micro when
-you only care about aggregate hit rate.
+Anchor: accuracy is one number summed over the diagonal; the off-diagonal is where the cost lives. I read per-class recall off the confusion matrix — the same way aptkit reports recall@k separately from precision@k instead of one blended score.
+
+**Q: How is precision@k related to the precision you'd read off a confusion matrix?**
 
 ```
-  balanced classes:   macro ≈ micro
-  rare class fails:    macro DROPS sharply   ← it weights the rare class fully
-                       micro barely moves    ← dominated by the big class
+   TP/(TP+FP)  ≡  matched / min(k, retrieved)   ← precision-at-k.ts:53,55
 ```
-*Anchor: macro weights classes equally, micro weights examples equally.*
+
+Anchor: identical ratio, the denominator is just "the top-k window" instead of "all flagged rows." aptkit's `scorePrecisionAtK` is classifier precision with the flagged set pinned to k.
+
+**Q: A class has zero predictions. What's its precision?**
+
+```
+   column sum = 0  →  precision undefined  →  ok:false (not score 0)
+```
+
+Anchor: undefined, not zero — the same distinction `precision-at-k.ts` draws with its `NOT_WELL_FORMED` guard on a zero denominator. Folding it to 0 silently drags macro-F1 down.
 
 ## See also
 
-- `01-supervised-pipeline.md` — produces the predictions the matrix tallies
-- `05-class-imbalance.md` — why macro and micro F1 diverge
-- `09-calibration.md` — the next question after "is it right?": "is its
-  confidence honest?"
-- `05-evals-and-observability/` — how aptkit grades outputs today
-  (`scoreDetections`, `scorePrecisionAtK`)
+- [05-class-imbalance.md](./05-class-imbalance.md) — why accuracy lies; macro-F1 reads off this matrix.
+- [09-calibration.md](./09-calibration.md) — the matrix is threshold-dependent; calibration fixes the threshold honestly.
+- [01-supervised-pipeline.md](./01-supervised-pipeline.md) — where evaluation sits in the pipeline.
+- [14-training-run-logging.md](./14-training-run-logging.md) — log the confusion matrix per run.
+- [README.md](./README.md) — sub-section map and the bridge note.

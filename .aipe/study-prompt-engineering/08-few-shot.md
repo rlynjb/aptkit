@@ -1,191 +1,264 @@
 # 08 — Few-shot prompting
 
-**Industry name:** few-shot / in-context examples — *Industry standard*
+**Subtitle:** few-shot prompting — examples constrain format harder than
+instructions (Industry standard)
 
 ## Zoom out, then zoom in
 
-Here's a thing that took me too long to internalize: **examples constrain output
-more than instructions do.** You can write three paragraphs telling a model the
-exact format you want and it'll still wander; show it two examples in that format
-and it locks on. The catch — examples cost context tokens, and 3–5 good ones beat
-20 mediocre ones every time. In aptkit the few-shot *slot* exists in the prompt
-package, but it's worth being honest up front: the examples are currently eval
-anchors, not yet spliced into the prompt string.
+Examples constrain output more tightly than instructions do. Tell a model
+"return concise JSON" and it interprets "concise"; *show* it three exemplars
+and it pattern-matches the shape. aptkit has a structural slot for this — and
+deliberately, honestly, mostly doesn't use it for agent prompts. Where
+few-shot genuinely lands here is calibrating the rubric judge.
 
 ```
-  Zoom out — where examples live (and don't)
+  Zoom out — the examples slot, and where it actually feeds
 
-  ┌─ Authoring ───────────────────────────────────────────────┐
-  │  PromptPackage.examples[]  (types.ts:7 PromptExample)      │ ← we are here
-  │    query.ts:79  revenue-by-state {input, expectedContains} │
-  │    diagnostic.ts:75  voucher-dropoff-diagnosis             │
-  │  rubric-judge.ts: calibrationExamples (SPLICED into prompt)│
-  └───────────────────────────┬────────────────────────────────┘
-  ┌─ Assembly ────────────────▼────────────────────────────────┐
-  │  renderPromptTemplate({schema, intent})  — examples NOT     │
-  │  injected into the agent system strings (the honest gap)    │
-  └──────────────────────────────────────────────────────────────┘
+  ┌─ Source layer ──────────────────────────────────────────────┐
+  │  ★ PromptPackage.examples[] ★  { input, expectedContains }    │ ← we are here
+  │     packages/prompts/src/types.ts:7                           │
+  └─────────────┬──────────────────────────────┬─────────────────┘
+                │ NOT spliced into prompt       │ DOES feed
+                ▼                                ▼
+  ┌─ Prompt assembly ──────────┐   ┌─ Eval layer ─────────────────┐
+  │ renderPromptTemplate only   │   │ expectedContains assertions  │
+  │ substitutes {var}           │   │ + rubric calibrationExamples │
+  │ → examples never rendered   │   │   (THESE are few-shot)       │
+  └─────────────────────────────┘   └──────────────────────────────┘
 ```
 
-Zoom in: there are two camps in this repo. The agent packages have an
-`examples[]` array that documents intent and feeds evals but **does not** get
-rendered into the prompt. The rubric judge *does* splice `calibrationExamples`
-into its judging prompt (`rubric-judge.ts:125`) — that's the one place few-shot
-is genuinely wired.
+Zooming in: few-shot is putting worked examples in the prompt so the model
+imitates them. The pattern's strength is format-locking — examples pin the
+output shape better than any adjective. Its cost is tokens: every example
+eats context budget. And its honest status in aptkit: the agent prompts use
+*instructions and inline format specs* instead of spliced examples, while
+the rubric judge uses true few-shot calibration.
 
-## The structure pass
+## Structure pass
 
-**Layers:** the example definition (data on the package) → the splice (does it
-enter the prompt string?) → the model (does it imitate?).
+**Layers.** Source (the `examples[]` slot) → assembly (which ignores it) →
+eval (which consumes it).
 
-**Axis — does this example reach the model?** This is the axis that exposes the
-gap:
+**Axis — do these examples reach the model as prompt content?** Trace it:
 
 ```
-  Axis: "does this example enter the prompt sent to the model?"
+  Axis: "does this example end up in the text the model sees?"
 
-  ┌─ rubric-judge calibrationExamples ─┐  seam  ┌─ agent examples[] ──────┐
-  │ SPLICED into system prompt          │ ══╪══► │ NOT spliced — used for  │
-  │ (rubric-judge.ts:125)               │ flips  │ evals/docs only         │
-  │ → model sees them, anchors scale    │        │ → model never sees them │
-  └─────────────────────────────────────┘        └──────────────────────────┘
+  PromptPackage.examples[]      → NO  (renderPromptTemplate ignores it)
+  expectedContains arrays       → NO  (they're eval assertions)
+  rubric calibrationExamples    → YES (rubric-judge.ts:126 renders them)
+  inline format spec in prompt  → YES (it IS the prompt text)
 ```
 
-**Seam:** the splice step. In the rubric judge the examples cross into the prompt
-string; in the agents they don't. **What this means concretely:** the agents rely
-on *instructions* (the `## Output` shape) to constrain format, not examples —
-which works because the shape is explicit, but it's strictly weaker than
-showing examples would be. The `PromptExample` slot (`types.ts:7`) is the
-foundation for closing this gap; the wiring is `not yet exercised`.
+**Seam.** The load-bearing boundary is between *the examples slot* and *the
+rendered prompt*. They look connected — both live on a prompt-shaped type —
+but nothing crosses that seam for agent prompts. Recognizing that the slot
+is an eval fixture, not prompt content, is the whole lesson.
 
 ## How it works
 
-### Move 1 — the mental model
+You know how a TypeScript example in a doc comment doesn't actually run —
+it's there for the reader, not the compiler? aptkit's `PromptPackage.examples`
+are like that for the *agent* prompts: present for the eval harness, not fed
+to the model. Let's walk what's real and what's a slot.
 
-You already know that a unit test communicates a function's contract better than
-its doc comment — the example input/output is unambiguous in a way prose isn't. A
-few-shot example is that for a model: show the exact transformation you want, and
-the model pattern-matches to it harder than it parses your instructions.
+### Step 1 — the slot exists, typed and populated
 
-```
-  Pattern — few-shot in the prompt
+Every prompt package declares examples:
 
-  system: "Classify the query. Examples:
-    Input: 'what changed last week?'  → monitoring     ← example 1
-    Input: 'why did revenue drop?'    → diagnostic     ← example 2
-    Input: 'what should I do?'        → recommendation" ← example 3
-  user: <the real query>
-  → model imitates the demonstrated mapping
-```
-
-### Move 2 — walking the two camps
-
-**Camp 1 — calibration examples that ARE spliced (the rubric judge).**
-`buildRubricJudgeSystemPrompt` (`rubric-judge.ts:125`) renders
-`calibrationExamples` straight into the system prompt:
-
-```
-  Inline annotation — rubric-judge.ts:125 calibration splice
-
-  const examples = rubric.calibrationExamples?.length
-    ? `\nCalibration examples. Use these only to anchor the scoring scale;
-        do not repeat them.\n${... map(e => `Input:\n${e.input}\nExpected:\n${e.expected}`)}`
-    : '';
-  // → the model SEES these examples and anchors its scoring to them
+```ts
+// packages/prompts/src/query.ts:79
+examples: [
+  {
+    name: 'revenue-by-state',
+    input: { question: 'What was revenue by state in the last 30 days?',
+             intent: 'monitoring' },
+    expectedContains: ['SP', 'RJ', 'MG'],   // ← Brazilian states = eval assertion
+  },
+],
 ```
 
-Two production-grade details: the guard *"Use these only to anchor the scoring
-scale; do not repeat them"* stops the classic few-shot failure where the model
-parrots an example back as its answer; and `calibrationExamples` is optional —
-when absent the splice is empty (`rubric-judge.ts:129`). This is few-shot doing
-the job instructions can't: pinning a subjective scoring scale to concrete
-anchors.
+That `expectedContains` is the tell. It's not an exemplar output for the
+model to imitate — it's a list of strings the eval expects to find in the
+*answer*. This is a test fixture wearing a prompt-shaped field.
 
-**Camp 2 — examples that are NOT spliced (the agents).** `query.ts:79` defines a
-`revenue-by-state` example with `expectedContains: ['SP','RJ','MG']`;
-`diagnostic.ts:75` defines `voucher-dropoff-diagnosis`. These feed evals (the
-`expectedContains` is an assertion target, concept 05) and document the prompt's
-intent — but `renderPromptTemplate` never injects them into the system string.
-**What this costs:** the agents constrain format with instructions alone. For the
-classifier that's fine (the output space is three words); for format-sensitive
-generation it leaves the strongest constraint unused.
+### Step 2 — assembly ignores it
 
-**When to use few-shot vs not.** Use it for classifiers and format-sensitive
-tasks (the intent classifier would be a textbook fit — and note it currently uses
-zero-shot instructions, `intent.ts:19`). Skip it for open-ended generation where
-examples would bias the model toward imitating the examples instead of answering.
-The cost is always tokens: every example sits in the static prefix and is re-sent
-every call (concept 04), so 3–5 sharp examples beat a pile of mediocre ones.
+`renderPromptTemplate` only does `{var}` substitution:
 
-**The interaction with structured output.** A few-shot example can *be* the
-structured form itself — show one complete, valid JSON object and the model
-imitates the shape better than a schema description alone. The diagnostic prompt
-gestures at this by embedding a literal shape (`diagnostic.ts:30`), which is
-halfway between an instruction and an example.
+```ts
+// packages/prompts/src/types.ts:24
+export function renderPromptTemplate(template, variables): string {
+  return template.replace(/\{([a-zA-Z0-9_]+)\}/g, (match, name) =>
+    variables[name] === undefined ? match : variables[name]);
+}
+```
 
-### Move 3 — the principle
+Nothing iterates `examples[]` into the prompt string. The query agent builds
+its system text from the template plus `{schema}`/`{intent}`/`{project_id}`
+(`query-agent.ts:79`) — the examples never enter. So for agent prompts,
+few-shot-as-spliced-examples is `not yet exercised`. The slot is real; the
+splice is not.
 
-**Examples are the highest-bandwidth way to constrain a model — and the most
-expensive in tokens.** Reach for them when the output is format-sensitive and the
-format is hard to describe; skip them when instructions suffice or when imitation
-would distort an open-ended answer. In this repo the lesson is also a roadmap:
-the slot exists, one consumer uses it well (the judge), and the agents are a
-clean place to wire it.
+### Step 3 — what aptkit uses INSTEAD: inline format specs
+
+The agent prompts don't go example-free — they constrain format with inline
+*specifications* rather than worked examples. The recommendation prompt
+enumerates the exact object shape:
+
+```ts
+// packages/prompts/src/recommendation.ts:54
+Each object must have:
+- title: string
+- bloomreachFeature: scenario | segment | campaign | voucher | experiment
+- estimatedImpact: string OR { range: string, rangeUsd?: {...}, assumption }
+```
+
+And the query prompt gives tool-call *templates* (EQL query forms) rather
+than full input/output pairs (`query.ts:30`). These are a lighter-weight
+cousin of few-shot: they pin format with a spec instead of paying the token
+cost of full exemplars. It's a defensible call for a token-tight local model
+(concept 4) — but it forgoes the format-locking power of real examples.
+
+### Step 4 — where few-shot is REAL: the rubric judge
+
+The one place worked examples genuinely enter a prompt is the rubric judge's
+calibration, and it's done exactly right:
+
+```ts
+// packages/evals/src/rubric-judge.ts:125
+const examples = rubric.calibrationExamples?.length
+  ? `\nCalibration examples. Use these only to anchor the scoring scale; do not
+     repeat them.\n${rubric.calibrationExamples
+       .map((ex) => `Input:\n${ex.input}\nExpected:\n${ex.expected}`).join('\n\n')}`
+  : '';
+```
+
+```
+  Pattern — few-shot done right (the judge)
+
+  ┌─ calibration examples ─────────────────────────────┐
+  │ Input: <a sample subject>                           │
+  │ Expected: <the correct score/verdict for it>        │
+  │ ... 2-5 of these ...                                │
+  │ + "Use these ONLY to anchor the scale; don't repeat"│ ← anti-leak guard
+  └─────────────────────────────────────────────────────┘
+   the judge sees how to score by EXAMPLE, not just by rubric text
+```
+
+This is textbook few-shot: input/expected pairs that pin the judge's scoring
+scale, capped small, with an explicit instruction not to parrot them. Three
+to five good calibration examples anchor a judge far better than a paragraph
+describing the scale — because the model pattern-matches the examples.
+
+### Step 5 — when to use few-shot, when not
+
+```
+  Comparison — few-shot fit by task
+
+  classifiers / format-sensitive  → USE (examples lock the format)
+    e.g. the intent classifier WOULD benefit from 3 labeled examples
+  rubric judges                   → USE (calibration — aptkit does this)
+  open-ended generation           → SKIP (examples narrow creativity)
+    e.g. the query agent's prose answer — instructions suffice
+```
+
+The rule: 3–5 good examples beat 20 mediocre ones (more examples = more
+tokens and more chance of overfitting the model to incidental patterns). And
+few-shot interacts with structured output (concept 2) — a single example can
+*be* the structured JSON form itself, doubling as a format spec and a
+schema demonstration.
+
+### The principle
+
+**Examples constrain output more tightly than instructions, at the cost of
+tokens — so use them where format-locking matters (classifiers, judges) and
+skip them for open-ended generation.** aptkit's honest position is
+instructive: it format-locks with inline specs for token economy and reserves
+true few-shot for the one place imitation matters most — calibrating an
+LLM judge. The slot on `PromptPackage` is an eval fixture, not prompt content;
+knowing that gap is the difference between reading the type and reading the
+code.
 
 ## Primary diagram
 
-```
-  Few-shot in aptkit — two camps, one seam
+The examples slot, the two paths out of it, and the real few-shot use.
 
-  PromptExample {input, expectedContains}   (types.ts:7)
-        │
-        ├──► CAMP 1: rubric-judge calibrationExamples
-        │       SPLICED into system prompt (rubric-judge.ts:125)
-        │       "anchor the scale; do not repeat them"
-        │       → model imitates ✓
-        │
-        └──► CAMP 2: agent examples[] (query.ts:79, diagnostic.ts:75)
-                feeds evals via expectedContains (concept 05)
-                NOT spliced into the prompt → model never sees ✗
-                (the honest gap: few-shot-as-infra not yet exercised)
+```
+  Few-shot in aptkit — slot vs reality
+
+  ┌─ PromptPackage.examples[] ──────────────────────────────────┐
+  │  { name, input, expectedContains }   ← eval fixture shape    │
+  └─────────────┬───────────────────────────────┬────────────────┘
+   spliced into │ NO                       feeds │ YES
+   the prompt?  ▼                                ▼
+  ┌─ Agent prompt ─────────────┐   ┌─ Eval ────────────────────────┐
+  │ instructions + inline       │   │ expectedContains assertions   │
+  │ format specs (not examples) │   │                               │
+  │ → few-shot NOT YET EXERCISED│   └───────────────────────────────┘
+  └─────────────────────────────┘
+  ┌─ Rubric judge (REAL few-shot) ──────────────────────────────┐
+  │  calibrationExamples → Input/Expected pairs rendered into    │
+  │  the judge's system prompt + "anchor only, don't repeat"     │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The few-shot result (Brown et al., GPT-3) is the finding that models do
-in-context learning from examples without weight updates — the examples *are* the
-training signal for that one call. The practitioner refinements since: example
-*ordering* matters (recency bias toward the last example), example *diversity*
-matters more than count, and for classifiers the label distribution in your
-examples can bias the output. The "do not repeat the examples" guard in the
-rubric judge is the operational counter to the parroting failure mode. The honest
-gap here — a curated, versioned example *library* feeding the agents — is the
-infrastructure most mature prompt systems grow; this repo has the type for it
-(`PromptExample`) but not the wiring.
+Few-shot prompting is the oldest reliable technique in the field — the GPT-3
+paper's "language models are few-shot learners" is the origin, and it remains
+the most dependable way to pin output format. The modern caveat: as models
+got more instruction-following, inline specs ("return an object with fields
+x, y, z") often suffice for format, which is the bet aptkit makes for its
+agent prompts.
+
+Where few-shot stays irreplaceable is *calibration* of subjective tasks — a
+judge, a classifier with fuzzy boundaries — because a scale is far easier to
+demonstrate than to describe. That's exactly the one place aptkit reaches for
+it (`rubric-judge.ts`). The token-cost tradeoff connects directly to concept
+4: on a small local window, every example is budget you're not spending on
+retrieved context.
 
 ## Interview defense
 
-**Q: When do examples beat instructions?** When the output is format-sensitive
-and the format is easier to show than describe — classifiers, structured shapes,
-specific styles. Examples constrain harder because the model pattern-matches to
-them. The cost is tokens (every example is re-sent each call), so 3–5 sharp ones
-beat 20 mediocre ones.
+**Q: Why do examples constrain output better than instructions?**
+
+Instructions are interpreted — "concise" means different things to the model
+than to you. Examples are imitated — the model pattern-matches the shape,
+length, and format of what you showed it. That's why few-shot is the
+reliable lever for format-sensitive tasks like classifiers and judges. The
+cost is tokens, so cap it at 3–5 strong examples; 20 mediocre ones overfit
+and blow the budget.
 
 ```
-  instruction: "classify into 3 categories"   ← weaker constraint
-  + 3 examples of the exact mapping            ← stronger constraint
-  cost: examples live in the re-sent prefix
+  "be concise" → model interprets → varies
+  <3 example outputs> → model imitates → locks the shape
 ```
-*Anchor: `rubric-judge.ts:125` (spliced calibration) vs `query.ts:79` (unspliced).*
 
-**Q: The part people forget?** The **anti-parroting guard**. Drop in examples and
-a model will sometimes return an example verbatim instead of solving the real
-input. The rubric judge defends this explicitly ("do not repeat them"). Few-shot
-without that guard is a footgun on subjective tasks.
+Anchor: "aptkit reserves real few-shot for the rubric judge —
+`calibrationExamples` rendered as Input/Expected pairs with 'anchor only,
+don't repeat.' The agent prompts use inline format specs instead, to save a
+local model's token budget."
+
+**Q: aptkit's `PromptPackage` has an `examples` field. Is the repo doing
+few-shot?**
+
+Not for agent prompts. `renderPromptTemplate` only substitutes `{var}` — it
+never iterates `examples[]` into the prompt. Those examples carry
+`expectedContains`, which are eval assertions; they're test fixtures, not
+prompt content. The slot exists, the splice doesn't. The one true few-shot
+use is the judge's calibration examples.
+
+Anchor: "Slot in `types.ts:7`, never rendered — eval fixture, not few-shot.
+Real few-shot lives in `rubric-judge.ts:126`."
 
 ## See also
 
-- `02-structured-outputs.md` — an example can be the structured shape itself.
-- `04-token-budgeting.md` — examples are a re-sent prefix cost.
-- `05-eval-driven-iteration.md` — `expectedContains` makes examples eval anchors.
-- `06-single-purpose-chains.md` — the classifier is a textbook few-shot candidate.
+- [01-anatomy.md](01-anatomy.md) — the examples section of the prompt
+  anatomy
+- [02-structured-outputs.md](02-structured-outputs.md) — an example can
+  double as a schema demonstration
+- [04-token-budgeting.md](04-token-budgeting.md) — examples cost context
+  budget
+- [05-eval-driven-iteration.md](05-eval-driven-iteration.md) — where the
+  `examples` slot actually feeds

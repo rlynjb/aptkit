@@ -1,26 +1,26 @@
 # 01 — LLM foundations
 
-> Anchor: LLM application engineering. · Curriculum: Phase 1 (no curriculum file
-> in this repo; exercises cite real aptkit/buffr paths instead).
+> Anchor: LLM application engineering (loopd-shaped) — aptkit's home territory.
+> Curriculum: Phase 1.
 
-The interface, not the architecture. What an LLM is as a function, how text
-becomes tokens, what the sampling knobs do, and the four engineering patterns
-aptkit uses to put a model into production: structured outputs, provider
-abstraction, heuristic-before-LLM routing, and override locks.
+What the model is, and how aptkit talks to it. This is the layer that turns
+"call an LLM" into a provider-neutral, cost-aware, validated interface.
 
-These move fast — you've shipped AdvntrCue, so the shapes are familiar. The slow
-part is where aptkit's choices differ from a cloud-first app: the default model
-is **local Gemma with no native tool-calling**, which forces emulation and
-shapes nearly everything downstream.
+The crown jewel here is the **provider abstraction**
+(`ModelProvider.complete()`) and the **emulated tool calling** on Gemma —
+a local model with no native tool API.
 
-## Files (self-contained per concept)
+## Files
 
-1. `01-what-an-llm-is.md` — the IO model; why `ModelProvider.complete()` is the right shape
-2. `02-tokenization.md` — tokens as the unit; the char-per-token estimator in the context guard
-3. `03-sampling-parameters.md` — temperature/top-p/top-k; why classifiers run deterministic
-4. `04-structured-outputs.md` — `generateStructured` + validators; JSON or it errors
-5. `05-streaming.md` — NDJSON trace streaming (the repo streams traces, not tokens — `not yet exercised` for token streaming)
-6. `06-token-economics.md` — the usage ledger; OpenAI-only pricing, Gemma free
-7. `07-heuristic-before-llm.md` — `parseIntent` keyword shortcut before the LLM
-8. `08-provider-abstraction.md` — the load-bearing seam; how buffr swaps the store
-9. `09-user-override-locks.md` — `not yet exercised` in aptkit; the pattern and where it would live
+- `01-what-an-llm-is.md` — the IO model; the model as a function, not a database.
+- `02-tokenization.md` — tokens vs characters; how aptkit estimates them (char-ratio guard).
+- `03-sampling-parameters.md` — temperature/top-p/top-k; where aptkit sets them.
+- `04-structured-outputs.md` — `generateStructured` + validators; typed contracts at the LLM boundary.
+- `05-streaming.md` — `not yet exercised` for LLM tokens; NDJSON streams events instead.
+- `06-token-economics.md` — the `usage-ledger.ts` cost ledger (OpenAI-only pricing).
+- `07-heuristic-before-llm.md` — the coverage gate as the heuristic filter before the model.
+- `08-provider-abstraction.md` — `ModelProvider`, the factory, the fallback chain, the context guard.
+- `09-user-override-locks.md` — the pattern, and why aptkit (a core lib) doesn't own this state yet.
+
+Self-contained per concept; read `08-provider-abstraction.md` and
+`04-structured-outputs.md` first if you only read two.

@@ -1,178 +1,168 @@
-# Shared State, Races, and Synchronization — what one thread buys you
+# Shared State, Races, and Synchronization
 
-**Industry name(s):** data races / synchronization · shared mutable state · run-to-completion semantics · **Type:** Industry standard
+**Subtitle:** shared mutable state / data races / the single-threaded safety guarantee — *the race condition* (Industry standard).
 
 ## Zoom out, then zoom in
 
-Most of a "synchronization" chapter is about locks, atomics, and channels protecting shared memory from concurrent threads. aptkit has none of those, and the reason is the single most useful fact about its runtime: there's one thread, so there's nothing to lock.
+The verdict first: aptkit has **no locks, no mutexes, no atomics, no channels — and it needs none, today.** Not because it's clever about synchronization, but because it has almost no shared mutable state and zero real concurrency. The interesting question isn't "where are the locks" — it's "what mutable state exists, and what would break the moment real concurrency arrived?"
 
 ```
-  Zoom out — where shared state could live, and what guards it
+  Zoom out — where mutable state lives in the runtime
 
-  ┌─ Runtime layer ──────────────────────────────────────────────────┐
-  │   runAgentLoop: messages[], toolCalls[]  → LOCAL to one call (no  │
-  │                                             sharing → no race)     │
-  └──────────────────────────────────┬─────────────────────────────────┘
-  ┌─ Provider layer ──────────────────▼─────────────────────────────────┐
-  │   GemmaModelProvider.toolUseCount  → instance field, MUTABLE        │ ← we are here
-  │   FallbackModelProvider.lastSelectedProvider → instance field, MUT  │
-  └──────────────────────────────────┬─────────────────────────────────┘
-  ┌─ Retrieval layer ─────────────────▼─────────────────────────────────┐
-  │   InMemoryVectorStore.chunks (Map) → mutable, shared if reused      │
-  │   conversation-memory counters (Map) → mutable per-instance         │
-  └──────────────────────────────────────────────────────────────────────┘
-
-  guard mechanism across all of them: JS run-to-completion. no locks exist.
+  ┌─ Capability layer ──────────────────────────────┐
+  │  agents — fully stateless per call               │
+  └───────────────────────┬──────────────────────────┘
+  ┌─ Runtime layer ───────▼──────────────────────────┐
+  │  runAgentLoop — all state is STACK-LOCAL          │
+  │   (messages[], toolCalls[], finalText)            │
+  └───────────────────────┬──────────────────────────┘
+  ┌─ Provider / store layer ─────────────────────────┐
+  │  ★ GemmaModelProvider.toolUseCount ★  (mutable)   │ ← THIS CONCEPT
+  │  ★ InMemoryVectorStore.chunks (Map) ★ (mutable)   │   the only shared state
+  └───────────────────────────────────────────────────┘
 ```
 
-**Zoom in.** A data race needs two things: shared mutable state, and two execution contexts touching it at the same instant. aptkit has the first (a few mutable fields) but structurally cannot have the second (one thread). So this file is short by design — it explains *why* the races are absent, names the one place that's still a latent footgun (a provider instance shared across concurrent agent runs), and stops. Don't invent locking the repo doesn't need.
+**Zoom in.** A race condition needs two things: shared mutable state, *and* two threads/tasks touching it interleaved. aptkit has a little of the first and (effectively) none of the second. So this file is mostly about identifying the two pieces of mutable instance state, showing why they're safe under today's single-task model, and naming precisely the concurrency pattern that would turn them into bugs.
 
-## Structure pass
+## The structure pass
 
-Trace the **state** axis — who owns each piece of mutable state, and can two things touch it concurrently?
+Trace the axis **"who can mutate this, and could two writers overlap?"** down the layers.
 
 ```
-  Axis: "is this state shared across concurrent work?" — per location
+  One axis — "is this mutable, and can writers overlap?" — by layer
 
-  ┌──────────────────────────────────────────────────────────┐
-  │ runAgentLoop messages[] / toolCalls[]                      │  → NO: born and dies
-  │   (run-agent-loop.ts:94-95)                                │     inside one call
-  └───────────────────┬────────────────────────────────────────┘
-      ┌───────────────▼────────────────────────────────────────┐
-      │ GemmaModelProvider.toolUseCount (gemma-provider.ts:44)   │  → MAYBE: shared if one
-      │ FallbackModelProvider.lastSelectedProvider (:30)         │     provider instance is
-      │                                                          │     reused across runs
-      └───────────────┬────────────────────────────────────────┘
-          ┌───────────▼────────────────────────────────────────┐
-          │ InMemoryVectorStore.chunks Map (:12)                 │  → SHARED by design
-          │   (the corpus — read by many queries)                │     (reads only after index)
-          └────────────────────────────────────────────────────┘
+  ┌─ stack-local (runAgentLoop) ──┐   mutable, but private to ONE call
+  │  messages[], toolCalls[]       │   → no overlap possible; dies with the call
+  └──────────────┬─────────────────┘
+  ┌─ instance state (per object) ┐   mutable, SHARED across calls to that object
+  │  toolUseCount, chunks Map      │   → overlap possible IF two tasks share the
+  └──────────────┬─────────────────┘     instance AND interleave
+  ┌─ module / global ────────────┐   none — no module-level mutable state
+  │  (no singletons, no globals)   │   → nothing to race on
+  └───────────────────────────────┘
 ```
 
-The seam: **the boundary between call-local state and instance state.** Inside `runAgentLoop`, everything is a local variable — no two calls can see each other's `messages`. The moment state moves onto a provider *instance* field (`toolUseCount`, `lastSelectedProvider`), it's shared across every call to that instance. On one thread that's still safe (run-to-completion), but it's the only place the safety depends on *not* awaiting between read and write — and the provider code does await between them.
+The seam is between **stack-local** and **instance** state. Stack-local state can never race — each `runAgentLoop` call gets its own `messages` array (`run-agent-loop.ts:94`), its own `toolCalls` (`run-agent-loop.ts:95`); two concurrent loops would have two separate arrays. Instance state is different: if you hand the *same* `GemmaModelProvider` to two agents and run them concurrently, they share `toolUseCount`. The axis-answer flips from "can't overlap" to "could overlap" exactly at that boundary. → and "concurrently" is the word doing all the work, because aptkit never actually does that (`02-processes-threads-and-tasks.md`).
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know `useState` doesn't tear: a React component's state updates aren't interrupted mid-update by another render, because JS runs each callback to completion before starting the next. Same guarantee, server-side. Between two `await` points, your code runs atomically — no other task can interleave. The race window only opens *across* an `await`.
+You've hit this in the browser. Two `fetch` calls that both do `count++` on a shared variable — if their `.then` callbacks interleave, you can read `count`, get preempted, and write a stale value. The fix you reach for is usually *not* a lock (JS has no real ones) but *not sharing the mutable state* — give each its own, or make the update atomic-by-being-synchronous. aptkit takes the synchronous route by default: JS can't interrupt a synchronous statement, so `count++` between awaits is safe.
 
 ```
-  Run-to-completion — the free mutex
+  The race kernel — what makes a data race
 
-  task A:  read count ── increment ── write count   ← all synchronous:
-           └──────── ATOMIC, no gap ────────┘          no task B can interleave
-
-  task A:  read count ── await fetch ── write count  ← the await is a GAP:
-                          ▲                              task B CAN run here
-                          │ if A and B share `count`, B sees stale value
-                       race window
+  shared state ─┐
+                ├─► two tasks read-modify-write ─┐
+  interleaving ─┘    with a yield BETWEEN         ├─► lost update / torn read
+                     read and write               │
+                                                  ▼
+  remove EITHER ingredient → no race possible
 ```
 
-The rule: **synchronous spans are atomic; the danger is read-modify-write that straddles an `await` on shared state.** That's the one pattern to hunt for.
+Named by what breaks if removed:
+- **Shared state** — remove it (give each task its own copy) and there's nothing to corrupt. This is what stack-local arrays do in `runAgentLoop`.
+- **Interleaving with a yield mid-update** — remove it (keep the read-modify-write synchronous, no `await` between) and JS's run-to-completion guarantees atomicity. This is what makes `toolUseCount++` safe.
 
-### Move 2 — the three kinds of state, walked
+aptkit removes *both* ingredients, which is belt-and-suspenders safe.
 
-**Call-local state: safe, the common case.** `run-agent-loop.ts:94`:
+### Move 2 — the two pieces of mutable state, examined
+
+**`GemmaModelProvider.toolUseCount` — a mutable counter, safe by synchronicity.** Here's the only mutable scalar in a provider:
 
 ```ts
-const messages: ModelMessage[] = [{ role: 'user', content: userPrompt }];
-const toolCalls: ToolCallRecord[] = [];
-let finalText = '';
-```
-
-These live in the function's closure. Every `runAgentLoop` invocation gets its own. Two concurrent agent runs (say, two Studio replays in flight) never share these arrays — there's no race because there's no sharing. This is the dominant pattern in the repo and it's correct.
-
-**Instance counter state: a latent footgun.** `gemma-provider.ts:44` and `:110`:
-
-```ts
+// packages/providers/gemma/src/gemma-provider.ts:44, 110-114
 private toolUseCount = 0;
 // ...
 private nextToolUseId(name: string): string {
   const id = `gemma-${name}-${this.toolUseCount}`;
-  this.toolUseCount += 1;          // ← read-modify-write on instance state
+  this.toolUseCount += 1;     // ← read-modify-write, but fully synchronous
   return id;
 }
 ```
 
-`nextToolUseId` runs synchronously (no `await` between read and write), so even if the same `GemmaModelProvider` instance served two concurrent `complete()` calls, this increment itself can't tear. But the *intent* — monotonic, collision-free tool-use ids — assumes a single logical conversation. Share one provider instance across two unrelated agent runs and the ids interleave (`gemma-search-0`, `gemma-search-1` from two different conversations). That's not a data race; it's an identity-collision-by-sharing. The repo's usage pattern is one provider per run, so it's fine today — but it's the field to flag in review. Same shape for `FallbackModelProvider.lastSelectedProvider` (`fallback-provider.ts:30`): it records which provider won the *last* call, so sharing one fallback instance across concurrent calls makes "last selected" ambiguous.
+This generates unique tool-use IDs (`gemma-search_knowledge_base-0`, `-1`, …). The read-modify-write (`this.toolUseCount += 1`) has **no `await` between the read and the write** — it's one synchronous statement. Under JS's run-to-completion rule, nothing can interleave there, so even if two tasks called `nextToolUseId` "concurrently," each call runs atomically. The latent hazard isn't a torn write — it's *cross-conversation ID collisions*: if one `GemmaModelProvider` instance is shared across two unrelated conversations, their tool-use IDs draw from the same counter. That's a *logical* sharing bug, not a memory race, and it's invisible today because each agent run wires its own provider. Sharing a provider across concurrent conversations is `not yet exercised`.
+
+**`InMemoryVectorStore.chunks` — a `Map`, safe by no-concurrent-writers.** The store holds a `Map` that accumulates across `upsert` calls:
+
+```ts
+// packages/retrieval/src/in-memory-vector-store.ts:12, 18-23
+private readonly chunks = new Map<string, VectorChunk>();
+// ...
+async upsert(chunks: VectorChunk[]): Promise<void> {
+  for (const chunk of chunks) {
+    this.assertDimension(chunk.vector, `chunk "${chunk.id}"`);
+    this.chunks.set(chunk.id, chunk);    // ← mutation, but synchronous within the loop
+  }
+}
+```
+
+The `upsert` loop mutates the `Map` synchronously (no `await` inside the `for`), and `search` only *reads* it. The classic hazard — a `search` iterating `this.chunks.values()` (`in-memory-vector-store.ts:28`) while an `upsert` mutates the same `Map` — would throw or skip entries in many languages. In aptkit it can't happen, because (a) there's one thread and (b) neither method yields mid-iteration. A `search` runs its entire scan synchronously before any `upsert` could run. Concurrent index-while-querying is `not yet exercised`, and it's the exact scenario where buffr's `PgVectorStore` (a real database with MVCC) earns its keep — Postgres handles concurrent read/write correctly; the in-memory `Map` only handles it because nothing is concurrent.
 
 ```
-  The footgun: instance state shared across runs
+  Comparison — why the Map is safe now vs. what breaks under concurrency
 
-  one provider instance ── complete() call A ──► toolUseCount: 0→1→2
-                       └── complete() call B ──► toolUseCount: 2→3→4
-                                                  ▲
-                            ids from A and B interleave on the shared counter
-                            (no torn write — but a logical id collision)
-
-  the fix is not a lock: it's "one provider instance per agent run"
+  TODAY (single task)                  IF two tasks interleaved (hypothetical)
+  ──────────────────────               ─────────────────────────────────────
+  search() scans fully    ┐            search() starts iterating values()  ┐
+  THEN upsert() mutates    ├ safe       upsert() mutates Map mid-iteration  ├ would
+  (or vice versa)          │            → "Map changed during iteration" or  │ break
+  never interleaved        ┘            skipped/duplicated hits              ┘
 ```
 
-**Shared corpus state: read-only after index.** `in-memory-vector-store.ts:12` — `private readonly chunks = new Map<string, VectorChunk>()`. The `Map` is mutated during `upsert` (indexing) and read during `search` (querying). If those phases overlapped concurrently you'd want care, but the lifecycle is index-then-query: writes happen at setup, reads happen at runtime. A concurrent `upsert` during a `search` would, on one thread, still be safe — the `search` loop (`in-memory-vector-store.ts:28`) is synchronous and runs to completion before any `upsert` task could start. The single thread is doing the synchronization for free.
-
-**Why no locks, atomics, or channels exist — and shouldn't.** There is no `Atomics`, no `Mutex`, no message channel anywhere in `packages/`. Adding one would be cargo-culting: locks coordinate threads, and there's one thread. The correct "synchronization primitive" in this codebase is the run-to-completion guarantee plus the discipline of keeping state call-local. The day aptkit adds `worker_threads` (the `05`/`08` escape hatch for the cosine scan), *then* shared-memory concerns become real — and the answer there is message-passing (workers don't share heap by default), not locks.
+**Everything else is stack-local and unshareable.** Inside `runAgentLoop`, `messages` (`run-agent-loop.ts:94`), `toolCalls` (`run-agent-loop.ts:95`), and `finalText` (`run-agent-loop.ts:96`) are all declared per-call. Two concurrent loops would never see each other's arrays. The `for` loop's `turn` counter, the per-turn `toolResults` — all stack-local. This is the bulk of aptkit's mutable state, and none of it can race, ever, by construction.
 
 ### Move 3 — the principle
 
-Single-threaded JS gives you a coarse mutex for free: any synchronous span is atomic, so the only race surface is shared state touched across an `await`. The engineering move isn't to add locks — it's to keep state call-local so there's no shared surface at all, and where instance state is unavoidable (a counter, a "last selected"), make sure either the read-modify-write is synchronous or the instance isn't shared across logical work. aptkit does the first instinctively (everything in `runAgentLoop` is local) and is exposed only on the second, in a way that's a usage convention, not a code bug.
+The cheapest synchronization is no shared state. aptkit's safety comes from two disciplines applied without fanfare: keep per-request state on the stack (so it can't be shared), and keep read-modify-writes synchronous (so they can't be interleaved). You only reach for locks/atomics/channels when you have genuine parallelism *and* unavoidable shared state — neither of which aptkit has yet. The day it gets concurrent task fan-out (`Promise.all` over shared instances), the two pieces of instance state become real hazards, and the answer won't be a JS lock (there isn't one) — it'll be "don't share the instance" or "move the state to a store that handles concurrency" (Postgres).
 
 ## Primary diagram
 
-The complete state map: local state is race-free, instance state is convention-guarded, the corpus is read-only at runtime, and run-to-completion is the only synchronization.
-
 ```
-  aptkit shared-state map — complete
+  Shared state and safety in aptkit — complete
 
-  ┌─ ONE thread: run-to-completion is the only synchronization ──────────┐
-  │                                                                       │
-  │  CALL-LOCAL (safe — no sharing)                                       │
-  │   runAgentLoop: messages[], toolCalls[], finalText                    │
-  │   structured-generation: attempts[]                                   │
-  │                                                                       │
-  │  INSTANCE STATE (convention-guarded — "one instance per run")         │
-  │   GemmaModelProvider.toolUseCount    ── sync RMW, no tear             │
-  │   FallbackModelProvider.lastSelectedProvider ── set per call          │
-  │   conversation-memory counters Map   ── per-conversation ids          │
-  │                                                                       │
-  │  SHARED CORPUS (read-only at query time)                              │
-  │   InMemoryVectorStore.chunks Map ── written at index, read at search  │
-  │                                                                       │
-  │  ✗ no locks  ✗ no atomics  ✗ no channels — none needed on one thread  │
-  └────────────────────────────────────────────────────────────────────────┘
+  ┌─ One thread, one task at a time (the safety guarantee) ─────────┐
+  │                                                                 │
+  │  STACK-LOCAL (per call — cannot be shared, cannot race)         │
+  │   ┌──────────────────────────────────────────────────────┐     │
+  │   │ runAgentLoop: messages[], toolCalls[], finalText       │     │
+  │   └──────────────────────────────────────────────────────┘     │
+  │                                                                 │
+  │  INSTANCE STATE (shared across calls to one object)             │
+  │   ┌──────────────────────────────┐  ┌────────────────────────┐ │
+  │   │ GemmaProvider.toolUseCount    │  │ InMemoryVectorStore     │ │
+  │   │  safe: sync read-mod-write    │  │  .chunks (Map)          │ │
+  │   │  hazard: cross-convo ID reuse │  │  safe: no concurrent    │ │
+  │   │  if instance shared           │  │  writers; hazard: index │ │
+  │   └──────────────────────────────┘  │  -while-query (→ PgVector)│ │
+  │                                      └────────────────────────┘ │
+  │                                                                 │
+  │  GLOBAL / MODULE: none. No singletons, no module-level mutables.│
+  │  LOCKS / ATOMICS / CHANNELS: none — not yet needed.             │
+  └─────────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The "free mutex" of single-threaded JS is why Node sidestepped an entire class of bugs that plague threaded servers — no torn reads, no deadlocks, no lock-ordering discipline. The cost is that you can't use threads for CPU parallelism without re-introducing the problem, which is why `worker_threads` deliberately does *not* share the JS heap: workers communicate by copying or transferring messages, so there's still no shared mutable state to race on. If aptkit ever offloads the cosine scan to a worker, the corpus would be transferred or rebuilt in the worker, and synchronization would be message-passing — the channel model, not the lock model. See `02` for the thread model this rests on, and `study-distributed-systems` for the harder version of the same problem once buffr's multi-process runtime coordinates shared Postgres state across processes (where run-to-completion no longer saves you).
+JavaScript's single-threaded model is a synchronization *strategy*, not just a constraint — "run to completion" gives you atomicity for free on any code path with no `await`. That's why most Node code never touches a lock: races require both shared state and a yield between read and write, and idiomatic Node keeps mutations synchronous. The discipline aptkit follows — stack-local per-request state, instance state only where it must persist (the corpus) — is the same one that keeps Express handlers safe. The place it would crack is `worker_threads` with `SharedArrayBuffer` (real shared memory, real `Atomics`) or sharing a mutable instance across concurrent tasks. Neither is in the repo. The retrieval contracts are designed so that "make the store concurrency-safe" is answered by swapping in `PgVectorStore` (in buffr), not by adding locks to the in-memory one.
 
 ## Interview defense
 
-**Q: How does aptkit avoid data races without any locks?**
+**Q: aptkit has shared mutable state — why are there no locks?**
+Because a race needs shared state *and* interleaving with a yield mid-update, and aptkit removes both. The two pieces of mutable instance state — `toolUseCount` and the chunks `Map` — are mutated synchronously, so JS's run-to-completion makes the updates atomic; and there's one thread with no concurrent tasks, so nothing interleaves. Locks would be solving a problem that can't occur yet.
 
 ```
-  one JS thread + run-to-completion semantics
-  → any synchronous span is atomic; no two tasks run at the same instant
-  → race surface = shared state touched ACROSS an await
-  aptkit keeps state call-local (runAgentLoop locals) → no shared surface
+  race = shared state + interleaved read-mod-write. Remove either → safe.
 ```
+*Anchor: `toolUseCount += 1` is one synchronous statement — nothing can interleave between the read and the write.*
 
-Anchor: "Single-threaded JS is a free coarse mutex — the only race window is a read-modify-write on shared state that straddles an `await`, and the repo keeps state call-local to avoid even that."
-
-**Q: Is there any shared mutable state I should worry about?**
-
-```
-  yes — instance fields: GemmaModelProvider.toolUseCount,
-        FallbackModelProvider.lastSelectedProvider
-  not a torn-write race (the RMW is synchronous)
-  but a logical collision IF one instance is shared across concurrent runs
-  fix: one provider instance per agent run (a usage convention, not a lock)
-```
-
-Anchor: "The provider instances carry mutable counters — safe under the repo's one-instance-per-run usage, but the thing I'd flag if someone tried to share a provider across concurrent conversations."
+**Q: What breaks the day you add `Promise.all` over a shared provider?**
+The instance state becomes shared across overlapping tasks. `toolUseCount` would hand the same ID prefix to two conversations; a `search` could iterate the chunks `Map` while an `upsert` mutates it. The fix isn't a JS lock — give each task its own provider instance, and move the corpus to a store that handles concurrent read/write (Postgres / `PgVectorStore`).
 
 ## See also
 
-- `02-processes-threads-and-tasks.md` — the single thread that makes run-to-completion hold
-- `03-event-loop-and-async-io.md` — the `await` points that open the only race windows
-- `study-distributed-systems` — coordination across processes (buffr), where run-to-completion no longer protects shared state
+- `02-processes-threads-and-tasks.md` — why "concurrent tasks" doesn't happen today
+- `05-memory-stack-heap-gc-and-lifetimes.md` — where this state lives in memory
+- `07-backpressure-bounded-work-and-cancellation.md` — the fan-out that would introduce concurrency
+- `study-distributed-systems` — concurrency once buffr is the process owner

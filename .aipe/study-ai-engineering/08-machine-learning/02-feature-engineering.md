@@ -1,337 +1,190 @@
-# Feature engineering
+# Feature Engineering
 
-**Subtitle:** raw input → fixed-width numeric vector · *Language-agnostic*
+> feature engineering · data transformation
+
+Same disclaimer as file 01, and I'll keep being blunt: **aptkit has no features because aptkit trains no model.** There is no feature table, no transform module, no `extract_features` anywhere in `packages/`. This is new ground. What follows is study material plus exercises that would *introduce* feature engineering, not a description of code that exists.
+
+The anchor that makes this concrete for you is contrl. That project is, at its core, a feature-engineering project wearing a rep-counter costume. Raw MediaPipe pose landmarks are useless to a classifier as-is; the work that makes contrl function is turning those landmarks into meaningful per-rep numbers. That transform is the lesson of this entire file.
 
 ## Zoom out, then zoom in
 
-This is the same generic supervised pipeline from file 01, but now the starred
-box is the *feature layer* — the one between the raw rows and the split. Every
-later box only ever sees what this box produces.
+Feature engineering is stage two of the five-stage pipeline. It sits between raw data and the split, and it is where the load-bearing work lives. Star on stage two.
 
 ```
-  Zoom out — the supervised pipeline, feature layer starred
-
-  ┌─ Data layer ───────────────────────────────────────────────────┐
-  │  raw rows + LABELS  (query, document, was-it-relevant?)        │
-  └───────────────────────────┬─────────────────────────────────────┘
-                              │ feature engineering ← THIS FILE
-  ┌─ Feature layer ───────────▼─────────────────────────────────────┐
-  │  ★ featurize(raw) → fixed-width numeric vector X ★              │
-  └───────────────────────────┬─────────────────────────────────────┘
-                              │ split (file 03)
-  ┌─ Split layer ─────────────▼─────────────────────────────────────┐
-  │  train · val · test                                            │
-  └───────────────────────────┬─────────────────────────────────────┘
-                              │ fit
-  ┌─ Model layer ─────────────▼─────────────────────────────────────┐
-  │  f(X) → ŷ                                                       │
-  └───────────────────────────┬─────────────────────────────────────┘
-                              │ ship
-  ┌─ Serving layer ───────────▼─────────────────────────────────────┐
-  │  SAME featurize() at inference                                 │
-  └──────────────────────────────────────────────────────────────────┘
+Where feature engineering lives (★ = this file)
+┌──────┐   ┌────────────┐   ┌──────────────────┐   ┌───────┐   ┌────────┐
+│ DATA │──▶│  FEATURES ★ │──▶│ TRAIN/VAL/TEST   │──▶│ MODEL │──▶│ DEPLOY │
+│ raw  │   │ raw →        │   │                  │   │ small │   │        │
+│      │   │ engineered   │   │                  │   │       │   │        │
+└──────┘   └────────────┘   └──────────────────┘   └───────┘   └────────┘
+              ▲ ~60–80% of the outcome decided here
 ```
 
-Now zoom in. A model cannot read a `(query, document)` pair, a date, or the word
-"monitoring". It can only multiply numbers. Feature engineering is the code that
-turns whatever you have — strings, timestamps, nested objects — into one
-fixed-length row of floats. It is unglamorous and it is where 60–80% of the work
-and almost all of the production bugs live. The algorithm choice is a footnote
-next to this.
+The rough split of where outcome comes from: features ~60–80%, the split discipline some, the model only ~10%. If you remember one number from this sub-section, make it that. The reason is simple — the model can only see what the features expose. A great learner over bad features is a confident wrong answer.
 
 ## Structure pass
 
-**Layers.** Raw input → transforms (scale, encode, embed, derive) → assembled
-numeric vector. Each transform is a small pure-ish function; the feature layer is
-the *composition* of them into one wide row of known width.
+Feature engineering has its own internal layers, from rawest to most refined. Each layer is a transform with its own failure mode.
 
-**Axis — where does error originate?** Trace a wrong prediction back into this
-layer. Was a feature uninformative (the model never had the signal)? Was it
-computed differently at serve time than at train time (skew)? Did a feature
-secretly contain the answer (leakage)? Each of those is a feature-layer failure
-that no model can fix, because the model only ever sees `X`.
+- **Raw signal.** What the sensor or source emits. For contrl: `{x, y, z}` per joint, per frame, ~33 landmarks, 30+ frames a second. Useless to a model directly — it's a firehose of positions with no meaning.
+- **Cleaned signal.** Smoothing, gap-filling, unit normalization. Failure: noise leaks through, or you smooth away the thing you care about.
+- **Derived quantities.** Per-frame physics: joint angles, velocities. Failure: wrong reference frame, wrong joint triple.
+- **Aggregated features.** Per-*example* summaries: min knee angle over a rep, range of motion, time-at-bottom, peak velocity. This is the row the model actually eats. Failure: aggregating over the wrong window.
+- **Feature set (versioned).** The named, frozen collection `v3 = {knee_angle_min, rom, time_at_bottom, peak_velocity}`. Failure: you change a feature and can no longer compare today's model to last week's.
 
-**Seam.** The load-bearing boundary is **`featurize(raw) → number[]`** — the
-single function that maps one raw unit to one fixed-width vector. It must be
-*one* function with *two* callers: a batch loop at training time and a single
-live call at serving time. The moment those two paths compute features
-differently, every metric you measured becomes a lie.
+The seam that bites hardest is raw→aggregated: you collapse a time series of frames into one row per rep, and getting the window boundaries wrong silently corrupts every feature.
 
 ## How it works
 
-### Move 1 — the mental model
+### Move 1 — Mental model
 
-You already know `precision@k` from this repo. `scorePrecisionAtK`
-(`packages/evals/src/precision-at-k.ts`) grades a *ranked list of ids* — it never
-touches features. Feature engineering is the step that produces the numbers a
-model uses to *build* that ranked list in the first place. Think of it like a
-frontend serializer: a React form holds rich objects, but the wire only accepts a
-flat JSON body, so you write one `serialize(formState)` function and run it on
-every submit. `featurize` is that serializer — except the wire is a model, the
-body is `number[]`, and the width is fixed forever once you train.
+A feature is a **lens that makes the signal the model needs visible, and hides the rest.** Raw landmarks contain the answer ("was this a good squat?") but buried under thousands of irrelevant numbers. A good feature is a sharp lens; a bad feature is a smudged one.
 
 ```
-  Pattern — featurize is a serializer to fixed-width floats
-
-  rich raw input              featurize()            fixed-width vector
-  ┌────────────────────┐   ┌──────────────┐       ┌──────────────────────┐
-  │ query: "deploy err"│   │ scale        │       │ [0.81, 0.30, 1.0,    │
-  │ doc:   {len, text} │──►│ encode       │ ─────►│  0.12, 0.0]          │
-  │ ts:    2026-06-01  │   │ embed/derive │       │  (always 5 wide)     │
-  └────────────────────┘   └──────────────┘       └──────────────────────┘
-   any shape, any types        pure-ish              floats only, same N
+Mental model — features as lenses
+   raw firehose                lens 1            lens 2            lens 3
+  {x,y,z}×33×N frames  ──▶  knee_angle(t)  ──▶  min over rep  ──▶  knee_angle_min
+  (thousands of numbers)    (1 number/frame)    (1 number/rep)     (a feature)
+        ▲ model can't                                                ▲ model CAN
+          use this                                                     use this
 ```
 
-The hard rule hiding in that diagram: the output is *always the same width, in
-the same order, with the same meaning per slot*. Slot 2 is "cosine similarity"
-on every row, forever. A model has no column names — position is the only
-identity a feature has.
+Each lens throws away information on purpose. The art is throwing away the irrelevant and keeping the predictive. You're not adding information — the answer was always in the raw data — you're making it *legible*.
 
-### Move 2 — the transforms, one at a time
+### Move 2 — Step by step
 
-Take the running domain: a **learned reranker** over aptkit retrieval. buffr's
-`PgVectorStore.search(vector, k)`
-(`/Users/rein/Public/buffr/src/pg-vector-store.ts`) already returns
-`{ id, score, meta }[]` sorted by cosine similarity. A reranker would re-order
-those hits using a model, and that model needs each `(query, hit)` pair turned
-into a numeric row. Here is how each raw field becomes a slot.
+Pseudocode for a *new* feature module. **Not yet exercised in aptkit** — there is no transform code in `packages/`; the closest real instance of this work is contrl, described in prose only.
 
-**Numeric scaling.** Raw numbers come on wildly different ranges: a cosine score
-is `[0,1]`, a document length might be `0..5000`. Many models let large-magnitude
-features dominate purely because they are large. Scale each numeric feature to a
-comparable range so the model weighs them on merit, not on units.
+**Part 1 — From raw to per-frame derived quantities.**
 
 ```
-  Scaling — put every numeric feature on the same footing
-
-  raw                         scaled (min-max → [0,1])
-  cosine_sim  0.81 ─────────► 0.81     (already small)
-  doc_length  4200 ─────────► 0.84     (4200 / 5000 cap)
-  recency_days  3  ─────────► 0.03     (3 / 90 cap)
+Per-frame derivation
+landmark[hip], landmark[knee], landmark[ankle]
+        │
+        ▼  angle = arccos( (hip-knee)·(ankle-knee) / (|hip-knee||ankle-knee|) )
+   knee_angle(frame_t)   ← one number per frame
 ```
 
-```text
-# pseudocode — fit scaler on TRAIN ONLY, reuse the learned bounds at serve
-scaler.fit(X_train)            # learns min/max (or mean/std) per column
-X_train = scaler.transform(X_train)
-X_serve = scaler.transform(x)  # SAME bounds — never re-fit on serving data
+```python
+def knee_angle(frame):                  # pseudocode — not in aptkit
+    return angle_between(frame.hip, frame.knee, frame.ankle)
 ```
 
-The trap is fitting the scaler on the whole dataset: the min/max then carry
-information from the test set into training. Fit on train, freeze, reuse.
+This is the contrl lesson in one function: the *physics* lives here. Pick the wrong three joints and every downstream feature is garbage.
 
-**Categorical encoding (one-hot).** A model cannot take the string `"monitoring"`.
-A categorical field with no order becomes one binary slot per possible value —
-"one-hot". Three intents become three columns; exactly one is `1`.
+**Part 2 — From per-frame to per-rep aggregates.**
 
 ```
-  One-hot — one column per category, exactly one is hot
-
-  intent = "diagnostic"
-                       is_monitoring  is_diagnostic  is_recommendation
-                       ┌────────────┬──────────────┬──────────────────┐
-                       │     0      │      1       │        0         │
-                       └────────────┴──────────────┴──────────────────┘
+Aggregation over a rep window
+knee_angle(t):  170 150 120  95  80  95 130 165 ...
+                └──────── one rep window ────────┘
+                          ▼ aggregate
+  knee_angle_min = 80   range_of_motion = 90   time_at_bottom = 2 frames
 ```
 
-```text
-# pseudocode — categories are FROZEN at train time
-CATEGORIES = ["monitoring", "diagnostic", "recommendation"]   # fixed vocabulary
-def encode_intent(value):
-    return [1.0 if value == c else 0.0 for c in CATEGORIES]    # width = 3, always
-    # an unseen category at serve time → all zeros (never widen the vector)
+```python
+def rep_features(rep_frames):           # pseudocode — not in aptkit
+    angles = [knee_angle(f) for f in rep_frames]
+    return {
+        "knee_angle_min": min(angles),
+        "rom":            max(angles) - min(angles),
+        "time_at_bottom": sum(1 for a in angles if a < BOTTOM_THRESHOLD),
+        "peak_velocity":  max(abs(d) for d in deltas(angles)),
+    }
 ```
 
-Never integer-encode an unordered category as `0,1,2` — that tells the model
-`recommendation > monitoring`, an ordering you did not mean.
-
-**Text → counts or embeddings.** Free text needs its own bridge. The cheap route
-is counts (how many query terms appear in the doc — `query_term_overlap`). The
-rich route is an embedding: a pre-trained model maps text to a fixed-width dense
-vector. buffr already embeds with `nomic-embed-text` at 768 dims; the *cosine
-score* it produces is itself a feature.
+**Part 3 — Versioning the feature set.**
 
 ```
-  Text → numeric, two routes
-
-  "deploy error" ┌─ counts ──► query_term_overlap = 2   (cheap, 1 slot)
-                 │
-                 └─ embed ───► [0.02, -0.11, ...]        (rich, 768 slots,
-                                                          pre-trained, frozen)
+Feature-set versioning
+feature_set_v1 = { knee_angle_min, rom }
+feature_set_v2 = { knee_angle_min, rom, time_at_bottom }          ← added one
+feature_set_v3 = { knee_angle_min, rom, time_at_bottom, peak_velocity }
+                  ▲ each frozen + named → models stay comparable across versions
 ```
 
-```text
-# pseudocode — overlap is a derived count; embeddings come pre-trained
-def query_term_overlap(query, doc_text):
-    q = set(tokenize(query.lower()))
-    d = set(tokenize(doc_text.lower()))
-    return float(len(q & d))           # one numeric slot
+```python
+FEATURE_SET_V3 = ["knee_angle_min", "rom", "time_at_bottom", "peak_velocity"]
+def build_matrix(reps, feature_set=FEATURE_SET_V3):
+    return [[rep[name] for name in feature_set] for rep in map(rep_features, reps)]
 ```
 
-**Ratios and derived features.** Often the *relationship* between two raw fields
-carries more signal than either alone. `recency_days` derived from a timestamp,
-or `overlap / query_length` as a normalized match rate, gives the model the thing
-you would have eyeballed yourself.
+Versioning is the part people skip and regret. Without it you can't answer "did the model get better, or did I change the features?"
 
-```
-  Derived — encode the relationship, not just the raw fields
+### Move 3 — The principle
 
-  now=2026-06-28, doc_ts=2026-06-25  ──► recency_days = 3
-  overlap=2, query_len=3             ──► match_rate   = 0.67
-```
-
-**Handling missing values.** Real rows have holes — a doc with no timestamp, a
-query with no detected intent. You cannot hand a model `null`. Pick an explicit
-policy (impute a sentinel, or impute the train-set median) *and* add a binary
-"was-missing" flag so the model can learn that absence itself is signal.
-
-```
-  Missing values — impute + flag, never pass null
-
-  recency_days = null
-        │ impute median (e.g. 30)        plus a flag column
-        ▼
-  recency_days = 30.0      recency_was_missing = 1.0
-```
-
-```text
-# pseudocode — assemble the full reranker feature row
-def featurize(query, hit, now):
-    overlap = query_term_overlap(query, hit.meta["text"])
-    ts = hit.meta.get("ts")
-    recency = (now - ts).days if ts else MEDIAN_RECENCY   # impute
-    return [
-        hit.score,                       # 0: cosine_sim (from PgVectorStore)
-        scale_len(len(hit.meta["text"])),# 1: doc_length, scaled
-        overlap,                         # 2: query_term_overlap
-        recency,                         # 3: recency_days (imputed if null)
-        1.0 if ts is None else 0.0,      # 4: recency_was_missing flag
-    ]                                    # fixed width 5, fixed order, forever
-```
-
-**Move 2.5 — the aptkit reality.** Not yet exercised in aptkit — aptkit runs
-pre-trained LLMs, not trained models. The pattern is taught here as study ground.
-The closest real artifacts are the *score* that `PgVectorStore.search()` already
-emits (a feature in waiting) and the keyword heuristic in
-`packages/agents/query/src/intent.ts` — a hand-written `parseIntent` that a
-trained classifier would replace, with the same string-to-numeric featurization
-described above.
-
-### Move 3 — the principle
-
-A feature is a *contract slot*: fixed position, fixed meaning, computed by one
-function that runs identically at train and serve time. Spend your effort here,
-not on the algorithm — informative, leak-free, skew-free features beat a fancier
-model on the same data almost every time. The feature function is the seam where
-"works in the notebook" turns into "fails in prod," so treat it as production
-code, not notebook scratch.
+**Features are the program; the model is the interpreter.** You spend your effort designing lenses, and you measure feature quality not by how clever it is but by whether it moves the held-out score. When in doubt, add a feature before you change the model.
 
 ## Primary diagram
 
-```
-  Feature engineering — one function, two callers, fixed width
+The canonical picture: the full raw→engineered ladder for one rep, the same pipeline contrl runs in spirit.
 
-  TRAINING (batch)                         SERVING (one request)
-  ┌──────────────┐                         ┌──────────────┐
-  │ labeled rows │                         │ one (q, hit) │
-  │ (q, hit, y)  │                         │ live pair    │
-  └──────┬───────┘                         └──────┬───────┘
-         │            ★ same featurize() ★        │
-         ▼   ┌──────────────────────────────┐  ◄─┘
-             │ scale · one-hot · embed ·     │
-         ▼   │ derive · impute+flag          │   ← THE SEAM
-             └──────────────┬────────────────┘
-                            ▼
-            ┌──────────────────────────────────────┐
-            │ X = [cosine, doc_len, overlap, ...]   │  fixed width, fixed order
-            └──────────────┬────────────────────────┘
-                           ▼
-                    f(X) → ŷ  ──►  ranked ids  ──►  scorePrecisionAtK(...)
+```
+Feature engineering ladder — raw landmarks to a model-ready row
+RAW          CLEANED          DERIVED            AGGREGATED         FEATURE SET (v3)
+{x,y,z}×33   smoothed,        knee_angle(t),     min/max/dwell      [knee_angle_min,
+ per frame   gap-filled,  ──▶ velocity(t)    ──▶ over the rep   ──▶  rom,
+ ×N frames   normalized       per frame          window              time_at_bottom,
+   │            │                │                 │                  peak_velocity]
+   │ firehose   │ denoised       │ physics         │ summary          │ frozen + named
+   ▼            ▼                ▼                 ▼                  ▼
+ unusable    usable but      meaningful but     one row per         the matrix X
+ by model    too raw         too granular       rep ← the unit       the model eats
+                                                  the model predicts
 ```
 
-The arrow on the far right is the whole bridge: feature engineering feeds the
-model, the model emits ranked ids, and `scorePrecisionAtK` grades *those ids* —
-it never sees `X`. Features are graded only indirectly, through the output.
+Read it as a funnel: thousands of numbers in, four numbers out, each transform discarding what the model doesn't need. The model never sees the firehose — only the four-number row on the right.
 
 ## Elaborate
 
-Two failure modes dominate this layer, and both are invisible in a notebook.
-First, **train/serve skew**: the notebook lowercases the query, the serving path
-forgets to, so slot 2 (`query_term_overlap`) silently shifts and accuracy craters
-in prod with green tests. The fix is structural — *one* `featurize` module
-imported by both callers, never two copies. Second, **leakage from a feature**:
-you accidentally include a column that encodes the label. For the reranker, the
-sin is feeding in the position the *current* retrieval already assigned, or any
-field derived from the known-relevant set — the model scores 0.99 offline and
-random in prod because that column does not exist at serve time. A leaked feature
-and a skewed feature look identical from the metric alone; you find them by
-asking, for every slot, "is this computable from a single live request, the same
-way, before the answer is known?" If not, cut it. This is why files 02 and 03 are
-longer than file 04: the model is easy; honest features are not.
+- **More features is not better.** Each feature is a chance to leak, to overfit, or to introduce train/serve skew. Add features that move the val score and delete the ones that don't.
+- **The aggregation window is the silent killer.** Collapsing a time series to one row per example means defining "one example." Get the rep boundaries wrong and `knee_angle_min` is computed over half a rep. Test the windowing in isolation.
+- **Train/serve skew is born here.** If your training features are computed in Python and your serving features in TypeScript on-device, they *will* drift apart. Ideally one feature module runs in both places; at minimum, test that both produce the same numbers on the same input.
+- **Normalization belongs to the pipeline, not the row.** Things like "scale to zero mean / unit variance" must be fit on *train only* and applied to val/test — fitting the scaler on all data leaks test statistics into training. (That's a leak; file 03 covers the family.)
+- **contrl anchor.** This is contrl. Raw MediaPipe gives you `{x, y, z}` per joint per frame; on its own that's noise. The project works because you derive joint angles, velocity, range-of-motion, and time-at-bottom per rep — and those engineered features carry essentially all of the rep-quality signal. If you handed a model the raw landmarks instead, it would need vastly more data to relearn what one line of angle math gives you for free. That's the 60–80% claim made tangible.
 
 ## Project exercises
 
-### Build the reranker feature function
+### Build a feature-extraction module with explicit windowing
 
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a pure `featurize(query, hit, now)` module returning a
-  fixed-width `number[]` — `[cosine_sim, doc_length_scaled, query_term_overlap,
-  recency_days, recency_was_missing]` — consuming the `{id, score, meta}` shape
-  that `PgVectorStore.search()` returns, plus a unit test asserting every output
-  is the same length regardless of input.
-- **Why it earns its place:** the feature function is the seam the entire section
-  depends on; building it as one importable module is what prevents train/serve
-  skew before any model exists.
-- **Files to touch:** new `/Users/rein/Public/buffr/eval/featurize-rerank.ts`
-  (reading the hit shape from `/Users/rein/Public/buffr/src/pg-vector-store.ts`)
-  and new `/Users/rein/Public/buffr/eval/featurize-rerank.test.ts`.
-- **Done when:** the test passes asserting fixed width across varied inputs,
-  including a hit with a missing timestamp (imputed value + flag set).
-- **Estimated effort:** `1–4hr`
+- **Exercise ID:** EX-ML-02a (Phase 2C — the feature stage of the new belt; aptkit has no transform code today)
+- **What to build:** A pure module that takes raw per-frame records and a rep-window definition and returns one feature row per rep: angle-derived min, range-of-motion, dwell time, peak velocity. Pure functions, no I/O, fully unit-testable.
+- **Why it earns its place:** This is the load-bearing 60–80%. Building it makes concrete what contrl does implicitly and gives you a tested artifact to point at when an interviewer asks "show me feature work, not model work."
+- **Files to touch:** Case B (new) — `aptkit/packages/ml-evals/src/features.ts` with `repFeatures()` and `kneeAngle()`; tests at `aptkit/packages/ml-evals/src/features.test.ts`. Consumed by `pipeline.ts` from EX-ML-01a. No existing source edits.
+- **Done when:** Unit tests pass for at least: a known synthetic rep producing expected angle-min and ROM, and an edge case (truncated window) handled explicitly rather than producing NaN.
+- **Estimated effort:** 1–2 days
 
-### Audit a candidate feature for leakage
+### Add feature-set versioning
 
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a short written checklist applied to each proposed reranker
-  feature, answering "is this computable from one live request, the same way, before
-  the label is known?" — and flagging at least one leaking feature (e.g. a column
-  derived from the known-relevant set in `/Users/rein/Public/buffr/eval/queries.json`).
-- **Why it earns its place:** naming leakage and skew before training is the
-  senior move; a leaked feature is the single most common reason offline metrics
-  beat production.
-- **Files to touch:** new `/Users/rein/Public/buffr/docs/rerank-feature-audit.md`.
-- **Done when:** the note classifies each slot as safe or leaking, with a
-  one-line justification per slot tied to serve-time availability.
-- **Estimated effort:** `<1hr`
+- **Exercise ID:** EX-ML-02b (Phase 3 — ML evals; make feature sets comparable across model runs)
+- **What to build:** A named, frozen feature-set registry (`FEATURE_SET_V1`, `_V2`, …) plus a `buildMatrix(reps, featureSet)` that records which version produced a given training run.
+- **Why it earns its place:** Without versioning you can't separate "the model improved" from "I changed the inputs." This is the discipline that makes the evals in Phase 3 trustworthy.
+- **Files to touch:** Case B (new) — `aptkit/packages/ml-evals/src/feature-sets.ts`; the run metadata written by `pipeline.ts` records the feature-set version. Optional: a `buffr` training-log row capturing `feature_set_version`.
+- **Done when:** A training run logs which feature-set version it used, and switching versions changes the recorded metadata so two runs can be compared apples-to-apples.
+- **Estimated effort:** 1–4hr
 
 ## Interview defense
 
-**Q: "Why does a model need fixed-width numeric features at all?"**
-Because a model is matrix math — it multiplies a weight vector by an input vector,
-and that only works if every input is the same length, in the same order, all
-numeric. There are no column names; slot position *is* the feature's identity.
-`featurize` is the function that guarantees that shape on every row.
+**Q: You have a week to improve a model. What do you do?**
 
 ```
-  raw (any shape) ──► featurize ──► [f0, f1, f2, f3, f4]  (always N, always floats)
-                                     position = meaning
+week budget ──▶ ███████░  features    (look at errors, add/fix lenses)
+                █░░░░░░░  model        (swap in one line at the end)
 ```
-*Anchor: a model has no column names — slot position is the only identity a feature has.*
 
-**Q: "Offline precision@k is 0.95, production is near random. First suspect?"**
-The feature layer, not the model. Either train/serve skew (a feature computed
-differently in the two paths) or leakage (a feature that encoded the label and
-does not exist at serve time). Both are invisible to the metric and both are
-fixed in `featurize`, not in the algorithm.
+I'd spend most of it on features: pull the worst-predicted examples, find what the current features can't distinguish, and add a lens that separates them. The model swap is the last hour. Anchor: in contrl, the win was always a better angle/velocity feature, never a fancier classifier.
+
+**Q: How does a feature cause a production failure even when offline metrics look great?**
 
 ```
-  great offline, bad prod ─► skew? ─► leakage? ─► (only then) model?
-   both live in featurize(), not the algorithm
+TRAIN feature code (python)  ─┐
+                              ├─ disagree on same input ──▶ train/serve skew
+SERVE feature code (on-device)┘                              offline 0.95, live flop
 ```
-*Anchor: one featurize() with two callers; every slot must be serve-time-computable before the answer is known.*
+
+Train/serve skew. The features are computed by different code in different places and silently diverge. The fix is one shared feature module, or a test that asserts both paths agree. Anchor: contrl's on-device per-frame feature math must match whatever produced its training labels, or rep detection degrades for new users.
 
 ## See also
 
-- `01-supervised-pipeline.md` — the arc this feature layer sits inside
-- `03-train-val-test.md` — why the scaler is fit on train only
-- `05-evals-and-observability/` — `scorePrecisionAtK` grades the output these features feed
+- [01-supervised-pipeline.md](./01-supervised-pipeline.md) — the five stages this transform sits inside
+- [03-train-val-test.md](./03-train-val-test.md) — why the split must respect feature correlation

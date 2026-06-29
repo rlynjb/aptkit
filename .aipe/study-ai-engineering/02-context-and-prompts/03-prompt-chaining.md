@@ -1,303 +1,175 @@
 # Prompt chaining
 
-**Subtitle:** Multi-step pipelines · one job per step · *Industry pattern, aptkit's analytics pipeline*
+> Multi-step decomposition (Industry standard)
+
+One giant prompt that "analyze the data, find problems, diagnose them, and recommend fixes" is the junior move. It overflows the context, blurs responsibility, and when it goes wrong you can't tell *which* part failed. Prompt chaining splits the work into stages where each stage has one job and feeds the next. aptkit's analytics pipeline is exactly this: anomaly-monitoring (scan) → diagnostic-investigation (investigate one anomaly) → recommendation (propose ≤3 actions). Three separate capabilities, three separate prompts, output of one becoming input to the next. What aptkit *doesn't* have yet is a single orchestrator that runs the chain end-to-end — each link exists, but the wiring is the gap.
 
 ## Zoom out, then zoom in
 
-Before the mechanism, here's the shape of aptkit's clearest chain. Three separate
-agents run in sequence, each producing the typed input for the next.
+The pipeline is a directed chain. Raw data enters the first capability; each capability narrows the problem and hands a typed result to the next. The data shape shrinks and sharpens at every hop — from "all metrics" to "the anomalies" to "one diagnosis" to "a few actions."
 
 ```
-  Zoom out — the analytics chain
+The analytics chain — one job per link (LAYERS)
 
-  ┌─ AnomalyMonitoringAgent ──────────────────────────────────┐
-  │  scan() → Anomaly[]      (own prompt pkg, own tool policy) │
-  └──────────────────────────┬────────────────────────────────┘
-                            │ Anomaly
-  ┌─ DiagnosticInvestigationAgent ─▼──────────────────────────┐
-  │  investigate(anomaly) → Diagnosis                          │ ← ★ each step ★
-  └──────────────────────────┬────────────────────────────────┘
-                            │ Anomaly + Diagnosis
-  ┌─ RecommendationAgent ─────▼───────────────────────────────┐
-  │  propose(anomaly, diagnosis) → Recommendation[]            │
-  └─────────────────────────────────────────────────────────────┘
+  metrics / signals
+        │
+        ▼  ┌─────────────────────────────────────────────┐
+           │ ANOMALY-MONITORING   "scan: what's wrong?"    │  capability 1
+           │ runAgentLoop → Anomaly[]                      │  monitoring-agent.ts
+           └─────────────────────────────────────────────┘
+        │  Anomaly[]
+        ▼  ┌─────────────────────────────────────────────┐
+           │ DIAGNOSTIC-INVESTIGATION "why this one?"      │  capability 2
+           │ runAgentLoop → Diagnosis                      │  diagnostic-agent.ts
+           └─────────────────────────────────────────────┘
+        │  Diagnosis
+        ▼  ┌─────────────────────────────────────────────┐
+           │ RECOMMENDATION   "what to do (≤3)?"           │  capability 3
+           │ runAgentLoop → Recommendation[]               │  recommendation-agent.ts
+           └─────────────────────────────────────────────┘
+        │  Recommendation[]
+        ▼
+  ★ each link = its own capabilityId, its own prompt, its own typed output
 ```
 
-Now zoom in. Prompt chaining is doing one LLM task per step and feeding its output
-into the next step's input, instead of asking one giant prompt to do everything.
-aptkit's analytics pipeline is the textbook case: *find* an anomaly, then
-*explain* it, then *act* on it. Three jobs, three agents, three prompts. The
-payoff is that each step has a small context, a single responsibility, and an
-error boundary — a bad diagnosis doesn't corrupt detection, it just produces a
-weaker recommendation.
+Each box is a complete, independently-runnable capability. The arrows are typed handoffs. The chain is the composition — currently assembled by callers, not by a single orchestrator.
 
 ## Structure pass
 
-**Layers.** Each step is a full agent: a prompt package (the system prompt + its
-variables), a tool policy (least-privilege tool grant), and a `runAgentLoop` call.
-The chain is these three layers composed in sequence.
+One axis: **the responsibility boundary — what each link is allowed to decide**.
 
-**Axis — what does each step *know*?** Trace the data forward. Monitoring knows
-the workspace schema and produces `Anomaly[]`
-(`monitoring-agent.ts:57`). Diagnostic knows *one* anomaly plus the schema and
-produces a `Diagnosis` (`diagnostic-agent.ts:55-62`). Recommendation knows the
-anomaly *and* the diagnosis and produces `Recommendation[]`
-(`recommendation-agent.ts:64-75`). Each step's context contains only what its job
-needs — not the whole world.
+- **anomaly-monitoring** — decides *what's anomalous*. Returns `Anomaly[]`. `packages/agents/anomaly-monitoring/src/monitoring-agent.ts`, its own `ANOMALY_MONITORING_CAPABILITY_ID` (13), one `runAgentLoop` (66).
+- **diagnostic-investigation** — decides *why one anomaly happened*. Takes an anomaly, returns a `Diagnosis`. `packages/agents/diagnostic-investigation/src/diagnostic-agent.ts`, its own `DIAGNOSTIC_INVESTIGATION_CAPABILITY_ID` (12), one `runAgentLoop` (64).
+- **recommendation** — decides *what to do about it*, capped at three. Takes a diagnosis, returns `Recommendation[]`. `packages/agents/recommendation/src/recommendation-agent.ts`, its own `RECOMMENDATION_CAPABILITY_ID` (20), one `runAgentLoop` (77).
 
-**Seam.** The boundary between steps is the typed handoff: an `Anomaly` object, a
-`Diagnosis` object. Above each seam: free-form model reasoning inside one agent.
-Below it: a validated, parsed value the next agent treats as plain input. The axis
-"is this model output or input?" flips at each handoff — one agent's parsed result
-is the next agent's data.
+The seam is the typed output of each loop. `runAgentLoop<Anomaly[]>` → `runAgentLoop<Diagnosis>` → `runAgentLoop<IdlessRecommendation[]>`. The contract between links is a TypeScript type, not a shared mutable blob — so a link can be tested, replayed, or swapped in isolation.
 
 ## How it works
 
-### Move 1 — the mental model
-
-You compose pure functions all the time: `format(validate(parse(raw)))`. Each
-function does one thing, takes typed input, returns typed output, and you can test
-each in isolation. A render pipeline is the same — parse, transform, paint. Prompt
-chaining is that pattern with LLM calls as the functions. The difference is each
-"function" is a whole agent loop, and the value passed between them is a parsed,
-validated object, not a raw model string.
+**Move 1 — the mental model.** Think of an assembly line, not a single craftsman. Each station does one operation on the part and passes it down. If a recommendation is bad, you don't re-examine the whole factory — you look at the recommendation station, because its input (the diagnosis) is right there, typed and inspectable.
 
 ```
-  Chaining as function composition
+The chain as separate capabilities (PATTERN)
 
-   workspace ──► [ scan ] ──► Anomaly ──► [ investigate ] ──► Diagnosis ──► [ propose ] ──► Recommendation[]
-                  │                          │                                │
-                  one job                    one job                          one job
-   each box: own prompt + own tools + own loop; output of one = input of next
+  runAgentLoop<Anomaly[]>      runAgentLoop<Diagnosis>     runAgentLoop<Rec[]>
+  capabilityId: monitoring  →  capabilityId: diagnostic →  capabilityId: recommend
+  prompt: "scan"               prompt: "investigate"       prompt: "propose ≤3"
+        │                            │                           │
+        └── Anomaly[] ───────────────┘── Diagnosis ──────────────┘── Recommendation[]
+  each link: own prompt package, own trace, own typed result
 ```
 
-### Move 2 — building the chain, step by step
+**Move 2 — walk the links.**
 
-**Step 1 — monitoring detects.** The agent renders its prompt with the workspace
-schema and the category checklist, runs the loop, and returns parsed anomalies.
-From `monitoring-agent.ts:57-83`:
-
-```ts
-async scan(runOptions: MonitoringRunOptions = {}): Promise<Anomaly[]> {
-  const system = renderPromptTemplate(this.prompt, {        // monitoring prompt package
-    schema: schemaSummary(this.options.workspace),
-    categories: formatCategoryChecklist(categories),
-  });
-  const { parsed } = await runAgentLoop<Anomaly[]>({
-    capabilityId: ANOMALY_MONITORING_CAPABILITY_ID,
-    system, userPrompt: 'Run the anomaly checklist...',
-    maxTurns: 8, maxToolCalls: 6,
-    parseResult: tryParseAnomalies,
-  });
-  // ...returns severity-sorted Anomaly[]
-}
-```
-
-Its only job is "find anomalies." It never tries to explain or fix them — that
-keeps its prompt short and its tool policy tight.
+**Link 1 — scan returns a typed list of anomalies.** Its only job is detection; it doesn't diagnose or fix.
 
 ```
-  Step 1 — scan
-
-   schema + categories ──renderPromptTemplate──► system prompt
-                                                    │ runAgentLoop (maxTurns 8)
-                                                    ▼
-                                       parse ──► Anomaly[]
+monitoring-agent.ts (13, 66)                 one job: detect
+  capabilityId: ANOMALY_MONITORING_...  ────  its own capability identity (13)
+  const { parsed } =
+    await runAgentLoop<Anomaly[]>({       ──  own loop, own prompt (66)
+      capabilityId: ANOMALY_MONITORING_..., });
+  → Anomaly[]                             ──  typed handoff to link 2
 ```
 
-**Step 2 — diagnostic explains one anomaly.** The next agent takes a single
-`Anomaly`, serializes it straight into its prompt via the `{anomaly}` placeholder,
-and produces a `Diagnosis`. From `diagnostic-agent.ts:55-62`:
+`packages/agents/anomaly-monitoring/src/monitoring-agent.ts:66` runs a dedicated loop that returns `Anomaly[]`. That list is the entire contract it exposes downstream.
 
-```ts
-async investigate(anomaly: Anomaly, runOptions: DiagnosticRunOptions = {}): Promise<Diagnosis> {
-  const system = renderPromptTemplate(this.prompt, {        // diagnostic prompt package
-    schema: schemaSummary(this.options.workspace),
-    project_id: this.options.workspace.projectId,
-    anomaly: JSON.stringify(anomaly),                       // ← step 1's output, injected
-  });
-  // runAgentLoop<Diagnosis>(... parseResult: tryParseDiagnosis ...)
-}
-```
-
-The handoff is literal: step 1's parsed `Anomaly` becomes a `{anomaly}` variable
-in step 2's prompt. `renderPromptTemplate` does plain `{var}` substitution
-(`prompts/src/types.ts:24-32`) — no magic, just string replacement.
+**Link 2 — investigate one anomaly, return a diagnosis.** It receives an anomaly and goes deep on causation — a narrower, more expensive job than scanning.
 
 ```
-  Step 2 — investigate
-
-   Anomaly ──JSON.stringify──► {anomaly} ──┐
-   schema, project_id ─────────────────────┼─renderPromptTemplate──► system prompt
-                                            │  runAgentLoop (maxTurns 8)
-                                            ▼
-                                  parse ──► Diagnosis
+diagnostic-agent.ts (12, 64)                 one job: explain why
+  capabilityId: DIAGNOSTIC_INVESTIGATION_...─ separate identity (12)
+  const { toolCalls, parsed } =
+    await runAgentLoop<Diagnosis>({        ── own loop (64)
+      capabilityId: DIAGNOSTIC_..., });
+  → Diagnosis                              ── typed handoff to link 3
 ```
 
-**Step 3 — recommendation acts on the diagnosis.** The last agent takes *both* the
-anomaly and the diagnosis and proposes actions. From `recommendation-agent.ts:64-92`:
+`packages/agents/diagnostic-investigation/src/diagnostic-agent.ts:64`. It takes the output of link 1's choice (an anomaly) and produces a `Diagnosis`. Because it's a separate capability, its trace and errors are isolated — a failure here doesn't muddy the scan's record.
 
-```ts
-async propose(anomaly: Anomaly, diagnosis: Diagnosis, /* ... */): Promise<Recommendation[]> {
-  const system = renderPromptTemplate(this.prompt, {        // recommendation prompt package
-    schema: schemaSummary(this.options.workspace),
-    project_id: this.options.workspace.projectId,
-    diagnosis: JSON.stringify(diagnosis),                   // ← step 2's output, injected
-  });
-  const { parsed } = await runAgentLoop<IdlessRecommendation[]>({
-    capabilityId: RECOMMENDATION_CAPABILITY_ID,
-    system, maxTurns: 6, maxToolCalls: 4,
-    parseResult: (text) => tryParseRecommendations(text, this.taxonomy),
-    recoveryPrompt: (toolCalls) => buildRecoveryPrompt(anomaly, diagnosis, toolCalls),
-  });
-  // ...assigns ids, returns at most 3 Recommendation[]
-}
-```
-
-Note `maxTurns: 6` here versus `8` upstream — each step is tuned to its own job.
-The recommendation step's context is just the diagnosis plus the feature catalog
-it queries, not the raw detection data. Each prompt lives in its own package
-under `packages/prompts/src/` (`monitoring.ts`, `diagnostic.ts`,
-`recommendation.ts`), each a `PromptPackage` with its own `id`, `version`, and
-`capabilityId` (`prompts/src/types.ts:13-22`).
+**Link 3 — recommend at most three actions.** It turns a diagnosis into bounded, actionable output.
 
 ```
-  Step 3 — propose
-
-   Diagnosis ──JSON.stringify──► {diagnosis} ──┐
-   schema, project_id ──────────────────────────┼─renderPromptTemplate──► system prompt
-                                                 │  runAgentLoop (maxTurns 6)
-                                                 ▼
-                                       parse + assign ids ──► Recommendation[] (≤3)
+recommendation-agent.ts (20, 77)             one job: propose ≤3
+  capabilityId: RECOMMENDATION_...      ────  separate identity (20)
+  const { parsed } =
+    await runAgentLoop<IdlessRecommendation[]>({ ─ own loop (77)
+      capabilityId: RECOMMENDATION_..., });
+  → Recommendation[]                     ──  the chain's final output
 ```
 
-**The compose-then-render discipline.** A related pattern shows up in the
-rag-query agent: it *injects the profile* into the template, then renders
-placeholders — two composition steps in order. From `rag-query-agent.ts:53-58`:
+`packages/agents/recommendation/src/recommendation-agent.ts:77`. The ≤3 cap is a deliberate scope limit — bounded output is easier to act on and to evaluate.
 
-```ts
-const withProfile = options.profile
-  ? injectProfile(template, options.profile, { position: 'start', heading: PROFILE_HEADING })
-  : template;
-this.system = renderPromptTemplate(withProfile, {});   // inject context, THEN substitute vars
-```
+**The gap — there's no single orchestrator.** Each link runs as its own capability; nothing in the repo calls all three in sequence end-to-end as one entry point. Callers (and Studio) compose them. Wiring an explicit orchestrator is the Case A exercise.
 
-Same idea as the chain: build the prompt by composing well-defined steps, each
-with one job, rather than concatenating everything at once.
-
-### Move 3 — the principle
-
-Give each LLM step exactly one job and hand off typed values, not raw text. The
-wins compound: each step's context is small (cheaper, and dodges
-lost-in-the-middle), each step's prompt is testable in isolation, and errors are
-contained — a parse failure in diagnosis doesn't poison detection. The cost is
-latency (three sequential model calls) and the need to validate at each seam. For
-a pipeline where the steps are genuinely different jobs — find, explain, act —
-that trade is clearly worth it.
+**Move 3 — the principle.** Decompose so each step has one job, one prompt, one typed output. The payoff is three-fold: **focused context** (each prompt only carries what its job needs, so no single call bloats the window — ties straight back to [01-context-window.md](01-context-window.md)), **isolated errors** (a bad diagnosis is debuggable at its own `capabilityId`, with its own trace), and **per-step model choice** (the cheap scan could run on a smaller/cheaper model while the expensive diagnosis runs on a stronger one — the chain doesn't force one model for everything).
 
 ## Primary diagram
 
 ```
-  The analytics chain — one job per step, typed handoffs
+The chain: built links, missing wiring
 
-  AnomalyMonitoring          DiagnosticInvestigation        Recommendation
-  ┌────────────────┐         ┌────────────────────┐         ┌────────────────┐
-  │ prompt: monitor│         │ prompt: diagnostic  │         │ prompt: recommend
-  │ tools: read    │         │ tools: read+context │         │ tools: feature │
-  │ loop maxTurns 8│         │ loop maxTurns 8     │         │ loop maxTurns 6│
-  │  scan()        │ Anomaly │  investigate(a)     │Diagnosis│  propose(a,d)  │
-  │     ───────────┼────────►│     ────────────────┼────────►│     ───────────┼──► Recommendation[]
-  └────────────────┘         └────────────────────┘         └────────────────┘
-   each step: renderPromptTemplate({...}) → runAgentLoop → parseResult → typed value
-   errors isolate per step · context stays small per step · prompts test in isolation
+  anomaly-monitoring   ████  Anomaly[]      monitoring-agent.ts:66
+        ↓ typed handoff
+  diagnostic-invest.   ████  Diagnosis      diagnostic-agent.ts:64
+        ↓ typed handoff
+  recommendation       ████  Recommendation[] recommendation-agent.ts:77
+  ──────────────────────────────────────────────────────────────
+  end-to-end ORCHESTRATOR  ░░░░  not yet wired  ← Case A exercise
 ```
 
 ## Elaborate
 
-aptkit's chain is *static* — a fixed three-step sequence, not a dynamic plan the
-model assembles. That's deliberate: the steps are known and stable (you always
-detect before you explain, explain before you act), so a hardcoded chain is
-simpler and more debuggable than a planner. Each step also carries its own
-*recovery* path — `recommendation-agent.ts:103` builds a recovery prompt from the
-anomaly, diagnosis, and tool calls if the first parse fails — so the seam between
-steps is defended, not assumed. Two things worth noticing: the prompt packages are
-*versioned* (`id`, `version` on every `PromptPackage`), which means you can A/B a
-new monitoring prompt without touching diagnostic or recommendation — the chain's
-modularity extends to prompt evolution. And `renderPromptTemplate` is deliberately
-dumb: a single regex doing `{var}` substitution with no logic, no loops, no
-conditionals (`prompts/src/types.ts:24-32`) — the intelligence lives in the agents,
-not the templating. Read `01-context-window.md` to see *why* small per-step
-contexts matter, and `02-lost-in-the-middle.md` for the retrieval analogue of
-"keep each context tight."
+Why three capabilities beat one mega-prompt, concretely: each link's prompt package only describes *its* job, so the scan prompt never carries diagnosis instructions and the recommendation prompt never re-explains anomaly categories. That keeps every individual request small (the context-window win) and keeps each prompt easy to iterate without regressing the others. It also means you can replay or eval any single link in isolation — the promoted-fixture loop in [../05-evals-and-observability/01-eval-set-types.md](../05-evals-and-observability/01-eval-set-types.md) freezes each capability independently.
+
+The per-step model-choice angle is the strongest interview point. Scanning many metrics for anomalies is a high-volume, lower-judgment task — a smaller model is fine. Diagnosing root cause is low-volume, high-judgment — worth a stronger model. A monolithic prompt forces you to pay for the strongest model on the *whole* job; the chain lets you spend where judgment is actually needed. The honest caveat: aptkit *enables* per-step model choice (each `runAgentLoop` takes its own `ModelProvider`) but the repo doesn't yet ship a config that runs different models per link — and there's no single orchestrator running the chain end to end.
 
 ## Project exercises
 
-### Wire the three agents into one orchestrated `runPipeline`
+### Wire the three capabilities into an explicit end-to-end orchestrator
 
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a function that takes a workspace, runs `scan()`, then for
-  the top anomaly runs `investigate()`, then `propose()`, and returns
-  `{ anomaly, diagnosis, recommendations }` — with the chain short-circuiting
-  cleanly when `scan()` returns `[]`.
-- **Why it earns its place:** the agents exist but the explicit composition is the
-  thing an interviewer asks you to draw; building it proves you own the handoffs
-  and the empty-result boundaries.
-- **Files to touch:** a new module under `packages/agents/` (e.g. a small
-  `analytics-pipeline` package) importing the three agents, plus a test using
-  their fixture providers.
-- **Done when:** a test with fixture providers runs all three steps and asserts a
-  `Recommendation[]` comes out; an empty-anomaly fixture returns early with no
-  diagnosis call.
+- **Exercise ID:** `EX-CTX-03a`
+- **What to build:** An orchestrator function that runs anomaly-monitoring → (pick an anomaly) → diagnostic-investigation → recommendation as one call, threading each link's typed output into the next and emitting a combined trace. This realizes the Phase 1 (context) prompt-chaining pipeline as a single entry point instead of caller-assembled steps.
+- **Why it earns its place:** Every link exists but the chain itself is implicit. An explicit orchestrator makes the decomposition real, gives the whole pipeline one replayable artifact, and is the natural place to later assign a cheaper model to the scan step.
+- **Files to touch:** new orchestrator module composing `packages/agents/anomaly-monitoring/src/monitoring-agent.ts` (66), `.../diagnostic-investigation/src/diagnostic-agent.ts` (64), `.../recommendation/src/recommendation-agent.ts` (77).
+- **Done when:** one call takes raw signals to a `Recommendation[]`, the intermediate `Anomaly[]` and `Diagnosis` are inspectable, and a failure in any link is attributable to its `capabilityId`.
 - **Estimated effort:** `1–2 days`
 
-### Add a fourth chain step that critiques recommendations
+### Run the scan link on a cheaper model
 
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a new prompt package + agent that takes the
-  `Recommendation[]` and the original diagnosis and returns a confidence-adjusted,
-  deduplicated list — extending the chain by one job without touching the upstream
-  three.
-- **Why it earns its place:** proves the chain is genuinely modular — you can add a
-  step that consumes typed output and emits typed output without rewriting the
-  pipeline.
-- **Files to touch:** a new prompt file in `packages/prompts/src/` registered in
-  `packages/prompts/src/index.ts`, plus a new agent package mirroring
-  `packages/agents/recommendation/`.
-- **Done when:** the new agent parses a `Recommendation[]` input and returns a
-  filtered `Recommendation[]`, tested against a fixture provider.
-- **Estimated effort:** `1–2 days`
+- **Exercise ID:** `EX-CTX-03b`
+- **What to build:** In the orchestrator from `EX-CTX-03a`, inject a smaller/cheaper `ModelProvider` into anomaly-monitoring while keeping a stronger model for diagnosis, and record the per-link token cost.
+- **Why it earns its place:** It turns the conceptual "cheaper model early" benefit into a measured one — proving the chain's cost advantage over a monolith.
+- **Files to touch:** the orchestrator from `EX-CTX-03a`; the `ModelProvider` passed to `monitoring-agent.ts:66`.
+- **Done when:** the scan step demonstrably uses a different provider than diagnosis, and per-link token totals are reported.
+- **Estimated effort:** `1–4hr`
 
 ## Interview defense
 
-**Q: "Why split this into three agents instead of one big prompt?"**
-One job per step. Each agent has a small context (cheaper, avoids
-lost-in-the-middle), a tight tool policy, and an error boundary — a parse failure
-in diagnosis doesn't corrupt detection. And each prompt package is versioned, so I
-can iterate on detection without touching the rest. One mega-prompt would couple
-all three jobs and balloon the context.
+**Q: Why three capabilities instead of one prompt?**
 
 ```
-  one prompt: find+explain+act ──► huge context, coupled failures
-  three steps: find │ explain │ act ──► small contexts, isolated failures
+  one job per link → focused context, isolated errors, per-step model choice
+  monolith → bloated window, can't tell which part failed, one model for all
 ```
-Anchor: *three packages, three `runAgentLoop` calls — `monitoring-agent.ts:57`, `diagnostic-agent.ts:55`, `recommendation-agent.ts:64`.*
 
-**Q: "How does data actually move between steps?"**
-Typed handoffs. Each step's `parseResult` turns the model's text into a validated
-object — `Anomaly`, then `Diagnosis` — and the next step serializes that object
-into its prompt via a `{var}` placeholder. `renderPromptTemplate` does plain
-string substitution, nothing clever; the validated object is the contract.
+Anchor: three distinct `capabilityId`s and `runAgentLoop` calls — `monitoring-agent.ts:66`, `diagnostic-agent.ts:64`, `recommendation-agent.ts:77`.
+
+**Q: What's the contract between links?**
 
 ```
-  Anomaly ──JSON.stringify──► {anomaly} in diagnostic prompt
-  Diagnosis ──JSON.stringify──► {diagnosis} in recommendation prompt
-   (parse at each seam → next step treats it as plain input)
+  runAgentLoop<Anomaly[]> → runAgentLoop<Diagnosis> → runAgentLoop<Recommendation[]>
+  typed output, not a shared mutable blob
 ```
-Anchor: *`renderPromptTemplate(prompt, { anomaly: JSON.stringify(anomaly) })` — `diagnostic-agent.ts:58`, `prompts/src/types.ts:24`.*
+
+Anchor: each loop returns a typed `parsed` result that becomes the next link's input.
+
+**Q: What's missing?**
+
+Anchor: no single end-to-end orchestrator — links are caller-assembled; and per-step model differentiation is enabled (each loop takes its own `ModelProvider`) but not yet shipped. Honest gaps.
 
 ## See also
 
-- `01-context-window.md` — why small per-step contexts are cheaper and safer
-- `02-lost-in-the-middle.md` — the retrieval version of "keep each context tight"
-- `../04-agents-and-tool-use/` — what each `runAgentLoop` step does internally
-- `../01-llm-foundations/04-structured-outputs.md` — the `parseResult` validation at each seam
+- [01-context-window.md](01-context-window.md) — chaining keeps each link's request inside the window.
+- [02-lost-in-the-middle.md](02-lost-in-the-middle.md) — focused per-step context avoids the dead zone too.
+- [../05-evals-and-observability/01-eval-set-types.md](../05-evals-and-observability/01-eval-set-types.md) — each link is frozen independently as a fixture.

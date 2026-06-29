@@ -1,244 +1,164 @@
 # Build-time inlining, zero runtime fetch
 
-*Industry names: build-time inlining / asset bundling / static prerender. Type:
-Industry standard (Vite `?raw`).*
+**Industry name:** build-time data inlining / static-site asset embedding · **Type:** Industry standard (frontend build)
+
+The deliberate trade that bakes every fixture and doc into the JS bundle at build time, so the deployed Studio site makes zero data round-trips — paid for with a single 537 kB chunk over Vite's warning line.
+
+---
 
 ## Zoom out, then zoom in
 
-The Studio docs pages render markdown files. They could fetch those `.md` files
-at runtime — but on a static GitHub Pages deploy there's no server to fetch
-from, and a fetch is a round-trip you'd rather not pay. The question this file
-answers: **how does Studio show docs with zero runtime fetch, and what does that
-cost in bundle size?** The answer: the markdown is inlined into the JS bundle at
-build time, paying once at build for a fetch-free load — and the bill is a
-537 kB single chunk.
+Studio has two lives: a dev server (Vite middleware serving live replay routes) and a static GitHub Pages build (no server at all). On Pages there is nothing to fetch *from* — so all the data the demo needs is moved from "fetch at runtime" to "inline at build time."
 
 ```
-  Zoom out — where inlining sits in the client build
+  Zoom out — where the inlining happens
 
-  ┌─ Build time (Vite + tsc) ───────────────────────────────────┐
-  │  main.tsx: import md from '../../../docs/*.md?raw'           │
-  │  → Vite reads the file, inlines its TEXT into the JS bundle  │
-  │                                  ★ THIS CONCEPT ★            │ ← we are here
-  └───────────────────────────┬──────────────────────────────────┘
-                              │  one 537 kB index-*.js (no splitting)
-  ┌─ Runtime (browser, GitHub Pages) ▼────────────────────────────┐
-  │  DocPage renders the inlined string via react-markdown        │
-  │  ZERO fetch for docs — the text is already in the bundle      │
-  └───────────────────────────────────────────────────────────────┘
-
-  the trade: a fatter initial download (paid once, cached) for a deploy with no
-  server and no runtime doc fetch. right for a static demo, wrong for a big app.
+  ┌─ Build time (Vite) ───────────────────────────────────────┐
+  │  import fixture from '.../fixtures/*.json'   → JSON inlined │ ← we are here
+  │  import md from '../../docs/*.md?raw'         → string inlined│
+  │     ▼ bundled into one index-*.js (537 kB)                  │
+  └───────────────────────────┬───────────────────────────────┘
+                              │ deploy to GitHub Pages (static)
+  ┌─ Runtime (browser) ───────▼───────────────────────────────┐
+  │  React reads inlined data — NO fetch(), NO API, NO server  │
+  └────────────────────────────────────────────────────────────┘
 ```
 
-The pattern: **move work from runtime to build time.** Instead of "ship a small
-bundle, fetch the docs when needed," it's "ship a bigger bundle with the docs
-baked in, fetch nothing." The cost moves from per-visit network latency to
-one-time bundle weight.
+The cost axis flips from *network* to *bundle size*: instead of paying a fetch round-trip per data item at runtime, you pay once in first-load JS. For a fixture-only demo on a static host, that is the right side of the trade.
 
 ## The structure pass
 
-Trace the **lifecycle** axis (when does the work happen) across the boundary.
+Trace **the cost axis — "when is the data paid for: build or runtime?"** across the build seam.
 
 ```
-  One axis (when) traced across the build/runtime seam
+  Axis: "when is the data cost paid?" — across the build/runtime seam
 
-  ┌─ build time ───────────────┐  seam   ┌─ runtime ─────────────┐
-  │ ?raw import → file text     │ ══════► │ string already present│
-  │ inlined into JS bundle      │ (flips) │ render, NO fetch      │
-  └─────────────────────────────┘         └───────────────────────┘
-         work done ONCE                       work done ZERO times
+  ┌─ build time ──────────────────┐  seam   ┌─ runtime (Pages) ───────────┐
+  │ import JSON / md?raw           │ ══╪══►  │ data already in the bundle   │
+  │ → serialized into the chunk    │ (flips) │ → 0 fetches, 0 server        │
+  │ cost: bundle grows (537 kB)    │         │ cost: larger first paint     │
+  └───────────────────────────────┘         └──────────────────────────────┘
 ```
 
-- **Layers:** build (Vite resolves `?raw`) over runtime (browser renders).
-- **Axis:** lifecycle — *when* the doc-loading work happens. It flips from
-  "every page visit" (fetch model) to "once, at build" (inline model).
-- **Seam:** the `?raw` import. That's where a runtime concern (fetching a file)
-  becomes a build-time constant (a string literal in the bundle).
+- **Layers:** build (inlines) → bundle (carries) → runtime (reads, never fetches).
+- **Axis:** when the data is paid for. The seam moves it from runtime-network to build-time-bundle.
+- **Seam:** the Vite `import` (JSON import + `?raw` suffix). Crossing it converts a would-be runtime `fetch` into a compile-time constant.
 
 ## How it works
 
 #### Move 1 — the mental model
 
-You know how `import logo from './logo.svg'` in a bundler doesn't fetch the SVG
-at runtime — the bundler resolves it at build, and you just get a URL or the
-inlined data? `?raw` is the same move for text: the import resolves to the
-file's *contents as a string* at build time.
+You know that `import data from './x.json'` gives you the parsed object with no `fetch` — the bundler reads the file at build time and writes its contents into the JS. Build-time inlining is that move applied to *everything the demo needs*: fixtures as JSON imports, markdown docs as raw-string imports. The runtime never asks the network for anything.
 
 ```
-  Pattern — build-time inline vs runtime fetch
+  Pattern — move the fetch from runtime to build
 
-  INLINE (this code):              FETCH (the alternative):
+  RUNTIME FETCH (not used on Pages):     BUILD-TIME INLINE (what Studio does):
 
-  build: read docs/x.md            build: ship a small bundle
-         → "## Title\n..."          runtime: fetch('/docs/x.md')
-         → bake into bundle                  → await response
-  runtime: string is HERE                    → render
-           render immediately       (1 round-trip per page, needs a server)
-  (0 fetch, bigger bundle)
+   browser ──fetch('/fixture')──► server   build: import fixture from '*.json'
+        │                                        │ serialize into chunk
+        ▼ wait, parse                            ▼
+   render                                   browser: data is already here → render
+   (N round-trips, needs a server)          (0 round-trips, no server)
 ```
 
 #### Move 2 — the step-by-step walkthrough
 
-**Step 1 — the `?raw` import inlines the file text.** In Studio's entry —
-`apps/studio/src/main.tsx:12-13`:
+**Step 1 — fixtures inline as JSON imports.** The Vite config imports every agent fixture directly. Each becomes a compile-time constant baked into the bundle:
 
 ```ts
-import coreApiMarkdown from '../../../docs/core-api.md?raw';
+// apps/studio/vite.config.ts  (the fixture imports)
+import monitoringFixture from '../../packages/agents/anomaly-monitoring/fixtures/sp-revenue-monitoring.json';
+import diagnosticFixture from '../../packages/agents/diagnostic-investigation/fixtures/sp-revenue-diagnostic.json';
+import queryFixture      from '../../packages/agents/query/fixtures/revenue-by-state-query.json';
+// ... recommendation fixtures (electronics-spike, sp-revenue-drop, voucher-dropoff)
+```
+
+These are the recorded `ModelResponse[]` that `FixtureModelProvider` replays. On Pages there is no replay *server* — the fixtures *are* the data, embedded.
+
+**Step 2 — docs inline as raw strings via `?raw`.** The in-app doc pages need the markdown source as a string. The `?raw` suffix tells Vite to import the file's raw text instead of executing it:
+
+```ts
+// apps/studio/src/main.tsx:12-13
+import coreApiMarkdown from '../../../docs/core-api.md?raw';   // ← whole .md file as a string constant
 import userGuideMarkdown from '../../../docs/studio-guide.md?raw';
 ```
 
-The `?raw` suffix tells Vite: don't treat this as a module, read the file and
-hand me its contents as a string. At build, Vite replaces these imports with
-string literals containing the entire markdown text. The `docs/*.md` files
-become part of the JS.
+At runtime, `DocPage` renders these strings through react-markdown with no fetch — the markdown ships *inside* `index-*.js`.
 
-**Step 2 — the string renders with no fetch.** `DocPage` takes that string and
-runs it through `react-markdown` + `remark-gfm` + a `github-slugger` TOC. There
-is no `fetch`, no `await`, no loading state — the content is synchronously
-present the moment the component mounts. On GitHub Pages, where `VITE_STATIC_DEMO=1`
-sets `base: '/aptkit/'` (`vite.config.ts:196`) and there's no API server, this
-is the *only* way the docs could render — there's nothing to fetch from.
+**Step 3 — the result: zero-fetch static site.** Because every fixture and doc is a constant in the bundle, the deployed Studio makes no runtime data request. It is a pure client-side app on a static host. There is no API to be slow, no server to provision, no CORS, no cold start.
 
-**Step 3 — the cost lands as bundle weight.** The price of inlining everything —
-markdown, every workspace component, `react-markdown`, `lucide-react` — is one
-big chunk. The built artifact: `apps/studio/dist/assets/index-C9mrf4h5.js` at
-**537,310 bytes** (and a 27 kB CSS file). That's past Vite's default 500 kB
-chunk-size warning, which *fires on every build* and which nothing acts on.
-
-**The boundary condition — there's no code-splitting.** The Vite config
-(`vite.config.ts`) sets `base` and the dev middleware but defines **no**
-`build.rollupOptions.output.manualChunks`, no dynamic `import()`, no lazy
-routes. Every workspace — Recommendation, Monitoring, Diagnostic, Query, Rubric,
-RAG, Docs — ships in that single initial download even though a visitor opening
-the RAG page never needs the Diagnostic code. The whole app is one chunk because
-nothing told the bundler to split it.
+**Where it breaks — one chunk, over the warning line.** The cost lands as bundle size. The build emits a single JS chunk:
 
 ```
-  Layers-and-hops — what the browser pays on first load
-
-  ┌─ Browser ─────┐ hop 1: GET /aptkit/index.html  ┌─ GitHub Pages ─┐
-  │  cold visit   │ ──────────────────────────────► │  static files  │
-  │               │ hop 2: GET index-*.js (537 kB) ◄─│  (no server)   │
-  └───────┬───────┘                                  └────────────────┘
-          │ parse + execute 537 kB (incl. ALL docs + ALL workspaces)
-          ▼
-     render any page — docs included — with ZERO further fetch
+  apps/studio/dist/assets/index-C9mrf4h5.js   →  537,310 bytes
 ```
 
-#### Move 2 variant — the load-bearing skeleton
+That is over Vite's default `chunkSizeWarningLimit` of 500 kB, so the build prints the "(!) Some chunks are larger than 500 kB" warning. There is no `manualChunks`, no `chunkSizeWarningLimit` override, no lazy route in the config — everything (React, lucide-react, all six agents' code, every fixture, both docs) is in one chunk. For a static demo that loads once and runs entirely client-side, a 537 kB first load is an accepted cost: the user pays it once, then every interaction is instant with no network. The warning is the closest thing the repo has to a budget signal (`audit.md` Lens 1), and it is firing — acknowledged, not silenced.
 
-The kernel: **(1) resolve the asset at build time, (2) embed it as a constant,
-(3) render the constant with no async at runtime.**
+#### Move 2.5 — dev vs Pages (the two lives)
 
-- Drop build-time resolution (fetch instead) → you need a server and pay a
-  round-trip per page; impossible on pure static hosting.
-- Drop the embed (lazy-load the chunk) → you've reintroduced a fetch, trading
-  bundle size back for latency — sometimes the right call, but not zero-fetch.
-- The *missing* hardening — code-splitting — is what would keep the zero-fetch
-  property for docs while shrinking the initial download for everything else.
-  Its absence is the load-bearing weakness.
-
-The skeleton is "resolve-at-build + render-sync." Code-splitting and lazy
-loading are the hardening this build skips.
-
-#### Move 2.5 — current state vs future state
+The same app behaves differently in its two builds, and that is the point of the pattern:
 
 ```
-  Phase A (now)                    Phase B (if it grew)
-  ─────────────────                ─────────────────────
-  one 537 kB chunk                 route-split chunks
-  all workspaces inlined           lazy import() per workspace
-  all docs inlined (?raw)          docs stay inlined (keep zero-fetch)
-  fires Vite 500 kB warning        each chunk under warning
-  fine for a demo                  needed if customer-facing
-
-  what DOESN'T change: the ?raw zero-fetch property for docs. Splitting is
-  orthogonal — you'd lazy-load WORKSPACES while keeping docs inlined.
+  Phase A: dev (`vite --host`)        Phase B: Pages (`build:pages`)
+  ────────────────────────────        ──────────────────────────────
+  Vite middleware exposes 5           no server at all
+   replay API routes, streams         fixtures + docs inlined at build
+   NDJSON traces                      → static files on GitHub Pages
+  data fetched live from middleware   → 0 runtime fetch
+  can run real Anthropic/OpenAI       fixture-replay only (deterministic)
 ```
 
-The migration cost is low and additive: `manualChunks` or `React.lazy` per
-route. Nobody's done it because Studio is a dev/demo tool where a one-time
-537 kB load over a cached CDN is acceptable — a deliberate "ship it" call, not
-an oversight.
+What *doesn't* have to change between them: the React components. They read data the same way; only the *source* of that data moves from "fetched from middleware" (dev) to "inlined constant" (Pages). The inlining is a build-mode concern, not an app-code concern.
 
 #### Move 3 — the principle
 
-Trade runtime work for build-time work when the deploy target can't (or
-shouldn't) do the work at runtime — a static host has no server to fetch from,
-so inlining isn't an optimization, it's the enabler. The generalizable rule:
-**the cheapest fetch is the one you made unnecessary at build time** — but watch
-the bundle, because inlining without splitting concentrates all the cost into
-one cold-load. Here the docs-inlining is the right call; the missing
-code-splitting is the unmeasured cost riding alongside it.
+When the host is static and the data is fixed at build time, move the fetch into the bundler. You trade a larger first-load payload for zero runtime round-trips and zero server — the right trade when the data is demo-fixed and the host has no backend. The discipline is naming the cost: the 537 kB chunk is over Vite's line and the build says so. An accepted-and-visible cost beats a hidden one.
 
 ## Primary diagram
 
 ```
-  Build-time inlining + zero-fetch — the whole trade
+  Build-time inlining — full picture
 
-  ┌─ BUILD TIME (Vite) ─────────────────────────────────────────┐
-  │  import md from 'docs/x.md?raw'  → file text becomes a const │
-  │  + all workspace components + react-markdown + lucide        │
-  │  ───────────────► one index-*.js  (537 kB, no manualChunks)  │
-  │       Vite logs "chunk > 500 kB" warning — unacted-on        │
-  └───────────────────────────┬──────────────────────────────────┘
-                              │ static deploy to GitHub Pages
-  ┌─ RUNTIME (browser) ───────▼──────────────────────────────────┐
-  │  cold load: 1× 537 kB JS (cached after)                      │
-  │  render any page incl. docs → ZERO runtime fetch             │
-  └───────────────────────────────────────────────────────────────┘
-       gain: fetch-free static deploy   cost: fat cold load, unmeasured
+  ┌─ Build (Vite, `build:pages`) ─────────────────────────────────┐
+  │  import fixture.json   ──┐                                      │
+  │  import doc.md?raw      ──┼──► serialized into ──► index-*.js   │
+  │  React + lucide + agents ─┘     one chunk           537,310 B   │
+  │                                 (> 500 kB Vite warning, ACCEPTED)│
+  └───────────────────────────┬────────────────────────────────────┘
+                              │ deploy → GitHub Pages (static host)
+  ┌─ Runtime (browser) ───────▼────────────────────────────────────┐
+  │  React reads inlined constants                                  │
+  │  fixtures → FixtureModelProvider replay                         │
+  │  docs     → DocPage react-markdown render                       │
+  │  ── 0 fetch, 0 API, 0 server, every interaction instant ──      │
+  └──────────────────────────────────────────────────────────────────
 ```
 
 ## Elaborate
 
-`?raw` is Vite's mechanism (Webpack has `raw-loader`, the idea predates both);
-it's the text equivalent of asset inlining. The deeper context here is the
-deploy target: aptkit's Studio ships to GitHub Pages as a fixture-only static
-demo (the recent commits "static fixture-only GitHub Pages build" and "Enable
-GitHub Pages from the deploy workflow"). On a static host there is no backend to
-serve `/docs/core-api.md`, so the choice isn't "inline vs fetch for speed" —
-it's "inline or it doesn't work at all." The bundle-size cost is the honest
-consequence, and the absent code-splitting is where you'd start if Studio ever
-became customer-facing. Read next: `02-linear-scan-vs-ann-tradeoff.md` (the
-cosine scan that, in the in-browser RAG demo, runs on this same main thread).
+Inlining build-time-known data is a standard static-site move — it is what static-site generators do with content, what `import.meta.glob` and `?raw` exist for in Vite. The tradeoff it manages is the classic one: first-load payload vs runtime round-trips. For a fixture-replay demo with no live backend the calculus is one-sided — there is no server to fetch from, so inlining is not even really a choice, it is the only way to ship the data. The single-chunk 537 kB is the honest cost, and the path to shrink it (route-level code-splitting, `manualChunks` to peel out React) is exactly the standard frontend lever — `not yet exercised` because the demo loads once and the cost is paid once.
+
+The rendering and build mechanics live in `study-frontend-engineering`; this file owns only the *performance* trade.
 
 ## Interview defense
 
-**Q: Your Studio bundle is 537 kB in one chunk. Defend it.**
-
-Verdict first: it's the right call for what Studio is — a dev/demo tool deployed
-static to GitHub Pages — and I can tell you exactly what I'd change if it became
-customer-facing. The 537 kB is one chunk because there's no code-splitting, and
-the docs are inlined via Vite `?raw` so the static deploy needs zero runtime
-fetch — there's no server to fetch from. The trade is a fat one-time cold load
-(cached after) for a fetch-free static site. To fix the size without losing the
-zero-fetch property: lazy-load the *workspaces* with `React.lazy` / route-level
-`import()` while keeping the docs inlined.
+**Q: Why is your Studio bundle one 537 kB chunk over Vite's warning?**
+Deliberate. The Pages build inlines every fixture (JSON imports) and every doc (`?raw` string imports) so the static site makes zero runtime fetches — no server, no API, no cold start. The cost is first-load JS. For a demo that loads once and runs entirely client-side, paying 537 kB once to get zero round-trips forever is the right trade. The Vite warning is firing and I left it visible, not silenced.
 
 ```
-  sketch while you talk:
-
-  build:  docs/*.md?raw → inlined string   +  all workspaces → 1 chunk (537 kB)
-  runtime: render docs, ZERO fetch         ← the property worth keeping
-  fix:    React.lazy per workspace → split chunks, docs stay inlined
+  build: import json + md?raw → one chunk (537 kB, warns)
+  runtime: read constants → 0 fetch, 0 server
 ```
+Anchor: "moved the fetch into the bundler; pay once in JS, never on the network."
 
-One-line anchor: *"inlining is the enabler for a serverless static deploy, not
-just an optimization — and code-splitting is the orthogonal fix for the size."*
+**Q: How would you cut the bundle if you needed to?**
+Route-level code-splitting (lazy-load the per-agent pages) and `manualChunks` to peel React and lucide into a vendor chunk that caches across deploys. Neither is wired yet — the demo loads once so the cost is paid once. The lever is standard; I just haven't needed to pull it.
 
-**Q: Have you measured the load cost?**
-
-No — and that's the honest gap. No Lighthouse run, no FCP/LCP, no main-thread
-profile. The 537 kB is a `ls -la` on the dist artifact, not a measured
-load-time impact. First thing I'd do: a Lighthouse pass to see whether the
-single chunk actually hurts cold-load on a throttled connection before splitting
-on instinct.
+Anchor: "split by route, vendor-chunk the framework — standard, not yet needed."
 
 ## See also
 
-- `audit.md` — lens 7 (rendering/client), red-flag #3.
-- `02-linear-scan-vs-ann-tradeoff.md` — the in-browser cosine scan on this main
-  thread.
-- Cross-guide: `study-frontend-engineering` (bundling, rendering, build).
+- `audit.md` — Lens 1 (the Vite warning as the only budget signal), Lens 7 (rendering/bundle), Lens 8 (red flag #6)
+- `study-frontend-engineering` — Studio rendering, the Vite build pipeline, dev-middleware replay routes

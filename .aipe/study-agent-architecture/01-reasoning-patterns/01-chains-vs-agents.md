@@ -1,148 +1,154 @@
 # Chains vs Agents — the boundary
 
-**Industry standard.** "Workflow vs agent," "static chain vs autonomous loop." Type label: pattern boundary.
+**Industry term:** chain / workflow vs agent (autonomous loop). *Industry standard.*
 
 ## Zoom out, then zoom in
 
-Before any reasoning pattern, the first question: is there a loop at all? Here's where that boundary sits in aptkit.
+Okay — here's the whole question before we touch a line of code. Every LLM feature you build sits on one side of a single line: did *you* write the order of steps, or does the *model* pick the next step at runtime? That's the chains-vs-agents boundary, and it's the entry point to every reasoning pattern in this sub-section.
 
 ```
-  Zoom out — the control-flow boundary in aptkit
+  Zoom out — the boundary inside the Capability layer
 
-  ┌─ Caller layer (a capability's public method) ────────┐
-  │  RagQueryAgent.answer()   RecommendationAgent.propose│
-  │  classifyIntent()  ← a CHAIN step (one call, no loop)│
-  └───────────────────────────┬──────────────────────────┘
-                              │ hands a system prompt + tools
-  ┌─ Loop layer ──────────────▼──────────────────────────┐
-  │  ★ runAgentLoop ★  ← the AGENT: model picks next move │ ← we are here
-  │  run-agent-loop.ts:76                                 │
-  └───────────────────────────┬──────────────────────────┘
-                              │ emits tool-call intent
-  ┌─ Tool layer ──────────────▼──────────────────────────┐
-  │  ToolRegistry.callTool — the harness runs it          │
-  └───────────────────────────────────────────────────────┘
+  ┌─ Capability layer (packages/agents/*) ──────────────────────┐
+  │                                                              │
+  │   ★ THE BOUNDARY ★                                           │ ← we are here
+  │   left of it:  CODE decides the step order  (chain)          │
+  │   right of it: MODEL decides the next action (agent)         │
+  │                                                              │
+  └───────────────────────────────┬──────────────────────────────┘
+                                   │ runAgentLoop → model.complete()
+  ┌─ Runtime layer (packages/runtime) ──▼───────────────────────┐
+  │  the agent loop — only reached when you're on the right side │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-The distinction is structural. In a **chain**, you the engineer wrote the steps; the model fills a slot but never chooses what comes next. In an **agent**, the model writes the steps at runtime — it decides which tool to call and when to stop. aptkit has both, and the cleanest way to see the line is `classifyIntent` (a chain) calling into `runAgentLoop` (an agent).
+Zoom in: aptkit is almost entirely on the *right* side. Every capability hands control to the model through `runAgentLoop`. But the distinction matters because the model's prompt can *constrain* the loop so hard it behaves like a chain — and aptkit does exactly that in places. The boundary is real even when one side is wearing the other's clothes.
 
-## Structure pass
+## The structure pass
 
-**Layers:** caller → loop → tool. **Axis to trace: who decides control flow?** Hold that one question constant and watch the answer flip as you descend.
+**Layers.** Two: the capability (outer, where the order is decided) and the loop (inner, where a single step runs).
+
+**The axis to trace: who decides control flow?** Hold that one question constant.
 
 ```
-  "who decides control flow?" — traced down aptkit's layers
+  "who decides control flow?" — traced across the boundary
 
-  ┌───────────────────────────────────────┐
-  │ caller: classifyIntent (query agent)  │  → CODE decides (one call,
-  │ query/src/intent.ts:13                │     fixed: classify then route)
-  └───────────────────────────────────────┘
-      ┌─────────────────────────────────────┐
-      │ loop: runAgentLoop                  │  → LLM decides (picks tool,
-      │ run-agent-loop.ts:98                │     picks when to stop)
-      └─────────────────────────────────────┘
-          ┌─────────────────────────────────┐
-          │ tool: callTool                  │  → TOOL just runs
-          └─────────────────────────────────┘
+  ┌─ chain ──────────┐   seam    ┌─ agent ───────────┐
+  │ CODE decides     │ ═══╪═════► │ MODEL decides     │
+  │ step1→step2→step3│ (it flips) │ next action / stop │
+  └──────────────────┘           └───────────────────┘
+         ▲                                ▲
+         └──── same axis, two answers ────┘
 ```
 
-**The seam that matters** is between caller and loop: control flips from CODE to LLM. That's load-bearing — it's the boundary where you hand the steering wheel to the model. `classifyIntent` deliberately stays a chain (you don't want the router to freewheel); `answer()` hands off to the loop because the retrieval path can't be predicted.
+**The seam.** The flip happens at the call into `runAgentLoop`. Above it, the engineer's code runs in a fixed order. Below it, the model emits the next action and the loop obeys. That boundary is load-bearing: it's where unpredictability enters the system.
 
 ## How it works
 
+**Use case in aptkit:** the recommendation flow looks like a chain from a distance — a host app runs anomaly-monitoring, then diagnostic-investigation, then recommendation in that fixed order. But each *stage* is an agent: inside `RecommendationAgent.propose` the model decides which of 13 read-only tools to call and when to stop. So the system is a hybrid — a chain on the outside, a loop inside each box. That's the most common production shape, and it's the one to recognize on sight.
+
 ### Move 1 — the mental model
 
-You know how a `fetch()` chain is `.then().then().then()` — you wrote every link, the data just flows through? That's a chain. Now picture a `while` loop where the *condition and the body* are chosen by something else on every iteration — you wrote the loop, but not what it does each pass. That's an agent.
+You already know the shape from frontend. A chain is a `.then()` chain of single-purpose functions: `validate().then(transform).then(save)`. You wrote the order; each function fills its slot. An agent is a `while` loop where the body asks a model "what now?" each iteration — like a reducer whose next action comes from outside your code.
 
 ```
-  Chain (engineer writes the steps) vs Agent (model writes them)
+  Chain (engineer writes the steps):
+    Input → Step 1 → Step 2 → Step 3 → Output
+            (model fills each slot; never chooses what comes next)
 
-  CHAIN:  input → [classify] → [route] → output
-                  ▲ you wrote this order; LLM fills each slot
-
-  AGENT:  ┌─────────────────────────────────────┐
-          │  Reason  → model picks next action   │
-          │     │                                │
-          │     ▼                                │
-          │  Act     → call a tool               │
-          │     │                                │
-          │     ▼                                │
-          │  Observe → read result               │
-          │     └──── loop or stop (model/budget)│
-          └─────────────────────────────────────┘
+  Agent (model writes the steps at runtime):
+  ┌───────────────────────────────────────────────┐
+  │              Agent control loop                │
+  │   ┌─────────┐                                  │
+  │   │ Reason  │ ← model decides next action      │
+  │   └────┬────┘                                  │
+  │        ▼                                       │
+  │   ┌─────────┐                                  │
+  │   │ Act     │ ← call a tool                    │
+  │   └────┬────┘                                  │
+  │        ▼                                       │
+  │   ┌─────────────┐                              │
+  │   │ Observe     │ ← read result                │
+  │   └────┬────────┘                              │
+  │        └──────────── loop or stop              │
+  └───────────────────────────────────────────────┘
 ```
 
 ### Move 2 — the walkthrough
 
-**The chain in aptkit: `classifyIntent`.** The query agent first runs a fixed classify-then-route step. One model call, no tools, no loop — the model fills a single slot (one word), and *your code* decides what happens with it.
+**Where aptkit puts the model in control.** Look at `RagQueryAgent.answer` (`packages/agents/rag-query/src/rag-query-agent.ts:62`). The agent never says "step 1: search, step 2: answer." It hands the model a tool and a system prompt and lets the loop run:
 
-```typescript
-// packages/agents/query/src/intent.ts:13
-const response = await model.complete({
-  system: 'Classify the user query as exactly one word: monitoring / diagnostic / recommendation...',
-  messages: [{ role: 'user', content: query }],
-  maxTokens: 16,            // ← tiny budget: this is a slot-fill, not a reasoning loop
-});
-return parseIntent(text);   // ← intent.ts:4 — YOUR code maps the word to a route
-```
-
-The model never sees a tool here. It can't decide to "search first" or "ask a clarifying question." It fills the slot; the chain moves on. That's the whole point of using a chain for routing — it's deterministic and cheap.
-
-**The agent in aptkit: `runAgentLoop`.** Contrast `RagQueryAgent.answer()` — it hands the model a tool schema and a loop, and the model decides whether and when to call `search_knowledge_base`.
-
-```typescript
-// packages/agents/rag-query/src/rag-query-agent.ts:66
+```ts
+// rag-query-agent.ts:66 — control handed to the model
 const { finalText } = await runAgentLoop({
   model: this.options.model,
-  tools: this.options.tools,          // ← the model can now act
-  toolSchemas,                         // ← it's told what's available
-  maxTurns: 6, maxToolCalls: 4,        // ← but the LOOP owns the budget
-  synthesisInstruction: buildSynthesisInstruction(...),
+  tools: this.options.tools,
+  system: this.system,        // "Always call search_knowledge_base first..."
+  userPrompt: question,
+  toolSchemas,                // the tools the model MAY pick from
+  maxTurns: 6,                // ...but bounded
+  maxToolCalls: 4,
 });
 ```
 
-The model owns *when* to search; the loop owns *how many times*. That split is the agent. **The boundary condition that breaks people:** if you give an agent no budget exit, it can loop tool calls forever — the model has no obligation to ever stop. aptkit's `maxTurns`/`maxToolCalls` are not optional polish; they're what makes the agent shippable. (Full treatment in `02-agent-loop-skeleton.md`.)
+The model decides whether to search, what query to search with, whether to search again, and when to stop and answer. That's the agent side.
+
+**Where the prompt drags it back toward a chain.** The system prompt says *"Always call the search_knowledge_base tool first before answering."* That's the engineer reaching across the boundary to pin the first step. The model still *could* answer without searching, but the prompt strongly orders it. This is the hybrid in miniature: structurally an agent, behaviorally near-chain on turn one. Name it honestly in an interview — "we left it an agent but constrained the first move in the prompt, accepting that the model can still deviate."
+
+**The decision rule, concretely.** Use a chain when you know the steps in advance and they don't depend on what the model finds. Use an agent when the steps depend on the result of earlier steps. aptkit's recommendation agent is an agent because it can't know up front which of the 13 tools will have the evidence it needs — it has to look, then decide what to look at next.
 
 ### Move 3 — the principle
 
-Use a chain when you know the steps in advance; use an agent when the steps depend on what the model finds. The cost of an agent is unpredictability — variable step count, variable cost, harder debugging. aptkit pays that cost exactly where it's worth it (retrieval, multi-tool investigation) and refuses to pay it where it isn't (intent classification stays a chain).
+The cost of an agent is unpredictability: variable step count, variable cost, harder debugging. You pay that cost only when the path genuinely can't be written ahead of time. When it can, a chain is cheaper, more debuggable, and more honest. The mistake is reaching for an agent because it sounds advanced — the senior move is choosing a chain when a chain is enough.
 
 ## Primary diagram
 
 ```
-  aptkit's chain→agent handoff, end to end
+  The boundary, with aptkit's hybrid marked
 
-  ┌─ Caller (query agent) ───────────────────────────────┐
-  │  classifyIntent  ──one call, no tools──►  intent word │  CHAIN
-  │  parseIntent(word)  ──►  pick which agent to run       │
-  └───────────────────────────┬──────────────────────────┘
-                              │ control flips here (the seam)
-  ┌─ Loop (runAgentLoop) ─────▼──────────────────────────┐
-  │  model.complete(tools) ⇄ callTool  ⇄ accumulate       │  AGENT
-  │  exit on: no tool_use (success) OR maxTurns (budget)  │
-  └───────────────────────────────────────────────────────┘
+  ┌─ Host app (outside aptkit) ─────────────────────────────────┐
+  │  monitor() → investigate() → recommend()   ← CODE order      │  CHAIN
+  └───────┬───────────────┬───────────────────┬──────────────────┘
+          ▼               ▼                    ▼
+     ┌─────────┐     ┌─────────┐         ┌─────────┐
+     │ anomaly │     │diagnostic│        │recommend│   each box:
+     │  agent  │     │  agent   │        │  agent  │   runAgentLoop
+     └────┬────┘     └────┬─────┘        └────┬────┘   ← MODEL order
+          │ model picks tools, decides when to stop    AGENT (inside)
+          ▼                                            
+   ┌──────────────────────────────────────────────────┐
+   │  runtime: runAgentLoop (packages/runtime)          │
+   └────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The chains-vs-agents line is the entry point to the whole reasoning-pattern family: every pattern below (ReAct, plan-and-execute, reflexion) is a way of structuring what happens *inside* the loop. aptkit lands firmly on the agent side for its capabilities, but it's disciplined about it — the cheap, predictable parts (intent routing, dimension validation) stay as code, not as model decisions.
+The chains-vs-agents line is the oldest distinction in agent design and the one people get wrong most often. The "agents" framing got popular because autonomous loops demo well; the production reality is that most shipped LLM systems are chains with one or two agentic stages. aptkit reflects that: a fixed outer sequence, agentic stages inside. Every other file in this sub-section (`02-agent-loop-skeleton` onward) is a way of structuring what happens *inside* the loop once you've decided to be on the agent side.
 
 ## Interview defense
 
-**Q: Is aptkit a workflow or an agent system?**
-Single-agent. One loop, `runAgentLoop`, six capabilities on top of it. The model picks the tool and picks when to stop; that's the agent signature. But I keep the router (`classifyIntent`) as a deterministic chain step — you don't hand the steering wheel to the model for a job a one-word classification solves.
+**Q: Is aptkit's recommendation flow a chain or an agent?**
+
+It's the hybrid — a chain outside, a loop inside each stage.
 
 ```
-  caller (CODE decides) ═══seam═══► loop (LLM decides)
-  classifyIntent                    runAgentLoop
+  outer: CODE fixes monitor → investigate → recommend   (chain)
+  inner: each stage = runAgentLoop, model picks tools    (agent)
 ```
-*Anchor: the line is "who chooses the next step." Code in the router, model in the loop.*
 
-**Q: Why not make routing an agent too?**
-Cost and debuggability. An agent router adds variable latency and a larger failure surface for a job that a single classify call does deterministically. I'd only escalate it to an agent if classification started failing on ambiguous queries that need a tool to disambiguate.
+The host app fixes the three-stage order; that's a chain. But inside `RecommendationAgent.propose` the model freely picks among 13 tools and decides when to stop — that's an agent. Calling it purely one or the other misses the design.
+
+*Anchor: chain outside, loop inside — name both altitudes.*
+
+**Q: When would you NOT use an agent here?**
+
+When the steps are known. If recommendation always needed exactly "fetch segments, then fetch campaigns, then format," I'd write that as three function calls and drop the loop — cheaper, deterministic, debuggable. The loop earns its cost only because the agent can't know which evidence it needs until it looks.
+
+*Anchor: agent cost is unpredictability; pay it only when the path can't be pre-written.*
 
 ## See also
 
-- `02-agent-loop-skeleton.md` — the kernel the agent side runs
-- `07-routing.md` — the chain-side router in full
-- `study-ai-engineering/04-agents-and-tool-use/01-agents-vs-chains.md` — the mechanics walk (cross-ref)
+- [02-agent-loop-skeleton.md](02-agent-loop-skeleton.md) — what's inside the loop once you're on the agent side.
+- [03-react.md](03-react.md) — the specific reasoning pattern aptkit's loop runs.
+- ReAct Thought-Action-Observation mechanics: `.aipe/study-ai-engineering/04-agents-and-tool-use/01-agents-vs-chains.md`.
+- The provider/tool seams this boundary sits on: `.aipe/study-system-design/`.

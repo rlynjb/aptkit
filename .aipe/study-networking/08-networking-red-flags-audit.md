@@ -1,138 +1,177 @@
 # Networking Red-Flags Audit
 
-**Industry name:** network-failure risk audit / protocol-resilience review · *Project-specific*
+**Ranked protocol & network-failure risks · evidence per verdict** — *Project-specific*
 
-## Zoom out, then zoom in
+## Zoom out — where the risks concentrate
 
-This is the file you reopen. It ranks every protocol-and-network-failure risk in aptkit by consequence, with the evidence for each verdict. No new mechanisms — just the ranked list and where to fix each.
-
-```
-  Zoom out — risks mapped onto the network surface
-
-  ┌─ aptkit ────────────────────────────────────────────────┐
-  │  Gemma/embed fetch → Ollama  ★ R1 no timeout ★           │
-  │                              ★ R2 no transport retry ★    │
-  │  Studio stream               R4 no stream timeout         │
-  │  Studio dev API (unauth)     R5 (→ study-security)        │
-  │  unbounded concurrent calls  R3 no client-side cap        │
-  └──────────────────────────────────────────────────────────┘
-  ┌─ buffr ──────────────────────────────────────────────────┐
-  │  pg.Pool                     R6 TLS unset in code         │
-  └──────────────────────────────────────────────────────────┘
-```
-
-**Zoom in.** A red-flags audit is verdict-first risk triage: name the failure, rate its consequence, point at the line, name the fix. The pattern: **rank by what actually breaks in production, not by what's easy to spot.**
-
-## Structure pass
-
-**Axis — consequence: "if this fires, what does the user/system lose?"** That single axis orders the whole list. A hang (R1) loses the whole request with no recovery; an unset TLS option (R6) is governed by config that's probably already correct. Same surface, very different blast radius — that contrast is the ranking.
+Every risk in this audit lives at one boundary: the outbound `fetch` to Ollama. aptkit's network surface is so small that the failure modes concentrate at a single point — which is good (one place to fix) and a trap (one place to forget). Here's the risk map.
 
 ```
-  Axis — blast radius — orders the risks
+  Zoom out — risks cluster at the one outbound wire
 
-  R1 no timeout         ──► request hangs forever, no recovery    HIGH
-  R2 no transport retry ──► transient blip = hard failure         MEDIUM
-  R3 no concurrency cap  ──► burst could flood Ollama             LOW (seq. today)
-  R4 no stream deadline  ──► a stuck stream hangs the UI          LOW-MED
-  R5 unauth dev API      ──► (security seam, cross-linked)        SCOPED OUT
-  R6 pg TLS unset in code──► relies on connection string          LOW
+  ┌─ aptkit ─────────────────────────────────────────────────┐
+  │  defaultHttpTransport: await fetch(localhost:11434)       │ ← ALL ranked risks here
+  │     #1 no timeout   #2 no retry/status-awareness          │
+  │     #3 host override → silent plaintext exposure          │
+  └──────────────────────────┬─────────────────────────────────┘
+                             │
+  ┌─ Ollama / Studio / buffr ▼─────────────────────────────────┐
+  │  lower-severity / other-repo / not-yet-exercised items     │
+  └──────────────────────────────────────────────────────────────┘
 ```
+
+## Zoom in — the concept
+
+A **red-flags audit** ranks the repo's network-failure and protocol risks by *consequence*, names the evidence for each, and says what to do. Not a checklist of best practices — a triage. The verdict shape: each item is `severity · evidence (file:line) · concrete failure · the move`. The partition: this names *what breaks on the wire*; **study-security** owns *whether each boundary is safe*; **study-system-design** owns *where the boundaries belong*.
+
+## Structure pass — the skeleton
+
+**Axis traced — "what's the blast radius when this fails?"** Ranked high→low by that single question.
+
+```
+  One question across the risks: "blast radius on failure?"
+
+  #1 no timeout        → whole interactive session wedges      HIGH
+  #2 no retry/status   → transient blip = hard failure         MEDIUM
+  #3 host override     → silent plaintext-on-network exposure  MEDIUM (conditional)
+  #4 no stream timeout → slow client buffers trace in memory   LOW
+  #5 unbounded body    → huge Ollama response, no size cap     LOW
+  ── not yet exercised: DNS, TLS, CORS, pooling, websockets ──
+```
+
+**Seam — the transport function.** Items #1, #2, #3, #5 all live inside the same ~15 lines (`defaultHttpTransport`). Fix the transport and four of five top risks close.
 
 ## How it works — the ranked audit
 
-#### R1 — No per-call timeout on the Ollama `fetch` · HIGH
+### Move 1 — the triage shape
 
-**Verdict:** the single most consequential network risk in the repo. A wedged Ollama daemon hangs the agent loop indefinitely.
-
-**Evidence:** `defaultHttpTransport` in `packages/providers/gemma/src/gemma-provider.ts:201-215` and `packages/retrieval/src/ollama-embedding-provider.ts:60-75` both call `fetch` with only an optional caller `signal` — no `AbortSignal.timeout`. Nothing in the repo constructs a timeout signal to pass in.
+Each risk is one card: severity, the line that proves it, the concrete failure, the fix. Read top to bottom; the top one is the only one that bites at one-user scale.
 
 ```
-  R1 — the hang path
+  The audit card shape
 
-  complete() ─► fetch(signal?) ─► Ollama stuck ─► ⧖ forever
-                    ▲ no AbortSignal.timeout means no deadline
+  ┌─────────────────────────────────────────────┐
+  │ SEVERITY  · the risk in one line              │
+  │ evidence: file:line                           │
+  │ failure:  if X happens, Y breaks (concrete)   │
+  │ move:     the fix, named                       │
+  └─────────────────────────────────────────────┘
 ```
 
-**Fix:** in each `defaultHttpTransport`, attach `AbortSignal.timeout(ms)` — merged with the caller's signal if present (`AbortSignal.any([signal, AbortSignal.timeout(ms)])`). One line per transport. Full treatment: `07-timeouts-retries-pooling-and-backpressure.md`.
+### Move 2 — the cards, ranked
 
-#### R2 — No transport-level retry or backoff · MEDIUM
+---
 
-**Verdict:** a transient network blip (Ollama mid-restart, connection reset) becomes a hard failure, because the only retry is *semantic* (bad tool-call JSON), not *transport*.
+**#1 · HIGH — No per-call timeout on the Ollama `fetch`.**
 
-**Evidence:** the retry loop in `gemma-provider.ts:62-89` re-issues the call only when the response parses but isn't a valid tool call (`looksLikeToolAttempt`). A thrown `fetch` error (connection refused, reset, non-2xx) propagates immediately — no retry, no backoff, no jitter. `FallbackModelProvider` retries across *providers*, which is a different mechanism and only configured in Studio's live modes.
+- **Evidence:** `packages/providers/gemma/src/gemma-provider.ts:201-215` and `packages/retrieval/src/ollama-embedding-provider.ts:60-75` — `await fetch(url, {...(signal ? {signal} : {})})` with no `AbortController` + `setTimeout`. The signal threads from `run-agent-loop.ts:91` but nothing fires it on a deadline.
+- **Failure (concrete):** Ollama accepts the TCP connection, then stalls — loading a 9B model into VRAM, swapping under memory pressure, or a wedged daemon. `await fetch` never resolves. The agent turn blocks indefinitely; in the CLI/agent path no outer caller aborts, so the whole interactive session hangs with no error and no recovery.
+- **Move:** Add a transport-local `AbortController` + `setTimeout(() => controller.abort(), DEADLINE)`, merged with the caller's signal. No contract above the transport changes (see `07` Move 2.5). This is the one resilience fix to ship even at one user — it guards liveness, not scale.
 
-**Fix:** wrap the transport `fetch` in a small retry-with-jitter for connection-level errors (not for `4xx`). Gate on R1 first — retry without a timeout never fires on a hang.
+```
+  the gap in one frame
 
-#### R3 — No client-side concurrency cap on Ollama calls · LOW (today)
+  await fetch(…, {signal?})     ← signal present, nothing fires it
+        │
+        └─ Ollama stalls (socket open) → hangs forever ★
+```
 
-**Verdict:** nothing limits in-flight requests to the daemon. Low *today* because agents run sequentially, so concurrency is effectively 1.
+---
 
-**Evidence:** no semaphore, queue, or `p-limit` around the `fetch` calls. Contrast buffr's `pg.Pool`, whose bounded size *does* provide backpressure (`buffr/src/pg-vector-store.ts`, `connect()` queues when saturated). aptkit's HTTP path has no equivalent.
+**#2 · MEDIUM — Binary status handling: any non-2xx is a terminal throw, no retry, no status-awareness.**
 
-**Fix:** none needed while execution is sequential; if Studio or buffr ever fans out agents concurrently against one Ollama, add a concurrency limiter. Tracked as a `not yet exercised` mechanism in `07`.
+- **Evidence:** `gemma-provider.ts:210`, `ollama-embedding-provider.ts:69` — `if (!res.ok) throw new Error(...)`. No retry, no backoff, no `Retry-After`/429 handling.
+- **Failure (concrete):** Ollama returns `503 model loading` during a cold start — a transient, self-healing condition. aptkit throws immediately; the agent run fails instead of waiting 2 seconds and succeeding. A 429, 500, and 404 are indistinguishable beyond the message string, so no condition-specific recovery is possible.
+- **Move:** For idempotent calls, add retry-with-jittered-backoff on retryable statuses (429, 503, network errors). Keep fail-fast for 4xx that won't self-heal. Note the `FallbackModelProvider` is *provider* failover, not *call* retry — they're complementary, not substitutes.
 
-#### R4 — No deadline on the streaming response · LOW-MEDIUM
+---
 
-**Verdict:** the NDJSON stream has no overall timeout; a replay whose underlying model call hangs (see R1) holds the response open and leaves the browser's `for await` loop waiting.
+**#3 · MEDIUM (conditional) — A `host` override silently turns plaintext-on-loopback into plaintext-on-a-network.**
 
-**Evidence:** `streamReplayResponse` (`apps/studio/vite.config.ts:888-919`) writes until `run` resolves; if the inner provider call hangs (R1), the stream never reaches its `result` line. The client loop in `apps/studio/src/api.ts:138-161` reads until the body ends — with no client-side abort.
+- **Evidence:** `gemma-provider.ts:48` / `ollama-embedding-provider.ts:47` — `options.host ?? 'http://localhost:11434'`; buffr passes `OLLAMA_HOST` (`buffr/src/config.ts:14`). The scheme is `http`, hardcoded into the transport's URL build.
+- **Failure (concrete):** Someone sets `host: 'http://10.0.0.5:11434'` to use a shared LAN Ollama. The prompts and embeddings now travel **unencrypted across the network** — and there's no code path that would add TLS, because the scheme is baked as `http`. No warning, no failure; it just works, insecurely.
+- **Move:** When `host` is non-loopback, require `https:` (or fail loud), or front the remote Ollama with a TLS-terminating proxy. The `whether-it's-safe` framing belongs to **study-security**; the on-the-wire fact is "the bytes are plaintext the moment the host leaves the box."
 
-**Fix:** this is mostly downstream of R1 — bounding the model call bounds the stream. A belt-and-suspenders client `AbortController` with a deadline would also cap it.
+---
 
-#### R5 — Unauthenticated Studio dev API · SCOPED OUT → `study-security`
+**#4 · LOW — No backpressure handling on the NDJSON stream write.**
 
-**Verdict:** the vite middleware exposes replay/promote/save routes with no auth (`apps/studio/vite.config.ts:201-526`), and `/api/replay/save` writes files. This is a *trust-boundary* concern, not a *protocol/network-failure* one.
+- **Evidence:** `apps/studio/vite.config.ts:908` — `res.write(encodeNdjsonRecord(...))` ignores the return value; no `drain` wait.
+- **Failure (concrete):** A slow client consuming a very large trace can't keep up; writes buffer in the server's socket memory. For the small traces here (a handful of events) this never bites, but a pathological trace + slow reader would grow memory.
+- **Move:** Honor `res.write`'s backpressure signal (wait for `drain`) if trace sizes ever grow. Today: acceptable, dev-only, small payloads.
 
-**Evidence:** `resolveReplayPath` (`vite.config.ts:1416-1425`) does constrain writes to `artifacts/replays`, which is the one network-input-validation control on that surface. Full analysis belongs to the neighbor guide.
+---
 
-**Fix:** owned by `study-security` (boundary safety). Mentioned here only so the audit is complete; the dev server is local-only by design.
+**#5 · LOW — Unbounded response body read.**
 
-#### R6 — Database TLS not set in buffr's code · LOW
+- **Evidence:** `gemma-provider.ts:213`, `ollama-embedding-provider.ts:72` — `await res.json()` reads the full body with no size cap.
+- **Failure (concrete):** A misconfigured or malicious Ollama returning a multi-gigabyte body would be buffered entirely into memory before parsing. For a trusted local daemon this is theoretical.
+- **Move:** Acceptable for a trusted loopback dependency; would matter only if the host pointed at an untrusted server.
 
-**Verdict:** `pg.Pool` is built from `connectionString` alone with no explicit `ssl` option, so encryption to Supabase depends entirely on the `DATABASE_URL` and the PaaS, not on code.
+---
 
-**Evidence:** `buffr/src/db.ts:4-6` — `new pg.Pool({ connectionString: databaseUrl })`, no `ssl`. Whether the wire is encrypted is `not yet verified in code`; Supabase URLs typically imply TLS, but the repo is silent.
+### Move 2.5 — what's NOT a red flag (correctly absent)
 
-**Fix:** make TLS explicit (`ssl: { rejectUnauthorized: true }` or a documented `sslmode=require` in the URL) so encryption isn't an implicit assumption. Treatment: `04-tls-and-trust-establishment.md`.
+These are absences that are *right*, not gaps — naming them prevents a reviewer from flagging them as missing.
+
+```
+  Correctly absent — not findings
+
+  DNS / routing      → loopback target, no resolution needed
+  TLS on loopback    → same-machine, no network to encrypt
+  CORS               → same-origin dev; static prod build has no API
+  HTTP retry at scale→ one user, one local origin; fail-fast is honest
+  WebSockets/SSE     → one-way request-scoped trace, chunked NDJSON suffices
+```
+
+Each is `not yet exercised` (see `00-overview.md`) and would become relevant only on a specific architecture change (remote host, hosted model, cross-origin UI).
+
+### Move 3 — the principle
+
+A small network surface concentrates risk rather than eliminating it. aptkit has one outbound wire, so it has one place to get timeouts, status-handling, and TLS-on-override right — and one place to forget them. The audit's verdict: the surface is honestly minimal and the absences are mostly correct, with exactly one that bites at any scale (the timeout) and two that bite the moment the wire goes remote or flaky (status-awareness, plaintext-on-override). Fix the transport function and four of five top risks close at once. The principle: rank by blast radius, fix the liveness bug first, and document the correct absences so they don't get cargo-culted into existence.
 
 ## Primary diagram
 
-```
-  Networking red-flags — ranked, with fix location
+The full ranked audit in one frame.
 
-  ┌──────┬──────────────────────────────┬────────┬─────────────────────────┐
-  │ rank │ risk                         │ sever. │ fix lives in            │
-  ├──────┼──────────────────────────────┼────────┼─────────────────────────┤
-  │  R1  │ no Ollama fetch timeout      │ HIGH   │ transport (1 line) · 07 │
-  │  R2  │ no transport retry/backoff   │ MEDIUM │ transport wrapper  · 07 │
-  │  R4  │ no stream deadline           │ LOW-MED│ downstream of R1        │
-  │  R3  │ no concurrency cap           │ LOW    │ limiter if concurrent   │
-  │  R6  │ pg TLS unset in code         │ LOW    │ buffr db.ts · 04        │
-  │  R5  │ unauth dev API               │ → sec  │ study-security          │
-  └──────┴──────────────────────────────┴────────┴─────────────────────────┘
+```
+  aptkit networking red-flags — ranked by blast radius
+
+  HIGH    #1 no timeout          gemma-provider.ts:201  → session hangs forever
+  ────────────────────────────────────────────────────────────────────────────
+  MEDIUM  #2 binary status       gemma-provider.ts:210  → transient blip = hard fail
+  MEDIUM  #3 host→plaintext      gemma-provider.ts:48   → remote http = exposed (cond.)
+  ────────────────────────────────────────────────────────────────────────────
+  LOW     #4 no stream drain     vite.config.ts:908     → slow client buffers memory
+  LOW     #5 unbounded body      gemma-provider.ts:213  → huge body buffered (trusted)
+  ────────────────────────────────────────────────────────────────────────────
+  CORRECT DNS · TLS-loopback · CORS · retry-at-scale · websockets  (not findings)
+  ABSENCE
+
+  4 of 5 top risks live in ONE function: defaultHttpTransport
 ```
 
 ## Elaborate
 
-The shape of this audit is typical of a young, well-factored system: the *architecture* is sound (injectable transports, a provider contract, loopback-only sockets), and the risks are all missing *hardening* — timeouts, retries, explicit TLS — rather than structural flaws. That's the good kind of debt: each fix is local and additive because the seams are already in the right place. The `AbortSignal` is plumbed (R1's fix is one line *because* the wire exists), the transports are swappable (R2's retry wrapper has a clean place to live), and the pool already gives backpressure where it matters. Rank-ordering forces the honest call: fix the hang first, because retries and stream deadlines are all downstream of it.
+Red-flags audits are most useful when they rank by consequence and resist the urge to flag every missing best practice. aptkit's network audit is short because its surface is short — and the discipline is distinguishing a *gap* (the timeout, which bites now) from a *correct absence* (TLS on loopback, which would be cargo-cult). The single highest-leverage move is the timeout, and it's cheap because the cancellation mechanism is already plumbed end-to-end. Everything else is either correctly deferred until the architecture changes or genuinely low-stakes for a single-user local tool. For *whether* the plaintext-on-override and the (gitignored) API keys are a security exposure, hand off to **study-security**; for how the timeout composes with the fallback chain under partial failure, hand off to **study-distributed-systems**.
 
 ## Interview defense
 
-**Q: "What's the biggest network risk in your system and how would you fix it?"**
-One sentence, then the fix: "A wedged Ollama daemon hangs the agent loop forever, because the `fetch` to it has no timeout — it forwards a caller's `AbortSignal` but never sets a deadline. The fix is one line: `AbortSignal.timeout` in the transport, merged with the caller's signal." Then show you ranked it: "Everything else is downstream — transport retry and stream deadlines only matter once the wait is bounded, and concurrency limits only matter once agents run in parallel, which they don't yet."
+**Q: What's the biggest networking risk in your codebase?**
+No per-call timeout on the outbound `fetch` to Ollama. The `AbortSignal` is threaded end-to-end, but nothing fires it on a deadline, so a stalled daemon hangs the whole session with no error. It's the only risk that bites at one-user scale, and the fix is local — a controller plus a timer inside the transport.
 
 ```
-  sketch: fix order follows the dependency
-
-  R1 timeout ──► unblocks ──► R2 retry ──► R4 stream deadline
-  (fix this first; the rest are downstream)
+  HIGH: no timeout → hang   (4 of 5 top risks in one ~15-line function)
+  fix the transport → most of the audit closes
 ```
+Anchor: *"small surface concentrates risk — one function holds four of five top items; the timeout is the one that bites now."*
 
-Anchor: *the hang is the root risk — bound the wait before adding any retry.*
+**Q: What network risks did you deliberately NOT address?**
+DNS, TLS on loopback, CORS, retry-at-scale, WebSockets — all correctly absent for a single-user, single-local-origin tool. I name them as `not yet exercised` rather than building them speculatively; each becomes real only on a specific change (remote host, hosted model, cross-origin UI).
 
 ## See also
 
-- `07-timeouts-retries-pooling-and-backpressure.md` — R1/R2/R3/R4 in full
-- `04-tls-and-trust-establishment.md` — R6, the TLS story
-- `00-overview.md` — the ranked findings in the context of the whole map
-- `study-security` (neighbor guide) — R5 and every trust boundary
+- `07-timeouts-retries-pooling-and-backpressure.md` — finding #1 in depth, with the fix
+- `04-tls-and-trust-establishment.md` — finding #3, the plaintext-on-override path
+- `05-http-semantics-caching-and-cors.md` — finding #2, the binary status model
+- `00-overview.md` — the ranked findings and `not yet exercised` inventory

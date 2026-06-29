@@ -1,78 +1,83 @@
-# Study — Software Design (aptkit)
+# Study — Software Design (AptKit)
 
-*A Philosophy of Software Design* (John Ousterhout), applied to the **live
-aptkit repo**. Not the book — the findings about your code. This guide takes the
-book's primitives (deep modules, information hiding, complexity, layering,
-interface design, defining errors out of existence) and walks where aptkit
-honors them, where it leaks, and the single move to fix each.
+A code-level design audit of the AptKit monorepo through the primitives
+in **John Ousterhout's *A Philosophy of Software Design*** — deep
+modules, information hiding, complexity, layering, pull-complexity-down,
+define-errors-out, readability. Two-pass, audit-style: one lens audit,
+then a file per design move the repo actually makes.
 
-> **Source note.** Every primitive named here comes from Ousterhout's book.
-> This guide teaches the ideas in original words and spends its weight on the
-> code; for the full conceptual treatment of any primitive, read the book and
-> see `read-aposd` (the book-style framework guide). The value here is the
-> findings about *your* files — original by construction.
+> **The through-line:** complexity is the enemy; deep modules are the
+> weapon. AptKit's spine is a set of deliberately deep ports (the model
+> contract, the two retrieval contracts) that hide a lot behind a little.
+> The best findings are how much they hide; the debt is a few facts that
+> leaked out of their module into two or three files.
 
-## The through-line
+## Source note
 
-```
-  complexity is the enemy   ──►   a deep module is the weapon
-  ─────────────────────────       ──────────────────────────────
-  change amplification             big behaviour
-  cognitive load              =     ÷  small interface
-  unknown-unknowns                 = depth
-
-  aptkit's bet: a few narrow contracts (ModelProvider, VectorStore,
-  EmbeddingProvider, CapabilityTraceSink) with deep, swappable bodies behind
-  each. The audit measures how well that bet held.
-```
-
-The repo is young but the interface discipline is above the bar for its size.
-The strongest single piece of evidence isn't a module — it's that
-`@aptkit/memory` was built as a *second* consumer of the retrieval contracts
-with zero new infrastructure. Interfaces drawn at the right place let that
-happen.
+The design primitives are from **A Philosophy of Software Design**
+(Ousterhout). They're taught here in original words and applied to
+AptKit's real files — read the book for the full framework, or the
+`read-aposd` guide for it taught chapter by chapter. The ports & adapters
+role-vocabulary is standard (Cockburn's hexagonal architecture / the
+dependency-inversion principle).
 
 ## Reading order
 
 ```
-  1. 00-overview.md          one-page orientation: the design shape at a glance
-  2. audit.md                Pass 1 — the 8-lens audit, ranked, with the
-                             red-flag checklist and the one-thing-to-fix-first
-  3. 01-…06-                 Pass 2 — deep walks of the six load-bearing moves
+  1. 00-overview.md   — the map + the PATTERN VOCABULARY this guide owns
+                        (port · adapter · client · seam · factory · DI · DIP)
+  2. audit.md         — Pass 1: the 8-lens audit, verdicts, ranked fixes
+  ────────────────────────────────────────────────────────────────────
+  Pass 2 — the design moves the repo exercises (deep walks):
+  3. 01-deep-provider-port.md             — the ModelProvider / retrieval ports
+  4. 02-emulation-hidden-behind-the-port.md — Gemma's hidden tool-call emulation
+  5. 03-contract-as-the-product.md         — the retrieval contract as deliverable
+  6. 04-guard-rails-as-information-hiding.md — minTopK / matchesFilter / dim guards
+  7. 05-injectable-transport-seam.md       — the sub-port that makes Gemma testable
+  8. 06-capability-as-composition.md       — the RAG agent assembled from ports
 ```
 
-Read `00-overview.md` for the map, `audit.md` for the verdicts, then the
-pattern files for the move you care about.
+Read `audit.md` for what's good, what's weak, and the three fixes ranked.
+Read the `0N-` files for the deep walks behind the patterns it cites.
 
-## The discovered patterns (Pass 2)
+## The map
 
-Named after the design *moves* aptkit actually makes — the file list is itself a
-teaching artifact:
+```
+  ┌─ 00-overview ─────────────────────────────────────────────┐
+  │  the deep seams + the PATTERN VOCABULARY (the dictionary)  │
+  └───────────────────────────┬───────────────────────────────┘
+  ┌─ audit ───────────────────▼───────────────────────────────┐
+  │  8 lenses → ranked findings → top-3 fixes                  │
+  └───────────────────────────┬───────────────────────────────┘
+        ┌────────────┬─────────┴────────┬────────────┬─────────┐
+        ▼            ▼                  ▼            ▼         ▼
+     01 ports    02 emulation       03 contract  04 guards  05 seam
+     (deepest)   (deepest adapter)  (the product)(info-hide)(testable)
+        └──────────────────── all compose into ──────────────────┘
+                                    ▼
+                          06 capability-as-composition
+                          (the agent built from the ports)
+```
 
-| file | the move | book primitive |
-| --- | --- | --- |
-| `01-deep-provider-module.md` | one 3-method contract, many deep bodies | deep module / interface design |
-| `02-emulation-hidden-behind-complete.md` | tool-calling Gemma doesn't have, hidden behind `complete()` | information hiding |
-| `03-contract-as-the-product.md` | retrieval contracts that never name a vendor; memory reuses them | information hiding / abstraction |
-| `04-guard-rails-as-information-hiding.md` | the search tool absorbs model weakness so callers never see it | define errors out of existence |
-| `05-injectable-trace-seam.md` | one `emit()` interface, body injected (in-memory ↔ Supabase) | deep interface / a seam (and its honest weakness) |
-| `06-capability-as-composition.md` | agent = prompt + policy + loop + validator, composed | layering / pull complexity down |
+## The three fixes the audit ranks (across the whole repo)
 
-## The verdict, in one line
-
-Above the bar for a repo this size. Fix first: **add a metadata filter to
-`VectorStore.search`** — it collapses two duplicated over-fetch-then-filter
-implementations, pushes the work down into each store, and kills the
-`topK * 4` magic-number drift (audit lens 3 and 8).
+1. **Collapse the dimension check to one `assertWiring`.** One invariant
+   written in three files (`pipeline.ts:23`, `in-memory-vector-store.ts:37`,
+   `conversation-memory.ts:62`). Lowest effort, clearest win.
+2. **Hoist `FixtureModelProvider` into a shared package.** An identical
+   18-line class copied into 5 agent packages.
+3. **Add an optional `filter` predicate to the `VectorStore` port.**
+   Removes the over-fetch-then-post-filter workaround from two call sites
+   and lets buffr's `PgVectorStore` push the filter into SQL.
 
 ## Cross-links
 
-- `../study-system-design/` — the same contracts at *service* altitude:
-  boundaries, the aptkit↔buffr split, where state lives. (Altitude rule:
-  module/interface here; service/architecture there.)
-- `../study-agent-architecture/` — `runAgentLoop` and agentic retrieval as
-  *reasoning* patterns, not just module shapes.
-- `../study-testing/` — the injectable-transport seam (`05-…`) is the same
-  boundary the tests mock; fixtures and replay live there.
-- `read-aposd` — the book-style framework guide that teaches these primitives
-  abstractly. Read it for depth; read this for your code.
+- `../study-system-design/` — the same provider/retrieval seams one
+  altitude up (service boundaries, scale). It cross-links back to the
+  PATTERN VOCABULARY here for the role definitions.
+- `../study-agent-architecture/` — the ReAct loop as a client of these ports.
+- `../study-testing/` — the fixture/replay test doubles this audit references.
+- `read-aposd` — the book taught as a standalone framework.
+
+Every claim cites a real `path:line` in this repo. Inferences are
+labeled. No invented code.

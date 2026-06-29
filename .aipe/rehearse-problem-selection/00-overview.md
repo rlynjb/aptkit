@@ -1,122 +1,91 @@
 # Problem Selection — Overview
 
-*Why aptkit deserved to be built before any line of it was designed.*
+The one-page orientation. This brief argues **why aptkit deserved to get built before any line of it got designed** — the human layer that sits in front of the design doc, the demo, and the interview defense.
 
-This is the human layer that sits *before* the design doc. The design doc
-answers "how did you build the provider-neutral core." This brief answers
-the harder question a skeptical reviewer asks first: **"why build a
-substrate at all instead of `npm install`-ing one?"**
+Coach posture: the goal isn't to make the project sound impressive. It's to rehearse the *honest* case, so that when a skeptical reviewer (a staff engineer, a hiring panel, future-Rein six months from now) asks "why did you build a framework instead of using one off the shelf?", the answer holds without flinching.
 
-Read these in order. The numbered files map 1:1 to the ten problem-brief
-answers the spec requires.
+## The honest frame
 
 ```
-  Where this brief sits in the rehearse family
+  WHAT THIS PROBLEM IS — and what it is NOT
 
-  ┌─ THIS BRIEF ──────────────────────────────────────────────┐
-  │  rehearse-problem-selection   WHY this problem deserves    │ ← here
-  │                                investment                  │
-  └────────────────────────────┬───────────────────────────────┘
-                               │  once "why" holds, then:
-  ┌────────────────────────────▼───────────────────────────────┐
-  │  rehearse-design-doc          HOW the decision is written   │
-  │  rehearse-hackathon-demo      HOW the value is shown        │
-  │  rehearse-interview-defense   HOW the work is defended      │
-  └──────────────────────────────────────────────────────────────┘
+  ┌─ IS ──────────────────────────────────────────────┐
+  │  • a personal-tooling problem (Rein's own apps)    │
+  │  • a portfolio problem (frontend → AI pivot)       │
+  │  • a learning problem (build the substrate to      │
+  │    understand the substrate)                       │
+  └────────────────────────────────────────────────────┘
+  ┌─ IS NOT ──────────────────────────────────────────┐
+  │  • a product with external users                   │
+  │  • a market opportunity / startup thesis           │
+  │  • an org mandate or a team's roadmap              │
+  └────────────────────────────────────────────────────┘
 ```
 
-## The honest frame (read this first)
+There are **no external users**, by design. Every "beneficiary" in this brief is Rein in one of her roles: the app builder, the job candidate, the learner. Pretending otherwise would be the single fastest way to lose a review room. The strength of this problem is not its market — it's that the cost it removes is *real and measured in Rein's own repos*, and the artifact it produces is *evaluated, swappable, and shipped to one live consumer.*
 
-┃ aptkit has **no external users**. By design. It is personal tooling plus
-┃ a portfolio artifact for a frontend→AI pivot. There is no revenue, no
-┃ org mandate, no customer ticket. Pretending otherwise would be the
-┃ fastest way to fail the skeptical-reviewer block.
-
-So this brief does not invent a market. It justifies investment on the two
-honest grounds that *do* hold:
-
-▸ **Operational pain (real, evidenced):** every AI app Rein has shipped
-  re-wired its own RAG/agent plumbing and welded itself to one cloud
-  vendor. AdvntrCue is the proof — bespoke Next.js + pgvector + GPT-4,
-  none of it reusable by the next app.
-
-▸ **Portfolio leverage (the pivot):** the substrate *is* the artifact. A
-  provider-neutral core with from-scratch RAG and an eval harness is a
-  stronger frontend→AI signal than another vendor-glued demo app.
-
-Where evidence is thin, the brief says so and writes the discovery
-question instead of faking a number.
-
-## The strategic fork in one diagram
-
-The whole brief turns on one decision. Here it is up front.
+## The fork
 
 ```
-  The build-vs-adopt fork
+  THE DECISION — build the substrate vs adopt a framework
 
-                        ┌─────────────────────────┐
-                        │  recurring pain:        │
-                        │  every app re-wires RAG │
-                        │  + welds to one vendor  │
-                        └────────────┬────────────┘
-                                     │
-                 ┌───────────────────┼───────────────────┐
-                 ▼                   ▼                   ▼
-         ┌──────────────┐   ┌──────────────┐   ┌──────────────────┐
-         │  DO NOTHING  │   │  ADOPT a     │   │  BUILD the       │
-         │  keep        │   │  framework   │   │  substrate       │
-         │  re-wiring   │   │ (LangChain / │   │  (aptkit)        │ ★ chosen
-         │  per app     │   │  LlamaIndex) │   │                  │
-         └──────────────┘   └──────────────┘   └──────────────────┘
-           cost: pain        cost: learning     cost: build time +
-           compounds         + control go to    you own the
-           every new app     the framework      maintenance
+                    ┌─────────────────────────┐
+   the pain ───────►│  build personal-agent   │──► aptkit (chosen)
+   (re-wiring RAG   │  substrate (aptkit)     │
+    every app,      └─────────────────────────┘
+    welded to one   ┌─────────────────────────┐
+    cloud vendor)   │  adopt off-the-shelf    │──► LangChain / LlamaIndex
+                    │  agent framework        │    or a turnkey hosted agent
+                    └─────────────────────────┘
+                    ┌─────────────────────────┐
+                    │  do nothing             │──► keep re-wiring per app
+                    └─────────────────────────┘
 ```
 
-★ **Chosen: BUILD.** Named opportunity cost: the weeks of build-and-maintain
-time that adopting LangChain/LlamaIndex would have spent for you — and the
-turnkey RAG those frameworks hand you on day one. Full reasoning in
-`03-options-and-opportunity-cost.md`.
+**Chosen: build (aptkit).** The opportunity cost is real and named in `03-options-and-opportunity-cost.md` — weeks of substrate work that a framework would have given for free, paid deliberately to buy learning depth, local-first control, provider-neutrality, and a portfolio artifact that proves the AI-engineering pivot.
 
-## The three success metrics (the whole bet in three numbers)
-
-These are how you'll know the substrate earned its keep. All three are
-grounded in code that exists today — see `04-success-metrics-and-feedback-loop.md`.
+## The smallest useful scope that validated the premise
 
 ```
-  Did the substrate earn its keep? — three checks
-
-  ┌─ 1. RETRIEVAL QUALITY ────────────────────────────────────┐
-  │  precision@k / recall@k over a small REAL corpus          │
-  │  evidence: scorePrecisionAtK / scoreRecallAtK             │
-  │            (packages/evals/src/precision-at-k.ts)         │
-  └────────────────────────────────────────────────────────────┘
-  ┌─ 2. ANSWER QUALITY ───────────────────────────────────────┐
-  │  rubric-judge scores grounded/cited answers               │
-  │  evidence: packages/evals/src/rubric-judge.ts             │
-  └────────────────────────────────────────────────────────────┘
-  ┌─ 3. THE SWAP HELD ────────────────────────────────────────┐
-  │  one-line VectorStore swap (InMemory → Pg) verified       │
-  │  across TWO repos; clean-clone npm install builds in buffr│
-  │  evidence: PgVectorStore implements VectorStore           │
-  │            (buffr/src/pg-vector-store.ts:19), wired in     │
-  │            buffr/src/session.ts:41                         │
-  └────────────────────────────────────────────────────────────┘
+  de-risk spike  ──►  the 16 packages  ──►  one live consumer
+  (does provider-      (provider-neutral     (buffr swaps
+   neutral +           core, RAG from         InMemoryVectorStore
+   local Gemma         scratch, evals)        → PgVectorStore on
+   actually work?)                            Supabase pgvector)
 ```
 
-Metric 3 is the load-bearing one. The first two say "the RAG works." The
-third says "the *substrate* works" — the entire premise of building over
-adopting. If the contract didn't let buffr swap `InMemoryVectorStore` for
-`PgVectorStore` in one line across a repo boundary, the build was a waste
-and adopt was the right call.
+The premise — "a provider-neutral, local-first agent layer can be reused across my apps without re-wiring" — is validated the moment **a second repo (buffr) consumes the published bundle and swaps one contract implementation without touching agent code.** That's the proof. Everything past it is expansion, not validation.
 
-## Reading order
+## The files in this brief
 
 ```
-  00-overview.md ......................... you are here
-  01-problem-brief.md .................... pain · evidence · why now · beneficiaries · constraints
-  02-scope-cuts-and-non-goals.md ......... smallest useful scope · what NOT to build
-  03-options-and-opportunity-cost.md ..... do-nothing / adopt / build · the named costs
-  04-success-metrics-and-feedback-loop.md  the three metrics · how the loop closes
-  05-skeptical-reviewer-questions.md ..... the review-room questions that bite
+  00-overview.md                       ← you are here
+  01-problem-brief.md                  pain · evidence · why now · beneficiaries · constraints
+  02-scope-cuts-and-non-goals.md       smallest useful scope + what was deliberately NOT built
+  03-options-and-opportunity-cost.md   build vs adopt vs do-nothing, each with its cost
+  04-success-metrics-and-feedback-loop.md  observable outcomes + the loop that closes
+  05-skeptical-reviewer-questions.md   the review-room questions and the answers that hold
 ```
+
+## The 10-answer order (where each answer lives)
+
+```
+   1. user / operational problem      → 01  (pain)
+   2. evidence + current cost         → 01  (evidence; evidence vs inference labelled)
+   3. why now                         → 01  (why now)
+   4. beneficiaries + exclusions      → 01  (beneficiaries)
+   5. constraints                     → 01  (constraints)
+   6. options (incl. do nothing)      → 03
+   7. smallest useful scope           → 02
+   8. non-goals + cuts                → 02
+   9. success metrics + feedback loop → 04
+  10. risks + objections              → 05
+```
+
+▸ Read in order. `01` makes the case there's a problem worth money. `02` and `03` prove the scope and the fork were chosen, not stumbled into. `04` defines what "it worked" means in observable terms. `05` is the rehearsal — the room where the case gets attacked.
+
+## See also
+
+- `01-problem-brief.md` — the core case
+- `/Users/rein/Public/aptkit/.aipe/project/context.md` — the live repo grounding
+- `/Users/rein/Public/buffr/src/pg-vector-store.ts` — the one live consumer's contract implementation

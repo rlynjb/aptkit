@@ -1,258 +1,193 @@
 # 03 — Idempotency, Deduplication, and Delivery Semantics
 
-**Industry names:** idempotency keys · upsert (insert-or-update) · at-most-once / at-least-once / effective-exactly-once · deduplication — *Industry standard.*
+**Industry names:** idempotent operation · idempotency key · upsert · at-most-once / at-least-once / effective-exactly-once. **Type:** Industry standard.
 
 ## Zoom out, then zoom in
 
-Once you have retries (file 02), you have a new problem: a retry might re-apply a
-write that already succeeded. The defense is **idempotency** — making an operation
-safe to run twice — and the repo has exactly one strong instance of it: the
-`upsert ... on conflict (id)` in `PgVectorStore`.
+The repo has one genuinely idempotent operation and one that pretends to be safe to retry but isn't. Knowing which is which is the whole lesson.
 
 ```
-  Zoom out — where deduplication lives
+  Zoom out — where retries land, and whether the target survives them
 
-  ┌─ App layer ─────────────────────────────────────────────────────────┐
-  │  pipeline.index(doc) → chunks with DETERMINISTIC ids "<docId>#<n>"   │ ← key chosen here
-  └──────────────────────────────┬───────────────────────────────────────┘
-                                 │ store.upsert(chunks)
-  ┌─ Storage adapter ────────────▼───────────────────────────────────────┐
-  │  InMemoryVectorStore: Map.set(id, chunk)  — last write wins by key    │
-  │  PgVectorStore: insert ... on conflict (id) do update  ← ★ idempotent │ ← we are here
-  └──────────────────────────────┬───────────────────────────────────────┘
-                                 │ TCP
-  ┌─ Postgres ───────────────────▼───────────────────────────────────────┐
-  │  agents.chunks — primary key (id) enforces the dedup                  │
-  └─────────────────────────────────────────────────────────────────────┘
+  ┌─ App ─────────────────────────────────────────────────────────┐
+  │  FallbackProvider retry → model call    ← NOT idempotent       │
+  │  runAgentLoop force-final-turn          ← NOT idempotent       │
+  └────────────────────────────────┬───────────────────────────────┘
+                                   │ writes
+  ┌─ Storage (Postgres) ───────────▼───────────────────────────────┐
+  │  ★ chunks upsert  on conflict (id) do update  ← IDEMPOTENT ★    │ ← we are here
+  │  documents upsert on conflict (id) do update  ← IDEMPOTENT      │
+  └──────────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: an operation is **idempotent** when running it N times leaves the system
-in the same state as running it once. A keyed upsert is the cleanest idempotent
-write there is: the *identity* of the row is the dedup mechanism, so a re-run
-overwrites rather than duplicates. The trick is choosing the key so that "the same
-logical thing" always lands on the same key.
+Zoom in: **idempotency** means *doing it twice has the same effect as doing it once.* It's the property that makes a retry *safe*. Once a call can be retried (and in a distributed system every call can — see `02`), you must ask of each target: "if this runs twice, what breaks?" An idempotent upsert: nothing breaks, the second write overwrites the first with identical data. A model call: it breaks your bill and possibly your output — two calls, two charges, two different generations.
 
-## Structure pass
+## Structure pass — layers, one axis, the seams
 
-**Layers.** Key construction (app) → upsert (adapter) → primary-key constraint (DB).
+**Layers:** the write targets, top to bottom: model call → trace insert → chunks upsert → documents upsert.
 
-**Axis — trace `delivery guarantee` across the writes in the repo.**
+**The one axis: *what happens if this runs exactly twice?*** This is the idempotency x-ray:
 
 ```
-  Axis — "if this runs twice, what happens?" — across the three write paths
+  "run it twice — same result?"  — traced across the write targets
 
-  ┌─ chunk upsert (PgVectorStore.upsert) ──────┐
-  │  same id → overwrites                       │  → EFFECTIVELY EXACTLY-ONCE ✓
-  └──────────────────────┬──────────────────────┘   (idempotent by primary key)
-       ┌─────────────────▼────────────────────────┐
-       │ trace insert (persistMessage)            │  → AT-LEAST-ONCE-ish, NO dedup ✗
-       └─────────────────┬────────────────────────┘   (no key; a retry doubles the row)
-            ┌────────────▼──────────────────────────┐
-            │ memory.remember (best-effort)         │  → AT-MOST-ONCE (swallowed on fail) ✗
-            └─────────────────────────────────────────┘   (a failure drops it silently)
+  ┌────────────────────────────────────────────────┐
+  │ model call (Gemma/Anthropic)   twice = 2 charges, │  ✗ NOT idempotent
+  │                                2 generations      │
+  └────────────────────┬──────────────────────────────┘
+       ┌───────────────▼──────────────────────────────┐
+       │ trace INSERT into agents.messages   twice =   │  ✗ NOT idempotent
+       │                       2 rows                  │     (append-only)
+       └───────────────┬──────────────────────────────┘
+             ┌─────────▼──────────────────────────────┐
+             │ chunks upsert  on conflict (id)  twice =│  ✓ IDEMPOTENT
+             │                same final row           │
+             └─────────┬──────────────────────────────┘
+                 ┌─────▼──────────────────────────────┐
+                 │ documents upsert  on conflict (id)  │  ✓ IDEMPOTENT
+                 └─────────────────────────────────────┘
 ```
 
-**Seam.** The guarantee flips hard across these three writes: the chunk upsert is
-idempotent, the trace insert is not (no unique key — re-running would duplicate
-rows), and the memory write is at-most-once by design (the `catch {}` swallows
-failures). Three different delivery semantics in one codebase — knowing which is
-which is the lesson.
+The answer flips at the database boundary: the writes *to Postgres* are idempotent by construction; the writes *to the model and the trace log* are not. That split is the seam — and it tells you exactly which operations you can retry blindly (the upserts) and which need a dedup key first (everything above).
 
 ## How it works
 
-### Move 1 — the mental model: the key IS the dedup
+### Move 1 — the mental model
 
-You already do this in React: a list `.map()` needs a stable `key` so React can
-tell "this is the same item, updated" from "this is a new item." An idempotent
-write is the same idea at the database: a stable row id so the database can tell
-"this is the same chunk, re-embedded" from "this is a new chunk." Same primitive,
-different layer.
+You already know the shape from a React form with a primary key: if you `PUT /users/42` twice with the same body, the row ends up the same — the `id` makes the write idempotent. A `POST /users` *without* a client-supplied id is not: twice creates two rows. Idempotency is "is the identity of the result fixed by the input, or invented by the operation?"
 
 ```
-  The idempotency kernel — stable key → upsert → one row no matter how many writes
+  The idempotency kernel — identity decides the outcome of a repeat
 
-  write #1: upsert(id="doc:42#0", vector=v1) ─┐
-  write #2: upsert(id="doc:42#0", vector=v1) ─┤──► row "doc:42#0" exists ONCE
-  write #3: upsert(id="doc:42#0", vector=v2) ─┘    (last write wins; never duplicated)
+  request carries id=K  ──►  WHERE id=K exists? ──no──► insert
+                                  │
+                                 yes ──► overwrite (same data → no-op effect)
 
-  the id is computed from (docId, chunkIndex) — same input → same key → same row
+  repeat with same id=K  ──►  always lands on the same row
+  ───────────────────────────────────────────────────────────
+  no id in the request   ──►  every call invents a new identity ──► duplicates
 ```
+
+The kernel: **a deterministic key that the operation keys on.** Remove the key and the operation invents identity on each call — that's the non-idempotent case.
 
 ### Move 2 — walking the mechanism
 
-**Step 1 — deterministic chunk ids.** The id isn't random; it's derived from the
-document and the chunk's position, so re-indexing the same document produces the
-*same* ids:
+**Part 1 — the idempotent upsert (the part the repo gets right).** Here's the chunk write in buffr:
 
-```
-  // chunk id shape, from packages/retrieval (VectorChunk): "<docId>#<index>"
-  index("doc:42", text) → chunks: ["doc:42#0", "doc:42#1", "doc:42#2", ...]
-  re-index("doc:42", text)  → SAME ids → upsert overwrites, no duplicates
-```
-
-This is the load-bearing choice. A random UUID per chunk would make every re-index
-*append* a fresh copy of the whole document — the corpus would grow without bound.
-The deterministic id is what makes re-indexing idempotent.
-
-**Step 2 — the in-memory store dedups by Map key.** The simplest possible upsert:
-
-```ts
-// packages/retrieval/src/in-memory-vector-store.ts:18-23
-async upsert(chunks: VectorChunk[]): Promise<void> {
-  for (const chunk of chunks) {
-    this.assertDimension(chunk.vector, `chunk "${chunk.id}"`);
-    this.chunks.set(chunk.id, chunk);   // ← Map.set: same key overwrites. Idempotent for free.
-  }
-}
+```sql
+-- packages/.../pg-vector-store.ts:47-56  (PgVectorStore.upsert)
+insert into agents.chunks
+  (id, document_id, app_id, chunk_index, content, embedding, embedding_model, meta)
+values ($1, $2, $3, $4, $5, $6::vector, $7, $8)
+on conflict (id) do update set            -- ← the idempotency mechanism
+  document_id     = excluded.document_id,
+  app_id          = excluded.app_id,
+  chunk_index     = excluded.chunk_index,
+  content         = excluded.content,
+  embedding       = excluded.embedding,
+  embedding_model = excluded.embedding_model,
+  meta            = excluded.meta;
 ```
 
-`Map.set` *is* an upsert — second write to the same key replaces the first. No
-duplicates possible. This is idempotency falling out of the data structure.
-
-**Step 3 — the durable store enforces it at the database.** `PgVectorStore` does
-the same thing with SQL's `on conflict`:
-
-```ts
-// buffr/src/pg-vector-store.ts:47-56
-await client.query(
-  `insert into agents.chunks (id, document_id, app_id, chunk_index, content, embedding, ...)
-   values ($1, $2, $3, $4, $5, $6::vector, ...)
-   on conflict (id) do update set            -- ← idempotency key = primary key (id)
-     document_id = excluded.document_id, app_id = excluded.app_id,
-     chunk_index = excluded.chunk_index, content = excluded.content,
-     embedding = excluded.embedding, ...`,
-  [c.id, docId, this.appId, chunkIndex, content, toVectorLiteral(c.vector), ...],
-);
-```
-
-`on conflict (id) do update` is the database guaranteeing "one row per id" — the
-primary key constraint is the dedup. Re-run the whole index ten times: the chunk
-table is identical to running it once. This is *effectively exactly-once* for the
-chunk write, achieved without any distributed coordination — just a stable key and
-a uniqueness constraint. That combination is the cheapest exactly-once you can buy.
-
-**Step 4 — where it's NOT idempotent: the trace.** `persistMessage` is a bare
-`insert` with no unique key on the message content:
-
-```ts
-// buffr/src/supabase-trace-sink.ts:27-37 (paraphrased shape)
-insert into agents.messages (conversation_id, role, content, ..., created_at)
-values ($1, $2, $3, ..., coalesce($8::timestamptz, now()))
-// ← no "on conflict" — re-running this INSERTS A SECOND ROW
-```
-
-There's no idempotency key here. If `flush()` were ever retried after a partial
-failure, you'd get duplicate trace rows. Today that doesn't happen (flush runs once
-per turn, and a failure throws out of `ask`), so the *delivery semantic* is "at most
-once, and if the process survives, exactly once" — but it's not *guaranteed*
-exactly-once, because nothing dedups a retry. Naming that honestly matters: the
-chunk write is idempotent by construction; the trace write is not.
-
-### Move 2.5 — the three delivery semantics, side by side
+Read `on conflict (id) do update`: if a row with this `id` already exists, overwrite it instead of erroring. The `id` is deterministic — it's `"<docId>#<chunkIndex>"` (the `VectorChunk` shape from `packages/retrieval`). So re-indexing the same document produces the *same* chunk ids and the *same* embeddings, and the upsert converges to an identical final state no matter how many times it runs. That is what makes ingestion *safe to retry* — and it's why a crashed-and-restarted index job doesn't double the corpus. The `documents` write (`runtime.ts:11`) uses the same pattern: `on conflict (id) do update set content = excluded.content`.
 
 ```
-  Comparison — three writes, three guarantees, in this repo
+  Re-running ingestion converges — that's idempotency earned by the key
 
-  write              key / dedup            on retry          semantic
-  ─────────────────  ────────────────────   ───────────────   ─────────────────────
-  chunk upsert       primary key (id)        overwrites        effectively exactly-once ✓
-  trace insert       none                    duplicates row    at-least-once (no dedup) ✗
-  memory.remember    id memory:<cid>:<n>     overwrites...     at-most-once (swallowed) ⚠
-                     (idempotent IF reached)  ...but a failure  on failure it's silently
-                                              is caught & dropped  gone (best-effort)
+  run 1:  doc "guide.md" → chunks "guide.md#0", "guide.md#1"  ──► 2 rows
+  run 2:  same doc        → SAME ids                          ──► 0 new rows,
+                                                                  same 2 rows updated in place
+  run N:  ────────────────────────────────────────────────────► still 2 rows
 ```
 
-The memory write is the subtle one. Its *id* (`memory:<convId>:<n>`) is
-deterministic, so the *write itself* is idempotent like the chunk write. But
-`session.ts:64-69` wraps it in `try { ... } catch {}` — a failure is swallowed so a
-lost memory never costs the user the answer they already got. That's a deliberate
-*at-most-once* choice for a best-effort side-effect. Idempotent-when-it-runs, but
-not retried-until-it-succeeds.
+**Part 2 — the non-idempotent retry (the part that bites).** Now contrast the model call. When the failover chain advances (`fallback-provider.ts:64`) or `runAgentLoop` forces a final turn after an error (`run-agent-loop.ts:216`), it issues a *fresh* `provider.complete(request)`. There's no idempotency key on the request — nothing says "if you already answered this exact request, return the prior answer." So a retry is a brand-new model call:
+
+```
+  Layers-and-hops — a retried model call is a new call, not a dedup hit
+
+  ┌─ App ──────────────┐  attempt 1: POST /api/chat  ┌─ Ollama ───┐
+  │ FallbackProvider    │ ──────────────────────────► │  generates │  ← charge/compute #1
+  │  (p0 throws)        │                              └────────────┘
+  │  advances to p1     │  attempt 2: POST (no key)   ┌─ Anthropic ┐
+  │                     │ ──────────────────────────► │  generates │  ← charge/compute #2,
+  └─────────────────────┘                             └────────────┘     DIFFERENT output
+```
+
+This is **at-most-once becoming maybe-twice.** If p0 actually *did* the work but the response was lost (a partial failure — see `02`), advancing to p1 does the work *again*. For a read-only question-answering call that's just wasted cost. For anything with a side effect it would be a double-action. The repo's agents are read-only (`toolPolicy` allowlists, per `context.md`), so the blast radius today is cost and output nondeterminism — not data corruption. But the *pattern* is non-idempotent, and that's the thing to recognize.
+
+**Part 3 — delivery semantics, named on the repo's two paths.**
+
+```
+  Delivery semantics — what each path actually guarantees
+
+  ┌──────────────────────┬───────────────────┬──────────────────────────────┐
+  │ path                  │ semantics         │ why                          │
+  ├──────────────────────┼───────────────────┼──────────────────────────────┤
+  │ model call (chain)    │ at-MOST-once*     │ tried per-provider once; a   │
+  │                       │  (*twice on retry)│ retry has no dedup key       │
+  │ trace event → messages│ at-LEAST-once-ish │ append-only INSERT; a retry  │
+  │                       │                   │ would duplicate rows         │
+  │ chunk/doc ingest      │ effective         │ at-least-once delivery + an  │
+  │                       │ EXACTLY-ONCE      │ idempotent upsert = converges │
+  └──────────────────────┴───────────────────┴──────────────────────────────┘
+```
+
+The bottom row is the textbook trick: **you don't get exactly-once *delivery* — you get at-least-once delivery plus an idempotent *operation*, which is observationally exactly-once.** The chunk pipeline already has this property for free, because the key (`docId#index`) makes the delivery count irrelevant. That's the strongest idempotency story in the repo and worth naming explicitly.
+
+**Part 4 — idempotency keys on model calls — `not yet exercised`.** The mechanism that would make a model-call retry safe is an **idempotency key**: hash the request, store `(key → response)` for a window, and on a retry with the same key return the cached response instead of re-calling. The repo has the *infrastructure* to do this (`@aptkit/memory`'s `recall` is keyed retrieval over the same vector store) but does not apply it to dedup model calls. Attach point: a key on `ModelRequest` plus a small cache the chain checks before `provider.complete`.
 
 ### Move 3 — the principle
 
-"Exactly-once delivery" across a network is impossible — the sender can never know
-if a lost ack means "the write failed" or "the write succeeded and the ack was
-lost." What you *can* build is **at-least-once delivery + idempotent processing =
-effectively exactly-once.** Retry until you get an ack (at-least-once), and make the
-operation safe to apply twice (idempotent), and the duplicates the retries cause are
-harmless. aptkit gets the idempotent half right for chunks via the keyed upsert; it
-just doesn't pair it with at-least-once retry on the trace, which is fine because
-the trace is best-effort.
+Retries and idempotency are a pair — you can't have one safely without the other. The order of operations is always: (1) decide a call can be retried (it's remote, so it can), (2) check whether the target is idempotent, (3) if not, make it idempotent *before* you retry. The repo did this correctly for the database (the upsert key) and hasn't yet for the model call (no key). The general move: **push identity into the request so the operation keys on it, and "exactly once" falls out of "at least once" for free.**
 
 ## Primary diagram
 
+Every write target with its idempotency verdict and delivery semantics.
+
 ```
-  Idempotency in aptkit — the key carries the guarantee
+  The idempotency map — retry-safe vs not
 
-  ┌─ App: pipeline.index(doc) ────────────────────────────────────────┐
-  │  deterministic id = "<docId>#<chunkIndex>"   ← same input → same key│
-  └────────────────────────────────┬──────────────────────────────────┘
-                                   │ upsert(chunks)
-            ┌──────────────────────┴───────────────────────┐
-            ▼                                               ▼
-  ┌─ InMemoryVectorStore ─┐                  ┌─ PgVectorStore (buffr) ───────┐
-  │  Map.set(id, chunk)   │                  │  insert ... on conflict (id)  │
-  │  same key overwrites  │                  │  do update                    │
-  │  → idempotent         │                  │  → idempotent (PK constraint) │
-  └───────────────────────┘                  └───────────────┬───────────────┘
-                                                             │ TCP
-                                              ┌─ Postgres: agents.chunks ─────┐
-                                              │  PRIMARY KEY (id) = the dedup  │
-                                              └────────────────────────────────┘
-
-  contrast: agents.messages (trace) has NO such key → retries would duplicate
+  ┌─ App process ──────────────────────────────────────────────────┐
+  │  model call          ── retry = new call, no key   ✗  at-most*  │
+  │  trace event         ── retry = new row            ✗  ≥once-ish  │
+  └──────────────────────────────────┬──────────────────────────────┘
+                                     │ to Postgres
+  ┌─ Storage ──────────────────────── ▼─────────────────────────────┐
+  │  chunks  on conflict (id=<doc#i>) ── retry = same row  ✓         │
+  │  documents on conflict (id)       ── retry = same row  ✓         │
+  │     └─ at-least-once delivery + idempotent op = EFFECTIVE        │
+  │        exactly-once  (the corpus converges no matter the count)  │
+  └──────────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-Idempotency keys in their full form — a client-generated UUID sent with a request so
-the *server* can dedup retries (Stripe's `Idempotency-Key` header is the canonical
-example) — are `not yet exercised` here, and they don't need to be: aptkit's
-idempotency is *natural* (the chunk's identity is its key) rather than *synthetic*
-(a key minted just for dedup). Synthetic keys matter when the operation has no
-natural identity — "charge this card $10" has no inherent id, so you invent one.
-"Store the embedding for chunk doc:42#0" already has an identity, so you reuse it.
+"Exactly-once" is the most misunderstood phrase in distributed systems. You cannot guarantee a message is *delivered* exactly once over an unreliable network — the sender can't tell "lost request" from "lost acknowledgment," so it must either risk losing the message (at-most-once) or risk duplicating it (at-least-once). What you *can* do is make the *effect* exactly-once by making the operation idempotent, which is what `on conflict (id)` buys here. This is why Kafka's "exactly-once semantics" is really "at-least-once delivery + idempotent producer + transactional consumer" — the same trick the chunk upsert uses, scaled up.
 
-This is the cheaper, better version when you can get it. The move would attach if
-buffr ever exposed an HTTP endpoint that clients retried — then a synthetic
-idempotency key on the request would dedup retries at the boundary, the way the
-primary key dedups them at the storage layer today.
+Idempotency keys are the generalization for operations that *aren't* naturally idempotent (charging a card, sending an email). Stripe's API is the canonical example: you pass an `Idempotency-Key` header and Stripe dedups for 24 hours. The repo's model calls are the equivalent un-keyed `POST` — fine while read-only, a bug the day a tool gains a side effect.
 
 ## Interview defense
 
-**Q: "Is your indexing safe to retry?"**
-"Yes, for the chunk writes — and it's safe for a specific reason. Chunk ids are
-deterministic, `<docId>#<chunkIndex>`, and `PgVectorStore` does `insert ... on
-conflict (id) do update`. So re-indexing the same document upserts the same rows
-instead of appending duplicates — effectively exactly-once via a natural
-idempotency key. The trace writes are *not* idempotent — `persistMessage` has no
-unique key, so a retried flush would duplicate rows. That's acceptable because the
-trace is best-effort and flush runs once, but I wouldn't retry it without adding a
-dedup key first."
+**Q: "Is your ingestion pipeline safe to retry?"**
+"Yes, and here's why specifically: the chunk write is `on conflict (id) do update` at `pg-vector-store.ts:47`, and the chunk id is deterministic — `docId#chunkIndex`. So re-running index on the same document produces identical ids and overwrites in place; the corpus converges regardless of how many times the job runs. That's effective exactly-once: at-least-once delivery plus an idempotent operation."
 
 ```
-  sketch
+  re-index converges
 
-  chunk:  upsert(id) on conflict do update   → retry-safe ✓ (PK is the key)
-  trace:  insert (no key)                     → retry doubles rows ✗
-  memory: deterministic id, but catch{}        → at-most-once by choice ⚠
+  doc → chunks "d#0","d#1" → upsert (id) → same 2 rows every run
 ```
 
-**Q: "Why can't you just have exactly-once delivery?"** — the load-bearing answer:
-"Because the sender can't distinguish a failed write from a successful write with a
-lost acknowledgment. So you build it from two halves you *can* have: at-least-once
-delivery (retry until acked) plus idempotent processing (safe to apply twice). The
-duplicates the retries cause become harmless. My chunk upsert is the idempotent
-half; the keyed primary constraint is what absorbs the duplicate."
+Anchor: *the deterministic key makes the upsert idempotent, so retry-safety is free.*
 
-*Anchor:* `on conflict (id) do update` (`pg-vector-store.ts:49`) is the natural
-idempotency key; the trace insert has none.
+**Q: "Is your model fallback safe to retry?"**
+"No — and I'd name it honestly. A retry is a fresh `provider.complete` with no idempotency key, so if the first provider actually did the work but lost the response, advancing re-does it: double cost, different output. It's tolerable today because the agents are read-only, but it's a non-idempotent retry. The fix is an idempotency key on `ModelRequest` with a short-lived response cache."
+
+Anchor: *idempotent on the DB (keyed upsert), not on the model call (un-keyed retry).*
 
 ## See also
 
-- `02-partial-failure-timeouts-and-retries.md` — retries are why idempotency matters
-- `08-sagas-outbox-and-cross-boundary-workflows.md` — idempotent steps make sagas safe to re-run
-- **study-database-systems** — primary keys, unique constraints, `on conflict` internals
-- **study-data-modeling** — the `agents.chunks` schema and its key design
-```
+- `02-partial-failure-timeouts-and-retries.md` — retries are *why* idempotency matters
+- `08-sagas-outbox-and-cross-boundary-workflows.md` — the dual write relies on both upserts being idempotent to be re-runnable
+- `04-consistency-models-and-staleness.md` — read-your-writes after an idempotent upsert
+- `study-database-systems` — how `on conflict` is implemented (the unique index, the conflict arbiter)
+- `study-data-modeling` — the chunk id scheme and the soft `document_id` link

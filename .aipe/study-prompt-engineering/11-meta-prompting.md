@@ -1,190 +1,245 @@
 # 11 — Meta-prompting
 
-**Industry name:** meta-prompting / prompt generation — *Industry standard*
+**Subtitle:** meta-prompting — an LLM writes prompts for another LLM call
+(Industry standard)
 
 ## Zoom out, then zoom in
 
-Meta-prompting is using an LLM to write or improve the prompts for *another* LLM
-call. It earns its keep on the initial drafting of a complex prompt — staring at a
-blank prompt is slow, and a model will give you a structured first draft in
-seconds. Where it doesn't earn its keep: small tweaks and prompts under high
-iteration pressure, where a human edit is faster than a round-trip. The risk I
-watch for: prompts that read like *LLM output* — vague, padded, hedge-laden —
-instead of like engineering specs. In aptkit there's a building block for
-templated prompt assembly, but **no LLM-writes-prompts pipeline is wired** — that
-part is `not yet exercised`.
+Meta-prompting is using a model to write or improve the prompts that other
+model calls consume. aptkit is *built by* this workflow — its slash-command
+toolchain leans on an LLM to draft prompts and study guides — but inside the
+runtime, prompts are assembled by deterministic string code, not generated
+by a model at runtime. The distinction matters: meta-prompting is an
+authoring-time practice here, not a runtime one.
 
 ```
-  Zoom out — prompt-building machinery vs meta-prompting
+  Zoom out — meta-prompting at authoring time, not runtime
 
-  ┌─ Building blocks that exist ──────────────────────────────┐
-  │  renderPromptTemplate({var})  — composes a prompt string   │ ← we are here
-  │  injectProfile()  — splices me.md INTO a system template   │
-  │  buildRubricJudgeSystemPrompt() — assembles a judge prompt  │
-  │     from a RubricDefinition (data → prompt)                 │
-  └───────────────────────────┬────────────────────────────────┘
-  ┌─ True meta-prompting (NOT in repo) ─▼──────────────────────┐
-  │  human writes goal → LLM drafts prompt → human reviews →    │
-  │  prompt enters the codebase as a PromptPackage              │  (not yet exercised)
-  └──────────────────────────────────────────────────────────────┘
+  ┌─ Authoring time (LLM drafts prompts) ───────────────────────┐
+  │  ★ human writes goal → LLM drafts prompt → human reviews ★    │ ← we are here
+  │     → prompt enters the codebase as a PromptPackage          │
+  │     (aptkit's slash commands lean on this under the hood)    │
+  └───────────────────────────┬──────────────────────────────────┘
+                              │ committed prompt
+  ┌─ Runtime (deterministic assembly) ▼───────────────────────────┐
+  │  renderPromptTemplate({var}) + injectProfile — STRING code,   │
+  │  no model generates a prompt at runtime → NOT YET EXERCISED   │
+  └────────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: the repo's prompts are *programmatically assembled* (data structures
-rendered into prompt strings) but *human-authored*. `buildRubricJudgeSystemPrompt`
-(`rubric-judge.ts:107`) is the closest thing — it turns a structured
-`RubricDefinition` into a prompt — which is meta-*construction* but not
-LLM-driven meta-*generation*.
+Zooming in: the meta-prompting workflow is human writes the goal → LLM drafts
+the prompt → human reviews and edits → prompt enters the codebase. The
+review step is load-bearing: it's what keeps the prompt from reading like LLM
+output instead of an engineering spec. aptkit's runtime prompt *assembly* is
+deterministic, so the meta-prompting in this repo lives in how its prompts
+and docs were authored, not in a runtime self-prompting loop.
 
-## The structure pass
+## Structure pass
 
-**Layers:** the goal (what the prompt should do) → the draft (who writes it:
-human or LLM) → the codebase prompt (the reviewed artifact).
+**Layers.** Authoring (LLM drafts, human reviews) → source (committed
+`PromptPackage`) → runtime (deterministic assembly).
 
-**Axis — who authors the prompt text?** This is the axis that separates what
-exists from what doesn't:
+**Axis — what writes the prompt text?** Trace it:
 
 ```
-  Axis: "who writes the prompt string?"
+  Axis: "what produces the prompt string?"
 
-  ┌─ Programmatic assembly (SHIPPED) ─┐  seam  ┌─ LLM generation (NOT shipped) ─┐
-  │ data → prompt via code            │ ══╪══► │ goal → LLM drafts prompt        │
-  │ rubric-judge: RubricDefinition    │ flips  │ → human reviews → codebase      │
-  │   → system prompt                 │        │ (meta-prompting proper)         │
-  │ injectProfile: profile → template │        │   not yet exercised             │
-  └───────────────────────────────────┘        └──────────────────────────────────┘
+  authoring time   → an LLM drafts it (then a human edits)   ← meta-prompting
+  committed source → a static template literal              (frozen draft)
+  runtime assembly → renderPromptTemplate, string substitution (deterministic)
+  runtime model    → does NOT generate prompts for other calls → not exercised
 ```
 
-**Seam:** the authoring boundary. On the shipped side, *code* assembles prompts
-from structured data — deterministic, reviewable, no model in the loop. On the
-unshipped side, a *model* would draft the prompt. **Why the distinction matters:**
-programmatic assembly is safe and testable (the same `RubricDefinition` always
-yields the same prompt); LLM generation needs a human-review gate or you ship
-prompts that read like LLM output.
+**Seam.** The boundary between *authoring* and *runtime* is the load-bearing
+one. Meta-prompting happens on the authoring side of that seam — a model
+helps write the template. Once the template crosses into source, runtime
+treats it as fixed and assembles it with pure string code. Conflating the two
+sides is the mistake: a runtime that lets a model rewrite the prompt is a
+different, riskier system than one that assembles a reviewed template.
 
 ## How it works
 
-### Move 1 — the mental model
+You know how you might ask a model to scaffold a component, then read and fix
+every line before committing? Meta-prompting is that for prompts: the model
+drafts, you review, the result enters the repo as code you own. Let's walk
+where this lives in aptkit and where it deliberately stops.
 
-You already use code generators — a scaffolding CLI writes boilerplate you then
-edit, a schema generates types. Meta-prompting is a code generator where the
-generator is an LLM and the artifact is a prompt. The non-negotiable, same as any
-generated code: a human reviews it before it enters the repo.
+### Step 1 — the authoring workflow (how these prompts were born)
 
-```
-  Pattern — meta-prompting workflow (the proper form)
-
-  human: writes the GOAL ("a prompt that classifies support tickets")
-        │
-        ▼
-  LLM: drafts a candidate prompt
-        │
-        ▼
-  human: REVIEWS + edits (this gate is mandatory)
-        │
-        ▼
-  codebase: prompt enters as a versioned PromptPackage (concept 03)
-```
-
-### Move 2 — walking what exists
-
-**Programmatic prompt assembly (the shipped cousin).**
-`buildRubricJudgeSystemPrompt` (`rubric-judge.ts:107`) is a pure function:
-`RubricDefinition` in, system-prompt string out. It renders dimensions, scales,
-verdicts, checks, and calibration examples into a structured prompt
-deterministically:
+aptkit's interface is slash commands that compose markdown templates into
+prompts (per the project context — "markdown-as-source-of-truth, prompt
+templates as code, slash commands as the interface"). The study guide you're
+reading and the prompt packages were drafted through exactly the
+meta-prompting loop:
 
 ```
-  Inline annotation — rubric-judge.ts:107 prompt-from-data
+  Pattern — the meta-prompting authoring loop
 
-  const dimensions = rubric.dimensions.map(d => `${d.id} ${d.label}: ...`);  ← data → text
-  const verdicts   = rubric.verdicts.map(r => `- ${r.verdict}: ...`);
-  const outputShape = { dimensions: ..., verdict: ..., fix: '', reasoning: '' };
-  return [ `You are a rubric judge for: ${rubric.title}.`, ...,
-           'Use exactly this shape:', JSON.stringify(outputShape) ].join('\n');
-  // → one rubric definition → one deterministic prompt. No LLM authored this.
+  ┌──────────────────────────────────────────────────────┐
+  │ 1. human writes the GOAL (a spec, a capability intent) │
+  │ 2. LLM DRAFTS the prompt / template                    │
+  │ 3. human REVIEWS and edits  ← the load-bearing step    │
+  │ 4. prompt enters the codebase as a PromptPackage       │
+  │ 5. from here, runtime treats it as fixed source        │
+  └──────────────────────────────────────────────────────┘
 ```
 
-This is meta-prompting's safe half: prompts built *from structure*, so changing a
-rubric changes its prompt without hand-editing the string. **What breaks without
-it:** every new rubric needs a hand-written prompt, and the prompts drift apart.
+The output of this loop is the static system literals you've seen —
+`QUERY_PROMPT`, `RECOMMENDATION_PROMPT`. They read like engineering specs
+(numbered hard rules, explicit output contracts), not like model chatter,
+*because* a human edited them after the draft. Skip step 3 and you get the
+failure mode below.
 
-**Profile injection as templated composition.** `injectProfile`
-(`context/src/profile-injector.ts:25`) splices a profile document (me.md) into a
-system template before rendering (`rag-query-agent.ts:56`). It's pure
-string-in/string-out and runs *before* `renderPromptTemplate` so placeholders
-survive (`:30` comment). This is prompt *composition* — assembling a final prompt
-from parts — which is the mechanical substrate meta-prompting builds on.
+### Step 2 — runtime assembly is deterministic, not generative
 
-**What's NOT here.** No tool, script, or slash command in this repo asks an LLM to
-*write* a prompt that then becomes a `PromptPackage`. The prompts in
-`packages/prompts/src/*.ts` are hand-authored. So the full meta-prompting loop
-(goal → LLM draft → review → codebase) is `not yet exercised`.
+At runtime, no model writes a prompt. The assembly is pure string code:
 
-### Move 3 — the principle
+```ts
+// packages/prompts/src/types.ts:24
+export function renderPromptTemplate(template, variables): string {
+  return template.replace(/\{([a-zA-Z0-9_]+)\}/g, (m, name) =>
+    variables[name] === undefined ? m : variables[name]);
+}
+```
 
-**Meta-prompting is a generator pattern, and like any generator its output must
-pass a human review gate before it's trusted.** It's a drafting accelerant, not
-an authoring replacement — it shines on cold-start complex prompts and wastes
-time on small edits. The repo's shipped half (prompts assembled from structured
-data) is the deterministic, testable foundation; the LLM-driven half is a roadmap
-item with one hard rule attached: review, or you ship prompts that read like an
-LLM wrote them.
+```ts
+// packages/context/src/profile-injector.ts:25 — also pure string-in/string-out
+export function injectProfile(systemTemplate, profileText, opts): string {
+  const block = opts?.heading ? `${opts.heading}\n${profileText}` : profileText;
+  return opts?.position === 'end' ? `${systemTemplate}\n\n${block}`
+                                  : `${block}\n\n${systemTemplate}`;
+}
+```
+
+Both are deterministic transforms. A model is never in the loop that builds
+the prompt sent to another model. So *runtime* meta-prompting — a model
+generating a prompt for a downstream call — is `not yet exercised`. The
+meta-prompting in this repo is the authoring history of those literals.
+
+### Step 3 — when meta-prompting saves time, when it doesn't
+
+```
+  Comparison — meta-prompting fit
+
+  initial drafting of a complex prompt → USE (LLM gets you to a v0 fast)
+  a study guide / a long template      → USE (aptkit's docs were drafted so)
+  a small tweak to a live prompt       → SKIP (faster to edit by hand)
+  a prompt under high iteration pressure→ SKIP (the eval loop is the tool,
+                                              not a re-draft each cycle)
+```
+
+The rule of thumb: meta-prompting is a *drafting* accelerator. It gets you
+from a blank file to a reviewable v0. Once a prompt is live and you're tuning
+it against evals (concept 5), the eval loop — not another LLM draft — is the
+right tool. Re-drafting a live prompt with a model throws away the
+hard-won, eval-tested edits.
+
+### Step 4 — the risk: prompts that read like LLM output
+
+The failure mode meta-prompting invites: a prompt that sounds like a model
+wrote it — hedged, padded, vague ("please try your best to be helpful and
+thorough"). Compare that to aptkit's actual prompts, which are terse and
+spec-like:
+
+```ts
+// packages/prompts/src/recommendation.ts:18 — reads like a spec, not chatter
+## Hard rules
+1. Pass project_id: {project_id} to every tool call when a tool accepts ...
+2. Make at most 4 tool calls. Mostly reason from the diagnosis ...
+4. Each recommendation MUST set bloomreachFeature to exactly one ...
+```
+
+Numbered, imperative, testable. That's the human review step (step 1's #3)
+having done its job — the LLM draft got edited down into an engineering
+artifact. The risk is real precisely when you skip the review and commit the
+draft.
+
+### The principle
+
+**Meta-prompting is an authoring accelerator — a model drafts, a human
+reviews into a spec, the result enters the codebase as owned source.** Keep
+it on the authoring side of the seam: runtime should assemble reviewed
+templates deterministically, not let a model rewrite the prompt on the fly.
+And never skip the review — an unedited LLM-drafted prompt reads like
+chatter, not a contract.
 
 ## Primary diagram
 
+The authoring loop, the seam, and the deterministic runtime.
+
 ```
-  Meta-prompting in aptkit — shipped vs roadmap
+  Meta-prompting in aptkit — authoring vs runtime
 
-  SHIPPED: programmatic assembly (code writes prompts from data)
-  ┌────────────────────────────────────────────────────────────┐
-  │ RubricDefinition ──buildRubricJudgeSystemPrompt──► prompt   │
-  │ profile (me.md) ──injectProfile──► template ──render──► sys │
-  │   deterministic · testable · no model in the loop           │
-  └────────────────────────────────────────────────────────────┘
-
-  ROADMAP: meta-prompting proper (LLM writes prompts)   [not yet exercised]
-  ┌────────────────────────────────────────────────────────────┐
-  │ goal → LLM draft → HUMAN REVIEW (gate) → PromptPackage      │
-  │   risk: prompts that read like LLM output, not specs        │
-  └────────────────────────────────────────────────────────────┘
+  ┌─ AUTHORING (meta-prompting lives here) ─────────────────────┐
+  │  goal ─► LLM drafts ─► HUMAN REVIEWS/EDITS ─► PromptPackage  │
+  │  slash commands compose markdown templates under the hood    │
+  └────────────────────────────┬──────────────────────────────────┘
+              ════════════════ seam ════════════════
+                              │ committed, frozen source
+  ┌─ RUNTIME (deterministic, no model writes prompts) ▼───────────┐
+  │  renderPromptTemplate({var})  +  injectProfile(profile)       │
+  │  pure string transforms → the prompt sent to the model        │
+  │  runtime meta-prompting → NOT YET EXERCISED                   │
+  └────────────────────────────────────────────────────────────────┘
+   risk if review skipped: a prompt that reads like LLM output, not a spec
 ```
 
 ## Elaborate
 
-Meta-prompting spans a spectrum: at the deterministic end, templating systems
-assemble prompts from structured config (this repo's `buildRubricJudgeSystemPrompt`
-and `renderPromptTemplate`); at the autonomous end, frameworks like DSPy
-*optimize* prompts against a metric with no human in the draft loop (the fully
-automated form, which the spec lists as out of scope and the repo doesn't touch).
-The pragmatic middle — human writes the goal, LLM drafts, human reviews — is what
-most teams actually use, because it captures the drafting speedup while keeping
-the review gate that prevents LLM-flavored prompt rot. The risk is real: an
-unreviewed LLM-drafted prompt tends to be longer, vaguer, and more hedge-laden
-than a human spec — exactly the qualities a good prompt avoids.
+Meta-prompting spans a spectrum: at the light end, using a model to draft a
+prompt you then own (aptkit's authoring practice); at the heavy end, runtime
+systems where a model generates the next prompt in a chain (prompt-rewriting
+agents, automatic prompt optimization like DSPy or APE). aptkit sits firmly
+at the light end — its slash-command toolchain is a meta-prompting authoring
+surface, and its runtime is deterministic by design.
+
+That design choice is defensible for a toolkit: deterministic assembly is
+reviewable, testable, and reproducible (it feeds the replay eval pipeline,
+concept 5). A runtime that regenerates prompts would break replay
+determinism. So the absence of runtime meta-prompting isn't a gap to rush to
+fill — it's a deliberate boundary that keeps the system testable.
+Automated prompt *optimization* (a model searching prompt-space against an
+eval) is the genuinely-unbuilt extension, and it would compose with the
+existing eval harness.
 
 ## Interview defense
 
-**Q: When does meta-prompting help and when does it hurt?** Helps for the initial
-draft of a complex prompt (beats a blank page). Hurts on small tweaks and
-high-iteration prompts where a human edit is faster than a model round-trip. And
-it always needs a human review gate — unreviewed LLM-drafted prompts read like
-LLM output, not engineering specs.
+**Q: What is meta-prompting and where does it belong?**
+
+Using an LLM to write or improve prompts for other LLM calls. It belongs at
+authoring time: a model drafts, a human reviews the draft into an engineering
+spec, the result enters the codebase as owned source. Keep it off the runtime
+path — a system that lets a model rewrite prompts on the fly is harder to
+test and breaks replay determinism. aptkit's slash-command toolchain is the
+authoring surface; its runtime assembly (`renderPromptTemplate`,
+`injectProfile`) is pure deterministic string code.
 
 ```
-  goal → LLM draft → [HUMAN REVIEW] → codebase
-                        the mandatory gate
+  authoring: LLM drafts → human reviews → committed spec
+  runtime:   deterministic string assembly (no model writes prompts)
 ```
-*Anchor: programmatic assembly exists (`rubric-judge.ts:107`,
-`profile-injector.ts:25`); LLM-driven generation is not yet exercised.*
 
-**Q: The part people forget?** The **review gate**, and the distinction between
-*assembling* a prompt from data (deterministic, safe — what the repo does) and
-*generating* one with an LLM (needs review). Conflating them is how unreviewed,
-LLM-flavored prompts sneak into a codebase.
+Anchor: "aptkit's prompts read like specs — numbered hard rules, explicit
+output contracts — because a human edited the LLM draft. Runtime is
+deterministic; runtime meta-prompting isn't exercised, and that keeps replay
+deterministic."
+
+**Q: What's the risk of meta-prompting, and how do you avoid it?**
+
+Prompts that read like LLM output — hedged, padded, vague — instead of like
+specs. The avoidance is the human review step: edit the draft down to
+numbered, imperative, testable instructions. And scope it to drafting; once a
+prompt is live, tune it against evals rather than re-drafting it with a model,
+or you throw away eval-tested edits.
+
+Anchor: "Skip the review → chatter prompts. aptkit's
+`recommendation.ts` hard-rules are the reviewed-spec shape."
 
 ## See also
 
-- `03-prompts-as-code.md` — the PromptPackage a meta-prompt would become.
-- `05-eval-driven-iteration.md` — evals are how you'd validate a generated prompt.
-- `01-anatomy.md` — `injectProfile` composes the system section.
-- `08-few-shot.md` — `buildRubricJudgeSystemPrompt` also splices examples.
+- [03-prompts-as-code.md](03-prompts-as-code.md) — the committed
+  `PromptPackage` the authoring loop produces
+- [01-anatomy.md](01-anatomy.md) — `injectProfile` and template rendering as
+  the deterministic assembly
+- [05-eval-driven-iteration.md](05-eval-driven-iteration.md) — the tool for
+  tuning a live prompt instead of re-drafting it

@@ -1,58 +1,75 @@
-# 03 — Contract as the Product
+# The Contract as the Product
 
-**Subtitle:** Information hiding via vendor-neutral contracts · the abstraction
-*is* the deliverable — *Industry standard* (the retrieval port pattern;
-"depend on an interface, not an implementation").
+**Industry name(s):** dependency inversion / published interface /
+contract-first design · **type:** Industry standard
+
+The retrieval contracts (`EmbeddingProvider` + `VectorStore`) aren't
+plumbing inside the RAG pipeline — they're the deliverable. The strongest
+evidence: a brand-new feature, episodic memory (`@aptkit/memory`), reuses
+them with *zero new infrastructure*, and an external repo (buffr) ships
+the durable implementation. When a contract proves right by being reused
+without modification, the contract is the product.
 
 ---
 
 ## Zoom out, then zoom in
 
-The RAG pipeline in aptkit has two adaptability seams, and the design bet is that
-those two seams — not the in-memory store, not nomic, not pgvector — are the
-actual product. The vendors are interchangeable; the contracts are forever.
+Here's the whole retrieval story in one frame. Two small interfaces sit
+in the middle. Above them: the index path, the query path, the search
+tool, and — the proof — the memory engine, all written against the
+interfaces. Below them: an in-memory adapter here, a Postgres adapter
+in buffr.
 
 ```
-  Zoom out — where the retrieval contracts sit
+  Zoom out — the contracts are the center of gravity
 
-  ┌─ Agent / tool layer ─────────────────────────────────────────┐
-  │  search_knowledge_base tool · @aptkit/memory (remember/recall)│
-  └────────────────────────────┬───────────────────────────────────┘
-                               │ pipeline.index() / pipeline.query()
-  ┌─ Pipeline (vendor-blind) ──▼───────────────────────────────────┐
-  │  indexDocument · queryKnowledgeBase — names ONLY embedder+store│
-  └──────────────┬─────────────────────────┬────────────────────────┘
-                 │ ★ EmbeddingProvider ★    │ ★ VectorStore ★   ← we are here
-  ┌─ Adapters ───▼────────────┐  ┌──────────▼────────────────────────┐
-  │ OllamaEmbeddingProvider   │  │ InMemoryVectorStore (cosine)       │
-  │ (nomic, 768)              │  │ PgVectorStore (in buffr, drop-in)  │
-  └───────────────────────────┘  └─────────────────────────────────────┘
+  ┌─ Clients of the contracts ─────────────────────────────────────┐
+  │ indexDocument · queryKnowledgeBase · search_knowledge_base tool │
+  │ createConversationMemory (remember/recall) ← the PROOF          │
+  └────────────────────────────┬────────────────────────────────────┘
+                               │ embed() / upsert() / search()
+  ┌─ Contracts ★ ──────────────▼────────────────────────────────────┐
+  │ EmbeddingProvider  ·  VectorStore   (contracts.ts)              │  ← we are here
+  └────────────────────────────┬────────────────────────────────────┘
+                               │ implemented by
+  ┌─ Adapters ─────────────────▼────────────────────────────────────┐
+  │ InMemoryVectorStore · OllamaEmbeddingProvider  (in aptkit)      │
+  │ PgVectorStore  (in buffr — different repo, same contract)       │
+  └───────────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: the concept is **information hiding at the seam** — the pipeline
-encapsulates the decision "what embeds text, what stores vectors" so completely
-that the words "nomic", "Ollama", "pgvector" appear *nowhere* in the pipeline
-code. The header comment states it as law (`contracts.ts:1-5`): "the pipeline
-logic never names a vendor." The question it answers: how do you write RAG once
-and run it against an in-memory array today and Postgres tomorrow with no change
-to the pipeline?
+Zoom in: the concept is **dependency inversion made the deliverable** —
+the high-level policy (RAG, memory) and the low-level detail (in-memory,
+pgvector) both depend on an abstraction the codebase owns. The question:
+*how do you know your abstraction is the right boundary and not a guess?*
+Answer: you reuse it for something it wasn't designed for, and it fits
+without changing.
 
 ---
 
-## Structure pass
+## The structure pass
 
-- **Layers:** consumer (tool / memory) → pipeline functions → the two contracts
-  → the concrete adapters.
-- **Axis — "is a vendor named here?":** trace it down.
-  - consumer → no. Calls `pipeline.query(q, k)`.
-  - pipeline → no. `indexDocument`/`queryKnowledgeBase` speak `embedder`,
-    `store`, `vector` only (`pipeline.ts:31-59`).
-  - contract → no. `EmbeddingProvider`/`VectorStore` carry a `dimension` and
-    verbs, no vendor (`contracts.ts:22-37`).
-  - adapter → **yes, finally.** "nomic-embed-text", `localhost:11434`, cosine.
-- **Seam:** the two contract types. Vendor knowledge flips from absent to present
-  exactly there. And the proof the seam is right: a *second, unplanned* consumer
-  (`@aptkit/memory`) plugged into the same seam with zero new infrastructure.
+**Layers.** Policy (RAG pipeline, memory engine) → contracts
+(the two interfaces) → mechanism (in-memory cosine, pgvector SQL).
+
+**Axis — trace `dependency` again, but watch for the *reuse* signal.**
+
+```
+  One axis: "who depends on the contract — and how many, doing what?"
+
+  ┌─ retrieval index/query ─┐ ─┐
+  ┌─ search tool            ┐  │  all depend DOWN on the same
+  ┌─ memory remember/recall ┐  ├─► two contracts — built for RAG,
+  └─────────────────────────┘ ─┘  reused by memory unmodified
+                ▼
+  ┌─ EmbeddingProvider / VectorStore ┐  depends on nothing
+  └──────────────────────────────────┘
+```
+
+**Seam.** The contract boundary is load-bearing because *count the
+clients*: the more independent things that depend on a contract without
+forcing it to change, the more the boundary was real. Memory crossing the
+same seam RAG uses is the seam proving itself.
 
 ---
 
@@ -60,223 +77,230 @@ to the pipeline?
 
 ### Move 1 — the mental model
 
-You know how a React component takes `props` and doesn't care whether the data
-came from a `fetch`, a cache, or a test fixture? The component codes against the
-*prop shape*. The pipeline codes against the *contract shape* — `embed(texts)`
-and `upsert/search` — and doesn't care what's behind them.
+You know how a well-designed React hook gets reused in components it was
+never written for — `useFetch` written for one screen turns out to power
+five — and you don't touch the hook, you just call it? A contract that's
+the *product* is that, at the architecture seam. You design
+`VectorStore` for document RAG, then realize episodic memory is *also*
+"embed a thing, store it, search by similarity" — and you reuse the
+contract verbatim.
 
 ```
-  Pattern — two contracts, the pipeline between them, vendors at the edges
+  Pattern — one contract, N independent clients, zero changes
 
-   index path:   doc ─► chunkText ─► embedder.embed() ─► store.upsert()
-                              (the pipeline only ever calls these two verbs)
-   query path:   query ─────────────► embedder.embed() ─► store.search() ─► hits
-
-   ┌──────────────────┐        ┌──────────────────┐
-   │ EmbeddingProvider│        │ VectorStore      │
-   │  dimension        │        │  dimension        │
-   │  embed(texts)     │        │  upsert(chunks)   │
-   └──────────────────┘        │  search(vec, k)   │
-                               └──────────────────┘
-        ▲ swap the body, the pipeline never notices ▲
+   RAG index ──┐
+   RAG query ──┤
+   search tool ─┼──► [ VectorStore contract ] ──► InMemory / Pg
+   memory ─────┘      (designed for the first 3,
+                       reused by the 4th unchanged)
 ```
-
-The strategy: **the two contract types are the deliverable; everything that
-satisfies them is an implementation detail living at the edge.**
 
 ### Move 2 — the step-by-step walkthrough
 
-**The two contracts, in full.** Tiny — and that's the point.
+**The contract carries only what every adapter must promise.** Look at
+what's *not* in `VectorStore` (`contracts.ts:33`): no `connect()`, no
+`close()`, no SQL, no collection name. Just `dimension`, `upsert`,
+`search`. The interface is the minimum that's true of every backing
+store. That minimalism is what lets pgvector and an in-memory array both
+satisfy it.
+
+**RAG is the first client.** The pipeline functions speak only the
+contract (`pipeline.ts`):
 
 ```ts
-// packages/retrieval/src/contracts.ts:22-37
-export type EmbeddingProvider = {
-  id: string;
-  dimension: number;                          // fixed per provider (768 = nomic)
-  embed(texts: string[]): Promise<number[][]>;
-};
-export type VectorStore = {
-  dimension: number;
-  upsert(chunks: VectorChunk[]): Promise<void>;
-  search(vector: number[], k: number): Promise<VectorHit[]>;
-};
+const vectors = await wiring.embedder.embed(texts);     // EmbeddingProvider
+await wiring.store.upsert(chunks);                      // VectorStore
+// ...
+return wiring.store.search(vector, topK);               // VectorStore
 ```
 
-`embed` is one verb. `VectorStore` is two verbs plus a `dimension`. Behind these:
-HTTP to Ollama, a cosine scan over a `Map`, or pgvector's ANN index in buffr. The
-pipeline (`pipeline.ts`) imports the *types* and never an adapter.
+`indexDocument` (:32) and `queryKnowledgeBase` (:50) name no vendor. The
+comment at `contracts.ts:1–5` states the rule out loud.
 
-**The pipeline names nothing.** Here's the index path — read it for vendor words:
+**Memory is the proof.** Now read `createConversationMemory`
+(`conversation-memory.ts:60`). It takes the *same two contracts* by
+dependency injection (:18–31) and re-implements RAG's two paths under new
+names:
 
 ```ts
-// packages/retrieval/src/pipeline.ts:31-47 (condensed)
-export async function indexDocument(doc, wiring: RetrievalWiring) {
-  assertWiring(wiring);                          // dim check (see below)
-  const texts = chunkText(doc.text);
-  if (texts.length === 0) return;
-  const vectors = await wiring.embedder.embed(texts);     // contract verb
-  const chunks = texts.map((text, i) => ({
-    id: `${doc.id}#${i}`,
-    vector: vectors[i]!,
-    meta: { ...(doc.meta ?? {}), docId: doc.id, chunkIndex: i, text },
-  }));
-  await wiring.store.upsert(chunks);             // contract verb
-}
+async remember(turn) {                       // = the RAG INDEX path
+  const [vector] = await embedder.embed([text]);
+  await store.upsert([{ id: `${kind}:${turn.conversationId}:${n}`, vector, meta }]);
+},
+async recall(query, k) {                     // = the RAG QUERY path
+  const [vector] = await embedder.embed([query]);
+  const hits = await store.search(vector, fetchK);
+  return hits.filter(h => h.meta?.kind === kind).slice(0, k).map(...);
+},
 ```
 
-`wiring.embedder` and `wiring.store` — that's all it knows. Swap
-`InMemoryVectorStore` for `PgVectorStore` and not one line here changes.
-
-**The one piece of shared knowledge the contract guards: dimension.** A corpus
-embedded at 768 dims can't be searched by a query of another dimension — silent
-mismatch corrupts ranking. So the contract carries `dimension` and the pipeline
-fails *loud, at wiring time*:
-
-```ts
-// pipeline.ts:22-29
-function assertWiring(wiring: RetrievalWiring): void {
-  if (wiring.embedder.dimension !== wiring.store.dimension) {
-    throw new Error(`dimension mismatch: embedder "${wiring.embedder.id}" is ` +
-      `${wiring.embedder.dimension}-dim but store is ${wiring.store.dimension}-dim ...`);
-  }
-}
-```
-
-This is a one-way door (lens 6 of the audit): a mistake here is unrecoverable
-without re-indexing, so it's made impossible to proceed past.
-
-**The proof the seam is right — memory reuses it with zero new infra.** This is
-the strongest design evidence in the whole repo. `@aptkit/memory` needed to store
-and recall conversation turns by similarity. It did *not* build a memory store.
-It took the *same two contracts*:
-
-```ts
-// packages/memory/src/conversation-memory.ts:60-87 (condensed)
-export function createConversationMemory(opts) {
-  const { embedder, store } = opts;              // the SAME contracts
-  // remember = the RAG index path, one row:
-  async remember(turn) {
-    const [vector] = await embedder.embed([format(turn)]);
-    await store.upsert([{ id: `${kind}:${turn.conversationId}:${n}`, vector,
-                          meta: { kind, conversationId, text } }]);
-  }
-  // recall = the RAG query path:
-  async recall(query, k) {
-    const [vector] = await embedder.embed([query]);
-    const hits = await store.search(vector, fetchK);
-    return hits.filter(h => h.meta?.kind === kind).slice(0, k)...;
-  }
-}
-```
-
-`remember` *is* `indexDocument` for one row; `recall` *is* `queryKnowledgeBase`
-with a `kind` filter. A contract a second consumer adopts unchanged was drawn at
-the right boundary — that's the load-bearing claim, and it's testable: strip the
-contracts and memory would need its own store, its own embedder wiring, its own
-dimension guard. It needed none.
+`remember` *is* index; `recall` *is* query. No new interface, no new
+store type, no schema migration. The comment at :48–59 says it plainly:
+*"Pass a `PgVectorStore` for durable memory, an `InMemoryVectorStore`
+for tests — the logic is identical."* That's the contract proving it was
+drawn at the right boundary.
 
 ```
-  Layers-and-hops — one seam, two consumers, zero duplicated infra
+  Layers-and-hops — memory reuses RAG's exact two paths
 
-  ┌─ retrieval ──────┐   embed()/upsert()/search()   ┌─ EmbeddingProvider ┐
-  │ indexDocument    │ ─────────────────────────────►│ + VectorStore      │
-  │ queryKnowledge   │                                │ (the contracts)    │
-  └──────────────────┘                                │                    │
-  ┌─ memory ─────────┐   embed()/upsert()/search()    │                    │
-  │ remember / recall│ ─────────────────────────────►│  ◄── same seam     │
-  └──────────────────┘   (no new store, no new infra) └────────────────────┘
+  ┌─ Memory client ──┐  remember(turn)        recall(query)
+  │ conversation-    │       │                     │
+  │ memory.ts        │       ▼ embed+upsert         ▼ embed+search+filter
+  └──────────────────┘  ┌────────────────────────────────┐
+                        │ EmbeddingProvider + VectorStore │  ← same contract
+                        │   (the RAG index/query paths)   │     as RAG
+                        └────────────────┬────────────────┘
+                                         ▼
+                            InMemoryVectorStore / PgVectorStore
 ```
+
+**The external proof — buffr's `PgVectorStore`.** The durable adapter
+lives in a *different repository* and is injected into aptkit from
+outside. aptkit's core never imports it. A contract that an external repo
+can satisfy without aptkit knowing is a published interface in the truest
+sense.
+
+### Move 2 variant — the load-bearing skeleton
+
+1. **Kernel:** a minimal interface owned by the policy layer + injection
+   of the implementation + ≥2 independent clients that depend on it.
+
+2. **What breaks if removed:**
+   - Put a vendor method on the contract (e.g. `store.sql(...)`) → the
+     in-memory adapter can't satisfy it; the abstraction collapses to
+     "Postgres with extra steps" and memory/tests can't reuse it.
+   - Let memory define its *own* store interface → two near-identical
+     contracts drift apart; buffr now has to implement two; the "zero
+     new infra" win evaporates. (This is the leak the audit warns about
+     in lens 3.)
+   - Remove injection (let the pipeline `new InMemoryVectorStore()`) →
+     buffr can't supply pgvector; the contract stops being a product and
+     becomes an internal detail.
+
+3. **Skeleton vs hardening:** the kernel is the minimal contract + DI +
+   reuse. The dimension field on the contract is hardening (it makes the
+   one-way-door explicit — see `04`).
+
+### Move 2.5 — current state vs future state
+
+The contract is right, but it's not yet *complete*. One capability is
+missing and the absence leaks.
+
+```
+  Phase A (now)                        Phase B (the fix the audit names)
+  ─────────────                        ──────────────────────────────────
+  VectorStore has no metadata filter.  VectorStore gains optional filter:
+  Both the search tool (:88) and        search(vector, k, filter?)
+  memory recall (:94) OVER-FETCH        Pg pushes filter into SQL WHERE;
+  (topK*4 / max(k*4,20)) then           in-memory filters in the scan.
+  POST-FILTER by meta in the client.    Clients drop the over-fetch +
+  Same workaround, two magic numbers,   the two magic numbers; the
+  two files.                            knowledge lives in ONE place.
+```
+
+What doesn't have to change in Phase B: the policy layer (RAG, memory),
+the adapters' core ranking, the DI wiring. Only the contract grows one
+optional argument. That's the payoff of getting the contract right first
+— the fix is additive, not a rewrite.
 
 ### Move 3 — the principle
 
-The most valuable thing a module can produce is sometimes not behaviour but a
-*boundary*. When the abstraction is the product, a second use case costs almost
-nothing — which is exactly the test of whether you drew it in the right place.
-aptkit's retrieval contracts passed that test the day `@aptkit/memory` shipped on
-top of them unchanged.
+You don't know an abstraction is correct until something reuses it that
+you didn't design it for. Designing the contract first, then proving it
+by reuse, is how you turn "an interface I hope is right" into "the thing
+the system is actually built on." The reuse is the unit test for the
+abstraction.
 
 ---
 
 ## Primary diagram
 
 ```
-  Contract as the product — full picture
+  The contract as the product — full recap
 
-  ┌─ consumers ──────────────────────────────────────────────────────┐
-  │  search_knowledge_base tool   │   @aptkit/memory remember/recall   │
-  └──────────────┬──────────────────────────────┬─────────────────────┘
-                 │ pipeline.index/query           │ embed/upsert/search
-  ┌─ pipeline (vendor-blind) ───────────────────▼─────────────────────┐
-  │ indexDocument · queryKnowledgeBase · assertWiring (dim one-way door)│
-  └──────────────┬────────────────────────────────────────────────────┘
-  ════════════════ THE SEAM (contracts.ts:22-37) ════════════════════════
-   EmbeddingProvider {dimension, embed}      VectorStore {dimension, upsert, search}
-  ════════════════════════════════════════════════════════════════════════
-   ┌─ nomic/Ollama ─┐   ┌─ InMemoryVectorStore ─┐   ┌─ PgVectorStore (buffr) ─┐
-   │ embed via HTTP │   │ cosine over a Map     │   │ pgvector ANN, durable    │
-   └────────────────┘   └────────────────────────┘   └──────────────────────────┘
+  ┌─ Policy layer (high-level, owns the contract) ──────────────────┐
+  │ RAG: indexDocument · queryKnowledgeBase · search tool           │
+  │ Memory: remember (=index) · recall (=query)   ← reuse, no change │
+  └────────────────────────────┬────────────────────────────────────┘
+              both depend DOWN  │ on the abstraction
+  ┌─ Contract ★ ────────────────▼────────────────────────────────────┐
+  │ EmbeddingProvider { dimension, embed }                          │
+  │ VectorStore       { dimension, upsert, search }                 │
+  │   minimal — only what EVERY adapter can promise                 │
+  │   (gap: no metadata filter yet → over-fetch leaks to clients)   │
+  └────────────────────────────▲────────────────────────────────────┘
+              detail depends UP │ on the same abstraction (inverted)
+  ┌─ Mechanism layer ───────────┴────────────────────────────────────┐
+  │ InMemoryVectorStore (cosine, this repo)                          │
+  │ PgVectorStore (SQL, buffr — external, injected in)               │
+  └────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## Elaborate
 
-This is "program to an interface" stated at full strength: the interface is not a
-convenience, it's the thing you ship. The reason it matters for RAG specifically
-is that the vector-store landscape churns fast (Pinecone → pgvector → Qdrant →
-…) and the embedding model churns faster — pinning the pipeline to any one of
-them would mean rewriting it on every swap. aptkit pinned it to two types
-instead.
+This is the dependency-inversion principle stated as a product
+decision: the high-level policy and the low-level detail both depend on
+an abstraction the *high-level side* owns. Most codebases get this
+backward — the policy imports the database driver. AptKit inverts it: the
+contract lives with the policy (`@aptkit/retrieval`), and the database
+lives outside (buffr).
 
-The honest weakness lives right next to the strength: the contract is *minimal to
-a fault* — `search(vector, k)` has no metadata filter, so both consumers
-re-invent over-fetch-then-filter on top of it
-(`search-knowledge-base-tool.ts:88`, `conversation-memory.ts:94`). That's
-`audit.md`'s fix-first finding and the subject of
-`04-guard-rails-as-information-hiding.md`. The minimal contract was the right
-*young-repo* call (the in-memory store gains nothing from a filter); it's now
-ready to grow a `filter?` parameter that pushes the work down into each store.
+The whole monorepo exists for this (`context.md`): `@rlynjb/aptkit-core`
+ships to npm carrying the contracts, and any host app fills the slots.
+The contract *is* the product — literally the npm surface. Compare to
+AdvntrCue, where pgvector was welded into the app: useful, but not a
+library. AptKit's move is making the boundary the thing you ship.
+
+Read next: `04-guard-rails-as-information-hiding.md` (the dimension field
+on the contract), `06-capability-as-composition.md` (an agent built by
+injecting these contracts).
 
 ---
 
 ## Interview defense
 
-**Q: What's the strongest evidence your retrieval abstraction is at the right
-boundary?**
-
-A second consumer adopted it unchanged. Conversation memory needed
-store-and-recall-by-similarity; instead of building a memory store, it took the
-exact `EmbeddingProvider`/`VectorStore` contracts — `remember` is the index path
-for one row, `recall` is the query path with a `kind` filter — and shipped with
-zero new infrastructure. A contract that survives an unplanned second use was
-drawn correctly.
+**Q: How do you know the retrieval contract is the right abstraction and
+not over-engineering?** Because memory — a feature it wasn't designed for
+— reuses it with zero new infrastructure. `remember` is the index path,
+`recall` is the query path, over the same `EmbeddingProvider` and
+`VectorStore`. And buffr's `PgVectorStore`, from a separate repo,
+satisfies it without aptkit importing anything. An over-engineered
+abstraction has one user and lots of speculative methods; this one has
+three internal users plus an external implementation and only three
+methods.
 
 ```
-  remember  ≡  indexDocument (one row)
-  recall    ≡  queryKnowledgeBase (+ kind filter)
-  → same contracts, no new store
+  the test for a real abstraction: count the independent reusers
+
+  designed for:   RAG document search
+  reused by:      memory (unchanged) + buffr's PgVectorStore (external)
+  methods added for the reuse:  zero
+  → the boundary was real
 ```
 
-**Q: What does the contract deliberately *not* do, and why?**
+Anchor: "an abstraction is proven by reuse you didn't design for."
 
-It has no metadata filter on `search`. That keeps it minimal and gives the
-in-memory store nothing to implement — but it forces both consumers to over-fetch
-`k*4` and filter client-side. It's a real leak (the same workaround in two
-files). The fix is a `filter?` parameter that pgvector can satisfy in SQL; it
-wasn't added early because the contract is a published must-not-change surface
-and the early cost didn't justify it.
+**Q: The contract has no metadata filter — isn't that a hole?** Yes, and
+the audit names it (lens 3). It's the one place the abstraction is
+incomplete: because the port can't filter, two clients over-fetch and
+post-filter with their own magic numbers. The honest read is that the
+contract is *correct but not complete* — the fix is additive (one
+optional `filter` arg), and getting the rest of the contract right is
+exactly what makes the fix cheap. A perfect contract that needs a rewrite
+to extend would be worse.
 
-*Anchor:* "The contract is the product. Proof: `@aptkit/memory` is `remember`/
-`recall` built on the same two retrieval contracts with no new infrastructure."
+Anchor: "correct boundary, incomplete surface — the fix is additive."
 
 ---
 
 ## See also
 
-- `01-deep-provider-module.md` — the same "depend on a contract" move for models.
-- `04-guard-rails-as-information-hiding.md` — the missing `filter?` and the
-  over-fetch workaround it forces.
-- `audit.md` — lens 3 (the dimension triple-check leak + the filter leak), lens 6
-  (dimension as a fail-loud one-way door).
-- `../study-system-design/` — the buffr `PgVectorStore` binding at service
-  altitude; `../study-agent-architecture/` — retrieval reaching agents as a tool.
+- `01-deep-provider-port.md` — the ports this file's contracts are an instance of
+- `04-guard-rails-as-information-hiding.md` — the dimension field on the contract
+- `06-capability-as-composition.md` — injecting these contracts into an agent
+- `00-overview.md` — DIP / DI in the PATTERN VOCABULARY
+- `audit.md` — lens 1 & 3 (the over-fetch leak), lens 8 (the filter fix)
+- `../study-system-design/` — the same seam at the architecture altitude
+- `../study-agent-architecture/` — memory as agentic retrieval

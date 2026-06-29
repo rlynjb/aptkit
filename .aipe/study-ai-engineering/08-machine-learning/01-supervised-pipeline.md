@@ -1,215 +1,199 @@
-# The supervised learning pipeline
+# Supervised Learning Pipeline
 
-**Subtitle:** data → features → split → train → deploy · *Language-agnostic*
+> supervised learning pipeline · ML lifecycle
+
+Let me say the uncomfortable thing first, before we draw a single box: **aptkit trains no model.** There is no supervised pipeline in this repo. No labeled dataset, no feature table, no train/val/test split, no `.fit()` call, no serialized weights. This whole sub-section is new ground. Everything below is study material and buildable exercises — not a tour of shipped code. When I say a stage "lives here," I mean *here in the generic pipeline*, not *here in aptkit*. Read it that way.
+
+You do have one real ML project to anchor against: contrl, the pose-landmark rep counter (MediaPipe pose → on-device rep detection in React Native). I'll keep pointing at it in prose because it's the one place you've actually touched data, features, and a model end to end. But contrl isn't the repo we're studying, so I won't cite its files — just its shape.
 
 ## Zoom out, then zoom in
 
-aptkit has no ML pipeline, so the layers diagram below is the *generic*
-supervised pipeline — the thing every classifier, regressor, and recommender is
-built from. The starred box is the whole arc; the rest of this section zooms
-into one box each.
+A supervised pipeline is five stages in a line. The model — the thing people obsess over — is the fourth stage, and it's the smallest, latest, most swappable piece. Here's the whole thing with a star on where *this file* lives, which is **everywhere**, because this file is about the pipeline as a whole.
 
 ```
-  Zoom out — the supervised pipeline (generic; aptkit has none)
-
-  ┌─ Data layer ───────────────────────────────────────────────────┐
-  │  raw rows + LABELS (the thing you want to predict)              │
-  └───────────────────────────┬─────────────────────────────────────┘
-                              │ feature engineering (file 02)
-  ┌─ Feature layer ───────────▼─────────────────────────────────────┐
-  │  fixed-width numeric vectors X, label vector y                  │
-  └───────────────────────────┬─────────────────────────────────────┘
-                              │ split (file 03)
-  ┌─ Split layer ─────────────▼─────────────────────────────────────┐
-  │  train · val · test  (disjoint, split at the inference unit)    │
-  └───────────────────────────┬─────────────────────────────────────┘
-                              │ fit + select (files 04–08)
-  ┌─ Model layer ─────────────▼─────────────────────────────────────┐
-  │  ★ fitted model: f(X) → ŷ ★   evaluated on held-out test       │
-  └───────────────────────────┬─────────────────────────────────────┘
-                              │ ship
-  ┌─ Serving layer ───────────▼─────────────────────────────────────┐
-  │  same feature code at inference; monitor drift (file 15)        │
-  └──────────────────────────────────────────────────────────────────┘
+Supervised pipeline — the five stages (★ = this file: the whole line)
+┌──────────┐   ┌────────────┐   ┌──────────────────┐   ┌─────────┐   ┌──────────┐
+│  DATA    │──▶│  FEATURES  │──▶│ TRAIN / VAL / TEST │──▶│  MODEL  │──▶│  DEPLOY  │
+│  collect │   │  raw →     │   │  split + fit + eval │   │  the    │   │  serve + │
+│  + label │   │  engineered│   │  on held-out data   │   │  learner│   │  monitor │
+└──────────┘   └────────────┘   └──────────────────┘   └─────────┘   └──────────┘
+   ★ big          ★ big              ★ medium             ★ SMALL       ★ medium
+  (most bugs    (load-bearing      (where leaks         (swappable,   (where it
+   live here)    work lives)        hide)                late)         meets reality)
 ```
 
-Now zoom in. "Training a model" is the smallest box in that stack. The arc is
-mostly *data plumbing*: getting clean labeled rows, turning them into stable
-numeric features, and splitting them so your test score predicts production. An
-LLM person already knows the serving end — you call a function, you get an
-output. Supervised ML adds everything *left* of serving: you build the function
-by fitting it to examples instead of downloading it.
+The size labels under each box are the whole lesson. Most "AI bugs" in classical ML are **data bugs and feature bugs**, not model bugs. The model is a thin layer that maps engineered features to a prediction; if the features are wrong, no model architecture saves you. You'll spend 70% of real ML time in the first two stages and call it "ML work" even though no learning is happening yet.
 
 ## Structure pass
 
-**Layers.** Data → features → split → model → serving. Each layer hands a
-narrower, more numeric artifact to the next. The model layer is where the
-"learning" happens, but it is fed entirely by the three layers above it.
+Walk the line left to right; each seam is a place where a bug can hide and where you can put a test.
 
-**Axis — where does error originate?** Trace a bad prediction backward. Was the
-label wrong (data layer)? Was the feature uninformative or computed differently
-at inference (feature layer)? Did test leak into train (split layer)? Only if
-all three are clean is the error actually the *model's*. Beginners debug the
-model; the error is almost always upstream.
+- **Data → Features.** Seam: schema and units. Raw records (events, frames, rows) cross into a numeric feature space. Bugs: missing values, mixed units, label noise, timezones.
+- **Features → Train/Val/Test.** Seam: the split. This is where *leakage* enters — if your split mixes near-identical rows across train and val, your metrics lie. (File 03 is entirely about this seam.)
+- **Train/Val/Test → Model.** Seam: the fit. The learner consumes a feature matrix `X` and labels `y`; it knows nothing about your domain. Garbage features in, confident garbage out.
+- **Model → Deploy.** Seam: train/serve skew. The features computed at serving time must match training *exactly* — same code path ideally. In contrl this seam is real: the angle math that runs on-device per frame must match whatever produced your training labels.
 
-**Seam.** The load-bearing boundary is **the feature function** — the code that
-maps raw input to the numeric vector `X`. It must run identically at training
-time and inference time. Training reads it from a labeled dataset; serving reads
-it from one live request. Same function, two callers. When training and serving
-compute features differently, every downstream metric lies.
+The seams matter more than the boxes. A pipeline is correct when every seam has a contract you can assert.
 
 ## How it works
 
-### Move 1 — the mental model
+### Move 1 — Mental model
 
-You already know precision@k from this repo. `scorePrecisionAtK`
-(`packages/evals/src/precision-at-k.ts`) takes *retrieved ids* and *relevant
-ids* and returns `matched / min(k, retrieved)`. A supervised pipeline is the
-machine that *produces* the thing being scored. Today the "relevant ids" come
-from your vector store's similarity sort. In a trained pipeline, a fitted model
-produces them — and you grade it with the exact same metric.
+A supervised pipeline is a **conveyor belt**, not a brain. Data goes in one end, a prediction comes out the other, and the "learning" is just one station fitting a function `f(X) → y` from examples. Hold this picture:
 
 ```
-  Pattern — the pipeline as a function factory
-
-  examples            ┌──────────────┐        a function
-  (X, y) ───────────► │  fit / train │ ─────► f: X → ŷ
-  labeled rows        └──────────────┘        (deploy this)
-                                              │
-  one live request ───────────────────────────┘
-   (same feature code) ───► f(x) ───► prediction
+Mental model — conveyor belt, not brain
+  raw world                                                   prediction
+     │                                                            ▲
+     ▼                                                            │
+  ┌─────┐   transform   ┌─────────┐   fit f(X)→y   ┌───────┐   apply f
+  │ DATA│──────────────▶│ FEATURES│───────────────▶│ MODEL │──────────▶
+  └─────┘               └─────────┘                └───────┘
+     "what happened"     "numbers the         "the only stage
+                          model can eat"        that 'learns'"
 ```
 
-You don't *write* `f`. You write the feature code and pick the algorithm; `fit`
-writes `f` for you by minimizing error on the examples.
+The belt only learns at one station. Everything upstream is plumbing and everything downstream is serving. If you treat ML as "pick a fancy model," you've stared at one station and ignored the belt.
 
-### Move 2 — the arc, one box at a time
+### Move 2 — Step by step
 
-**Data layer — rows with labels.** Supervised means every training row carries
-the answer. For a learned reranker over aptkit retrieval, a row is *(query,
-candidate document, was-this-the-right-doc?)*. The label is the load-bearing
-column; without it there is nothing to learn from.
+Since aptkit has no pipeline, this is pseudocode for a *new* skeleton. **Not yet exercised in aptkit** — there is no `fit`, no `X`, no `y` anywhere in `packages/`. Treat the code below as the thing the Phase 2C exercise asks you to scaffold.
+
+**Stage 1 — Data: collect and label.**
 
 ```
-  query_id  doc_id   features…        label (relevant?)
-  q1        d4       [0.81, 12, 1]    1
-  q1        d9       [0.40,  3, 0]    0
-  q2        d2       [0.77,  8, 1]    1
+Data stage
+┌────────────────────────────────────────────────┐
+│ raw_records = load("workout_sessions.jsonl")     │
+│ # each record: { session_id, user_id, frames[],  │
+│ #                label: "good_rep" | "bad_rep" }  │
+│ assert no record missing a label                  │
+│ assert label ∈ known set   ← contract at the seam │
+└────────────────────────────────────────────────┘
 ```
 
-**Feature layer — raw → numeric.** Models eat fixed-width numeric vectors, not
-prose. The query/doc pair becomes `[cosine_sim, doc_length, has_exact_match]`.
-This is file 02, and it is 60–80% of the work.
+This is where most bugs are born: a label typo, a duplicated session, a unit mismatch. Assert the contract here or chase it for a week downstream.
 
-**Split layer — disjoint sets.** Carve the rows into train / val / test so the
-test set contains *units never seen in training* (file 03). For a per-query
-reranker, split by `query_id`, not by row — or the same query leaks across sets.
+**Stage 2 — Features: raw → engineered.**
 
-**Model layer — fit and select.** Run `fit(X_train, y_train)`, tune on val,
-report once on test. Train a simple model and a strong one, pick the simpler
-that wins (file 04).
+```
+Feature stage
+raw frames ──▶ extract ──▶ feature_row
+[{x,y,z}×33]            { knee_angle_min, rom, time_at_bottom, peak_velocity }
+                          ▲ the load-bearing transform (file 02)
+```
 
-**Move 2.5 — the aptkit reality.** Not yet exercised in aptkit — aptkit runs
-pre-trained LLMs, not trained models. The pattern is taught here as study
-ground. The closest real artifact is the eval layer (`packages/evals`), which
-*grades* outputs with the same metrics a trained pipeline would use, but the
-"model" it grades is retrieval + an LLM, never a fitted `f`.
+```python
+def extract_features(session):           # pseudocode — not in aptkit
+    return {
+        "knee_angle_min": min(knee_angle(f) for f in session.frames),
+        "rom":            range_of_motion(session.frames),
+        "time_at_bottom": dwell(session.frames),
+    }
+```
 
-### Move 3 — the principle
+**Stage 3 — Train/Val/Test: split, fit, evaluate.**
 
-A supervised pipeline is mostly *data engineering with a fitting step in the
-middle*. The model is one box; the value is in clean labels, honest splits, and
-a feature function that runs the same in both worlds. Optimize the pipeline, not
-the algorithm.
+```
+Split + fit
+features ──┬──▶ TRAIN (fit) ──▶ model
+           ├──▶ VAL (tune)  ──▶ pick hyperparams
+           └──▶ TEST (once) ──▶ the number you report
+            ▲ split by SESSION/USER, never by frame (file 03)
+```
+
+```python
+train, val, test = grouped_split(features, group="user_id")  # not row-wise!
+model = fit(train.X, train.y)
+score = evaluate(model, val)            # tune against val
+final = evaluate(model, test)           # touch test once
+```
+
+**Stage 4 — Model: the small late part.**
+
+```python
+model = LogisticRegression()   # swap for anything; it's one line
+model.fit(X, y)
+```
+
+That's it. The model is one swappable line. This is why "what model should I use?" is the wrong first question.
+
+**Stage 5 — Deploy: serve and monitor.** Run the *same* feature code at serving time. Log inputs and predictions so you can detect when the live data drifts away from training data.
+
+### Move 3 — The principle
+
+**The model is the small, late, swappable part; the data and features are the program.** When metrics are bad, look upstream first. Nine times out of ten the bug is a label, a unit, or a leak — not the learner.
 
 ## Primary diagram
 
-```
-  The full arc, with the seam marked
+The canonical picture for this file: the five stages with their failure modes attached, so you read the pipeline as a chain of contracts.
 
-  TRAINING                                    SERVING
-  ┌──────────┐                                ┌──────────┐
-  │ labeled  │                                │ one live │
-  │ rows     │                                │ request  │
-  └────┬─────┘                                └────┬─────┘
-       │            ★ same feature function ★      │
-       ▼  ┌─────────────────────────────────┐  ◄──┘
-          │  featurize(raw) → numeric X      │   ← THE SEAM
-       ▼  └─────────────────────────────────┘
-  ┌──────────┐   split   ┌──────────┐  fit   ┌──────────┐
-  │ X_train  │ ────────► │ X_val    │ ─────► │ f: X → ŷ │ ──► prediction
-  │ y_train  │           │ X_test   │ report └──────────┘
-  └──────────┘           └──────────┘ once
 ```
+Supervised pipeline — stages, seams, and where bugs live
+┌────────┐  units/labels  ┌──────────┐   the split    ┌────────────┐  fit  ┌───────┐  skew  ┌────────┐
+│  DATA  │═══════════════▶│ FEATURES │═══════════════▶│ TRAIN/VAL/ │══════▶│ MODEL │═══════▶│ DEPLOY │
+│        │   ▲ seam 1     │          │   ▲ seam 2      │   TEST     │ ▲seam3│       │ ▲seam4 │        │
+└────────┘                └──────────┘                 └────────────┘       └───────┘        └────────┘
+ BUGS:                     BUGS:                         BUGS:                BUGS:            BUGS:
+ missing/dup,              wrong units,                  leakage across       overfit,         train/serve
+ label noise,              data leak into                groups, test         under-fit        skew, drift
+ wrong timezone            a feature                     touched too much
+   └─ ~40% of real ML pain ─────────────────────────────┘   └──── ~50% ────┘   └ ~10% ┘
+```
+
+Notice the percentages at the bottom: the model station carries maybe 10% of where things actually go wrong. The first two stages plus the split carry the rest.
 
 ## Elaborate
 
-The discipline's hard-won lesson: the algorithm is rarely the bottleneck. Two
-teams with the same data and different algorithms usually land within a few
-points of each other; two teams with the same algorithm and different *features*
-diverge wildly. That is why files 02 and 03 are longer than file 04. The serving
-seam (the shared feature function) is also where production failures cluster —
-"works in the notebook, fails in prod" is almost always train/serve feature
-skew, not a bad model.
+- **"AI bug" is almost always a data bug.** When a classical model misbehaves, your first move is to look at the actual rows — sort by prediction error, eyeball the worst 20. You'll usually find a labeling or unit problem, not a modeling one.
+- **The model is swappable on purpose.** Keep the interface `fit(X, y) → predict(X)` so you can swap logistic regression for a gradient-boosted tree without touching the other four stages. If swapping the model means rewriting features, your seams leaked.
+- **Train/serve skew is the deploy-stage killer.** The classic production failure: features computed in a notebook with pandas at training time, recomputed in TypeScript at serving time, and the two disagree subtly. Share the feature code or you'll ship a model that scored 0.95 offline and flops live.
+- **contrl anchor.** Your rep counter is exactly this belt, even though you may not have drawn it as five boxes. DATA = recorded workout sessions of pose landmarks; FEATURES = per-rep joint angles and velocities derived from raw `{x,y,z}` landmarks; the MODEL is whatever decides "rep / not-rep"; DEPLOY = the on-device per-frame inference loop. The lesson transfers directly: when contrl miscounts, the bug is far more likely to be in how you derived the angle than in the classifier.
+- **Don't over-build the skeleton.** Phase 2C wants the thinnest end-to-end belt that runs, not a production MLOps stack. One script that loads, extracts, splits, fits, and prints a score is the win.
 
 ## Project exercises
 
-### Build a labeled dataset for a learned reranker
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a script that reads `/Users/rein/Public/buffr/eval/queries.json`
-  and the corpus, runs the existing vector retrieval, and emits a labeled CSV of
-  `(query_id, doc_id, cosine_score, doc_len, is_relevant)` rows — `is_relevant`
-  from the known answer per query.
-- **Why it earns its place:** forces you to produce the *(X, y)* artifact that
-  the entire rest of this section consumes. You cannot fake the data layer.
-- **Files to touch:** new `/Users/rein/Public/buffr/eval/build-rerank-dataset.ts`,
-  reading `/Users/rein/Public/buffr/eval/queries.json` and
-  `/Users/rein/Public/buffr/src/pg-vector-store.ts`.
-- **Done when:** the script writes a CSV where each query contributes one
-  positive row and several negatives, and row counts match
-  `queries × candidates`.
-- **Estimated effort:** `1–4hr`
+### Scaffold a minimal end-to-end pipeline skeleton
 
-### Diagram the train/serve seam for an intent classifier
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a written design note that identifies, for a learned
-  replacement of `packages/agents/query/src/intent.ts`, the single feature
-  function that must run identically at train and serve time, and where each
-  caller lives.
-- **Why it earns its place:** the seam is the #1 production ML bug; naming it
-  before any code is the senior move.
-- **Files to touch:** new `/Users/rein/Public/buffr/docs/intent-classifier-seam.md`.
-- **Done when:** the note names the shared `featurize(query)` function and shows
-  both call sites (batch training vs single live request).
-- **Estimated effort:** `<1hr`
+- **Exercise ID:** EX-ML-01a (Phase 2C — first end-to-end ML belt; this is new ground, aptkit has none today)
+- **What to build:** The thinnest possible supervised pipeline that runs all five stages on toy or recorded data: load → extract features → grouped split → fit a trivial model → print val/test scores. The point is the *shape*, not the accuracy.
+- **Why it earns its place:** You've never built the full belt as one artifact — contrl gave you data/features/inference but no explicit train/val/test discipline. Having a runnable skeleton turns "I understand ML pipelines" into "I have built one," which is the difference an interviewer can probe.
+- **Files to touch:** Case B (new) — `aptkit/packages/ml-evals/src/pipeline.ts` (or a `train.py` under `buffr/scripts/ml/` if you want the Python ecosystem for `sklearn`). New package: `aptkit/packages/ml-evals/package.json`. No existing aptkit source changes.
+- **Done when:** `node packages/ml-evals/dist/pipeline.js` (or `python buffr/scripts/ml/train.py`) runs the five stages end to end and prints a val score and a test score, with the split done by group (session/user), not by row.
+- **Estimated effort:** 1–2 days
+
+### Add seam-contract assertions to the data stage
+
+- **Exercise ID:** EX-ML-01b (Phase 2C — harden the new belt's first seam)
+- **What to build:** A small validation step at the Data→Features seam that asserts the contract: no missing labels, labels in a known set, no duplicate session IDs, consistent units. Fail loud and early.
+- **Why it earns its place:** It internalizes the file's core claim — most ML bugs are data bugs — by making the data stage refuse bad input instead of silently poisoning the model. Cheap insurance that demonstrates maturity.
+- **Files to touch:** Case B (new) — `aptkit/packages/ml-evals/src/validate.ts` (called from `pipeline.ts`). No existing source edits.
+- **Done when:** Feeding a record with a missing label or a duplicate session ID throws a clear error naming the offending record, and the happy path passes silently.
+- **Estimated effort:** 1–4hr
 
 ## Interview defense
 
-**Q: "Walk me through a supervised pipeline end to end."**
-Data with labels → feature function turns raw into numeric `X` → split into
-disjoint train/val/test at the inference unit → fit a model, tune on val, report
-once on test → deploy the *same feature function* at serving time → monitor for
-drift. The model is one box; the rest is data plumbing.
+**Q: Your offline model scored 0.95 but tanked in production. Where do you look first?**
 
 ```
-  data ─► features ─► split ─► fit ─► test ─► deploy ─► monitor
-            ▲ same code reused at serve time ▲
+Offline 0.95  ──vs──  Production bad
+     │                      │
+     └── same model, so the gap is ── ▶ DATA or FEATURES or the SPLIT
+                                          (not the learner)
 ```
-*Anchor: the feature function is the seam shared by training and serving.*
 
-**Q: "A prediction is wrong in production. Where do you look first?"**
-Upstream, not at the model. Check the label quality, then whether the feature
-was computed the same way at serve time as at train time (skew), then whether
-test leaked into train. The model is the *last* suspect because it only sees
-what those layers feed it.
+Train/serve skew or a leaky split, almost always. I'd diff the features computed offline against the features computed live for the same input, and I'd re-check that the split grouped by the unit the model sees as new. Anchor: contrl — if rep detection works in my dev recordings but fails on a new person, that's a generalization/skew problem, not a model-capacity problem.
+
+**Q: A teammate wants to spend the sprint trying five model architectures. Good use of time?**
 
 ```
-  bad ŷ  ─► label? ─► feature skew? ─► leakage? ─► (only now) model?
+effort ──▶ DATA  FEATURES  MODEL
+           ████  ███████   █     ← payoff is concentrated upstream
 ```
-*Anchor: error originates upstream; debug the data and the seam first.*
+
+Usually no. The model is ~10% of the outcome here. I'd spend the sprint cleaning labels and improving features, then swap the model in one line at the end. Anchor: contrl's accuracy lives in the angle/velocity feature math, not in the choice of classifier.
 
 ## See also
 
-- `02-feature-engineering.md` — the load-bearing feature layer
-- `03-train-val-test.md` — the split that makes test predict prod
-- `05-evals-and-observability/` — how aptkit grades outputs today
+- [02-feature-engineering.md](./02-feature-engineering.md) — the load-bearing second stage
+- [03-train-val-test.md](./03-train-val-test.md) — the split where leaks hide

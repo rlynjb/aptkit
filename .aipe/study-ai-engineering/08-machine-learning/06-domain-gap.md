@@ -1,302 +1,223 @@
 # Domain gap
 
-**Subtitle:** train on one distribution, serve on another · *Language-agnostic*
+> industry name: **domain gap** / **distribution shift** · type: **generalization failure**
+
+This is the failure that makes engineers distrust ML, because the model was *good* — 94% on the test set, signed off, shipped — and then it quietly fell apart in the wild and no alarm went off. Domain gap is the mismatch between the distribution you trained on and the distribution you actually run on. Nothing throws. The model just gets quietly, steadily wrong. New ground again: aptkit trains no model and ships no inference path, so everything here is the playbook, not a code tour — though this is the failure mode I'd anchor hardest to your contrl experience.
 
 ## Zoom out, then zoom in
 
-Before any definition, here is where a domain gap lives. The supervised pipeline
-runs left-to-right; the model is fit on the *train distribution* and then shipped
-across a boundary into a *serve distribution*. The starred boundary is where the
-gap opens — the model never sees that the world changed.
+Domain gap is unique among the concepts in this section: it's the only one that lives in the *seam between* two pipeline runs — the training pipeline and the deployment pipeline. It's not a stage; it's the gap that opens when the Data at train time and the Data at inference time were drawn from different worlds.
+
+Pipeline placement (★ = the gap between two pipelines)
 
 ```
-  Zoom out — the train→serve boundary (generic supervised pipeline)
-
-  ┌─ Train world ──────────────────────────────────────────────────┐
-  │  rows drawn from distribution  D_train                          │
-  │  (one app's queries · one embedding model · one point in time)  │
-  └───────────────────────────┬─────────────────────────────────────┘
-                              │ fit  →  f: X → ŷ
-  ┌─ Model ───────────────────▼─────────────────────────────────────┐
-  │  f learned the shape of D_train and ONLY that shape             │
-  └───────────────────────────┬─────────────────────────────────────┘
-                              │ ★ DEPLOY — the gap opens here ★
-  ┌─ Serve world ─────────────▼─────────────────────────────────────┐
-  │  live inputs drawn from distribution  D_serve  ≠  D_train       │
-  │  (buffr's personal corpus · a different provider · today)       │
-  └──────────────────────────────────────────────────────────────────┘
+  TRAIN-TIME PIPELINE                              INFERENCE-TIME PIPELINE
+  ┌────────┐  ┌──────────┐  ┌────────┐             ┌────────┐  ┌──────────┐  ┌────────┐
+  │ Data   │─▶│ Features │─▶│ Model  │──── ships ──▶│ Model  │─▶│ Features │◀─│ Data   │
+  │ (gym,  │  │          │  │ fit    │             │ (same  │  │          │  │ (living│
+  │  clean)│  │          │  │        │             │ weights)│ │          │  │  room) │
+  └────┬───┘  └──────────┘  └────────┘             └────────┘  └──────────┘  └───┬────┘
+       │                                                                          │
+       │  distribution P_train                          distribution P_deploy    │
+       └──────────────────────────────────────★─────────────────────────────────┘
+                                    DOMAIN GAP = P_train ≠ P_deploy
 ```
 
-Now zoom in. A *domain gap* is when `D_serve ≠ D_train` at the moment you deploy —
-not later, *now*. The model is unchanged and the code is unchanged; only the
-*inputs* are drawn from a different distribution than the one `fit` saw. Nothing
-errors. The metric you measured on your held-out test set was honest about
-`D_train` and silent about `D_serve`. Quality collapses without a stack trace.
+The diagram's whole point: the model weights are *identical* on both sides — the gap isn't in the model, it's in the data feeding it. The model learned the shape of P_train; when P_deploy has a different shape, the model is confidently applying the wrong map.
 
 ## Structure pass
 
-**Layers.** Train world → model → serve world. The model is the middle layer and
-it is *frozen* across the deploy boundary: it encodes the geometry of `D_train`
-and applies it blindly to whatever arrives.
+Lay the gap out along one axis — *what* shifted — and the seams sort the failure into named buckets:
 
-**Axis — train-distribution-vs-serve-distribution.** The whole topic is one
-question asked twice: what distribution produced the rows `fit` saw, and what
-distribution produces the rows inference sees? When the answer differs, you have
-a gap. Trace the axis through each input dimension — *source* (which app's
-queries), *embedding model* (which version produced the vectors), *user* (whose
-corpus), *time* (when). A shift on any one is enough.
+```
+  WHAT SHIFTED  ──────────────────────────────────────────────────────────────▶
 
-**Seam.** The load-bearing boundary is the **deploy step itself** — the arrow
-marked ★. Above it the model was validated against data it will never see again;
-below it the model meets data it was never validated against. Distinguish this
-from temporal *drift* (file 15): drift is the serve distribution sliding *over
-time after* deploy; a domain gap exists *at* deploy, on day one, because the two
-worlds were never the same to begin with.
+  ┌────────────────────┐  seam A  ┌────────────────────┐  seam B  ┌──────────────────────┐
+  │ COVARIATE SHIFT    │          │ LABEL SHIFT        │          │ CONCEPT DRIFT        │
+  │ inputs change      │          │ class mix changes  │          │ input→label mapping  │
+  │ P(x) differs       │          │ P(y) differs       │          │ P(y|x) itself moves  │
+  │ (gym→living room)  │          │ (rare class rarer) │          │ (rules changed)      │
+  └────────────────────┘          └────────────────────┘          └──────────────────────┘
+     fixable by                      fixable by                     hardest — model is now
+     normalization,                  re-weighting                   wrong about the world;
+     augmentation                                                    needs new labels
+```
+
+- **Seam A** separates "the inputs look different" (covariate shift — your contrl case) from "the class proportions changed" (label shift).
+- **Seam B** is the cliff. Concept drift means the *relationship* between input and label moved — the thing the model learned is no longer true. Normalization can't save you; you need fresh labeled data from the new world. (That ongoing-monitoring problem is drift detection — see file 15.)
+
+Most deployment surprises are covariate shift, which is the good news: it's the most fixable. The contrl case lives squarely in seam A.
 
 ## How it works
 
-### Move 1 — the mental model
+### Move 1 — Mental model: the home-court map
 
-You already grade retrieval with `scorePrecisionAtK` / `scoreRecallAtK`
-(`packages/evals/src/precision-at-k.ts`): hand it `retrievedIds` and
-`relevantIds`, get back `matched / total`. That score is only meaningful for the
-distribution the queries were drawn from. A domain gap is the moment you reuse a
-model — or a recorded fixture — across distributions and keep trusting the old
-score.
+A model is a map of the territory it trained on. Deploy it somewhere the territory differs and the map is still confidently drawn — it just points to the wrong places. The model doesn't *know* it's lost.
+
+The home-court pattern
 
 ```
-  Pattern — one model, two distributions, two truths
-
-   measured here ─┐                         ┌─ trusted here (WRONG)
-                  ▼                          ▼
-   D_train  ──► fit f ──► precision@k = 0.90 │ D_serve ──► f ──► precision@k = 0.42
-   (app A's        (held-out test            │ (buffr's        (nobody measured
-    queries)        from D_train)            │  personal corpus) this until prod)
-                                             ▲
-                              the model is identical; only the inputs moved
+                TRAIN WORLD (home court)            DEPLOY WORLD (away game)
+              ┌───────────────────────┐           ┌───────────────────────┐
+              │  bright, side angle,   │           │  dim, weird angle,     │
+              │  fit subjects,         │  ── ❌ ──▶ │  baggy clothes,        │
+              │  clean landmarks       │           │  noisy landmarks       │
+              └───────────────────────┘           └───────────────────────┘
+                        │                                     │
+                        ▼                                     ▼
+              model is calibrated here          model applies SAME rules here
+              (accuracy looks great)            (accuracy silently collapses)
+                                                 no error thrown ⚠
 ```
 
-The trap is that `f` returns confident outputs on `D_serve` exactly as it did on
-`D_train`. Confidence is not calibrated across the gap. You only learn the number
-fell if you *re-measure on the target distribution*.
+The danger isn't that the model fails loudly. It's that it keeps returning confident answers that are wrong, and your test-set metric — measured on the home court — never warned you.
 
-### Move 2 — diagnosing and closing the gap
+### Move 2 — Step by step
 
-Take the concrete case: a **learned reranker** trained on app A's
-queries/corpus, redeployed over buffr's `PgVectorStore`
-(`/Users/rein/Public/buffr/src/pg-vector-store.ts`). Buffr's corpus is personal
-(`work.md`, `stack.md`, `coffee.md` — see
-`/Users/rein/Public/buffr/eval/queries.json`), the query phrasing is different,
-and the embeddings come from `nomic-embed-text:v1.5`. Three distribution shifts
-at once.
+**Part 1: Characterize both distributions.** You can't detect a gap you never measured. Summarize the train distribution (per-feature means, ranges, key stats) and do the same on a sample of real deploy data.
 
-**Spot the shift — compare feature statistics, not vibes.** Before trusting any
-model across a boundary, profile the same features on both distributions. A gap
-shows up as different means/spreads.
+Distribution fingerprints
 
 ```
-  feature            D_train (app A)      D_serve (buffr)     shifted?
-  cosine_sim         mean 0.71 sd 0.08    mean 0.52 sd 0.19   ★ yes
-  doc_length(toks)   mean 220  sd  40     mean 95   sd 70     ★ yes
-  has_exact_match    rate 0.38            rate 0.06           ★ yes
-                                          ▲ embeddings from a different model
-                                            put cosine on a different scale
+  feature: landmark_brightness
+  TRAIN  ┤  mean 0.72  ████████████░░░░  range [0.5, 0.9]
+  DEPLOY ┤  mean 0.31  ████░░░░░░░░░░░░  range [0.1, 0.5]
+                                          ▲ shifted left → covariate shift
 ```
 
-```text
-# PSEUDOCODE — not aptkit code. Profile each feature on both distributions.
-def domain_report(train_rows, serve_rows, feature_names):
-    for name in feature_names:
-        t = column(train_rows, name)          # values seen at fit time
-        s = column(serve_rows, name)          # values seen at serve time
-        # large gap in mean/sd ⇒ the model's learned thresholds are off-scale
-        report(name, mean(t), sd(t), mean(s), sd(s),
-               shifted = abs(mean(t) - mean(s)) > 2 * sd(t))
+**Part 2: Compare and quantify the gap.** Put the two fingerprints side by side and measure the distance per feature (population stability index, KL divergence, or even a simple mean/std delta to start). Flag features that moved.
+
+```python
+# PSEUDOCODE — not yet exercised in aptkit (no model, no inference data)
+train_stats  = summarize(X_train)          # per-feature mean, std, range
+deploy_stats = summarize(X_deploy_sample)  # same features, real-world sample
+for f in features:
+    gap[f] = distance(train_stats[f], deploy_stats[f])  # PSI / KL / mean-delta
+flagged = [f for f in features if gap[f] > threshold]   # these shifted
 ```
 
-**Mitigation 1 — normalization (make the scale match).** If `cosine_sim` lives at
-mean 0.71 in train and 0.52 in serve because a *different embedding model*
-produced the vectors, the model's learned weights are reading the wrong scale.
-Standardize each feature to z-scores so "where it sits relative to its own
-distribution" is what the model sees, not the raw magnitude.
+**Part 3: Close the gap with the cheapest lever that works.** Input normalization (standardize features so a dim room maps onto the trained range), data augmentation (train on dimmed/rotated/occluded variants so the home court is bigger), domain adaptation (explicitly adapt the model), or — the real fix for concept drift — collect labeled target-domain data and retrain.
+
+Lever ladder (cheapest first)
 
 ```
-  raw feature                z-score (per-distribution standardize)
-  ┌──────────────┐           ┌──────────────────────────────┐
-  │ cosine 0.52  │  ──────►  │ z = (0.52 - μ_serve)/σ_serve │ ──► comparable
-  │ (serve)      │           │   = (0.52 - 0.52)/0.19 = 0.0 │     to train z
-  └──────────────┘           └──────────────────────────────┘
-   absolute scale differs       relative position is preserved
+  ┌────────────────────────────────────────────────────────────────────────┐
+  │ 1. input normalization   ── cheap, no retrain ── handles scale/lighting   │
+  │ 2. data augmentation     ── retrain, no new labels ── widens home court   │
+  │ 3. domain adaptation     ── more involved ── aligns feature spaces        │
+  │ 4. collect target data   ── slow/expensive ── the only fix for concept    │
+  │                                                drift                       │
+  └────────────────────────────────────────────────────────────────────────┘
+       try top → bottom; stop when the gap closes on a deploy-domain test set
 ```
 
-```text
-# PSEUDOCODE — fit the scaler on TRAIN ONLY, then apply the SAME params at serve.
-scaler = fit_standardizer(X_train)            # stores μ, σ per feature
-X_train_z = scaler.transform(X_train)         # train on z-scores
-# ...later, at inference...
-x_serve_z = scaler.transform(x_serve)         # SAME μ, σ — never re-fit on serve
-y = f(x_serve_z)
-# Caveat: if the SCALE shifted (new embedding model), the saved μ/σ are stale.
-# Normalization fixes units; it does not invent target-domain knowledge.
-```
+> **Not yet exercised in aptkit.** There is no trained model, no inference pipeline, no `summarize`, no PSI/KL computation, no augmentation, and no deploy-domain dataset anywhere in `packages/` or buffr. aptkit has never deployed a model into a second distribution. The above is the shape to build.
 
-**Mitigation 2 — data augmentation (train on variety so f generalizes).** If you
-*know* serve inputs will be shorter and noisier, perturb the train rows so `fit`
-sees that variety: truncate documents, drop tokens, jitter cosine scores, mix in
-paraphrased queries. The model learns a decision boundary that survives the
-perturbations instead of memorizing app A's exact shape.
+### Move 3 — The principle
 
-```
-  one train row ──► augment ──► many rows covering the serve variety
-  q="what stack"          ┌─ q="which tools and stack"   (paraphrase)
-  doc=220 toks  ──────────┤─ doc truncated to 95 toks    (length jitter)
-  cosine=0.71             └─ cosine += noise(±0.1)        (scale jitter)
-```
-
-**Mitigation 3 — domain adaptation (lean toward the target).** Collect a small
-batch of *target-domain* labels — real buffr queries with their right doc — and
-either fine-tune `f` on them or reweight training so target-like rows count more.
-This is the only mitigation that injects actual knowledge of `D_serve`.
-
-```
-  D_train (large, cheap)        D_serve labels (small, expensive)
-  ┌──────────────┐              ┌──────────────┐
-  │ 10k app-A    │   reweight   │ 80 buffr     │
-  │ rows         │ ───────────► │ labeled rows │ ──► fine-tune f toward D_serve
-  └──────────────┘   or         └──────────────┘
-                     fine-tune
-   bulk shape                   the shape you actually serve
-```
-
-```text
-# PSEUDOCODE — collect target labels, then adapt. The honest baseline mitigation.
-serve_labeled = collect_labels(real_serve_queries)   # the work nobody wants to do
-f_adapted = fine_tune(f, serve_labeled)              # or: refit with sample weights
-# Always re-measure on a HELD-OUT slice of the TARGET distribution:
-report(scorePrecisionAtK(predict(f_adapted, serve_test), relevant, k))
-```
-
-**Move 2.5 — the aptkit reality.** Not yet exercised in aptkit — aptkit runs
-pre-trained LLMs, not trained models. The pattern is taught here as study ground.
-The closest *real* gap aptkit ships is in fixtures: every recorded fixture was
-captured under one provider and one embedding model. Replay an eval under a
-*different* provider and you have a domain gap by another name — and
-`packages/evals` is exactly the harness that would catch the precision@k drop.
-
-### Move 3 — the principle
-
-A test score is a claim about *one distribution*. The moment you move a model — or
-a fixture — across a source, a user, an embedding-model version, or (at deploy)
-time, that claim expires. The senior move is to never trust a metric measured on
-`D_train` as a prediction for `D_serve`; re-measure on the target, and if you
-can't, treat the deploy as unvalidated.
+**A model is only valid inside the distribution it was trained on; outside it, the model is guessing in a familiar accent.** Test-set accuracy measures the home court. Generalization to the deploy world is a *separate* claim that you must measure separately — by characterizing the deploy distribution and proving the model still holds there.
 
 ## Primary diagram
 
-```
-  The gap, the silence, and the three mitigations
+The full domain-gap detection and mitigation flow:
 
-  D_train ─► fit ─► f ─► precision@k = 0.90  (measured, honest about D_train)
-                    │
-                    │ ★ DEPLOY — no error, no warning ★
-                    ▼
-  D_serve ─────────► f ─► precision@k = 0.42  (NOT measured until prod)
-   │                       ▲
-   │  why it dropped:      └─ f reads serve features on the wrong scale
-   │                          / shapes it never trained on
-   ├─► normalize    : put features on a comparable scale (μ,σ from train)
-   ├─► augment      : train on perturbed rows so f covers serve variety
-   └─► adapt        : collect target-domain labels; fine-tune / reweight
-        then ALWAYS ─► re-measure on a held-out slice of D_serve
 ```
+                          DOMAIN-GAP DETECTION & MITIGATION
+  ┌──────────────────┐                         ┌──────────────────────────┐
+  │ train data       │  fingerprint ──▶ P_train│ deploy sample            │ fingerprint ──▶ P_deploy
+  │ (gym, clean)     │                         │ (living room, real users)│
+  └──────────────────┘                         └──────────────────────────┘
+            │                                              │
+            └──────────────────────┬───────────────────────┘
+                                   ▼
+                    ┌──────────────────────────────────┐
+                    │ per-feature distance (PSI / KL)   │
+                    │ flag features where gap > thresh   │
+                    └─────────────────┬─────────────────┘
+                                      │
+                  ┌───────────────────┴───────────────────┐
+                  ▼                                         ▼
+         gap small / none                            gap large
+                  │                                         │
+                  ▼                                         ▼
+         ship as-is, keep                  ┌────────────────────────────────┐
+         monitoring (file 15)              │ pick lever (cheapest first):   │
+                                           │  normalize → augment →         │
+                                           │  adapt → collect target data   │
+                                           └────────────────┬───────────────┘
+                                                            ▼
+                                           ┌────────────────────────────────┐
+                                           │ re-measure on a DEPLOY-DOMAIN   │
+                                           │ test set (not the home court)   │
+                                           └────────────────────────────────┘
+```
+
+The bottom-right box is the one people skip: after mitigating, you must re-measure on a *deploy-domain* test set, not the original one. Passing the home court again proves nothing.
 
 ## Elaborate
 
-The discipline's hard-won lesson: "it worked in the notebook, it died in prod"
-is, more often than train/serve *feature skew* (file 01's seam), a train/serve
-*distribution* gap — the feature code is identical but the inputs come from a
-different world. The two failure modes look the same in a dashboard (precision
-fell) and have opposite fixes: skew is a code bug, you make the two callers
-identical; a domain gap is a data fact, you cannot code your way out, you must
-either normalize the scale, augment toward the variety, or pay for target labels.
-The embedding-model version is the sneakiest axis — swapping `nomic-embed-text`
-for another model silently re-bases every cosine score, so a reranker tuned on
-the old scale degrades with zero code change. Read `15-drift-detection.md` next:
-same metric collapse, but the gap opens *over time after* deploy rather than *at*
-deploy.
+The things that bite:
+
+- **The gap is silent — that's the whole danger.** No exception, no 500, no failed assertion. The only signal is degraded outcomes, often surfacing as user complaints weeks later. This is *why* drift detection (file 15) exists: to convert the silence into an alarm.
+- **Augmentation must match the *real* shift, not an imagined one.** Augmenting with random rotations is useless if the real gap is lighting. Characterize the deploy distribution *first*, then augment toward it.
+- **Normalization can hide a concept drift you can't fix.** If P(y|x) actually moved — the rules changed, not just the inputs — normalizing inputs just makes a wrong model look confident. Distinguish covariate shift (fixable cheaply) from concept drift (needs new labels) before reaching for a lever.
+- **A "deploy-domain test set" is a real asset you have to build.** You can't validate the fix on the home court. Collecting even a small, honestly-labeled sample from the deploy world is often the highest-leverage thing you can do.
+
+The contrl anchor — this is the canonical example and it's *yours*: contrl's pose-landmark rep counter was effectively tuned against public-gym pose data — good lighting, clean side angles, fit subjects in fitted clothes, landmarks crisp and well-separated. Then a real user runs it in a dim living room, phone propped at a janky angle against a water bottle, wearing a baggy hoodie that swallows the elbow and knee landmarks. The landmark distribution shifts — joint positions noisier, some occluded, angles compressed — and the rep counter that worked flawlessly in testing starts miscounting: missing reps, double-counting, drifting. *That* is covariate shift (seam A), and the fixes are exactly the lever ladder above: normalize the landmark coordinates relative to the body, augment training with dimmed/rotated/occluded poses, and collect real living-room footage to validate against. The test-set number was never wrong — it just measured the gym, and users don't live in the gym.
 
 ## Project exercises
 
-### Build a domain-gap report between two corpora
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a script that runs buffr's retrieval over two corpora (e.g.
-  the personal corpus vs. a synthetic generic one), computes per-feature stats
-  (`cosine_sim`, `doc_length`, `has_exact_match`) on each, and prints a shift
-  table flagging features where the means differ by more than 2 train-sd.
-- **Why it earns its place:** makes the gap *visible as numbers* before any model
-  exists — the only honest way to know a model would transfer.
-- **Files to touch:** new
-  `/Users/rein/Public/buffr/eval/domain-gap-report.ts`, reading
-  `/Users/rein/Public/buffr/eval/queries.json` and
-  `/Users/rein/Public/buffr/src/pg-vector-store.ts`.
-- **Done when:** the script prints a table with `mean/sd` per feature for both
-  corpora and a `shifted?` column, and at least one feature is flagged.
-- **Estimated effort:** `1–4hr`
+### Build a distribution-comparison check
 
-### Re-measure a fixture eval under a swapped embedding model
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** an eval run that scores buffr retrieval with
-  `scorePrecisionAtK` under the recorded embedding model, then re-embeds the same
-  `queries.json` with a *different* model dimension/version and re-scores — the
-  delta is the domain gap, in points.
-- **Why it earns its place:** proves the harness in `packages/evals` is what
-  catches a silent collapse, and that the embedding-model version is a
-  distribution axis, not a config detail.
-- **Files to touch:** new
-  `/Users/rein/Public/buffr/eval/embedding-domain-gap.test.ts`, using
-  `/Users/rein/Public/aptkit/packages/evals/src/precision-at-k.ts` and
-  `/Users/rein/Public/buffr/src/pg-vector-store.ts`.
-- **Done when:** the test reports two precision@k numbers (original model vs.
-  swapped) and asserts the harness surfaces the drop rather than throwing.
-- **Estimated effort:** `1–2 days`
+- **Exercise ID:** EX-ML-06a — slots into Phase 5 (ML hardening), and is the natural feeder for the Phase 5 drift-detection work in file 15.
+- **What to build:** A check that takes two datasets (a "reference"/train sample and a "target"/deploy sample), computes a per-feature distribution distance (PSI to start), and emits a flagged report of which features shifted and by how much.
+- **Why it earns its place:** It turns the silent failure into a measurable one *before* deployment, and it's the reusable core that online drift detection (file 15) will call on a schedule. It's the cheapest insurance against a confident-but-wrong model.
+- **Files to touch:** Case B (new) — `packages/ml-evals/src/distribution-compare.ts` (PSI + per-feature report), `packages/ml-evals/src/dataset-stats.ts` (the fingerprint summarizer, shared with file 15). No existing aptkit file is touched; aptkit has no datasets or model today.
+- **Done when:** Given a gym-like reference fixture and a living-room-like target fixture, the check prints a per-feature PSI table, flags the features above a configurable threshold, and returns "shift detected" — and returns "no shift" when the two samples are drawn from the same distribution.
+- **Estimated effort:** 1–2 days
+
+### Add a deploy-domain holdout gate
+
+- **Exercise ID:** EX-ML-06b — Phase 5 ML hardening, building on EX-ML-06a.
+- **What to build:** A gate that re-scores a model on a *separate* deploy-domain holdout set and fails if accuracy drops more than a configured delta below the home-court test score.
+- **Why it earns its place:** It encodes the "re-measure on the deploy domain, not the home court" rule as a hard CI gate, so a model can't ship on its gym numbers alone.
+- **Files to touch:** Case B (new) — `packages/ml-evals/src/deploy-holdout-gate.ts`, plus a deploy-domain fixture under `packages/ml-evals/fixtures/deploy-domain/`. In buffr, a new config flag in `buffr` settings to point at the deploy-domain sample source (Case B, new).
+- **Done when:** The gate passes when home-court and deploy-domain scores are within the delta, and fails loudly (with the per-feature shift report from EX-ML-06a attached) when the deploy-domain score collapses.
+- **Estimated effort:** 1–4hr
 
 ## Interview defense
 
-**Q: "Your reranker scored 0.90 in eval and tanks in production. Walk me through it."**
-First I ask whether the production inputs come from the same distribution my test
-set did — different app, different user, different embedding-model version, or
-just first day on a new corpus. If yes, it's a domain gap: the 0.90 was honest
-about the train distribution and silent about the serve one. I re-measure on a
-held-out slice of the *target* distribution to size the drop, then choose a
-mitigation by *why* it shifted — scale (normalize), variety (augment), or genuine
-novelty (collect target labels and adapt).
+**Q: Your model hit 94% on the test set but users complain it's wrong. What's your first hypothesis?**
 
 ```
-  test 0.90 ─► [is D_serve = D_test?] ─no─► domain gap
-                       │yes                  ├─ re-measure on D_serve
-                       ▼                      └─ normalize / augment / adapt
-                   look elsewhere
+  test set (home court) ──▶ 94%  ── measured P_train
+  real users (away)     ──▶ ??   ── live in P_deploy
+                                    ▲ if P_train ≠ P_deploy → domain gap
 ```
-*Anchor: a test score is a claim about one distribution; re-measure on the target before trusting it.*
 
-**Q: "How is a domain gap different from drift?"**
-Same symptom, different *when*. A domain gap exists *at deploy* — `D_serve` was
-never equal to `D_train`, so day one is already broken. Drift is `D_serve`
-*sliding away over time after* a deploy that started healthy. The gap is a
-property of where you shipped the model; drift is a property of time. The gap is
-fixed by adaptation/normalization at deploy; drift is caught by monitoring and
-re-fitting on a schedule (file 15).
+Domain gap — the test set measured the training distribution, and production is a different one. I'd fingerprint both distributions and look for shifted features before touching the model. Anchor: *test-set accuracy is a home-court claim; deployment is an away game.*
+
+**Q: You found covariate shift. Why not just retrain on new data immediately?**
 
 ```
-  domain gap:  D_train ─┃─► D_serve   (≠ from the first request)
-                       deploy
-  drift:       D_serve(t0) ──► D_serve(t1) ──► D_serve(t2)   (slides over time)
-                  healthy        ...            degraded
+  retrain w/ labels ──▶ slow, expensive, needs labeled target data
+  normalize/augment ──▶ cheap, often closes covariate shift ── TRY FIRST
 ```
-*Anchor: domain gap is train-vs-serve at deploy; drift is serve-vs-itself over time.*
+
+Because covariate shift often closes with normalization or augmentation — no new labels needed. Collecting and labeling target data is the expensive last resort, reserved for true concept drift. Anchor: *climb the lever ladder cheapest-first.*
+
+**Q: How would you have caught the contrl rep-miscounting before users did?**
+
+```
+  gym landmarks  ─┐
+                  ├─ PSI per feature ──▶ brightness/angle shifted ──▶ ALARM
+  living-room ────┘
+```
+
+A distribution-comparison check on a sample of real living-room footage against the gym training data — the brightness and angle features would have flagged a shift pre-launch. Anchor: *characterize the deploy distribution before shipping, not after the complaints.*
 
 ## See also
 
-- `01-supervised-pipeline.md` — the train/serve seam this gap rides across
-- `15-drift-detection.md` — the same metric collapse, but opening over time
-- `05-evals-and-observability/` — the harness (`packages/evals`) that catches the precision@k drop
+- [`04-model-selection.md`](./04-model-selection.md) — the model you selected on the home court still has to survive the away game
+- [`05-class-imbalance.md`](./05-class-imbalance.md) — label shift is a cousin of imbalance that moves at deploy time
+- [`08-confusion-matrices.md`](./08-confusion-matrices.md) — the per-class view that shows *which* classes the gap is breaking; the one file here with real aptkit code

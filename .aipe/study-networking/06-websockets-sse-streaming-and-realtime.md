@@ -1,165 +1,185 @@
 # WebSockets, SSE, Streaming, and Realtime
 
-**Industry name:** streaming / long-lived transports / chunked transfer (NDJSON) · *Industry standard*
+**Long-lived connections · server-push · streaming responses · reconnect** — *Industry standard*
 
-## Zoom out, then zoom in
+## Zoom out — where realtime would live
 
-"Realtime" usually means a long-lived connection pushing updates. aptkit has exactly one streaming surface — and it's worth being precise about *which* mechanism it is, because it's not the one people assume.
-
-```
-  Zoom out — the one streaming path
-
-  ┌─ UI layer ─────────────────────────────────────────────────┐
-  │  Studio browser: reads response.body as a ReadableStream    │
-  │    for await (record of decodeNdjsonStream(chunks)) {...}   │
-  └───────────────────────────┬────────────────────────────────┘
-                              │  ★ ONE HTTP response, streamed in chunks ★
-                              │     (not a WebSocket, not SSE)
-  ┌─ Service layer ──────────▼─────────────────────────────────┐
-  │  vite middleware: res.write(ndjson) per event, res.end()    │
-  └────────────────────────────────────────────────────────────┘
-```
-
-**Zoom in.** The verdict first: this is **NDJSON over a single chunked HTTP response**, not WebSockets and not Server-Sent Events. The server holds one response open and writes newline-delimited JSON records as the agent runs; the browser reads the response body incrementally. It's one-way (server→client), tied to one request, and it ends when the work ends. The pattern to learn: **streaming a response body is the simplest realtime mechanism — no new protocol, no reconnect logic, just don't call `end()` until you're done.**
-
-## Structure pass
-
-**Layers:** agent loop (emits events) → middleware (encodes + writes) → browser (decodes + dispatches).
-
-**Axis — "who controls the connection's lifetime, and which way do messages flow?"** Trace it across the realtime options, real and absent:
+Realtime means the server keeps pushing after the request — WebSockets (bidirectional), SSE (server→client), or chunked streaming (one response, many chunks). aptkit has exactly one of these, and it's the simplest: **chunked NDJSON over a plain HTTP response** in Studio's dev server. No WebSockets, no SSE, no reconnect logic. Here's where the one streaming wire sits.
 
 ```
-  Axis — connection direction + lifetime — across realtime mechanisms
+  Zoom out — the streaming response in Studio dev
 
-  mechanism        direction        lifetime              in this repo?
-  ──────────────────────────────────────────────────────────────────────
-  NDJSON-over-HTTP server → client  one request          ★ YES (Studio stream)
-  SSE              server → client  long-lived, reconnect   NO (not yet exercised)
-  WebSocket        bidirectional    long-lived              NO (not yet exercised)
-  polling          client → server  repeated requests       NO
+  ┌─ Browser (Studio UI) ──────────────────────────────────────┐
+  │  fetch('/api/stream/query/replay') → read body stream      │ ← we are here
+  └──────────────────────────┬─────────────────────────────────┘
+                             │  HTTP/1.1, chunked, application/x-ndjson
+  ┌─ Vite dev middleware ─────▼─────────────────────────────────┐
+  │  streamReplayResponse: write(event)… write(result) end()    │
+  └──────────────────────────┬─────────────────────────────────┘
+                             │  agent runs in-process (no further wire)
+  ┌─ Agent loop ──────────────▼─────────────────────────────────┐
+  │  emits CapabilityEvent on each step → encoded as NDJSON line │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-**Seam:** the seam is `res.write()` vs `res.end()` on the server. As long as the handler keeps writing without ending, the response stays open and the client keeps receiving — that single decision *is* the streaming behavior.
+## Zoom in — the concept
+
+A **WebSocket** is a full-duplex connection that stays open for two-way messages; **SSE** is a one-way server-push channel; **chunked streaming** is a single HTTP response whose body arrives in pieces over time. The question: does aptkit keep any connection alive to push data as it's produced? Yes — one, and it's chunked streaming, not a socket protocol. The model's *generation* isn't streamed (it's `stream:false` to Ollama); what streams is the *agent's trace*, one event per line, so the UI can show progress live.
+
+## Structure pass — the skeleton
+
+**Layers:** event source (agent loop) → encoder (NDJSON) → transport (chunked HTTP write) → consumer (browser body reader). One direction only: server → browser.
+
+**Axis traced — "which direction does data flow, and when?"**
+
+```
+  One question across the realtime options: "direction + timing?"
+
+  ┌────────────────────────────────────────────────┐
+  │ WebSocket     │ both ways, anytime               │  → NOT used
+  │ SSE           │ server→client, anytime           │  → NOT used
+  │ chunked NDJSON│ server→client, during one request│  → ★ THIS is used
+  │ Ollama chat   │ stream:false → one full response │  → NOT streamed
+  └────────────────────────────────────────────────┘
+
+  aptkit streams the TRACE (chunked), not the model TOKENS
+```
+
+**Seam — the `onEvent` callback inside `streamReplayResponse`.** The agent loop emits events synchronously; the transport turns each into an NDJSON line and writes it to the open response. That callback is the joint between "agent produced an event" and "byte on the wire."
 
 ## How it works
 
-#### Move 1 — the mental model
+### Move 1 — the mental model
 
-You know how a `fetch` resolves once with a whole body. Now imagine the server never finishes that body — it keeps appending lines, and you read them as they land instead of waiting for the end. That's chunked transfer: one response, delivered in pieces. The kernel: **server writes records and flushes; client reads the body stream record by record; the connection closes when the server calls `end()`.**
+You know how a streaming `fetch` lets you read `response.body` chunk by chunk instead of waiting for the whole thing? That's the entire realtime mechanism here. The server holds the response open and writes one JSON line per agent step; the browser reads them as they land.
 
 ```
-  The pattern — NDJSON over one streamed response
+  The chunked-NDJSON pattern — one response, many lines, held open
 
-  server                                   client
-    │ ── 200, content-type: x-ndjson ─────► │  (headers first)
-    │ ── {"type":"event",...}\n ──────────► │  read + dispatch
-    │ ── {"type":"event",...}\n ──────────► │  read + dispatch
-    │ ── {"type":"result",...}\n ─────────► │  read final
-    │ ── res.end() ───────────────────────► │  stream done
-    │                                       │
-    one connection, server pushes, client pulls chunks as they arrive
+   client: fetch('/api/stream/…') ──► [response stays open]
+                                          │
+   server: write({type:'event', event:…})\n   ← agent step 1
+           write({type:'event', event:…})\n   ← agent step 2
+           write({type:'event', event:…})\n   ← tool call, usage…
+           write({type:'result', result:…})\n ← final
+           end()                                ← close → browser sees EOF
+                                          │
+   client: decodeNdjsonStream(chunks) ──► values[] as they arrive
 ```
 
-What breaks if you forget: if the server buffers instead of flushing each record (or an intermediary buffers it), the "realtime" illusion collapses — the client gets everything at once at the end. That's exactly what the `x-accel-buffering: no` header defends against.
+### Move 2 — walking the stream
 
-#### Move 2 — walking the stream in this repo
+**The agent loop is the event source.** As `runAgentLoop` runs, it emits `CapabilityEvent`s — `step`, `tool_call_start`, `tool_call_end`, `model_usage`, `warning`, `error` (the discriminated union guarded by `isCapabilityEvent`, `ndjson-stream.ts:41-62`). These are produced *synchronously* during the run, one per moving part.
 
-**The server writes one NDJSON record per event, then ends.** `streamReplayResponse` sets the streaming headers and writes as the agent emits (`apps/studio/vite.config.ts:888-919`):
+**The transport writes each event as an NDJSON line, on an open response.** `streamReplayResponse` sets the streaming headers, then passes an `onEvent` callback into the run that writes each event immediately:
 
 ```ts
-res.setHeader('content-type', 'application/x-ndjson; charset=utf-8'); // newline-delimited JSON
-res.setHeader('cache-control', 'no-cache');                          // don't cache a live stream
-res.setHeader('x-accel-buffering', 'no');                            // tell proxies: don't buffer
-
-const result = await run(body, (event) => {
-  res.write(encodeNdjsonRecord({ type: 'event', event }));           // one line per trace event
-});
-res.write(encodeNdjsonRecord({ type: 'result', result }));           // final line: the result
-// ... finally { res.end(); }                                        // close → client knows it's done
-```
-
-The `onEvent` callback is wired straight into the agent's trace sink, so every `step` / `tool_call_start` / `model_usage` event becomes a line on the wire the instant it's emitted. Errors are written as a `{type:'error'}` record rather than crashing the stream.
-
-**The browser reads the response body as a `ReadableStream`.** `runReplayStream` POSTs, then iterates the body (`apps/studio/src/api.ts:126-166`):
-
-```ts
-const response = await fetch(endpoint, { method: 'POST', headers, body });
-if (!response.body) { /* fall back to json error */ }
-
-for await (const record of decodeNdjsonStream(responseBodyChunks(response.body))) {
-  // record.value.type === 'event'  → options.onEvent(event)   (live UI update)
-  // record.value.type === 'result' → finalPayload = result
-  // record.value.type === 'error'  → throw
+// apps/studio/vite.config.ts:900-918
+res.setHeader('content-type', 'application/x-ndjson; charset=utf-8');
+res.setHeader('cache-control', 'no-cache');
+res.setHeader('x-accel-buffering', 'no');        // flush chunks, don't buffer
+try {
+  const body = await readJsonBody(req);
+  const result = await run(body, (event) => {
+    res.write(encodeNdjsonRecord({ type: 'event', event }));   // ← one line per step, live
+  });
+  res.write(encodeNdjsonRecord({ type: 'result', result }));   // ← final record
+} catch (error) {
+  res.write(encodeNdjsonRecord({ type: 'error', error: ... })); // errors as a line too
+} finally {
+  res.end();                                                    // close → browser EOF
 }
 ```
 
-`responseBodyChunks` adapts the browser's `ReadableStream` reader into an async iterable of `Uint8Array` chunks (`api.ts:169-180`); `decodeNdjsonStream` (from `@aptkit/runtime`) splits those bytes on newlines and parses each line, tolerating a partial trailing line until the next chunk completes it.
+The `res.write(...)` calls happen *during* the run, so the browser receives progress before the agent finishes. `encodeNdjsonRecord` (`runtime/src/ndjson-stream.ts:31-33`) is just `JSON.stringify(value) + '\n'` — the newline is the record delimiter. Note the layering comment in the code: runtime owns the *encoding* (`encodeNdjsonRecord`), Studio owns the *transport* (the `res.write`). The seam is clean.
 
-```
-  Layers-and-hops — the live event stream
+**The consumer reassembles lines across chunk boundaries.** TCP doesn't respect line boundaries — a chunk can split mid-JSON. `decodeNdjsonStream` (`ndjson-stream.ts:103-135`) buffers partial lines and only yields a value when it sees a newline:
 
-  ┌─ Service: agent loop ──────┐
-  │  emit(step/tool_call/...)  │
-  └─────────────┬──────────────┘
-       onEvent  │  res.write(ndjson line)
-                ▼
-  ┌─ Service: middleware (one open response) ──────────────────┐
-  │  content-type: x-ndjson · no-cache · x-accel-buffering: no  │
-  └─────────────┬──────────────────────────────────────────────┘
-   hop: chunked HTTP body, server → browser, one line at a time
-                ▼
-  ┌─ UI: browser ──────────────────────────────────────────────┐
-  │  response.body.getReader() → decodeNdjsonStream → onEvent() │
-  └────────────────────────────────────────────────────────────┘
+```ts
+// packages/runtime/src/ndjson-stream.ts:111-125 (the reassembly kernel)
+buffer += typeof chunk === 'string' ? chunk : decoder.decode(chunk, { stream: true });
+let newlineIndex = buffer.search(/\r?\n/);
+while (newlineIndex >= 0) {
+  const line = buffer.slice(0, newlineIndex);     // a complete line
+  buffer = buffer.slice(newlineIndex + newlineLength);
+  yield decodeNdjsonLine(line, ++lineNumber, options);   // emit it
+  newlineIndex = buffer.search(/\r?\n/);
+}
+// leftover partial line stays in `buffer` for the next chunk
 ```
 
-**Why NDJSON-over-HTTP and not SSE or WebSocket — the load-bearing choice.** The data flow here is strictly one-way (server reporting progress) and strictly bounded to one request (run this replay, stream its trace, finish). SSE would add an `EventSource` and a reconnect protocol the use case doesn't want — you don't want to *resume* a finished replay. A WebSocket would add a bidirectional, long-lived connection and a framing protocol for a job that never receives client messages mid-flight. NDJSON-over-a-response-body is the minimum that does the job: no new protocol, no reconnect state, the connection's end *is* the signal that the run is complete. The surprising part — that "streaming" here is just not calling `end()` early — is also the cheapest correct answer.
+```
+  Execution trace — chunk boundary splits a line
 
-**No reconnect, no heartbeat, no resume.** Because the stream is one-shot, there's no reconnection logic, no keep-alive ping, no last-event-id resume. If the connection drops mid-replay, the client throws and the run is simply re-issued. That's `not yet exercised` as a *resilience* feature and correct for a local dev tool — it would matter only for long-running, resumable, or multi-client realtime, which this isn't.
+  chunk 1 arrives: '{"type":"event","ev'
+    buffer = '{"type":"event","ev'   search('\n') = -1 → yield nothing, hold it
 
-**WebSockets / SSE / realtime pub-sub:** `not yet exercised` anywhere in aptkit. (Vite's own HMR uses a WebSocket in dev, but that's the dev server's machinery, not aptkit's code.) They'd become relevant if Studio needed to push updates *not* tied to a single request — live multi-user collaboration, a server-initiated notification — none of which exists.
+  chunk 2 arrives: 'ent":{...}}\n{"type":"result"'
+    buffer = '{"type":"event","event":{...}}\n{"type":"result"'
+    newline at idx 30 → line = '{"type":"event",...}' → YIELD
+    buffer = '{"type":"result"'      → hold, wait for its newline
+```
 
-#### Move 3 — the principle
+That buffering is the load-bearing part of any line-delimited streaming protocol: **drop it and a split chunk produces a JSON parse error on a valid record.** It's the streaming analog of why you can't `JSON.parse` a half-received body.
 
-The principle: **match the transport to the data flow, not to the buzzword.** "Streaming" reflexively suggests WebSockets, but a one-way, single-request progress feed is best served by streaming an HTTP response body — fewer moving parts, no reconnect protocol, the connection lifetime carries the "done" signal for free. Reaching for a WebSocket here would be adding a bidirectional long-lived channel to a problem that is neither bidirectional nor long-lived.
+**Malformed lines warn, they don't crash the stream.** `decodeNdjsonLine` returns a bounded `malformed_line` warning instead of throwing (`ndjson-stream.ts:64-82`), capped at `maxWarnings` (default 25). So one corrupt line doesn't abort the whole trace — the stream is resilient to partial garbage.
+
+**No reconnect, no resume — it's request-scoped.** This isn't a long-lived push channel; it's one HTTP request that streams its body and ends. There's no `Last-Event-ID`, no reconnect-with-offset, no heartbeat. If the connection drops mid-stream, the client just sees a truncated body — you re-run the request. That's fine because the underlying run is a *replay* (deterministic, cheap to redo), not a live subscription.
+
+**Model tokens are NOT streamed.** The Ollama wire uses `stream:false` (`gemma-provider.ts:71`), so the *model's* output arrives as one buffered JSON blob, not token-by-token. What you see "streaming" in Studio is the agent's step trace, not live token generation. That's a deliberate scope cut: real token streaming would mean `stream:true` to Ollama and a second NDJSON layer — `not yet exercised`.
+
+### Move 3 — the principle
+
+Realtime has a ladder of cost: chunked streaming (cheapest, one direction, request-scoped) → SSE (server push, auto-reconnect) → WebSockets (full duplex, stateful). aptkit climbed exactly one rung — chunked NDJSON — because its realtime need is "show agent progress during a run," which is one-way and request-scoped. The discipline is matching the transport to the interaction: a trace doesn't need a socket, it needs a body that flushes. The one non-obvious requirement even at this rung is the chunk-boundary buffer — the part everyone forgets until a line splits.
 
 ## Primary diagram
 
+The full streaming path: agent → encoder → chunked write → reassembly.
+
 ```
-  Realtime recap — NDJSON over one streamed HTTP response
+  aptkit realtime — chunked NDJSON, one direction, request-scoped
 
-  agent emits ─► middleware res.write(line) ─chunked HTTP─► browser reads line ─► UI updates
-       │                    │                                      │
-   trace events     headers: x-ndjson,                    decodeNdjsonStream
-   (step, tool,     no-cache, x-accel-buffering:no         splits on \n, tolerates
-    model_usage)            │                               partial trailing line
-       │            res.write(result line)                         │
-       └────────────► res.end()  ◄── the "done" signal ──► loop exits, returns result
-
-  NOT used: WebSocket (bidirectional), SSE (reconnect)  — not yet exercised
+  ┌─ Agent loop (in-process) ──────────────────────────────────┐
+  │  emit CapabilityEvent: step, tool_call_*, model_usage, …    │
+  └──────────────────────────┬─────────────────────────────────┘
+                             │  onEvent(event)
+  ┌─ encoder (runtime) ───────▼─────────────────────────────────┐
+  │  encodeNdjsonRecord(v) = JSON.stringify(v) + '\n'           │
+  └──────────────────────────┬─────────────────────────────────┘
+                             │  res.write(line)  ← Studio transport
+  ┌─ HTTP/1.1 chunked body ───▼─────────────────────────────────┐
+  │  …event\n …event\n …result\n  then res.end() (EOF)          │
+  │  headers: x-ndjson · no-cache · x-accel-buffering:no        │
+  └──────────────────────────┬─────────────────────────────────┘
+                             │  TCP (chunks split lines freely)
+  ┌─ Browser consumer ────────▼─────────────────────────────────┐
+  │  decodeNdjsonStream: buffer partials → yield whole lines    │
+  │  malformed line → bounded warning, stream survives          │
+  │  no reconnect/resume (re-run the deterministic replay)      │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-NDJSON-over-HTTP is the same shape the LLM provider APIs use for token streaming (`data:` lines for OpenAI, event streams for Anthropic) — the repo applies the pattern one level up, streaming *trace events* instead of tokens. The lineage is chunked transfer encoding from HTTP/1.1, which predates both SSE and WebSockets and remains the simplest way to push a bounded sequence. The runtime's `encodeNdjsonRecord` / `decodeNdjsonStream` pair (in `@aptkit/runtime`) is the reusable core; Studio just wires it to a response body. For how these streamed events become a debugging trail, see `study-debugging-observability`; for the latency characteristics of streaming vs buffering, see `study-performance-engineering`.
+NDJSON-over-chunked-HTTP is the workhorse of LLM tooling for exactly this reason: you want incremental output without the operational weight of WebSockets (connection state, reconnect, scaling sticky sessions). It degrades gracefully — a dropped connection is a truncated body, not a corrupted session — and it reuses the plain HTTP request you already have. The reassembly + bounded-warning design here is the careful part; it's what separates a toy streaming endpoint from one that survives real chunk boundaries and partial garbage. If aptkit ever needed live token streaming or a persistent subscription (push notifications from a long-running job), *that's* when SSE or WebSockets would earn their place. Today they're `not yet exercised`. See **study-distributed-systems** for the failure semantics of a dropped stream.
 
 ## Interview defense
 
-**Q: "You said it streams — is that a WebSocket?"**
-Correct the assumption directly: "No — it's NDJSON over a single chunked HTTP response. The data flow is one-way and tied to one request: run a replay, stream its trace events as newline-delimited JSON, end the response when the run finishes. A WebSocket would add a bidirectional long-lived channel I never use; SSE would add reconnect semantics I don't want for a one-shot job. The connection ending *is* the 'done' signal." Then the detail that shows you built it: "I set `x-accel-buffering: no` so an intermediary doesn't buffer the stream and kill the realtime feel."
+**Q: How do you stream agent output to the UI?**
+Chunked NDJSON over a plain HTTP response. The agent loop emits a `CapabilityEvent` per step; the dev middleware writes each as a JSON line on an open response, then a final result record, then closes. The client reassembles lines across TCP chunk boundaries with a buffer and tolerates malformed lines as bounded warnings. One direction, request-scoped — no WebSocket.
 
 ```
-  sketch: not-end()-yet is the whole trick
-
-  res.write(event)  ──► client sees it now
-  res.write(event)  ──► ... and now
-  res.end()         ──► done (no reconnect needed)
+  agent emit → JSON.stringify+'\n' → res.write (live) → res.end (EOF)
+  client buffers partial lines → yields whole records
 ```
+Anchor: *"the chunk-boundary buffer is the part people forget — without it a split line is a false parse error."*
 
-Anchor: *streaming a response body is just not calling `end()` until you're finished — match the transport to a one-way bounded flow.*
+**Q: Why not WebSockets or SSE?**
+The interaction is one-way and request-scoped — show progress during a run. Chunked streaming covers that with no connection state, no reconnect logic, and it reuses the HTTP request. WebSockets would be over-engineering for a trace. Also note: model tokens aren't streamed at all (`stream:false`); only the agent trace streams.
 
 ## See also
 
-- `05-http-semantics-caching-and-cors.md` — the `x-ndjson` content-type and the headers that keep the stream live
-- `03-tcp-udp-connections-and-sockets.md` — the single connection the stream rides on
-- `07-timeouts-retries-pooling-and-backpressure.md` — what happens if the stream never ends (no timeout)
+- `05-http-semantics-caching-and-cors.md` — the headers and content-type on the stream
+- `03-tcp-udp-connections-and-sockets.md` — why chunks split lines (TCP is a byte stream)
+- `07-timeouts-retries-pooling-and-backpressure.md` — backpressure on a streamed response
+- `00-overview.md` — WebSockets/SSE under `not yet exercised`

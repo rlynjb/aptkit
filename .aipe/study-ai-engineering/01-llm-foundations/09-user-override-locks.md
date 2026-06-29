@@ -1,230 +1,163 @@
-# User-override locks — when the human wins over the model
+# User-override locks
 
-**Subtitle:** intent_overridden_at · human edits beat model writes · *Project-specific*
+User-override locks · the `_overridden_at` pattern (Industry standard)
 
-> **Status: Not yet implemented.** aptkit has no `_overridden_at` field anywhere.
-> This file teaches the pattern, shows where it would live in buffr, and makes
-> building it the main exercise. The diagrams describe the target design, not
-> current code.
+When an LLM generates a field and a human corrects it, the next re-run must not clobber the correction. The pattern: every machine-writable field a user can edit gets a companion timestamp — `_overridden_at` — and the generator skips any field whose timestamp is set. aptkit core is a *library*; it doesn't own persistent user-editable state, so this is **not yet exercised** in aptkit itself. The editable state lives downstream, in buffr's `agents` schema. The pattern still matters — here's the whole thing.
 
 ## Zoom out, then zoom in
 
-Before the model writes back to a field a human can also edit, you need a rule for
-who wins. That rule is a lock — and today it's missing.
+aptkit generates; buffr stores and lets humans edit. The lock belongs at the storage boundary, which aptkit doesn't have.
 
 ```
-  Zoom out — where the override lock would sit
-
-  ┌─ Capability (classifier / enricher) ────────────────────────┐
-  │  wants to write an inferred value (intent, tag, summary)    │
-  └───────────────────────────┬─────────────────────────────────┘
-                              │ before write: check the lock
-  ┌─ Persistence (buffr) ─────▼─────────────────────────────────┐
-  │  ★ field + intent_source + intent_overridden_at ★           │ ← would live here
-  └───────────────────────────┬─────────────────────────────────┘
-                              │ SQL update (guarded)
-  ┌─ Storage ─────────────────▼─────────────────────────────────┐
-  │  agents.profiles / agents.messages — content + updated_at   │
-  └──────────────────────────────────────────────────────────────┘
+where the override lock belongs (NOT in aptkit core)
+┌─────────────────────────────────────────────┐
+│ buffr — agents schema (Postgres)              │  owns editable rows
+│   ★ field + field_overridden_at (the LOCK)    │  ← pattern lives HERE
+├─────────────────────────────────────────────┤
+│ aptkit — generates values (stateless lib)     │  no persistent state to lock
+├─────────────────────────────────────────────┤
+│ ModelProvider.complete()                       │
+└─────────────────────────────────────────────┘
 ```
 
-Models love to overwrite. Re-run a classifier and it cheerfully replaces whatever
-was there — including a value a human deliberately corrected. The override lock is
-a tiny piece of provenance: record *who* last set the field and *when the human
-touched it*, then teach the writer to never clobber a human edit. It's the
-difference between "the AI keeps undoing my fix" and a system that respects the
-person in the loop.
+The pattern is "last-writer-wins, but the human is the privileged writer." The question: *how do I re-run the model without overwriting what a person fixed?* You've hit this in any optimistic-UI form — local edits vs a refetch that would stomp them. The answer is the same: mark the human's write, and make the automated write yield to it.
 
 ## Structure pass
 
-**Layers.** Writer (model output) → guard (checks the lock) → row (field +
-`intent_source` + `intent_overridden_at`) → storage.
+Two writers compete for one field: the LLM (frequent, automated) and the human (rare, authoritative). Trace the **trust** axis — whose write wins.
 
-**Axis — authority.** Trace who's allowed to write the field. Without a lock, the
-last writer wins — usually the model, because it runs on every re-index. With a
-lock, authority is explicit: if `intent_overridden_at` is set, the human holds the
-field and the model must back off. The axis flips from "newest write wins" to
-"human write wins."
+```
+TRUST axis — who is allowed to overwrite this field?
+Writer          frequency     authority    on conflict
+──────────────────────────────────────────────────────────
+LLM re-run      every run     low          MUST yield ←★ seam
+Human edit      rare          high         always wins, sets *_overridden_at
 
-**Seam.** The guard before the write. Below it, a dumb `UPDATE`. Above it, a
-policy: "only write if no human override, or if this write is itself the human's."
-The lock field is the state that seam reads.
+The lock:  if field_overridden_at IS NOT NULL → LLM skips this field
+```
+
+The seam is the LLM write path. Without the lock, last-writer-wins means the *machine* wins (it runs constantly), silently erasing human corrections. The `_overridden_at` flag flips the rule: a set timestamp makes the field read-only to the generator. Trust inverts at exactly that check.
 
 ## How it works
 
-### Move 1 — the mental model
-
-You know optimistic UI with a dirty flag — once the user edits a field, you stop
-syncing the server value over their keystrokes? The override lock is a dirty flag
-that *persists*: `intent_overridden_at` is "the human touched this," and the model
-checks it the way your form checks `isDirty` before accepting a server update.
+**Mental model.** A per-field dirty bit, but it's a timestamp so you also get an audit trail. Generation reads the flag and routes: locked field → leave it; unlocked field → write the fresh value. Human edit sets the flag.
 
 ```
-  the dirty-flag pattern, persisted
-
-  field + intent_source ('model'|'user') + intent_overridden_at (timestamp|null)
-                                  │
-  model write ─► is intent_overridden_at set? ─yes─► SKIP (human owns it)
-                                              └no──► write, source='model'
-  human write ─► always write, source='user', stamp intent_overridden_at = now()
+The override lock — one field's lifecycle
+  LLM generates  → field = "Acme Inc", field_overridden_at = NULL
+        │
+  human edits    → field = "Acme Corp", field_overridden_at = now()  ← LOCKED
+        │
+  LLM re-runs    → field_overridden_at set? ─yes─▶ SKIP (keep "Acme Corp")
+                                            └no──▶ overwrite
 ```
 
-### Move 2 — the moving parts
-
-**Where it would live (and why it's absent today).** buffr's `agents.profiles`
-table has `content` and `updated_at` but **no source and no override timestamp** —
-so a re-enrichment can't tell a human edit from a stale model write. From
-`/Users/rein/Public/buffr/sql/001_agents_schema.sql:52`:
+**The schema shape (buffr, where it would live).** buffr's `agents` schema already owns the editable rows — profiles, messages, documents — but does *not* yet carry override columns. Here's the existing shape and where the lock attaches.
 
 ```sql
+-- buffr/sql/001_agents_schema.sql:52-58  (agents.profiles — editable, NO lock yet)
 create table if not exists agents.profiles (
   id uuid primary key default gen_random_uuid(),
   app_id text not null default 'laptop',
   user_id text,
-  content text not null,                 -- ← the field a model OR a human may set
+  content text not null,          -- LLM-generated AND human-editable → needs a lock
   updated_at timestamptz not null default now()
-  -- MISSING: intent_source           text   -- 'model' | 'user'
-  -- MISSING: intent_overridden_at    timestamptz
 );
+-- the pattern adds:  content_overridden_at timestamptz   (null = LLM owns it)
 ```
 
-```
-  today's profiles row — no provenance
+`content` is exactly the kind of field both writers touch: aptkit's `injectProfile` (`packages/context/src/profile-injector.ts:25-38`) reads/derives profile content, and a human may correct it. `updated_at` alone can't distinguish "machine touched it" from "human touched it" — that's why you need a *separate* override timestamp, not just the existing one.
 
-  content        ─► whoever wrote last (model usually wins on re-index)
-  updated_at     ─► WHEN, but not WHO or whether a human locked it
-  (no way to protect a human correction)
-```
-
-`agents.messages` (`001_agents_schema.sql:40`) is the same story: `content`,
-`model`, `tokens_used`, `created_at` — provenance of the *model* call, but no
-human-override marker. Note honestly: this is `not yet exercised` in aptkit;
-there's no `_overridden_at` field in the whole codebase.
-
-**The two columns the pattern needs.** Add provenance and a lock to the row:
-
-```sql
-alter table agents.profiles
-  add column intent_source        text not null default 'model',  -- 'model' | 'user'
-  add column intent_overridden_at timestamptz;                     -- null until a human edits
-```
+**The write-path guard (pseudocode — not yet exercised in aptkit).** The generator consults the lock before writing each field.
 
 ```
-  the guarded write (the rule in SQL)
+// where buffr would gate the LLM write
+for each generated field in row:
+  if row[field + '_overridden_at'] is not null:
+      skip            // human owns it — do not clobber
+  else:
+      row[field] = generated_value   // machine owns it — refresh
 
-  model write:
-    UPDATE agents.profiles SET content=$1, intent_source='model', updated_at=now()
-    WHERE id=$2 AND intent_overridden_at IS NULL;   ◄── no-op if human locked it
-
-  human write:
-    UPDATE agents.profiles SET content=$1, intent_source='user',
-           intent_overridden_at=now(), updated_at=now()
-    WHERE id=$2;                                     ◄── always wins, sets the lock
+// where the human edit sets the lock
+on user edit of field:
+  row[field] = user_value
+  row[field + '_overridden_at'] = now()   // claim it for the human
 ```
 
-The model's UPDATE carries `WHERE intent_overridden_at IS NULL` — if the human has
-set the lock, the row count comes back 0 and the model write quietly no-ops. The
-human's write sets the lock. After that, the model can never overwrite without an
-explicit unlock.
+**Why aptkit core can't hold this.** aptkit is stateless by design — `complete()` returns and forgets (see `01-what-an-llm-is.md`), capabilities produce values and hand them off. There's no row, no `updated_at` aptkit owns, so there's nothing to lock. The lock is inherently a property of *persisted, editable* state, and that's buffr's job. Putting it in aptkit would mean aptkit grew a database, which it deliberately doesn't have. So the honest status: the pattern is understood, the column lives downstream, **not yet exercised** in aptkit.
 
-**The writer-side check.** Before the model write, the capability reads the lock
-and decides. In aptkit's terms this is the same shape as the cheap guard in
-`07-heuristic-before-llm.md` — a deterministic check gating an expensive, mutating
-action.
-
-```
-  capability ─► read row ─► intent_overridden_at set?
-                              yes ─► skip model write, keep human value
-                              no  ─► run classifier, write with source='model'
-```
-
-### Move 3 — the principle
-
-Persist provenance, not just values. A field a model and a human both touch needs
-to record *who* and *whether the human claimed it*, and every model write must be
-guarded by that lock. The cheapest correct version is one timestamp column plus a
-`WHERE … IS NULL` clause — the human always wins, and you can prove it from the
-row.
+**The principle.** When two writers share a field and one is authoritative-but-rare, give the authoritative write a marker and make the frequent write yield to it. A bare `updated_at` is insufficient — it records *when*, not *who/whether-human*. The `_overridden_at` companion column encodes intent ("a human claimed this"), which is what the generator must respect. Same idea as a `pinned` flag, a manual-override switch, or git's "ours" merge strategy on a specific path.
 
 ## Primary diagram
 
-```
-  Override lock lifecycle (target design)
+The full lifecycle across the aptkit/buffr boundary — generation, human override, and the re-run that respects it.
 
-  [model write] ──► intent_overridden_at IS NULL? ─yes─► write, source='model'
-        ▲                         │ no
-        │                         └──► NO-OP (human owns the field)
-        │
-  [human edit] ──► write content, source='user', intent_overridden_at = now()
-        │
-        └──► from now on every model write hits the lock and no-ops
-   provenance columns make "who wins" a row fact, not a race
 ```
+User-override lock — across the boundary
+  APTKIT (stateless)              BUFFR agents schema (stateful)
+  ────────────────                ──────────────────────────────
+  generate content ─── write ───▶ profiles.content = "...", 
+                                  content_overridden_at = NULL
+                                          │
+                          HUMAN edits ────┤
+                                          ▼
+                                  content = "fixed",
+                                  content_overridden_at = now()  ★ LOCK
+                                          │
+  re-run generate ─── write? ───▶ overridden_at set?
+                                   yes ─▶ SKIP (keep human's "fixed")
+                                   no  ─▶ overwrite
+```
+
+aptkit always tries to write; buffr's lock decides whether the write lands.
 
 ## Elaborate
 
-This is human-in-the-loop provenance, the same idea as a CMS "edited by a person,
-don't auto-translate" flag or a CRM "manually verified" lock. It matters most for
-systems that re-run inference on a schedule — re-indexing, nightly enrichment —
-where the model would otherwise silently undo corrections. buffr is the right home
-because it owns the durable `agents` schema; aptkit's capabilities would consume
-the guard. Read `07-heuristic-before-llm.md` for the cheap-guard-before-expensive-
-action shape this reuses, and `04-structured-outputs.md` for validating the value
-the model proposes before it competes with the human's.
+This is a conflict-resolution policy — a coarse cousin of CRDTs and operational transforms, but for the human-vs-machine case where you don't merge, you just let the human win. It's also the data-modeling expression of "source of truth": the `_overridden_at` flag says "for this field, the human is now the source." Adjacent patterns: optimistic locking (version columns), soft-delete tombstones, and the `dirty`/`pristine` state machines you've used in form libraries. The deeper architecture note (aptkit = stateless toolkit, buffr = the stateful body holding the `agents` schema) is in the personal-agent-architecture memory. Read `01-what-an-llm-is.md` for why aptkit is stateless, and `04-structured-outputs.md` for how the values that get locked are generated.
 
 ## Project exercises
 
-### Add the override lock to buffr's profiles table
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a migration adding `intent_source` and `intent_overridden_at`
-  to `agents.profiles`, plus two guarded update paths (model write with
-  `WHERE intent_overridden_at IS NULL`, human write that stamps the lock).
-- **Why it earns its place:** this is the primary buildable target — it turns a
-  documented gap into a working human-in-the-loop guarantee against model clobber.
-- **Files to touch:** `/Users/rein/Public/buffr/sql/001_agents_schema.sql` (or a
-  new `002_*.sql`), and the buffr write path that updates profiles.
-- **Done when:** after a human edit sets the lock, a model write leaves `content`
-  unchanged (row count 0); before the lock, the model write applies.
-- **Estimated effort:** `1–4hr`
+### Add `*_overridden_at` columns and the write guard in buffr
 
-### Prove the lock with a re-enrichment test
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a test that writes a model value, then a human override, then
-  re-runs the model write and asserts the human value survived and `intent_source`
-  is still `'user'`.
-- **Why it earns its place:** the lock is only real if a re-run can't beat it; the
-  test is the receipt that the human wins.
-- **Files to touch:** buffr's test suite alongside the profiles write path.
-- **Done when:** the re-enrichment leaves the human value and source intact.
+- **Exercise ID:** `EX-LLM-09a`
+- **What to build:** This is unbuilt (Case B) — build the lock where it belongs. Add `content_overridden_at timestamptz` to `agents.profiles` (and the same companion to any other LLM-generated, human-editable field), then implement the write-path guard: the generation path skips fields whose `_overridden_at` is set, and the human-edit path sets it to `now()`.
+- **Why it earns its place:** Phase 1's data-meets-LLM lesson is that re-running a generator must not erase human corrections — and that aptkit (stateless) can't own this, so you learn the aptkit/buffr split firsthand. You'll implement the trust inversion in the one place state actually lives.
+- **Files to touch:** `buffr/sql/001_agents_schema.sql` (52-58 `agents.profiles`); the buffr write path that calls aptkit's generation; reference aptkit's read side `packages/context/src/profile-injector.ts` (25-38). Do not add state to aptkit core.
+- **Done when:** editing a profile sets `content_overridden_at`, a subsequent generation run leaves that field untouched, and an un-overridden field still refreshes on re-run.
 - **Estimated effort:** `1–4hr`
 
 ## Interview defense
 
-**Q: "A nightly classifier keeps overwriting fields users corrected. Fix it."**
-Add provenance: `intent_source` and `intent_overridden_at`. The model's UPDATE
-carries `WHERE intent_overridden_at IS NULL`, so once a human edit stamps the lock,
-the model write no-ops. The human always wins, and the row proves who set it.
+**Q: You re-run the LLM nightly — why doesn't it erase what users fixed?**
 
 ```
-  human edit ─► intent_overridden_at = now()
-  model write ─► WHERE intent_overridden_at IS NULL ─► 0 rows ─► no clobber
+  field_overridden_at = NULL  → LLM owns it  → overwrite freely
+  field_overridden_at = now() → human owns it → LLM SKIPS
+                                                 (human is privileged writer)
 ```
-Anchor: *a `WHERE … IS NULL` lock makes "human wins" a row fact, not a race.*
 
-**Q: "Does aptkit have this today?"**
-No — there's no `_overridden_at` field anywhere; `agents.profiles` has only
-`content` and `updated_at`, so the last writer (usually the model) wins. The
-pattern is designed and would live in buffr's `agents` schema. Being honest about
-the gap is the point.
+Each editable field has an `_overridden_at` companion; a set timestamp makes the generator skip that field. Last-writer-wins, but the human is the privileged writer. Anchor: *a set override timestamp makes the field read-only to the model.*
+
+**Q: Why not just use the existing `updated_at`?**
 
 ```
-  today:   content + updated_at        (no provenance, model clobbers)
-  target:  + intent_source + intent_overridden_at  (human-locked)
+  updated_at      → WHEN it changed   (machine writes bump it too)
+  overridden_at   → WHETHER a HUMAN claimed it  ← the bit you actually need
 ```
-Anchor: *not yet implemented — provenance is the missing column, buffr is the home.*
+
+`updated_at` records *when*, not *who* — the machine's own writes bump it, so it can't distinguish a human correction from a re-generation. You need a separate flag that encodes human intent. Anchor: *updated_at is a clock; overridden_at is a claim.*
+
+**Q: Why isn't this in aptkit core?**
+
+```
+  aptkit:  complete() → value → forget   (stateless, no rows to lock)
+  buffr:   agents schema → persisted editable rows  ← the lock lives here
+```
+
+Because the lock is a property of persisted editable state, and aptkit is a stateless library with no rows of its own — that state lives in buffr's `agents` schema. Anchor: *you can only lock state you own; aptkit owns none.*
 
 ## See also
 
-- `07-heuristic-before-llm.md` — the cheap-guard-before-write shape this reuses
-- `04-structured-outputs.md` — validating the model's proposed value first
-- `08-provider-abstraction.md` — the seam discipline buffr already proves
+- [`01-what-an-llm-is.md`](./01-what-an-llm-is.md) — why aptkit is stateless.
+- [`04-structured-outputs.md`](./04-structured-outputs.md) — how the locked values are generated.
+- [`08-provider-abstraction.md`](./08-provider-abstraction.md) — aptkit-as-library, the same separation-of-concerns instinct.

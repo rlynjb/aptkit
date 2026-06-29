@@ -1,236 +1,139 @@
-# Streaming — output that arrives in pieces
+# Streaming
 
-**Subtitle:** token streaming (the pattern) vs trace streaming (what aptkit does) · *Industry standard*
+Streaming responses · token streaming (Industry standard)
+
+Streaming, as the industry means it, is tokens appearing one at a time — the ChatGPT typewriter effect. aptkit does **not** do that for LLM output. Be blunt about it: aptkit's NDJSON stream carries trace *events* (the agent's steps), not model tokens. Studio shows "ran coverage gate → called tool → validated JSON," not characters materializing. That's correct for what aptkit builds, and it's a real gap for chat surfaces. LLM token streaming is **not yet exercised**.
 
 ## Zoom out, then zoom in
 
-Before you wire up a typing-cursor UI, see what aptkit actually streams: not model
-tokens, but trace *events* describing what the agent is doing.
+The thing aptkit streams lives above the model, in the trace layer — not inside `complete()`.
 
 ```
-  Zoom out — what flows out of aptkit incrementally
-
-  ┌─ Studio / client ───────────────────────────────────────────┐
-  │  reads an NDJSON stream, one JSON object per line            │
-  └───────────────────────────▲─────────────────────────────────┘
-                              │ NDJSON (trace events)
-  ┌─ Runtime ─────────────────┴─────────────────────────────────┐
-  │  ★ emits CapabilityEvents ★ step / tool_call / model_usage  │ ← we are here
-  └───────────────────────────┬─────────────────────────────────┘
-                              │ complete() — awaited whole, stream:false
-  ┌─ The model (Gemma) ───────▼─────────────────────────────────┐
-  │  returns the FULL response at once (no token stream yet)    │
-  └──────────────────────────────────────────────────────────────┘
+aptkit — what actually streams
+┌─────────────────────────────────────────────┐
+│ Studio UI — renders a live step list          │
+├─────────────────────────────────────────────┤
+│ ★ NDJSON stream of CapabilityEvent records     │  ← you are here (EVENTS)
+├─────────────────────────────────────────────┤
+│ Agent loop — emits an event per step           │
+├─────────────────────────────────────────────┤
+│ ModelProvider.complete() → full response       │  ← blocks until done, no token stream
+│ (no completeStream method exists)               │
+└─────────────────────────────────────────────┘
 ```
 
-There are two different things people call "streaming." Token streaming is the
-model emitting its answer one token at a time so a UI can render it as it's
-written — the ChatGPT typing cursor. Trace streaming is the *runtime* emitting
-structured events ("started step", "calling tool", "used 312 tokens") as the
-agent works. aptkit does the second and not yet the first. This file teaches token
-streaming as the industry pattern, then shows you exactly where aptkit diverges
-and why.
+The pattern is "stream the orchestration, not the generation." The question people *think* this answers is "how do I show text as it generates?" — but aptkit answers a different one: "how do I show the agent's progress live?" Like a CI pipeline UI streaming "step 1 ✓, step 2 running" versus a terminal printing a command's stdout char by char. Different streams, different granularity.
 
 ## Structure pass
 
-**Layers.** Model (produces output) → provider adapter (awaits it whole) → runtime
-(emits trace events) → NDJSON encoder → client (decodes line by line).
+Two streams could exist; only one does. Trace the **state** axis — what's mid-flight when the stream emits.
 
-**Axis — granularity over time.** Trace how fine-grained the incremental data is.
-The *ideal* token stream is per-token. aptkit's model call is all-or-nothing
-(`stream: false`). But the *runtime* is incremental at the event level — you see
-each step and tool call as it happens. So aptkit streams coarse (events) where the
-ideal streams fine (tokens).
+```
+STATE axis — what's in flight per emit?
+Stream                     emits                       exists in aptkit?
+──────────────────────────────────────────────────────────────────────
+Trace events (NDJSON)      one CapabilityEvent/step    YES ←★
+Token stream (chat)        one token/delta             NO (gap)
+complete()                 whole ModelResponse at once  YES (blocking)
+```
 
-**Seam.** The flip is the provider adapter. Below it, today, a single awaited
-response (no streaming). Above it, an incremental event stream. The adapter is
-exactly where token streaming *would* be plumbed in later — and the seam already
-exists.
+The seam is `complete()`. It's blocking — it returns the *entire* response when the model is done, no intermediate tokens. So the trace stream emits at step boundaries (between `complete()` calls), never inside one. There is no `completeStream` method on the provider; the token-granularity stream simply isn't wired.
 
 ## How it works
 
-### Move 1 — the mental model
-
-You know the difference between `const r = await fetch(url); await r.json()` and
-reading `r.body.getReader()` chunk by chunk? The first waits for everything; the
-second processes pieces as they land. Token streaming is the reader pattern
-applied to the model's output.
+**Mental model.** Two stream granularities. aptkit streams the coarse one (events between model calls); the industry's "streaming" means the fine one (tokens inside a model call). Hold both in your head and the gap is obvious.
 
 ```
-  await-the-whole vs read-the-chunks
+Two granularities of "streaming"
+  EVENT stream (aptkit has this)
+    ──[gate ran]──[tool called]──[json validated]──[done]──▶  (per agent step)
 
-  await complete()        ┌───────────────────────────┐
-   ───────────────────►   │ ...wait... full response  │   (aptkit today)
-                          └───────────────────────────┘
-  read chunks             ┌──┐┌──┐┌──┐┌──┐┌──┐
-   ──────────────────►    │To││ke││ns││ as││…  │  ──► render live (the pattern)
-                          └──┘└──┘└──┘└──┘└──┘
+  TOKEN stream (aptkit does NOT have this)
+    ──T──h──e── ──s──k──y── ──i──s── ──b──l──u──e──▶          (per token, inside one call)
+    └ would need completeStream() on ModelProvider; complete() blocks instead
 ```
 
-### Move 2 — the pattern: token streaming
-
-In the industry pattern, the provider opens a streaming connection and yields
-deltas; the runtime appends them to a buffer and pushes each delta to the client,
-so a UI renders text as it's generated. The shape is an async iterator of
-token-deltas. This is what you'd reach for to build a live "typing" answer.
-
-```
-  Token streaming (the pattern aptkit doesn't use yet)
-
-  model ──► delta ──► delta ──► delta ──► [done]
-                │        │        │
-                ▼        ▼        ▼
-            append to UI buffer, render each delta
-```
-
-### Move 2.5 — what aptkit actually does (current vs future)
-
-**The model call is non-streaming, on purpose.** Gemma's adapter calls Ollama with
-`stream: false` and awaits the entire response. The transport type bakes it in —
-`packages/providers/gemma/src/gemma-provider.ts:22`:
+**What the NDJSON layer actually moves.** It serializes trace records, one JSON object per line.
 
 ```ts
-export type GemmaChatTransport = (payload: {
-  model: string;
-  messages: { role: string; content: string }[];
-  stream: false;          // ← literally typed false; no token streaming today
-  options?: Record<string, unknown>;
-  signal?: AbortSignal;
-}) => Promise<OllamaChatResponse>;
-```
-
-```
-  Gemma today:  POST /api/chat { stream:false } ──► await full reply
-  token-level streaming from the model = not yet exercised
-```
-
-**What aptkit streams instead: NDJSON trace events.** The runtime emits a
-discriminated union of `CapabilityEvent`s — and there's a real NDJSON codec for
-them. The event union, `packages/runtime/src/events.ts:1`:
-
-```ts
-export type CapabilityEvent =
-  | { type: 'step'; … }
-  | { type: 'tool_call_start'; … }
-  | { type: 'tool_call_end'; durationMs: number; … }
-  | { type: 'model_usage'; provider: string; model: string; inputTokens?: number; … }
-  | { type: 'warning'; … }
-  | { type: 'error'; … };
-```
-
-And the streaming decoder that preserves partial lines across chunk boundaries —
-`packages/runtime/src/ndjson-stream.ts:103`:
-
-```ts
-export async function* decodeNdjsonStream<T>(chunks: AsyncIterable<string | Uint8Array>, …) {
-  let buffer = '';
-  for await (const chunk of chunks) {
-    buffer += typeof chunk === 'string' ? chunk : decoder.decode(chunk, { stream: true });
-    // split on \n, yield each COMPLETE line, keep the partial in buffer  ← chunk-boundary safe
-  }
+// packages/runtime/src/ndjson-stream.ts:31-33  (encodeNdjsonRecord)
+export function encodeNdjsonRecord(value: unknown): string {
+  return JSON.stringify(value) + '\n';   // one CapabilityEvent per line
 }
 ```
 
+NDJSON (newline-delimited JSON) is "one parseable object per line" — perfect for a stream because a reader can `split('\n')` and `JSON.parse` each line as it arrives. But the `value` here is a `CapabilityEvent` — a trace record like `{type:'tool_use', name, ...}` — not a token delta. The transport is stream-shaped; the payload is event-shaped.
+
+**Why complete() can't stream tokens.** Look back at the contract: it returns `Promise<ModelResponse>` (see `01-what-an-llm-is.md`). A `Promise` resolves once, with the whole value. There's no `AsyncIterable`, no callback per delta — so token streaming is architecturally absent, not just unimplemented.
+
 ```
-  aptkit streaming (real, today)
-
-  runtime ─► {type:"step"}\n ─► {type:"tool_call_start"}\n ─► {type:"model_usage"}\n
-                │                      │                            │
-                ▼                      ▼                            ▼
-         decodeNdjsonStream reassembles whole lines ─► Studio renders the trace
+  current:  complete(req): Promise<ModelResponse>   ← resolves ONCE, full text
+  needed:   completeStream(req): AsyncIterable<Delta> ← yields per token (gap)
 ```
 
-Studio's Vite middleware streams these NDJSON replay traces to the panel (apps/
-studio). So the live thing you watch is the *agent's reasoning trace*, not the
-model's text being typed out.
+**Why it's fine here.** aptkit's surfaces are analytics and RAG — structured-output capabilities (see `04-structured-outputs.md`), not free-form chat. You can't usefully stream a half-built JSON object to a validator; you need the whole thing to parse it. And the user-facing value is "watch the agent work," which the event stream nails. Token streaming earns its keep on chat UIs where perceived latency matters; aptkit doesn't have one yet.
 
-### Move 3 — the principle
-
-Stream the unit your consumer needs, not the unit the model happens to produce.
-For a chat UI, that's tokens. For an *observability* surface — which is what
-aptkit's Studio is — it's structured events. aptkit picked event streaming because
-its goal is to make agent behavior legible and replayable; token streaming is a
-later, additive feature that drops into the existing provider seam.
+**The principle.** Stream at the granularity your UI consumes. If the user waits on a *result* (parsed JSON), stream progress events. If the user reads *prose as it generates*, stream tokens. Picking the wrong granularity means either a frozen UI or a stream nobody can use.
 
 ## Primary diagram
 
-```
-  Two streams, one of them real today
+What aptkit streams today versus the token stream it lacks — the whole comparison in one frame.
 
-  PATTERN (not yet):  model ─tokens→ adapter ─deltas→ runtime ─deltas→ UI types live
-                                     ▲
-                                     │ stream:false today (Gemma)
-  REAL (today):       runtime ─CapabilityEvent→ NDJSON line → decodeNdjsonStream → Studio
-                       step / tool_call_start / tool_call_end / model_usage / warning / error
-   what arrives in pieces = TRACE EVENTS, not model tokens
 ```
+aptkit streaming, today vs the gap
+  AGENT LOOP                                    STUDIO UI
+  ──────────                                    ─────────
+  step: gate    ──┐
+  step: tool    ──┼─ encodeNdjsonRecord ──▶  NDJSON ──▶ live step list ✓
+  step: validate──┘   (one event / line)               (EVENT granularity)
+
+  complete(req) ──────────────────────────▶  Promise<ModelResponse>
+       │                                       resolves ONCE, full text
+       └─ no per-token emit  ✗  ── completeStream() NOT YET EXERCISED ──┘
+                                              (TOKEN granularity = gap)
+```
+
+Top path ships and powers Studio. Bottom path is the unbuilt chat-streaming surface.
 
 ## Elaborate
 
-Token streaming over HTTP is usually Server-Sent Events or chunked transfer with
-an async iterator of deltas; Ollama itself supports `stream: true`, so aptkit
-could enable it at the adapter without touching agents. The reason it hasn't:
-fixture replay and deterministic tests are simpler with whole responses, and the
-product value so far is the trace, not the typing effect. Be honest about this in
-interviews — "we stream traces, token streaming is a planned drop-in at the
-provider seam." Read `01-what-an-llm-is.md` for the `complete()` contract that
-would grow a streaming sibling, and `06-token-economics.md` for the `model_usage`
-event that already rides the trace stream.
+Real token streaming rides Server-Sent Events (SSE) or chunked HTTP: the vendor sends `data: {delta}` lines, the SDK exposes an async iterator, you append deltas to a buffer. Both Anthropic and OpenAI support it natively (`stream: true`). NDJSON is the right transport choice for the event stream — it's the same family as SSE, just self-framed. The thing that makes token streaming *hard* in aptkit isn't transport, it's that structured output needs the complete text to validate, so a streaming chat surface would be a parallel path, not a retrofit of `generateStructured`. Read `04-structured-outputs.md` for why whole-response is load-bearing, and `01-what-an-llm-is.md` for the `Promise`-returns-once contract.
 
 ## Project exercises
 
-### Add a streaming transport to the Gemma adapter
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a second Gemma transport that calls Ollama with `stream:true`,
-  yields token deltas as an async iterator, and a thin `completeStream()` that
-  re-emits them — keeping the existing `complete()` intact.
-- **Why it earns its place:** proves token streaming is an additive change at the
-  provider seam, not an agent rewrite — the whole point of the abstraction.
-- **Files to touch:** `packages/providers/gemma/src/gemma-provider.ts`,
-  `packages/providers/gemma/test/gemma-provider.test.ts`.
-- **Done when:** a test drives the streaming transport and collects deltas into the
-  same text the non-streaming path produces.
-- **Estimated effort:** `1–2 days`
+### Add completeStream to the provider port
 
-### Replay an NDJSON trace through the chunk-boundary decoder
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a test that feeds a CapabilityEvent NDJSON payload to
-  `decodeNdjsonStream` in deliberately ugly chunk splits (mid-line, mid-`\r\n`) and
-  asserts every event decodes intact.
-- **Why it earns its place:** the partial-line buffering is the hard part of any
-  stream decoder; this is the bug class real streaming work lives in.
-- **Files to touch:** `packages/runtime/test/ndjson-stream.test.ts`.
-- **Done when:** events decode correctly regardless of chunk boundaries.
-- **Estimated effort:** `1–4hr`
+- **Exercise ID:** `EX-LLM-05a`
+- **What to build:** This is unbuilt (Case B) — build it. Add an optional `completeStream(request): AsyncIterable<ModelDelta>` to the `ModelProvider` type, implement it for the Anthropic and OpenAI adapters using their native `stream: true` APIs, and feed deltas into the existing NDJSON encoder so a chat-style surface can render tokens live. Leave Gemma without it (provider declares it doesn't support streaming).
+- **Why it earns its place:** This is the headline gap in Phase 1 — you'll learn the `Promise` vs `AsyncIterable` split, how SSE/chunked deltas accumulate into a final response, and why a streaming path can't reuse the validate-the-whole-thing structured loop.
+- **Files to touch:** `packages/runtime/src/model-provider.ts` (54-58 the port type); `packages/providers/anthropic/src/anthropic-provider.ts` (28-61); `packages/providers/openai/src/openai-provider.ts`; `packages/runtime/src/ndjson-stream.ts` (31-33) to emit token records.
+- **Done when:** an Anthropic call yields incremental deltas through the NDJSON stream, the accumulated deltas equal the non-streaming `complete()` result, and providers without support fall back to a single full-response emit.
+- **Estimated effort:** `1–2 days`
 
 ## Interview defense
 
-**Q: "Does aptkit stream the model's tokens?"**
-No — the Gemma adapter calls Ollama with `stream:false` and awaits the full reply.
-What aptkit streams is NDJSON *trace events* (step, tool_call, model_usage) so
-Studio can show what the agent did. Token streaming is a planned drop-in at the
-provider seam.
+**Q: aptkit streams — does the UI show text generating token by token?**
 
 ```
-  expected: model ─tokens→ UI
-  actual:   runtime ─CapabilityEvents (NDJSON)→ Studio   (stream:false to the model)
+  Studio shows:  [gate ✓]──[tool ✓]──[validated ✓]   ← EVENTS (per step)
+  NOT:           T-h-e- -s-k-y- -i-s...               ← TOKENS (per delta)
+                 └ no completeStream(); complete() blocks
 ```
-Anchor: *aptkit streams traces, not tokens — by design, for observability.*
 
-**Q: "How would you add token streaming without breaking agents?"**
-Add a streaming transport/method beside `complete()` at the provider layer;
-agents that don't opt in keep awaiting whole responses. The seam already isolates
-the model, so nothing above it needs to know.
+No. It streams `CapabilityEvent` trace records (the agent's steps) over NDJSON, not model tokens. Anchor: *aptkit streams progress, not prose.*
+
+**Q: Why no token streaming if the vendors support it?**
 
 ```
-  complete()        ──► whole response   (unchanged callers)
-  completeStream()  ──► async iterator of deltas   (new, opt-in)
-       both behind the SAME ModelProvider seam
+  complete(): Promise<ModelResponse>   resolves once → full text
+  generateStructured needs FULL text to JSON.parse + validate
+  → streaming a half-built object is useless to a validator
 ```
-Anchor: *streaming is additive at the provider seam, not an agent rewrite.*
+
+Because aptkit's surfaces are structured-output analytics, and you can't validate a partial JSON object — you need the whole response. A chat surface would be a separate path, not yet built. Anchor: *you can't validate half a JSON object.*
 
 ## See also
 
-- `01-what-an-llm-is.md` — the `complete()` contract a stream method would join
-- `06-token-economics.md` — `model_usage`, an event that already rides the stream
-- `08-provider-abstraction.md` — the seam where streaming would plug in
+- [`04-structured-outputs.md`](./04-structured-outputs.md) — why whole-response is required.
+- [`01-what-an-llm-is.md`](./01-what-an-llm-is.md) — `complete()` returns a `Promise` once.
+- [`06-token-economics.md`](./06-token-economics.md) — usage is tallied from events, not a token stream.

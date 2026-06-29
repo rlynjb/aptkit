@@ -1,151 +1,107 @@
 # Study — Distributed Systems (applied to aptkit + buffr)
 
-## The honest verdict, up front
+> The question this guide answers: **what stays correct when coordination crosses a boundary and any participant can be slow, duplicated, stale, or unavailable?**
 
-aptkit is a **single-process TypeScript monorepo.** Most of the distributed-systems
-canon — consensus, replication, sharding, leader election, distributed
-transactions, exactly-once delivery — is `not yet exercised` here. There is no
-cluster, no quorum, no second replica, no message broker. Saying otherwise would
-be inventing infrastructure you didn't build.
+## Verdict first
 
-But "single-process" is not "no coordination." The moment your code calls
-`fetch()` to Ollama, or buffr opens a `pg.Pool` to a Supabase Postgres across the
-network, you have crossed a boundary where the other side can be **slow,
-unavailable, wedged, or racing your other writes** — and your correctness now
-depends on what happens when it is. That is the entire subject of distributed
-systems, in miniature. This guide teaches the full concept set, then anchors each
-one to the *real* coordination seam in your repos where it lives — or marks it
-`not yet exercised` and tells you exactly where it would attach if aptkit scaled.
+aptkit is a single-process TypeScript library. Most of the distributed-systems canon — consensus, replication, quorums, leader election, partitioning, exactly-once delivery — is **`not yet exercised`**. Saying that plainly is the whole point of this guide: you have not built distributed systems at scale (`me.md`), and pretending the repo does would teach you nothing transferable.
+
+But "single-process" is not "single-node." The moment a call leaves the process, you are in distributed-systems territory whether you asked to be or not. aptkit + buffr cross a boundary in exactly **four** places, and every one of them has a real, citable failure mode:
 
 ```
-  The whole coordinated system — what actually crosses a boundary
+  The four real coordination boundaries (everything else is in-process)
 
-  ┌─ Process: aptkit agent (single Node process) ──────────────────────┐
-  │                                                                     │
-  │   runAgentLoop ──► ModelProvider.complete()                         │
-  │       │                   │                                         │
-  │       │            ┌──────┴───────┐                                 │
-  │       │            ▼              ▼                                  │
-  │       │     FallbackModelProvider   ContextWindowGuardedProvider     │
-  │       │     (try A, then B,         (reject before the call         │
-  │       │      record attempts)        if input too big)              │
-  │       │            │                                                 │
-  │  emit(CapabilityEvent)  ── the in-process event log (the trace) ──┐  │
-  └───────┼─────────────┼────────────────────────────────────────────┼──┘
-          │             │ HTTP (no per-call timeout)                  │
-          │             ▼                                             │
-  ┌───── Network boundary ─────┐                                      │
-          │     ┌─ Ollama daemon :11434 ─┐  ← separate process/service│
-          │     │  POST /api/chat        │    partial failure lives here
-          │     │  POST /api/embed       │                            │
-          │     └────────────────────────┘                           │
-          │                                                          │
-  ┌─ Process: buffr runtime ───────────────────────────────────────┼──┐
-  │   ChatSession.ask() ──► PgVectorStore / SupabaseTraceSink       │  │
-  │       │                       │ pg.Pool (TCP)                   ▼  │
-  │       │              ┌────────┴────────┐         SupabaseTraceSink  │
-  │       │              ▼                 ▼         drains the trace   │
-  └───────┼──────── Network boundary ──────┼──── into agents.messages  │
-          │     ┌─ Supabase Postgres ──────▼─┐                         │
-          │     │  agents.{documents,chunks,  │  ← network DB:          │
-          │     │   conversations,messages}   │    pool, transactions,  │
-          │     │  + pgvector                 │    racing inserts       │
-          │     └─────────────────────────────┘                        │
+  ┌─ aptkit (single process, in-memory) ───────────────────────────┐
+  │                                                                 │
+  │   runAgentLoop  ──►  FallbackModelProvider  ──►  GemmaProvider  │
+  │                          (seam 2)                    │          │
+  └──────────────────────────────────────────────────────┼─────────┘
+                                                          │ HTTP, no timeout
+                                            seam 1 ───────▼─────────────┐
+                                          ┌─ Ollama daemon :11434 ──────┐│
+                                          │  separate service, no TLS   ││
+                                          └─────────────────────────────┘│
+                                                                         │
+  ┌─ buffr (the "body", consumes aptkit from npm) ───────────────────────┘
+  │                                                                       │
+  │   indexDocumentRow  ──►  documents insert  ──►  pipeline.index()      │
+  │       (seam 4: dual write)        │                   │               │
+  │                                   │ pg.Pool           │ PgVectorStore │
+  │   SupabaseTraceSink ──────────────┼───────────────────┼───────────┐   │
+  └───────────────────────────────────┼───────────────────┼───────────┼───┘
+                                       │ TCP :5432         │           │
+                          seam 3 ──────▼───────────────────▼───────────▼──┐
+                        ┌─ Supabase Postgres (network DB, pgvector) ───────┐│
+                        │  agents.documents · agents.chunks · agents.messages│
+                        └────────────────────────────────────────────────┘│
+                                                                            │
 ```
 
-## The real coordination seams (everything else is curriculum)
+That diagram is the map. Four seams, drawn where an axis (control / failure / state / guarantees) flips from one side to the other. The rest of the canon attaches to those seams as *what would have to change* when the repo grows — taught honestly as `not yet exercised`, with the attach point named.
 
-There are exactly **four** places in these two repos where coordination crosses a
-boundary and partial failure is real. Learn these cold; they are your whole
-distributed-systems portfolio today.
+## The four real seams
 
-```
-  Seam                          where it lives                       what can break
-  ────────────────────────────  ───────────────────────────────────  ──────────────────────────
-  1. app ↔ Ollama (HTTP)        gemma-provider.ts:201-215             daemon down / wedged;
-                                ollama-embedding-provider.ts:60-75    NO per-call timeout
-  2. provider fallback chain    fallback-provider.ts:47-89            one provider fails →
-                                                                      try next, record attempt
-  3. buffr ↔ Supabase Postgres  buffr/pg-vector-store.ts:38-65        pool exhaustion; per-doc
-                                buffr/supabase-trace-sink.ts:49-94    transaction; racing inserts
-  4. the trace as an event log  runtime/events.ts:1-32                ordering survives the race
-                                runtime/run-agent-loop.ts:111-187     only via event timestamp
-```
+| # | Seam | What it is | Real file | The failure that bites |
+|---|------|-----------|-----------|------------------------|
+| 1 | **app ↔ Ollama** | a separate service reached over local HTTP | `gemma-provider.ts:201` | daemon down or wedged, and **no per-call timeout** — the `fetch` waits forever |
+| 2 | **the failover chain** (`FallbackModelProvider`) | ordered providers tried in sequence | `fallback-provider.ts:50` | advances **only on a thrown error** — a slow provider that never throws defeats the chain |
+| 3 | **app ↔ Supabase Postgres** | a network database behind a connection pool | `pg-vector-store.ts:40` | per-document chunk upsert is atomic via `on conflict (id)`; the trace sink persists an emit-timestamp so `ORDER BY` recovers order from racing inserts |
+| 4 | **the dual write** | `documents` row, then `chunks` in a *separate* transaction | `runtime.ts:11` + `:17` | an embed failure after the doc insert **orphans the document** — a latent saga/outbox |
 
-## Ranked findings — read these first
+## Ranked findings (by consequence)
 
-1. **The Ollama HTTP calls have no per-call timeout (highest consequence).**
-   `gemma-provider.ts:201-215` and `ollama-embedding-provider.ts:60-75` call
-   `fetch()` with only an optional `AbortSignal` — no `AbortSignal.timeout()`, no
-   deadline. If the Ollama daemon wedges (model still loading, swap thrashing, a
-   hung GPU), `complete()` hangs until the caller aborts or the socket dies. In
-   the fallback chain this is worse: a *slow* provider never throws, so the chain
-   never advances to the next provider. Timeouts convert "infinitely slow" into
-   "failed fast," which is the only way the fallback logic and `maxTurns` budget
-   can actually protect you. → see `02-partial-failure-timeouts-and-retries.md`.
+1. **No deadline anywhere on the Ollama path** (`gemma-provider.ts:201`, `fallback-provider.ts:50`). The single most consequential gap. A wedged daemon — not crashed, just hung — blocks the `fetch`, which blocks the provider, which blocks the failover chain (it advances only on a *thrown* error), which blocks `runAgentLoop`. One slow node freezes the whole call. This is the textbook reason distributed systems use deadlines, and the repo has none. → `02-partial-failure-timeouts-and-retries.md`
 
-2. **The trace's monotonic ordering is reconstructed from event timestamps, not
-   insert order — and that's the one place you got distributed-systems-correct.**
-   `SupabaseTraceSink.emit()` is synchronous (aptkit's contract), but the Postgres
-   writes are queued promises drained by `flush()` via `Promise.all`
-   (`buffr/supabase-trace-sink.ts:49-94`). Those inserts race. The fix that makes
-   replay deterministic: the event's ISO `timestamp` is written into
-   `created_at`, so replay orders by *emit time*, not by *which insert won the
-   race*. This is logical-clock thinking applied to a real racing-writes problem.
-   → see `07-clocks-coordination-and-leadership.md` and
-   `06-queues-streams-ordering-and-backpressure.md`.
+2. **The dual write is a latent saga with no compensation** (`runtime.ts:5-18`). `indexDocumentRow` writes the `documents` row on the pool (auto-commit), then calls `pipeline.index()` which opens its *own* transaction for chunks. The two are not atomic, and `agents.chunks` deliberately has **no foreign key** to `documents` (`001_agents_schema.sql:27`). An embed failure between the two leaves a document with zero chunks and nothing to detect or repair it. → `08-sagas-outbox-and-cross-boundary-workflows.md`
 
-3. **`indexDocumentRow` is a dual write with no atomicity across the two systems
-   (a latent saga seam).** `buffr/runtime.ts` writes the `agents.documents` row in
-   one query, then calls `pipeline.index()` which embeds (Ollama) and upserts
-   chunks in a *separate* transaction. If the embed step throws after the
-   documents row is committed, you have a document with no chunks — a partial
-   commit across two operations. Today the blast radius is one local doc, so it's
-   acceptable; the moment indexing moves async or to a worker, this becomes a
-   textbook outbox/saga problem. → see `08-sagas-outbox-and-cross-boundary-workflows.md`.
+3. **Idempotency is real but partial** (`pg-vector-store.ts:47`). The chunk upsert is genuinely idempotent — `on conflict (id) do update` means re-running ingestion converges. But the `documents` write is *also* an idempotent upsert, while the failover chain and `runAgentLoop` retries are **not** idempotency-aware: a retried model call is a fresh call, billed again, with no dedup key. → `03-idempotency-deduplication-and-delivery-semantics.md`
 
 ## Reading order
 
 ```
-  01  distributed-system-map ........... the coordination map (start here)
-  02  partial-failure-timeouts-retries .. the most consequential gap (finding #1)
-  03  idempotency-dedup-delivery ........ upsert-by-id is your one idempotency win
-  04  consistency-models-staleness ...... stale recall, read-your-writes
-  05  replication-partitioning-quorums .. mostly `not yet exercised`
-  06  queues-streams-ordering ........... the trace sink's pending-queue
-  07  clocks-coordination-leadership .... finding #2, timestamp-ordered replay
-  08  sagas-outbox-cross-boundary ....... finding #3, the dual-write seam
-  09  red-flags-audit ................... ranked risks, evidence per verdict
+  00-overview                  ← you are here: the map + the verdict
+   │
+   ├─ 01-distributed-system-map        nodes, boundaries, ownership, failure domains
+   ├─ 02-partial-failure-timeouts-…    the #1 finding: no deadlines on the Ollama path
+   ├─ 03-idempotency-dedup-…           the upsert that converges; the retry that doesn't
+   ├─ 04-consistency-models-…          stale reads, read-your-writes across the DB seam
+   ├─ 05-replication-partitioning-…    mostly not yet exercised; the kind tag as a soft partition
+   ├─ 06-queues-streams-ordering-…     NDJSON trace stream; ordering recovered by timestamp
+   ├─ 07-clocks-coordination-…         ISO timestamps, no leader, no lease — why that's fine here
+   ├─ 08-sagas-outbox-…                the #2 finding: the orphaning dual write
+   └─ 09-distributed-systems-red-flags-audit   ranked risks with evidence
 ```
 
-## What is `not yet exercised` (named honestly)
+Read 02 and 08 first if you read nothing else — they carry the two load-bearing findings. Everything else either grounds those two or honestly marks where the canon doesn't yet apply.
 
-| Concept | Status | Where it would attach if aptkit scaled |
-| --- | --- | --- |
-| Consensus (Raft/Paxos) | `not yet exercised` | only if multiple buffr nodes shared write authority |
-| Replication / replica reads | `not yet exercised` | a Supabase read replica behind `PgVectorStore.search` |
-| Partitioning / sharding | `not yet exercised` | `app_id` is *already* a partition key (logical, single-node) |
-| Leader election | `not yet exercised` | a singleton indexer across multiple workers |
-| Distributed transactions / 2PC | `not yet exercised` | the `indexDocumentRow` dual write (finding #3) |
-| Sagas / compensation | latent, not built | same dual write, if it went async |
-| Idempotency keys | partial | `upsert ... on conflict (id)` gives idempotent writes |
-| Exactly-once delivery | `not yet exercised` | impossible to claim; the trace flush is at-most-once |
-| Message queue / broker | `not yet exercised` | the in-process `pending[]` array is the only "queue" |
-| Quorum reads/writes | `not yet exercised` | requires ≥3 replicas; there is one Postgres |
+## Repo-grounded vs `not yet exercised`
 
-## Cross-links to neighbor guides
+**Grounded in real files (you can open these and see the seam):**
+- partial failure across a service boundary (Ollama HTTP), and the *absence* of a timeout
+- a failover chain that records attempts and advances on thrown errors
+- idempotent upsert via `on conflict (id)`
+- per-document transaction atomicity (chunks) vs non-atomic dual write (doc + chunks)
+- ordering recovered from an emit-timestamp under racing inserts (`SupabaseTraceSink`)
+- a discriminated trace-event stream serialized as NDJSON
+- a logical partition (the `kind:'memory'` tag over a shared vector collection)
 
-- **study-networking** — the transport mechanics of the Ollama HTTP calls and the
-  `pg` TCP connection: DNS, connection reuse, TLS, the missing timeout at the
-  socket layer. This guide owns *coordination correctness*; networking owns *the wire*.
-- **study-database-systems** — the *datastore-local* consistency of Postgres: the
-  `begin/commit/rollback` in `PgVectorStore.upsert`, isolation levels, pgvector's
-  index. This guide owns coordination *across* the DB boundary; that one owns
-  what happens *inside* it.
-- **study-system-design** — the architectural shape and scale tradeoffs (why
-  local-first, why a single Postgres). This guide owns what stays correct when a
-  boundary is crossed.
-- **study-debugging-observability** — the trace as evidence for incident
-  reconstruction. This guide owns the trace's *ordering guarantees*; that one owns
-  reading it to debug.
-```
+**`not yet exercised` (taught with the attach point named, not invented):**
+- consensus / leader election / leases — single writer, no quorum (→ 07)
+- replication / quorums / failover of a replica — one Postgres, no replica (→ 05)
+- partitioning / shard keys — `app_id` is a tenant column, not a shard key (→ 05)
+- distributed transactions / 2PC — the dual write is the closest thing, and it's a *missing* saga (→ 08)
+- idempotency keys on model calls — upserts have them, retries don't (→ 03)
+- backoff / jitter — no retry loop on the network paths to back off (→ 02)
+- circuit breakers — failover records failures but never trips open (→ 02)
+- exactly-once delivery — at-most-once on the model call, at-least-once-ish on ingest (→ 03)
+- queue infrastructure, consumer groups, poison-message handling — no broker (→ 06)
+
+## Cross-links to neighboring guides
+
+This guide owns **correctness across a coordination boundary**. It does not re-teach:
+- **`study-networking`** — the transport itself: DNS, TCP, TLS, HTTP semantics, connection pooling mechanics, socket timeouts.
+- **`study-database-systems`** — datastore-*local* consistency: MVCC, isolation levels, the storage engine behind `on conflict`, index structure of pgvector.
+- **`study-system-design`** — the architectural shape and scale tradeoffs of the whole system.
+- **`study-debugging-observability`** — how you'd *see* a wedged daemon or an orphaned doc: the trace events, the logs, the incident.
+
+When a mechanism belongs to one of those, this guide cross-links instead of duplicating.

@@ -1,274 +1,182 @@
 # 06 — Queues, Streams, Ordering, and Backpressure
 
-**Industry names:** in-process work queue · event stream (NDJSON) · ordering guarantees · backpressure · poison message · fan-in / batched flush — *Industry standard.*
+**Industry names:** message queue · event stream · ordering guarantees · backpressure · poison message · consumer group. **Type:** Industry standard.
 
 ## Zoom out, then zoom in
 
-There is no Kafka, no Redis Streams, no message broker here — that's `not yet
-exercised`. But there are two real stream-shaped things worth studying: the
-**NDJSON trace stream** (the agent emits events that flow to the Studio UI or to
-Postgres) and the **`pending[]` write queue** inside `SupabaseTraceSink` (sync
-emits buffered, then drained by `flush()`). Both raise the core stream questions:
-ordering, backpressure, and what happens to a bad message.
+There's no broker — no Kafka, no Redis Streams, no SQS. **Queue infrastructure is `not yet exercised`.** But the repo *does* produce a real **event stream** — the trace events — and serializes it as NDJSON. So the streaming-and-ordering half of this topic is grounded; the broker-and-consumer-group half is honestly absent.
 
 ```
-  Zoom out — the two stream-shaped things in the repo
+  Zoom out — a stream the repo has, a broker it doesn't
 
-  ┌─ App: runAgentLoop ─────────────────────────────────────────────────┐
-  │  emit(CapabilityEvent) ── synchronous, in-order ──┐                  │ ← producer
-  └────────────────────────────────────────────────────┼─────────────────┘
-                                                        │
-            ┌───────────────────────────────────────────┴──────────────┐
-            ▼ (aptkit)                                                  ▼ (buffr)
-  ┌─ NDJSON stream → Studio UI ─┐              ┌─ SupabaseTraceSink.pending[] ─┐
-  │  one JSON object per line    │              │  push() each event's write,   │ ← we are here
-  │  ordered by emit             │              │  then flush() drains them all │
-  └──────────────────────────────┘              └───────────────┬───────────────┘
-                                                                │ Promise.all (racing inserts!)
-                                                  ┌─ agents.messages ────────────┐
-                                                  │  order rebuilt from created_at│
-                                                  └───────────────────────────────┘
+  ┌─ App (producer) ────────────────────────────────────────────────┐
+  │  runAgentLoop → trace.emit(CapabilityEvent)  ★ the stream ★       │ ← we are here
+  └───────────────┬──────────────────────────────┬──────────────────┘
+       NDJSON      │                    persisted │
+  ┌───────────────▼──────────┐        ┌───────────▼──────────────────┐
+  │ Studio (Vite middleware)  │        │ SupabaseTraceSink → messages  │
+  │  reads NDJSON, replays    │        │  created_at = emit timestamp  │
+  └───────────────────────────┘        └───────────────────────────────┘
+
+  ┄┄ not yet exercised: a broker between producer and consumer,
+     consumer groups, offsets, poison-message handling, backpressure ┄┄
 ```
 
-Zoom in: a **stream** is an ordered sequence of events a producer emits and a
-consumer processes. The hard questions are always the same three — does the consumer
-see events *in order*? what happens when the producer outruns the consumer
-(**backpressure**)? and what happens to one event the consumer *can't* process (a
-**poison message**)? aptkit answers the first with a clever timestamp trick and
-mostly dodges the other two — which is fine at its scale, and exactly what to name.
+Zoom in: a **stream** is an ordered sequence of events a producer emits and a consumer reads. A **queue** adds a durable buffer *between* them so the producer can outrun the consumer without either blocking. The repo emits a stream synchronously (`trace.emit` is a function call, not an enqueue) — so there's no buffer, no consumer lag, and no backpressure, because producer and consumer are the same thread. That's the key realization: the repo has a stream's *ordering* concerns without a queue's *decoupling* concerns.
 
-## Structure pass
+## Structure pass — layers, one axis, the seams
 
-**Layers.** Producer (agent emits) → buffer (`pending[]` / NDJSON line buffer) →
-consumer (Postgres insert / Studio render).
+**Layers:** producer (`runAgentLoop` emitting events) → serialization (NDJSON) → consumers (Studio replay, `SupabaseTraceSink`).
 
-**Axis — trace `is order preserved?` from producer to consumer.**
+**The one axis: *how is order established and preserved?*** Trace it from emission to recovery:
 
 ```
-  Axis — "is emit order == consumer order?" — producer to consumer
+  "what guarantees event order at this stage?"  — traced along the stream
 
-  ┌─ producer: emit(event) ────────────────────┐
-  │  synchronous, single-threaded → emit order  │  → STRICTLY ordered at the source ✓
-  │  is the truth                               │
-  └──────────────────────┬──────────────────────┘
-       ┌─────────────────▼────────────────────────┐
-       │ buffer: pending[] (array, push order)     │  → push order == emit order ✓
-       └─────────────────┬────────────────────────┘
-            ┌────────────▼──────────────────────────┐
-            │ consumer: Promise.all(pending) inserts │  → INSERT order is a RACE ✗
-            └─────────────────────────────────────────┘     (fixed by created_at, see below)
+  ┌──────────────────────────────────────────────┐
+  │ trace.emit() calls   order = CALL order        │  in-process, single thread:
+  │  (run-agent-loop.ts)  (program order)          │  total order, free
+  └────────────────────┬──────────────────────────┘
+       ┌───────────────▼──────────────────────────┐
+       │ NDJSON serialization  order = LINE order   │  append order preserved
+       │                                            │  in the byte stream
+       └───────────────┬──────────────────────────┘
+             ┌─────────▼──────────────────────────┐
+             │ SupabaseTraceSink INSERT            │  rows may RACE on insert →
+             │  order recovered by created_at      │  ORDER BY created_at restores it
+             └─────────────────────────────────────┘
 ```
 
-**Seam.** Order is preserved at the producer and in the buffer, then *lost* at the
-consumer — `Promise.all` fires all the inserts concurrently, so whichever Postgres
-write wins the race lands first. The seam where order breaks is the concurrent
-flush. The fix doesn't restore insert order; it makes insert order *irrelevant* by
-carrying the emit timestamp into the row. That's the lesson, and it's
-file 07's subject too.
+Order is free in-process (one thread, program order), preserved in the byte stream (line order), and *recovered* at the database by an explicit emit-timestamp. That last flip is the load-bearing one — and it's the seam.
+
+**The seam:** the `SupabaseTraceSink` boundary (`buffr/src/supabase-trace-sink.ts`). Ordering changes from *implicit* (program/line order) to *needs-reconstruction* (rows can land out of order under concurrency, so order is carried in a column, not in arrival).
 
 ## How it works
 
-### Move 1 — the mental model: a stream is a conveyor belt; order is the belt's promise
+### Move 1 — the mental model
 
-You know this from the event loop: callbacks queued in order, drained in order. A
-trace stream is a conveyor belt of events — the agent drops events on in the order
-they happen, and *something* downstream picks them up. The whole design question is
-whether the picking-up preserves the dropping-on order.
+You know a stream from an array you `.push()` to and read back in order, and you know NDJSON from line-delimited logs — each line one JSON object. The repo's trace is exactly that: emit appends an event, the consumer reads events in the order they were appended.
 
 ```
-  The stream kernel — produce in order, buffer, drain
+  The stream kernel — append-ordered events, one consumer-readable line each
 
-  producer:  e1 ─► e2 ─► e3 ─► e4   (emit order = ground truth)
-                  │
-                  ▼  push into buffer
-  buffer:   [ e1, e2, e3, e4 ]      (array preserves order)
-                  │
-                  ▼  drain
-  consumer:  ?? depends on HOW you drain ??
-             sequential await → e1,e2,e3,e4  (order kept)
-             Promise.all      → e?,e?,e?,e?  (order RACED) ← aptkit does this
+  producer:  emit(e0) → emit(e1) → emit(e2)
+                │         │         │
+                ▼         ▼         ▼
+  NDJSON:    {…e0…}\n  {…e1…}\n  {…e2…}\n     ← line order = emit order
+                                              ← each line independently parseable
 ```
 
-The load-bearing realization: a buffer keeps order, but *how you drain it* decides
-whether the consumer sees order. Drain sequentially and order survives; drain
-concurrently for speed and you trade order away — unless each event carries its own
-position.
+The kernel: **append-ordered events + a self-delimiting wire format.** Drop the delimiter (one giant JSON array) and you can't stream incrementally — the consumer must wait for the whole thing. NDJSON's `\n`-per-record is what lets Studio render events as they arrive.
 
 ### Move 2 — walking the mechanism
 
-**Step 1 — the producer emits synchronously, in order.** The agent loop calls
-`trace.emit()` at each step, and emit is *synchronous by contract* — it returns
-immediately, so the loop never blocks on the sink:
+**Part 1 — the producer: synchronous emit, no buffer.** Events come from `trace?.emit(...)` calls scattered through `runAgentLoop` (`run-agent-loop.ts`): `step` (:127), `model_usage` (:111), `tool_call_start` (:147), `tool_call_end` (:171), `warning` (:220), plus `error`. Each is a discriminated-union `CapabilityEvent` (`runtime/src/events.ts:1-24`) carrying a `capabilityId` and an ISO `timestamp`. Crucially, `emit` is a *synchronous call* — there's no queue between the loop and the sink. The loop produces; the sink consumes; same call stack, same thread. So there is no producer/consumer decoupling and, by extension, no consumer lag and no backpressure. The stream's *ordering* matters; its *buffering* doesn't exist.
 
-```ts
-// packages/runtime/src/run-agent-loop.ts:147-179 (the emit calls, in loop order)
-trace?.emit({ type: 'tool_call_start', capabilityId, toolName, args, timestamp: timestamp() });
-// ... run the tool ...
-trace?.emit({ type: 'tool_call_end', capabilityId, toolName, result, error, durationMs, timestamp: timestamp() });
+```typescript
+// packages/runtime/src/events.ts:1-9  (the event stream's element type)
+export type CapabilityEvent =
+  | { type: 'step'; capabilityId: string; role: string; content: string; timestamp: string }
+  | { type: 'tool_call_start'; capabilityId: string; toolName: string; args: unknown; timestamp: string }
+  | { type: 'tool_call_end'; capabilityId: string; toolName: string; result?: unknown;
+      error?: string; durationMs: number; timestamp: string }
+  // … model_usage | warning | error — all carry capabilityId + ISO timestamp
 ```
 
-Single-threaded, sequential — so the *emit order* is the ground truth for "what
-happened when." `start` always emits before its `end`. This ordering is free here
-because there's one producer and JS is single-threaded; it's the consumer side that
-gets interesting.
+The `timestamp` field is the load-bearing part: it's stamped *at emit time* (`timestamp()` → `new Date().toISOString()`, `events.ts:30`), not at persist time. That's what makes order recoverable downstream.
 
-**Step 2 — the buffer: a sync emit that queues an async write.** Here's the clever
-contract bridge. aptkit's sink must be *synchronous* (`emit(): void`), but a Postgres
-write is *async*. The `SupabaseTraceSink` reconciles them by pushing the write
-*promise* into an array and returning immediately:
+**Part 2 — the wire format: NDJSON, ordered by lines.** The events serialize to NDJSON (newline-delimited JSON) — `context.md` confirms the trace is "streamed/persisted as NDJSON," and Studio's Vite middleware streams it. Line order in the byte stream is emit order, because the producer is single-threaded and appends. A consumer reading the file top-to-bottom reconstructs the exact sequence.
 
-```ts
-// buffr/src/supabase-trace-sink.ts:49-93
-export class SupabaseTraceSink implements CapabilityTraceSink {
-  private readonly pending: Promise<void>[] = [];      // ← the in-process "queue"
+**Part 3 — the ordering recovery at the database (the real distributed-systems move).** Here's where it gets interesting. When `SupabaseTraceSink` persists events to `agents.messages`, multiple inserts can be in flight, and rows don't necessarily *land* in emit order under concurrency. The sink defends against this by persisting the *emit* timestamp into `created_at`:
 
-  emit(event: CapabilityEvent): void {                 // ← sync: satisfies aptkit's contract
-    switch (event.type) {
-      case 'step':
-        this.push(persistMessage(pool, conversationId, event.role, event.content, { createdAt: at }));
-        // ↑ persistMessage returns a Promise; we push it, don't await it
-        return;
-      // ... one case per CapabilityEvent variant ...
-    }
-  }
-  private push(p: Promise<void>): void { this.pending.push(p); }
-
-  async flush(): Promise<void> {
-    await Promise.all(this.pending);                   // ← drain CONCURRENTLY → inserts race
-  }
-}
+```sql
+-- buffr/src/supabase-trace-sink.ts:27-36  (persistMessage)
+insert into agents.messages
+  (conversation_id, role, content, tool_calls, tool_results, model, tokens_used, created_at)
+values ($1, $2, $3, $4, $5, $6, $7, coalesce($8::timestamptz, now()));
+                                              -- ↑ $8 = the event's emit timestamp
 ```
 
-The annotation that matters: `emit` doesn't await — it *fires* the write and stashes
-the promise. So emits are non-blocking (the agent runs at full speed), and the writes
-happen in the background. Then `flush()` (called once after the turn, in
-`session.ts:63`) awaits them all. This is a fan-in: many emits, one drain.
-
-**Step 3 — the ordering problem `Promise.all` creates, and the timestamp fix.**
-`Promise.all` starts every pending write concurrently. Postgres applies them in
-whatever order they arrive — a *race*. Without intervention, `tool_call_end` could
-land in the table *before* its `tool_call_start`. The fix (called out in the sink's
-own comment) is to stop relying on insert order entirely:
-
-```ts
-// buffr/src/supabase-trace-sink.ts:53-55, and persistMessage:26-30
-const at = event.timestamp;                            // ← the EMIT-time ISO timestamp
-// ...persistMessage writes it into created_at:
-//   values (..., coalesce($8::timestamptz, now()))    ← created_at = emit time, NOT insert time
-```
-
-Now replay orders by `created_at` (emit order), and the insert race is *irrelevant* —
-whoever wins the race, the row carries its true position. This is the single best
-piece of distributed-systems engineering in the two repos: it converts an ordering
-problem into a non-problem by attaching a logical position to each event instead of
-trusting physical arrival order. (The clocks angle is file 07.)
-
-**Step 4 — what's NOT handled: backpressure and poison messages.**
+Read the last column: `coalesce($8::timestamptz, now())`. The `$8` parameter is the event's *own* emit timestamp (captured as `at` from `event.timestamp`, `supabase-trace-sink.ts:53-85`). If it's present, the row records *when the event happened*, not when the INSERT committed. So even if two inserts race and commit out of order, `ORDER BY created_at` recovers the true emit sequence. The `coalesce(..., now())` fallback means a missing timestamp degrades to server-clock insert time — a reasonable last resort.
 
 ```
-  Layers-and-hops — backpressure: who slows down when the consumer can't keep up?
+  Layers-and-hops — racing inserts, order recovered by emit timestamp
 
-  ┌─ producer (agent) ─┐  emit, emit, emit...   ┌─ pending[] ─┐   inserts...  ┌─ Postgres ─┐
-  │  never blocks       │ ─────────────────────► │ grows       │ ────────────► │ may lag    │
-  │  (emit is sync)     │                        │ UNBOUNDED   │               │            │
-  └─────────────────────┘                        └─────────────┘               └────────────┘
-       ▲                                              ▲
-       └─ no signal flows back ──────────────────────┘
-          if Postgres is slow, pending[] just grows; nobody is told to slow down
+  ┌─ App (one thread) ──────┐  emit e0 @ t0, e1 @ t1   ┌─ SupabaseTraceSink ─┐
+  │ runAgentLoop            │ ─────(in order)────────► │ INSERT, created_at  │
+  │                         │                          │   = emit timestamp  │
+  └─────────────────────────┘                          └──────────┬──────────┘
+                                                                  │ concurrent
+                          rows may COMMIT out of order ──────────►│ INSERTs
+                                                       ┌──────────▼──────────┐
+                                                       │ agents.messages     │
+                                                       │ SELECT … ORDER BY    │  ← true emit
+                                                       │   created_at        │     order restored
+                                                       └─────────────────────┘
 ```
 
-There is **no backpressure**: `emit` always succeeds instantly, so if Postgres is
-slow, `pending[]` grows without bound and memory grows with it. At aptkit's scale
-(one agent run, a few dozen events) this never bites — the buffer is tiny and bounded
-by the turn. But it's the textbook gap: a real queue has a *bounded* size and pushes
-back (blocks or drops) when full. And there's **no poison-message handling**: if one
-`persistMessage` rejects, `Promise.all` rejects the whole `flush()`, and that throws
-out of `ask` — one bad event fails the entire turn's trace persistence rather than
-being isolated and skipped. Both are correct trades *at this scale* and would need
-attention only if the trace volume grew or the writes moved to a real broker.
+This is a small but genuine instance of the distributed-systems principle: **don't trust arrival order; carry order in the data.** It's the same reason event-sourced systems stamp every event with a sequence number or timestamp at the source.
+
+**Part 4 — backpressure, poison messages, consumer groups — `not yet exercised`.** All three need a broker the repo doesn't have:
+- **Backpressure** — when a consumer can't keep up, the system must slow the producer (block, drop, or buffer-then-spill). The repo's emit is synchronous, so there's nothing to back up — the "consumer" runs inline. Attach point: the day trace persistence becomes async (a real queue to Supabase), a slow DB would need to push back on the loop.
+- **Poison message** — an event that crashes the consumer every time it's processed, blocking the queue. The trace sink *should* swallow its own failures (a failed trace insert must not fail the agent turn — a property `study-debugging-observability` owns), so a "poison" trace event is contained by being best-effort. There's no dead-letter queue because there's no queue.
+- **Consumer groups / offsets** — multiple consumers splitting a partitioned stream, each tracking its position. Not applicable: one producer, inline consumers, no offset to commit.
 
 ### Move 3 — the principle
 
-Ordering, backpressure, and poison handling are the three questions every stream
-must answer, and you can answer each one *cheaply* if you understand what you're
-trading. aptkit answers ordering brilliantly (carry the position with the event, so
-the consumer never has to preserve it) and *defers* backpressure and poison handling
-by keeping the queue small and per-turn. The general principle: **don't trust the
-transport to preserve order — make each message self-positioning.** A logical
-timestamp or sequence number on every event means you can drain as fast and as
-concurrently as you like and still reconstruct the truth.
+In a single-threaded producer, order is free and you can forget about it. The instant the consumer is on the other side of a boundary — a database, a network, a broker — arrival order stops being emit order, and you must *carry order in the data* (a timestamp, a sequence number) to recover it. The repo does exactly this with `created_at`, which is the right instinct even though it has no broker. Backpressure and poison-message handling are the problems you buy *along with* a queue; the repo hasn't bought the queue, so it honestly doesn't have them.
 
 ## Primary diagram
 
-```
-  The trace stream — sync emit, buffered, concurrent drain, order via timestamp
+The whole stream path, from synchronous emit to order recovery.
 
-  ┌─ Producer: runAgentLoop (single-threaded) ──────────────────────────┐
-  │  emit(e, timestamp=NOW)  e1 → e2 → e3 ... in emit order ✓            │
-  └──────────────────────────────┬───────────────────────────────────────┘
-                                 │ emit() is SYNC — never blocks (no backpressure)
-  ┌─ Buffer: SupabaseTraceSink.pending[] ─▼──────────────────────────────┐
-  │  push(persistMessage(...))  → [ p1, p2, p3, ... ]  (unbounded)        │
-  └──────────────────────────────┬───────────────────────────────────────┘
-                                 │ flush(): Promise.all → inserts RACE
-  ┌─ Consumer: agents.messages ──▼───────────────────────────────────────┐
-  │  insert order = nondeterministic, BUT created_at = emit timestamp     │
-  │  → replay ORDER BY created_at → emit order recovered ✓                │
-  │  gaps: no backpressure (pending grows), no poison isolation (1 bad    │
-  │        write fails the whole flush)                                   │
-  └─────────────────────────────────────────────────────────────────────┘
+```
+  Trace event stream — emit, serialize, persist, recover order
+
+  ┌─ Producer (single thread) ─────────────────────────────────────┐
+  │  runAgentLoop: emit step, tool_call_start/_end, model_usage,    │
+  │   warning, error  — each a CapabilityEvent w/ ISO timestamp     │
+  │   (no queue; emit is a synchronous call → no backpressure)      │
+  └──────────────────────────────────┬──────────────────────────────┘
+            ┌─────────────────────────┴───────────────────────┐
+            │ NDJSON (line order = emit order)                 │
+  ┌─────────▼────────────┐                       ┌─────────────▼──────────────┐
+  │ Studio replay         │                       │ SupabaseTraceSink           │
+  │  reads lines in order │                       │  INSERT created_at = emit ts│
+  └───────────────────────┘                       │  racing inserts →           │
+                                                   │  ORDER BY created_at        │
+                                                   │   recovers emit order       │
+                                                   └─────────────────────────────┘
+
+  ┄┄ not yet exercised: broker · backpressure · poison/dead-letter · offsets ┄┄
 ```
 
 ## Elaborate
 
-The sync-emit / async-write split is a beautifully pragmatic answer to an impedance
-mismatch: aptkit's `CapabilityTraceSink` contract is sync (so the core never depends
-on a durable store), but durability is async. Buffering promises and draining once is
-the bridge. The risk it accepts — unbounded `pending[]` — is the same risk every
-"fire and forget then flush" buffer accepts; real systems bound it with a max size
-and a flush threshold (flush every N events or every T ms), which is exactly what a
-log shipper or a metrics agent does.
+The NDJSON-streaming-plus-timestamp pattern is the lightweight cousin of event sourcing and log-based architectures (Kafka's core idea: the log *is* the source of truth, ordered by offset). The repo uses a timestamp instead of a monotonic offset, which is fine for a single producer but would break under multiple producers whose clocks disagree — that's the clock problem, and it's why real log systems assign a *broker-side* sequence number (→ `07` for why clocks alone can't order distributed events).
 
-The poison-message gap is worth naming because it's a classic stream failure: in a
-real broker, one un-processable message shouldn't block or fail the whole stream — it
-goes to a dead-letter queue and the consumer moves on. Here, one rejected insert
-fails the whole `flush()`. The move, if trace volume grew, would be
-`Promise.allSettled` instead of `Promise.all` — persist what you can, collect the
-failures, and don't let one bad row lose the rest of the trajectory.
+Backpressure is the concept worth internalizing for when buffr's trace persistence goes async: the three responses to a full buffer are *block* (slow the producer — preserves all data, risks stalling the agent), *drop* (shed load — preserves throughput, loses traces), and *spill* (buffer to disk — preserves data, adds latency). For best-effort observability, *drop* is usually right; for the agent's actual output, *block* is. Knowing which data deserves which policy is the skill.
 
 ## Interview defense
 
-**Q: "How do you guarantee trace events are in order if the writes race?"**
-"I don't try to make the *writes* ordered — that's the trick. `SupabaseTraceSink`
-fires all the inserts concurrently with `Promise.all`, so insert order is a race. But
-every event carries its emit-time ISO timestamp, and that's written into
-`created_at`. So replay does `ORDER BY created_at` and recovers the true emit order
-regardless of which insert won. I moved the ordering guarantee from the transport to
-the data — each event is self-positioning, so concurrent draining is safe."
+**Q: "How do you keep your trace events ordered when they hit the database?"**
+"Each `CapabilityEvent` carries an ISO timestamp stamped at *emit* time, not insert time. `SupabaseTraceSink` writes it into `created_at` — `coalesce($8::timestamptz, now())` at `supabase-trace-sink.ts:30`. So even if concurrent inserts commit out of order, `ORDER BY created_at` recovers the true emit sequence. The principle: don't trust arrival order, carry order in the data."
 
 ```
-  sketch
-
-  emit(e, t=NOW) → pending[] → Promise.all (RACE) → rows with created_at=t
-                                                     replay ORDER BY created_at ✓
-  ordering lives on the EVENT, not the transport
+  emit ts → created_at column → ORDER BY recovers order despite racing inserts
 ```
 
-**Q: "What breaks if the trace volume gets large?"** — the load-bearing gaps:
-"Two things, both fine today and both fixable. One, no backpressure — `emit` is sync
-and never blocks, so if Postgres lags, `pending[]` grows unbounded and so does
-memory. A real queue bounds itself and pushes back. Two, no poison-message isolation
-— `Promise.all` means one rejected insert fails the entire `flush`, losing the whole
-turn's trace. I'd switch to `Promise.allSettled` and a bounded buffer with periodic
-flushing. At one-agent-run scale neither bites, which is why I haven't built them."
+Anchor: *order travels in the row's timestamp, not in insert arrival order.*
 
-*Anchor:* ordering via `created_at` (the win); unbounded `pending[]` and
-`Promise.all`-fails-all (the deferred gaps).
+**Q: "Where's your backpressure?"**
+"There isn't any, honestly, and that's correct for now — `trace.emit` is a synchronous in-process call, so producer and consumer are the same thread; there's nothing to back up. Backpressure becomes real the day trace persistence goes async behind a queue, and then I'd treat observability data as droppable and the agent's actual output as block-worthy. No broker means no consumer groups or dead-letter queues either — those are `not yet exercised`."
+
+Anchor: *no queue, so no backpressure — the producer and consumer share a thread.*
 
 ## See also
 
-- `07-clocks-coordination-and-leadership.md` — the timestamp-as-logical-position idea, in full
-- `02-partial-failure-timeouts-and-retries.md` — a poison write is a per-message failure to classify
-- **study-debugging-observability** — the trace as evidence; reading it back in order
-- **study-runtime-systems** — the event loop, microtask ordering, `Promise.all` vs `allSettled`
-```
+- `07-clocks-coordination-and-leadership.md` — why a timestamp orders a *single* producer but not multiple
+- `03-idempotency-deduplication-and-delivery-semantics.md` — at-least-once delivery is what a real queue would give you
+- `study-debugging-observability` — the trace stream as the observability backbone (this guide owns only its *ordering*)
+- `study-networking` — NDJSON streaming over HTTP, chunked transfer
+- `study-runtime-systems` — synchronous emit, the event loop, why there's no consumer lag

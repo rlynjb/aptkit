@@ -1,251 +1,171 @@
 # Arrays, Strings & Hash Maps
 
-**Industry name(s):** indexed sequences · dynamic arrays · strings · hash sets / hash maps (`Set`/`Map`) — *Industry standard / Language-agnostic*
-
----
+**Indexed sequences · strings · hash sets & maps (`Set`/`Map`)** — Industry standard.
 
 ## Zoom out, then zoom in
 
-This is the repo-grounded core. If you strip aptkit down to its data structures, what's left is arrays, strings, and maps — and almost nothing else. Every load-bearing path here is one of those three.
+This is the family aptkit *actually runs* the most. The embedding vector is an array, the chunker walks a string, and three quiet jobs ride on hash-set/hash-map `O(1)` membership. Here's where they sit.
 
 ```
-  Zoom out — where arrays/strings/maps live in aptkit
+  Zoom out — arrays, strings, and maps across aptkit
 
-  ┌─ Retrieval layer ───────────────────────────────────────────┐
-  │  chunkText: STRING.slice over a sliding window              │
-  │  embed():   string[] → number[][]  (array of 768-vectors)   │
-  │  ★ InMemoryVectorStore: Map<id, chunk> + ARRAY of hits ★     │
-  │  search():  iterate map → push to array → sort array        │
-  └───────────────────────────┬─────────────────────────────────┘
-                              │
-  ┌─ Tool layer ──────────────▼─────────────────────────────────┐
-  │  filterToolsForPolicy: SET membership (allowlist)           │
-  │  parseAgentJson: STRING scan (fence + brace search)         │
-  └───────────────────────────┬─────────────────────────────────┘
-                              │
-  ┌─ Memory / Eval layer ─────▼─────────────────────────────────┐
-  │  recall: Map<convId, counter> + over-fetch ARRAY + filter   │
-  │  precision@k: SET intersection over a sliced ARRAY          │
-  └──────────────────────────────────────────────────────────────┘
+  ┌─ Service layer — packages/tools, packages/runtime ───────────┐
+  │  tool policy      → Set<string> allowlist (O(1) gate)         │
+  │    tool-policy.ts │ allowed.has(name)                         │
+  │  parseAgentJson   → string scan (indexOf / lastIndexOf)       │
+  └───────────────────────────────┬───────────────────────────────┘
+                                   │
+  ┌─ Storage layer — packages/retrieval, packages/memory, evals ─┐
+  │  ★ embedding vector → number[768], the unit of retrieval ★    │
+  │    in-memory-vector-store.ts                                  │
+  │  chunk store      → Map<string, VectorChunk> (id → chunk)     │
+  │  memory counter   → Map<convId, n>  (collision-free ids)      │
+  │    conversation-memory.ts                                     │
+  │  precision@k      → Set intersection over top-k               │
+  │    precision-at-k.ts                                          │
+  └───────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: the vector store *is* an array-and-map structure — chunks live in a `Map<string, VectorChunk>` for `O(1)` upsert-by-id, and a query materializes them into an `Array<VectorHit>` to sort. You've built far gnarlier structures than this. The thing worth your attention is *why these primitives and not fancier ones* — and where the array choice will eventually break.
-
----
+Zoom in: an array is a contiguous indexed sequence (`O(1)` random access, `O(n)` scan). A hash map/set trades ordering for `O(1)` average lookup. The skill is knowing *which one each job wants* — and aptkit gets it right every time. You've built these from scratch; this file is about recognizing them in production code where they're unannounced.
 
 ## Structure pass
 
-**Layers:** the embedding vector (a fixed-length `number[768]`), the chunk store (a `Map` keyed by id), the hit list (a transient `Array` built per query), and the policy/dedup sets (`Set`).
-
-**Axis — state ownership:** trace "who owns this data and how long does it live?"
-
 ```
-  One axis — "what owns this, and how long does it live?"
+  layers:  the data unit  →  the collection that holds it  →  the lookup over it
+  axis held constant: "what does access cost on this structure?"
 
-  ┌────────────────────────────────────────────────┐
-  │ vector number[768]  → owned by a chunk, durable │
-  └────────────────────────────────────────────────┘
-      ┌──────────────────────────────────────────────┐
-      │ Map<id, VectorChunk> → owned by store, durable│ → keyed, O(1) upsert
-      └──────────────────────────────────────────────┘
-          ┌──────────────────────────────────────────┐
-          │ VectorHit[]  → built per query, thrown away│ → transient, sorted
-          └──────────────────────────────────────────┘
-              ┌──────────────────────────────────────┐
-              │ Set<string> → built per call, discarded│ → O(1) membership
-              └──────────────────────────────────────┘
+  ┌─ array: number[768] ────────┐   index access O(1); scan O(n)
+  │  the embedding vector        │   → ordered, contiguous, positional
+  └──────────────┬───────────────┘
+                 │  seam: ordering MATTERS below, ordering is GONE above
+  ┌─ Map<id, chunk> ────────────┐   keyed access O(1); no order guarantee
+  │  the chunk store             │   → identity lookup, not position
+  └──────────────┬───────────────┘
+                 │  seam: value lookup flips to pure membership
+  ┌─ Set<string> ───────────────┐   has() O(1); no value, just presence
+  │  the tool allowlist          │   → "is this in the set?" and nothing else
+  └──────────────────────────────┘
 ```
 
-**Seam — the `Map`→`Array` conversion inside `search`.** The store *holds* chunks in a map (fast keyed access) but *ranks* them as an array (you can't sort a map). That conversion, `for (const chunk of this.chunks.values())`, is the joint where "keyed storage" flips to "ordered ranking." It's the load-bearing line.
-
----
+The seam to notice: as you go down, you shed structure. The vector *needs* order (dimension `i` of the query must multiply dimension `i` of the chunk). The chunk store doesn't care about order, only identity. The allowlist doesn't even care about a value, only presence. Each structure is the *minimum* that does the job — that's the design lesson.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know two things already: a `.map()`/`.filter()` over an array is the bread-and-butter of frontend rendering, and a `Set` gives you `O(1)` membership instead of `Array.includes`'s `O(n)`. aptkit uses exactly those reflexes. The vector store is "a `Map` for storage, an `Array` for ranking." The policy filter is "a `Set` so the membership check is free." Nothing exotic — but the *choice of which* is the lesson.
+Three structures, one question each: arrays answer *"what's at position i?"*, maps answer *"what's stored under key k?"*, sets answer *"is x present?"*. You reach for the array when position is meaningful, the map when you look things up by identity, the set when all you need is membership.
 
 ```
-  Pattern — the store's two faces: keyed map vs ordered array
+  the three shapes, by the question they answer
 
-   storage face (durable)          ranking face (transient, per query)
-   ┌───────────────────────┐       ┌────────────────────────────────┐
-   │ Map<id, VectorChunk>   │  ──►  │ VectorHit[]  (push each chunk)  │
-   │  upsert by id: O(1)    │ iterate│  then .sort() then .slice(k)   │
-   │  no order              │ values │  ordered by score              │
-   └───────────────────────┘       └────────────────────────────────┘
-       why a Map: dedup by id on upsert, no scan to find a chunk
-       why an Array: you can't rank a Map; sorting needs a sequence
+  ARRAY            MAP                    SET
+  [a][b][c][d]     {k1→v1, k2→v2}         {x, y, z}
+   0  1  2  3
+  "at index 2?"    "value under k2?"      "is y in here?"
+   → O(1)           → O(1) avg             → O(1) avg
+  order matters    keyed, unordered       presence only
 ```
 
-### Move 2 — the walkthrough
+### Move 2 — walking aptkit's actual structures
 
-#### The chunk store is a Map keyed by id — so upsert dedups for free
-
-`InMemoryVectorStore` holds chunks in a `Map`, not an array:
+**The embedding vector — an array where position is the meaning.** A `number[768]` isn't just a list; each index *is* a semantic dimension. `cosineSimilarity` in `in-memory-vector-store.ts:46` walks the two arrays in lockstep:
 
 ```ts
-// packages/retrieval/src/in-memory-vector-store.ts:12, 18-23
-private readonly chunks = new Map<string, VectorChunk>();
-
-async upsert(chunks: VectorChunk[]): Promise<void> {
-  for (const chunk of chunks) {
-    this.assertDimension(chunk.vector, `chunk "${chunk.id}"`);
-    this.chunks.set(chunk.id, chunk);   // ← same id overwrites; dedup is free
+  for (let i = 0; i < a.length; i += 1) {
+    dot  += a[i]! * b[i]!;   // ← index i of query × index i of chunk — ORDER is load-bearing
+    magA += a[i]! * a[i]!;
+    magB += b[i]! * b[i]!;
   }
-}
 ```
 
-Why a `Map` and not an `Array<VectorChunk>`? Because re-indexing a document must *replace* its chunks, not append duplicates. Chunk ids are `"<docId>#<index>"` (`pipeline.ts:42`), so `chunks.set(id, …)` overwrites the prior version in `O(1)`. With an array you'd scan to find-and-replace (`O(n)`) or accept duplicates. The boundary condition: this only works because the id is a *stable, deterministic key*. Random ids would break the dedup.
+The whole thing breaks if the arrays are misaligned by even one position — which is exactly why the store asserts `vector.length === dimension` before it ever scores (line 36). The array's contract is "same length, same meaning per index," and the dimension guard enforces it loudly. This is the array primitive doing real work: positional, contiguous, no hashing.
 
-#### Search converts the Map to an Array because you can't rank a Map
+**The chunk store — a `Map` for identity, not position.** Line 12: `private readonly chunks = new Map<string, VectorChunk>()`. Upsert is `this.chunks.set(chunk.id, chunk)` — `O(1)`. Why a `Map` and not an array? Because upsert must be *idempotent*: re-indexing a doc with the same chunk id overwrites, doesn't duplicate. An array would need an `O(n)` find-and-replace; the `Map` makes "replace if exists" free. The search then iterates `.values()` — so the `Map` gives `O(1)` upsert *and* full iteration, which is exactly the access pattern (write by id, read all).
 
-A `Map` has no order. Ranking needs a sequence, so `search` materializes one:
+**The tool allowlist — a `Set` for pure membership.** `tool-policy.ts:16`:
 
 ```ts
-// packages/retrieval/src/in-memory-vector-store.ts:27-32
-const hits: VectorHit[] = [];
-for (const chunk of this.chunks.values()) {   // Map → iterate values
-  hits.push({ id: chunk.id, score: cosineSimilarity(vector, chunk.vector), meta: chunk.meta });
-}
-hits.sort((a, b) => b.score - a.score);        // Array → sortable
-return hits.slice(0, Math.max(0, k));          // Array → sliceable top-k
+  const allowed = new Set(policy.allowedTools);
+  return allTools
+    .filter((tool) => allowed.has(tool.name))   // ← O(1) per check vs O(m) array scan
+    ...
 ```
 
-This is the `Map`→`Array` seam. Every query rebuilds the hit array from scratch (it's transient state — owned by the call, discarded after). That's deliberate: scores depend on the query vector, so they can't be precomputed. The cost is the full materialize-and-sort every time (file **01**, file **06**). The fix at scale isn't a better array — it's an index (file **04**, **05**).
+Each tool is checked against the allowlist once. With a `Set`, every `has()` is `O(1)`, so filtering `t` tools against an allowlist is `O(t)`. With an array allowlist of size `m` it'd be `O(t·m)`. The set is the security primitive: least-privilege as a membership test. Boundary condition — a tool name not in the set is silently dropped, never offered to the model. That's the gate working.
 
-#### Strings: the sliding window in chunkText
-
-The one real string algorithm in aptkit is the chunker — a sliding window with overlap:
+**The memory id-counter — a `Map<convId, n>` for collision-free ids.** `conversation-memory.ts:71`:
 
 ```ts
-// packages/retrieval/src/chunker.ts:22-30
-const step = Math.max(1, size - overlap);      // 512 - 64 = 448 chars/step
-const chunks: string[] = [];
-for (let start = 0; start < text.length; start += step) {
-  chunks.push(text.slice(start, start + size));   // window [start, start+512)
-  if (start + size >= text.length) break;
-}
+  const counters = new Map<string, number>();
+  ...
+  const n = counters.get(turn.conversationId) ?? 0;   // ← current count for THIS conversation
+  counters.set(turn.conversationId, n + 1);            // ← monotonic bump
+  ... id: `${kind}:${turn.conversationId}:${n}`        // ← memory:conv-42:0, :1, :2, ...
 ```
 
-```
-  Window pattern — fixed-size windows with overlap
+The map keys a monotonic counter *per conversation*. Two turns in the same conversation get `:0` then `:1` — distinct ids, no collision. Two different conversations each start at `:0` but their ids differ by the `conversationId` segment. The map is doing the job a database `SERIAL` column would do, in memory, scoped per key. Drop the map and you'd reuse ids across turns and overwrite memory rows — the counter is load-bearing.
 
-  text:   ────────────────────────────────────────────────────►
-  win 0:  [════════════ 512 ════════════]
-  win 1:               [════════════ 512 ════════════]
-                       └─ 64 overlap ─┘
-  win 2:                            [════════════ 512 ════════════]
-          step = size - overlap = 448; overlap keeps a straddling
-          fact whole in at least one window
-```
-
-This is `O(n)` over the document length — each character is copied into at most two windows (because of overlap). The boundary condition the overlap exists to handle: a fact that lands *exactly* on a chunk boundary would be split in half and lost from both chunks; the 64-char overlap guarantees it stays whole in at least one window. The string is treated as an indexed sequence and `slice` is the array-of-chars operation underneath.
-
-#### Sets: O(1) membership for tool policy and distinct-hit counting
-
-Two places use a `Set` to turn an `O(n)` membership check into `O(1)`. The tool allowlist:
+**precision@k — `Set` intersection over a window.** `precision-at-k.ts:29`:
 
 ```ts
-// packages/tools/src/tool-policy.ts:15-16
-const allowed = new Set(policy.allowedTools);       // build once
-return allTools.filter((tool) => allowed.has(tool.name));  // O(1) per tool
-```
-
-And the precision@k distinct-hit counter, which uses a `Set` *twice* — once for the relevant ids (passed in as `ReadonlySet`), once to dedup hits:
-
-```ts
-// packages/evals/src/precision-at-k.ts:27-34
-function countDistinctHits(retrievedIds, relevantIds: ReadonlySet<string>, k): number {
-  const topK = retrievedIds.slice(0, k);    // array slice
-  const seen = new Set<string>();           // dedup set
+  const topK = retrievedIds.slice(0, k);
+  const seen = new Set<string>();
   for (const id of topK) {
-    if (relevantIds.has(id)) seen.add(id);  // O(1) membership + O(1) insert
+    if (relevantIds.has(id)) seen.add(id);   // ← membership in the relevant set, O(1)
   }
-  return seen.size;                         // distinct count
-}
+  return seen.size;                          // ← DISTINCT hits, dedup is free in a Set
 ```
 
-The `seen` set is doing double duty: membership (`relevantIds.has`) *and* deduplication (a relevant id appearing twice counts once). That's the canonical "intersection size via hash set" pattern — `|A ∩ B|` in `O(|topK|)` instead of `O(|topK|·|relevant|)`. The boundary condition: it measures *coverage* not *frequency*, which is why the dedup matters — a result list that returns the same relevant chunk five times shouldn't score five.
-
-#### Maps as counters: the per-conversation id sequence in memory
-
-`recall`/`remember` uses a `Map<string, number>` as a per-conversation counter so repeated turns get distinct ids:
-
-```ts
-// packages/memory/src/conversation-memory.ts:71, 78-80, 83
-const counters = new Map<string, number>();
-// inside remember():
-const n = counters.get(turn.conversationId) ?? 0;   // O(1) read, default 0
-counters.set(turn.conversationId, n + 1);            // O(1) increment
-id: `${kind}:${turn.conversationId}:${n}`,           // memory:conv-1:0, :1, :2 …
-```
-
-This is a hash-map-as-counter — the same shape as a frequency map, used here to generate monotonic ids per key. The boundary condition the comment names (line 69-70): it assumes `conversationId` is globally unique, so ids never collide *across* conversations. The counter is in-process state — restart the process and it resets to 0, which is fine because durable persistence (buffr's `PgVectorStore`) keys on the full id string, not the counter.
+`relevantIds` is a `ReadonlySet<string>`, so each "is this retrieved id relevant?" is `O(1)`. And `seen` being a `Set` means duplicates in the top-k window count once — the dedup is structural, not a manual check. This is set intersection expressed as "iterate one set, membership-test the other," the standard `O(min(a,b))` intersection.
 
 ### Move 3 — the principle
 
-**Match the structure to the access pattern, not to the data.** The same chunks live in a `Map` (because access is keyed and dedup matters) and get re-expressed as an `Array` (because ranking needs order). A `Set` shows up wherever the question is "is this in the collection?" The data is identical; the structure is chosen per *operation*. That's the whole discipline — and it's why aptkit needs no graph or tree to do its job well at small scale.
-
----
+Pick the structure that holds the *minimum* the job needs: position → array, identity → map, presence → set. aptkit never over-reaches — the allowlist is a set because it only ever asks "is this in," the vector is an array because position carries meaning. Reading which structure a job *deserves* is half of reading the code.
 
 ## Primary diagram
 
-Every array/string/map in aptkit, in one frame.
-
 ```
-  aptkit's three primitives — where each is reached for and why
+  aptkit's array/map/set jobs — one frame
 
-  STRING  ── chunkText: sliding window, slice [start, start+512)
-          └─ parseAgentJson: fence regex + indexOf('{')/lastIndexOf('}')
-
-  ARRAY   ── embed result: number[][] (each row a 768-vector)
-          ├─ VectorHit[]: built per query, sorted, sliced to top-k
-          └─ retrievedIds.slice(0, k): the top-k window for scoring
-
-  MAP     ── chunks: Map<id, VectorChunk>  → O(1) keyed upsert + dedup
-          └─ counters: Map<convId, n>      → O(1) per-conversation id seq
-
-  SET     ── allowed: Set<toolName>        → O(1) policy membership
-          └─ seen / relevantIds: Set<id>   → O(1) intersection for p@k
-
-  the join that matters: Map (storage) ──iterate values──► Array (ranking)
-                         inside InMemoryVectorStore.search
+  ARRAY (position is meaning)        MAP (identity → value)
+  ┌──────────────────────────┐       ┌────────────────────────────┐
+  │ number[768] embedding     │       │ chunks: Map<id, VectorChunk>│
+  │  cosine walks i in lockstep│      │  upsert O(1), idempotent    │
+  │  in-memory-vector-store:46 │      │  in-memory-vector-store:12  │
+  └──────────────────────────┘       │ counters: Map<convId, n>    │
+                                      │  collision-free ids         │
+  SET (presence only)                 │  conversation-memory:71     │
+  ┌──────────────────────────┐       └────────────────────────────┘
+  │ allowed: Set<toolName>     │
+  │  has() O(1) least-priv gate│       precision@k: Set intersection
+  │  tool-policy:16            │        over top-k window
+  │ seen / relevantIds         │        precision-at-k:29
+  └──────────────────────────┘
 ```
-
----
 
 ## Elaborate
 
-The `Map`-for-storage / `Array`-for-ranking split is the in-memory shadow of how a real vector database works: pgvector *stores* rows in a table (keyed, like the map) and *ranks* them via an index + `ORDER BY` (the sort, but index-accelerated). aptkit's `InMemoryVectorStore` is the contract-faithful toy version — same shape, no index. The hash set's `O(1)` membership is the same primitive a database uses for hash joins. None of this is accidental: the from-scratch pipeline was built to *be* the textbook version of the production system, so the data structures map one-to-one.
-
-Where this connects forward: the moment the array scan becomes too slow (file **01**'s `O(n)`-per-query wall), the answer is to stop ranking an array and start querying an *index* — which is a tree (file **04**) or a graph (file **05**, HNSW). The array isn't wrong; it's the structure you outgrow.
-
----
+Hash maps/sets are the workhorse of every production codebase precisely because `O(1)` average lookup collapses so many `O(n)` scans. The tradeoff they make — and it's worth naming — is **no ordering** and a worst-case `O(n)` on pathological hash collisions (a concern for adversarial input, not aptkit's internal ids). aptkit leans on JS's native `Map`/`Set`, which is the right call: you built `BinaryHeap` and `Graph` from scratch in `reincodes` because the *structure was the lesson*; here the structure is infrastructure, so the language primitive wins. The interesting DSA in this repo isn't the map — it's the *array* (the vector) and what you do to rank it, which is file 06.
 
 ## Interview defense
 
-**Q: Why does `InMemoryVectorStore` use a `Map` for storage but an `Array` for search?**
-
-> Storage is keyed and needs dedup-on-reindex — chunk ids are `docId#index`, so `Map.set` overwrites in `O(1)` and a re-indexed doc replaces its old chunks instead of duplicating. Ranking needs order, and you can't sort a `Map`, so `search` iterates the map values into a transient `VectorHit[]`, sorts by score, and slices the top-k. The map is durable state; the hit array is per-query and discarded.
+**Q: Why is the chunk store a `Map` and the tool allowlist a `Set`?**
+Different questions. The chunk store needs idempotent upsert keyed by id — `Map.set(id, chunk)` overwrites in `O(1)`, an array would need an `O(n)` find. The allowlist only ever asks "is this tool permitted?" — pure membership, so a `Set` with `O(1) has()` is the minimum that does it.
 
 ```
-  Map<id,chunk> ──iterate values──► VectorHit[] ──sort──► slice(k)
-  keyed/dedup (durable)              transient ranking (per query)
+  Map  → "what's under this key?"   chunk store, id-counter
+  Set  → "is this present?"          tool allowlist, relevant-ids
+  same O(1), different question
 ```
 
-**Q: Where does aptkit use a `Set`, and what does it buy?**
+Anchor: "Pick the structure that holds the minimum the job needs — the allowlist never needs a value, so it's a set, not a map."
 
-> Two places. Tool policy builds `new Set(allowedTools)` so the per-tool `allowed.has(name)` check is `O(1)` instead of `Array.includes`'s `O(n)`. And precision@k uses a `seen` set to count *distinct* relevant ids in the top-k — that's an intersection-size computation, `|retrieved ∩ relevant|`, in `O(k)`, with the set doubling as a dedup so a repeated chunk counts once. Coverage, not frequency.
-
-Anchor: *the structure is chosen per-operation — `Map` for keyed dedup, `Array` for ordered ranking, `Set` for `O(1)` membership and intersection.*
-
----
+**Q: The memory id-counter is just a `Map<string, number>`. What breaks without it?**
+Id collisions. Two turns in one conversation would both get id `memory:conv:0` and the second `upsert` would overwrite the first — you'd silently lose memory. The map keys a per-conversation monotonic counter so ids are unique within a conversation and the `conversationId` segment keeps them unique across conversations. It's a `SERIAL` column done in memory.
 
 ## See also
 
-- **01-complexity-and-cost-models.md** — the `O(n)` scan and `O(1)` membership costs.
-- **06-sorting-searching-and-selection.md** — the sort that ranks the hit array, and the top-k slice.
-- **04-trees-tries-and-balanced-indexes.md** — what replaces the array when the scan gets too slow.
-- `study-ai-engineering` — the same structures viewed as a RAG pipeline.
+- `01-complexity-and-cost-models.md` — why the scan is `O(n·d)` and `has()` is `O(1)`
+- `06-sorting-searching-and-selection.md` — what the vector array gets ranked by
+- `03-stacks-queues-deques-and-heaps.md` — the ordered structures aptkit does *not* use
+- **study-ai-engineering** — the embedding vector as a semantic object, not just an array

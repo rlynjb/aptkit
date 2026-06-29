@@ -1,196 +1,269 @@
 # 13 — Forbidden patterns and rotating formulas
 
-**Industry name:** output diversity / anti-repetition / formula rotation — *Project-specific*
+**Subtitle:** forbidden patterns / rotating formulas — fight convergence in
+repeated generation (Project-specific)
 
 ## Zoom out, then zoom in
 
-Run the same generative chain for the same user a dozen times and you'll notice
-it: every output sounds the same. "Great question! Here's a breakdown…" opener
-every time, the same three-bullet rhythm, the same closer. LLMs converge on
-phrasings. For a one-shot classifier nobody cares; for a chain that generates
-content *repeatedly* for the same user, the sameness reads as robotic. The fix is
-mechanical: explicitly forbid the openings that recur, and *rotate* a set of
-formulas across runs so consecutive outputs differ. In aptkit the rotation
-*mechanism* exists in the content workflow (angle round-robin); a forbidden-phrase
-*list* in a prompt is `not yet exercised`.
+Run the same generative chain for the same user over and over and the outputs
+start to sound identical — same openings, same cadence, same crutch phrases.
+The fix is to explicitly forbid the convergent phrasings and rotate through
+formulas. aptkit's closest live mechanism is the content-generation
+workflow's round-robin *variant angles* — convergence-fighting at the
+structure level — but an explicit forbidden-openings list is `not yet
+exercised`.
 
 ```
-  Zoom out — where repetition gets fought
+  Zoom out — convergence-fighting lives in the content workflow
 
-  ┌─ Authoring ───────────────────────────────────────────────┐
-  │  (no forbidden-openings list in any prompt — the gap)      │ ← we are here
-  └───────────────────────────┬────────────────────────────────┘
-  ┌─ Workflow (the rotation mechanism) ─▼──────────────────────┐
-  │  workflows/content-generation-workflow.ts                  │
-  │    planContentVariant: angle = angles[variantIndex % len]  │
-  │    → round-robins ANGLES across variants (anti-sameness)   │
-  └──────────────────────────────────────────────────────────────┘
+  ┌─ Workflow layer ────────────────────────────────────────────┐
+  │  ★ ensureGeneratedContent: round-robin ANGLES per variant ★   │ ← we are here
+  │     packages/workflows/src/content-generation-workflow.ts     │
+  │     forces variety by ROTATING the angle, not the phrasing    │
+  └───────────────────────────┬──────────────────────────────────┘
+                              │ per-variant plan
+  ┌─ Generation ──────────────▼───────────────────────────────────┐
+  │  generator(plan) → one variant for { section, angle }         │
+  │  explicit forbidden-openings list → NOT YET EXERCISED         │
+  └────────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: the repo's anti-repetition lever is *angle rotation* at the workflow
-level — each generated variant is assigned a different "angle" by round-robin
-(`planContentVariant`, `content-generation-workflow.ts:155`). That's the
-structural cousin of a prompt-level forbidden-openings list: instead of telling
-one prompt "don't start the same way," it varies the *framing* across calls.
+Zooming in: the concept is that LLMs converge on phrasings — a caption chain
+run ten times produces ten variants that all open "In this stunning..." The
+mechanism is to enumerate forbidden openings and rotate through a set of
+formulas so each run is forced onto a different track. This matters for any
+generative chain run repeatedly for the same user; it doesn't matter for
+one-shot classifiers or structured outputs.
 
-## The structure pass
+## Structure pass
 
-**Layers:** the rotation source (the set of angles/formulas) → the selector (which
-one this run gets) → the prompt (forbids recurrence) → the output (should differ
-from the last).
+**Layers.** Workflow (plans variants) → generation (produces one per plan) →
+output (the variants a user sees together).
 
-**Axis — does this run differ from the previous run?** That's the property
-rotation defends:
+**Axis — what forces two outputs from the same source to differ?** Trace it:
 
 ```
-  Axis: "will run N look different from run N-1?"
+  Axis: "what makes variant N differ from variant N-1?"
 
-  ┌─ Workflow rotation (SHIPPED) ─┐  seam  ┌─ Prompt forbidden-list (NOT) ─┐
-  │ angle = angles[idx % len]     │ ══╪══► │ "do NOT open with: <phrases>" │
-  │ → framing rotates per variant │ flips  │ → phrasing forced to vary      │
-  │ content-gen-workflow.ts:155   │        │   not yet exercised            │
-  └───────────────────────────────┘        └────────────────────────────────┘
+  nothing (naive)        → same prompt → convergent phrasing      ✗
+  rotate the ANGLE       → variantIndex % angles → different lens  ✓ (built)
+  rotate the SECTION     → variantIndex % sections → different src ✓ (built)
+  forbid prior OPENINGS  → enumerate banned phrasings              ✗ (not built)
+  rotate FORMULAS        → cycle through structural templates      ✗ (not built)
 ```
 
-**Seam:** the variant-index boundary — the modular arithmetic that maps run number
-to angle. **What breaks without rotation:** every variant of a section gets the
-same angle, the model converges on one phrasing, and you've generated N copies of
-the same thing wearing slightly different words.
+**Seam.** The load-bearing boundary is between *forcing variety structurally*
+(rotate the input — angle, section) and *forbidding convergence in phrasing*
+(ban the openings the model keeps reaching for). aptkit lives on the
+structural side. The phrasing side — the explicit forbidden list — is the
+unbuilt half.
 
 ## How it works
 
-### Move 1 — the mental model
+You know how a round-robin scheduler hands each request to the next worker so
+no one worker gets everything? aptkit fights output convergence the same way:
+it round-robins each content variant onto the next *angle*, so consecutive
+variants are forced to approach the source from different lenses. Let's walk
+the built mechanism and name the unbuilt one.
 
-You already round-robin things in code — load balancing across servers, cycling
-through a palette of colors so adjacent chart bars differ. Formula rotation is
-round-robin applied to *prompt framing*: keep a small set of angles, and assign
-the next one each run by index modulo set size, so consecutive outputs are forced
-onto different framings.
+### Step 1 — the built mechanism: round-robin angles
 
-```
-  Pattern — round-robin angle rotation
+The content workflow plans each variant by cycling through angles and
+sections with modular arithmetic:
 
-  angles = [A, B, C]
-  variant 0 → angles[0 % 3] = A
-  variant 1 → angles[1 % 3] = B
-  variant 2 → angles[2 % 3] = C
-  variant 3 → angles[3 % 3] = A   ← cycles, but adjacent variants always differ
-```
-
-### Move 2 — walking the rotation
-
-**The angle round-robin (the shipped mechanism).** `planContentVariant`
-(`content-generation-workflow.ts:139`) assigns each variant both a section and an
-angle by modular index:
-
-```
-  Inline annotation — content-generation-workflow.ts:148 planContentVariant
-
-  const sectionIndex = options.variantIndex % options.sections.length;  ← cycle sections
-  return {
-    ...,
-    section: options.sections[sectionIndex],
-    angle: options.angles[options.variantIndex % options.angles.length], ← cycle ANGLES
-  };
-  // → variant N and variant N+1 get DIFFERENT angles (until the set wraps)
+```ts
+// packages/workflows/src/content-generation-workflow.ts:139 (planContentVariant)
+const sectionIndex = options.variantIndex % options.sections.length;
+return {
+  sourceHash: options.sourceHash,
+  variantIndex: options.variantIndex,
+  sectionIndex,
+  section: options.sections[sectionIndex],
+  angle: options.angles[options.variantIndex % options.angles.length],  // ← rotation
+};
 ```
 
-So variant 0 might be section 1 from a "practical" angle, variant 1 section 2
-from a "contrarian" angle, and so on. The `ContentAngle` (`:4`) carries a `label`
-that the workflow emits in a trace step — *"generating ${plan.angle.label} for
-section…"* (`:111`). **What breaks without it:** `ensureGeneratedContent` would
-generate every variant from the same angle and the corpus would read as
-duplicated. The round-robin is the anti-sameness guarantee.
+```
+  Execution trace — round-robin angles (4 variants, 2 angles, 3 sections)
 
-**The variant-history awareness.** `ensureGeneratedContent`
-(`content-generation-workflow.ts:63`) tracks existing variants by `variantIndex`
-and a `sourceHash`, generating fresh ones starting after the last existing index
-(`baseIndex`, `:92`). So rotation continues *across regenerations* — the next
-batch picks up the angle cycle where the last left off, rather than restarting at
-angle 0 and repeating recent framings. This is the "rotation history" the spec
-points at: rotation is stateful across runs, not just within one batch.
+  variantIndex │ angle (idx % 2) │ section (idx % 3)
+  ─────────────┼─────────────────┼──────────────────
+       0       │  angles[0]      │  sections[0]
+       1       │  angles[1]      │  sections[1]
+       2       │  angles[0]      │  sections[2]
+       3       │  angles[1]      │  sections[0]
+                 └─ angle alternates → forces a different lens each variant
+```
 
-**What's NOT here — the prompt-level forbidden list.** No prompt in the repo
-contains an explicit "do not open with these phrases" or "rotate among these
-formulas" instruction. The anti-repetition is purely structural (vary the angle),
-not lexical (forbid the phrasing). For a chain like a caption generator the spec
-imagines, you'd add to the prompt a forbidden-openings list and an enumerated set
-of rotating formulas — that prompt-side lever is `not yet exercised`.
+Each variant's plan carries a *different* angle, and the generator gets that
+angle in its prompt context (`content-generation-workflow.ts:111` traces
+"generating {angle.label} for section..."). So convergence is fought by
+varying the *input lens*, not by policing the output text. This is the
+rotation pattern applied one level up from phrasing.
 
-### Move 3 — the principle
+### Step 2 — the workflow also skips dead variants
 
-**Repetition is a property of the chain, not of any single call — so the fix
-lives in how you vary *across* calls, not in one cleverer prompt.** Rotation
-(round-robin a set of angles/formulas, statefully across runs) and forbidden lists
-(name the phrasings that recur and ban them) are the two levers; this repo ships
-the structural one (angle rotation) and leaves the lexical one open. And the scope
-check matters: this only applies to generative chains run repeatedly for the same
-user — one-shot classifiers and structured outputs want *consistency*, not
-variety, so you'd never rotate them.
+A secondary anti-convergence guard: if the generator returns `null` (a
+variant it couldn't make useful), the workflow skips it and tries the next
+index, bounded by `maxSkips`:
+
+```ts
+// packages/workflows/src/content-generation-workflow.ts:116
+if (item === null) {
+  skipped.push(plan);
+  // trace a warning, continue to the next variantIndex
+  continue;
+}
+```
+
+That keeps the output set from including degenerate near-duplicates — a
+bounded version of "reject and re-roll." It's variety hygiene, not phrasing
+control, but it's in the same spirit.
+
+### Step 3 — the unbuilt half: forbidden openings and rotating formulas
+
+What's `not yet exercised`: an explicit list of banned openings and a set of
+rotating structural formulas in the prompt. The pattern would look like this
+(pseudocode — no such code exists in the repo):
+
+```
+  Forbidden-openings + rotating-formula (NOT YET EXERCISED in aptkit)
+
+  // in the generation prompt, per variant:
+  forbiddenOpenings = previousVariants.map(v => firstSentence(v))
+  prompt += "Do NOT open with any of: " + forbiddenOpenings.join(", ")
+  prompt += "Use formula #" + (variantIndex % FORMULAS.length) + ": "
+          + FORMULAS[variantIndex % FORMULAS.length]
+  // FORMULAS = ["question-hook", "stat-lead", "scene-set", "contrarian"]
+```
+
+The skeleton parts, named by what breaks without each:
+
+- **The forbidden list, fed from history.** Without it the model re-opens
+  with its favorite phrasing every time — the core convergence bug.
+- **The rotating formula.** Without it, even varied openings can share the
+  same structure. Rotating the formula forces structural variety.
+- **The rotation history (per user/source).** Without persisting which
+  formulas and openings were already used, rotation resets and converges
+  again. aptkit has the *hook* for this — `existing` variants are passed into
+  `ensureGeneratedContent` (`content-generation-workflow.ts:73`) and tracked
+  by `sourceHash` — but they drive section/angle rotation, not a
+  forbidden-openings list.
+
+The `existing`/`sourceHash` tracking is the foundation the unbuilt feature
+would build on: the workflow already knows what was generated before; an
+explicit forbidden-openings layer would read that history into the prompt.
+
+### Step 4 — when this matters, when it doesn't
+
+```
+  Comparison — does anti-convergence apply?
+
+  generative chain run repeatedly for one user (captions, content variants)
+                                              → YES (the content workflow)
+  a one-shot classifier (intent)            → NO (one of 3 words; sameness ok)
+  structured output (recommendation JSON)   → NO (schema-shaped; converge fine)
+```
+
+Anti-convergence is purely a *generative*, *repeated*, *human-facing*
+concern. A classifier *should* converge — you want the same query classified
+the same way every time. Forcing variety into a structured output would
+corrupt it. So this discipline is scoped tightly to repeated creative
+generation, which is exactly where the content workflow lives.
+
+### The principle
+
+**LLMs converge on phrasing under repetition, so repeated generative chains
+need a forced-variety mechanism — rotate the input lens, and forbid the
+openings the model keeps reaching for.** aptkit fights convergence
+structurally (round-robin angles and sections, skip dead variants) and tracks
+generation history by `sourceHash`, but the explicit forbidden-openings list
+and rotating-formula layer are the unbuilt half. The scope is narrow: only
+repeated, creative, human-facing generation — never classifiers or structured
+outputs, which are *supposed* to converge.
 
 ## Primary diagram
 
+The built structural rotation, the unbuilt phrasing controls, and the shared
+history hook.
+
 ```
-  Forbidden patterns & rotation — shipped vs gap
+  Anti-convergence in aptkit — built vs not yet exercised
 
-  SHIPPED: angle rotation (structural anti-sameness)
-  ┌────────────────────────────────────────────────────────────┐
-  │ ensureGeneratedContent (workflow.ts:63)                     │
-  │   baseIndex = last existing variant + 1   (stateful)        │
-  │   for each new variant:                                     │
-  │     angle = angles[variantIndex % angles.length]            │
-  │     → adjacent variants differ; cycle continues across runs │
-  └────────────────────────────────────────────────────────────┘
-
-  GAP: prompt-level forbidden formulas        [not yet exercised]
-  ┌────────────────────────────────────────────────────────────┐
-  │ "Do NOT open with: 'Great question', 'Here's a breakdown'.  │
-  │  Rotate among formulas: [direct answer | scenario | ...]"   │
-  └────────────────────────────────────────────────────────────┘
-
-  SCOPE: applies to repeated GENERATIVE chains only —
-         never to one-shot classifiers / structured outputs
+  ┌─ Source markdown ───────────────────────────────────────────┐
+  │  split into sections; targetCount variants needed            │
+  └────────────────────────────┬──────────────────────────────────┘
+                              │ per variantIndex
+  ┌─ BUILT: structural rotation ▼─────────────────────────────────┐
+  │  angle   = angles[idx % angles.length]    ← rotate the lens   │
+  │  section = sections[idx % sections.length]← rotate the source │
+  │  null variant → skip, try next (bounded by maxSkips)          │
+  └────────────────────────────┬──────────────────────────────────┘
+                              │ existing[] tracked by sourceHash
+  ┌─ NOT YET EXERCISED: phrasing control ▼────────────────────────┐
+  │  forbiddenOpenings = prior variants' first lines → into prompt │
+  │  rotating FORMULAS = cycle structural templates per variant    │
+  │  (would read the same sourceHash history the workflow tracks)  │
+  └────────────────────────────────────────────────────────────────┘
+   scope: repeated creative generation ONLY — never classifiers/structured
 ```
 
 ## Elaborate
 
-LLMs converge on high-probability phrasings — it's the same mechanism that makes
-them produce "delve" and "tapestry" — and for repeated generation that convergence
-is a UX problem, not a correctness one. The two production levers: *negative
-constraints* (forbidden-openings lists in the prompt — cheap, but the model
-sometimes drifts back) and *rotation* (cycle a curated set of framings, the more
-reliable lever because it changes the input distribution rather than asking the
-model to avoid an attractor). This repo's angle round-robin is the rotation lever,
-and the stateful `baseIndex` continuation (`:92`) is the detail that makes it
-actually work across regenerations instead of repeating the last batch's framings.
-Temperature is the crude alternative — turning it up adds variety but also adds
-errors, which is why structured rotation beats just cranking temperature.
+Output convergence is the practical cousin of "mode collapse" — under
+repetition and low temperature, a model funnels toward its highest-probability
+phrasings. Practitioners fight it three ways: temperature/sampling tweaks
+(blunt), input rotation (what aptkit does — vary the angle so the model starts
+from a different place), and explicit negative constraints (the unbuilt
+forbidden-openings list). The negative-constraint approach is the most
+reliable for *phrasing* specifically, because temperature affects everything
+and input rotation affects content more than cadence.
+
+aptkit's design is well-positioned to add the phrasing layer because the
+convergence-fighting infrastructure — variant planning, history tracking by
+`sourceHash`, dead-variant skipping — is already there. The forbidden-openings
+list is a prompt-assembly addition (read history → ban prior openings), not a
+new subsystem. That's the highest-leverage unbuilt feature for this concept.
 
 ## Interview defense
 
-**Q: A chain that generates content for one user keeps sounding the same — how do
-you fix it?** Two levers. Forbidden-openings list in the prompt (ban the recurring
-phrasings) and, more reliably, rotate a curated set of framings/angles across runs
-by round-robin — statefully, so consecutive outputs differ. In this repo the angle
-round-robin in the content workflow is the shipped version
-(`planContentVariant`). Only do this for repeated generative chains, never for
-classifiers, which want consistency.
+**Q: A caption generator run ten times produces ten captions that all sound
+the same. Why, and what do you do?**
+
+Under repetition the model funnels toward its highest-probability phrasings —
+same openings, same cadence. The fix is forced variety: rotate the input lens
+so each run starts from a different angle, and explicitly forbid the openings
+the model keeps reaching for by feeding prior variants' first lines into the
+prompt as a ban-list. Rotate through a set of structural formulas too, so
+even varied openings don't share one shape. Persist the rotation history per
+user, or it resets and converges again.
 
 ```
-  angles[variantIndex % len] · stateful baseIndex continuation
-  → adjacent runs forced onto different framings
+  naive: same prompt × 10 → "In this stunning..." × 10
+  rotate angle + forbid prior openings + cycle formulas → 10 distinct voices
 ```
-*Anchor: `planContentVariant` angle rotation (`content-generation-workflow.ts:155`);
-stateful `baseIndex` (`:92`).*
 
-**Q: The part people forget?** **Statefulness across regenerations** and **scope**.
-Rotation that restarts at angle 0 every batch repeats the recent framings — the
-`baseIndex` continuation fixes that. And applying anti-repetition to a classifier
-is a bug: there you *want* the same input to map to the same output.
+Anchor: "aptkit rotates angles and sections round-robin
+(`planContentVariant`, `variantIndex % angles.length`) and tracks history by
+`sourceHash` — the explicit forbidden-openings list is the unbuilt half it's
+set up to add."
+
+**Q: When does anti-convergence NOT apply?**
+
+One-shot classifiers and structured outputs — they're *supposed* to converge.
+You want the same query classified the same way every time, and a schema-shaped
+output should look the same shape every time. Forcing variety there corrupts
+correctness. The discipline is scoped strictly to repeated, creative,
+human-facing generation.
+
+Anchor: "Classifiers should converge — the intent classifier returning the
+same word for the same query is correct, not a bug."
 
 ## See also
 
-- `06-single-purpose-chains.md` — rotation lives in the content-generation chain.
-- `04-token-budgeting.md` — a forbidden-formulas list is prompt-prefix cost.
-- `09-chain-of-thought.md` — structured outputs (which you never rotate) vs generation.
-- `05-eval-driven-iteration.md` — diversity is a property you could eval-score.
+- [06-single-purpose-chains.md](06-single-purpose-chains.md) — the content
+  workflow as a single-purpose generative chain
+- [08-few-shot.md](08-few-shot.md) — examples can *cause* convergence if they
+  all share a phrasing
+- [09-chain-of-thought.md](09-chain-of-thought.md) — structured outputs that
+  should converge, not vary

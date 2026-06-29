@@ -1,233 +1,174 @@
 # Recursion, Backtracking & Dynamic Programming
 
-**Industry name(s):** recursion · bounded iteration / state machines · backtracking · memoization / tabulation (DP) — *Industry standard*
-
-> **Status: partially exercised.** The agent loop is a **bounded iterative state machine** — the closest thing aptkit has to a recursion-shaped control flow, and it's deliberately *iterative*, not recursive. Backtracking and dynamic programming are `not yet exercised` — no overlapping-subproblem cache, no search-tree with undo, runs anywhere in aptkit. You've built recursion-with-call-stack visualizers and recursive BST traversals; this file grounds the iterative state machine that's real and labels DP/backtracking as honest curriculum.
-
----
+**Bounded iteration as a state space · state machines · backtracking search · memoization & tabulation (DP)** — Industry standard. **Status in aptkit: bounded iteration exercised (the agent loop); backtracking & DP `not yet exercised`.**
 
 ## Zoom out, then zoom in
 
-The one control structure in aptkit that *could* have been recursive — the multi-turn agent loop — was written as a bounded `for` loop instead. That choice is the lesson.
+aptkit's agent loop is the interesting case here. It walks a *state space* — but as bounded forward iteration, not recursion, and explicitly *not* backtracking. The load-bearing DSA lesson is the hard iteration cap. There's no dynamic programming anywhere in aptkit or buffr.
 
 ```
-  Zoom out — the loop that stands in for recursion
+  Zoom out — where state-space iteration runs
 
-  ┌─ Service layer ─────────────────────────────────────────────┐
-  │  ★ runAgentLoop ★  (packages/runtime/src/run-agent-loop.ts)  │
-  │    for (turn = 0; turn < maxTurns; turn++)                   │
-  │      model.complete() → maybe run tools → append → repeat    │
-  │    a BOUNDED iterative state machine                        │
-  │    (recursion-shaped: "keep going until done or capped")    │
-  └───────────────────────────┬─────────────────────────────────┘
-                              │ recovery path
-  ┌─ one bounded retry, not a recursive descent ────────────────┐
-  │  runRecoveryTurn() — a SINGLE extra turn if parse fails      │
-  │  (NOT recursive backtracking; one shot, then give up)       │
-  └──────────────────────────────────────────────────────────────┘
+  ┌─ Service layer — packages/runtime ───────────────────────────┐
+  │  ★ run-agent-loop.ts:98  for (turn < maxTurns) ★              │ ← bounded
+  │    each turn = a state: call model → maybe tools → repeat     │   iteration
+  │    HARD CAP + forced-final turn = the load-bearing parts      │   (a state
+  │  parseAgentJson:17  bounded substring scan (no recursion)     │    machine)
+  └───────────────────────────────────────────────────────────────┘
 
-  not present anywhere: DP / memoization · backtracking search tree
+  no backtracking · no memoization · no DP table anywhere
 ```
 
-Zoom in: recursion is "a function that calls itself on a smaller subproblem until a base case." An iterative state machine is the same idea unrolled into a loop with explicit state and an explicit termination bound. DP adds a cache so overlapping subproblems aren't recomputed; backtracking adds undo so you can explore a search tree and retreat. aptkit uses the loop; it has no use for the cache or the undo.
-
----
+Zoom in: recursion, backtracking, and DP are all about *exploring a state space*. Recursion descends it; backtracking explores branches and undoes dead ends; DP caches overlapping subproblems so you never recompute. The agent loop touches the *first* idea (a state space traversed step by step) but deliberately avoids the others — it goes forward only, never branches, never backtracks. Naming that "it's iteration over states, capped, no backtracking" is the whole lesson. You built recursion-with-call-stack visualizers in `reincodes`; this file is about why the agent loop *isn't* one.
 
 ## Structure pass
 
-**Layers:** the bounded loop (real), the single bounded recovery turn (real), backtracking (absent), DP (absent).
-
-**Axis — control flow / termination:** trace "what guarantees this stops?"
-
 ```
-  One axis — "what guarantees termination?"
+  layers:  the state space  →  the exploration rule  →  the termination
+  axis held constant: "how do we move through states, and when do we stop?"
 
-  recursion          → a base case (smaller input each call)
-  aptkit agent loop  → a TURN COUNTER + forced-final escape   ← real
-  backtracking       → exhausted choices at every node        (absent)
-  DP                 → a finite filled table / memo            (absent)
-
-  the agent loop's guarantee is a HARD COUNT, not a base case —
-  because the LLM, not the code, decides whether to "recurse" again
+  ┌─ bounded iteration ─────────┐   move FORWARD only; stop at cap or terminal
+  │  agent loop (run-agent-loop) │   → linear path, no branching ★ EXERCISED
+  └──────────────┬───────────────┘
+                 │  seam: exploration flips from "forward only" to "branch + undo"
+  ┌─ backtracking ──────────────┐   try branch, recurse, UNDO on dead end
+  │  N-queens, puzzles           │   → explores a tree of choices  (not in aptkit)
+  └──────────────┬───────────────┘
+                 │  seam: exploration flips to "cache overlapping subproblems"
+  ┌─ dynamic programming ───────┐   memoize / tabulate repeated subproblems
+  │  edit distance, knapsack     │   → reuse, don't recompute  (not in aptkit)
+  └──────────────────────────────┘
 ```
 
-**Seam — code-bounded vs model-driven continuation.** Inside one turn, *code* decides the mechanics. But whether there's a *next* turn depends on whether the model emitted a tool call — the *model* drives the recursion-equivalent. The control axis flips at that seam: the loop is the code's, the recursion decision is the model's. That's why the bound must be a hard counter — you can't trust the model to hit a base case.
-
----
+The axis — *how do we move through states, and when do we stop?* — puts the agent loop firmly in the top layer: forward-only, capped. The seams below mark what aptkit *doesn't* do. That negative space is honest curriculum, not a gap to apologize for.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You've watched recursion build and unwind a call stack frame by frame. The agent loop is that pattern *unrolled*: instead of `solve(state)` calling `solve(smaller_state)`, it's `for each turn: advance(state)`. The "subproblem" is "what's left after this turn's tool results come back." It would be natural to write it recursively — `runTurn(messages)` calls `runTurn(messages + results)` — but aptkit makes it an explicit loop so the termination bound is dead obvious and there's no stack-depth risk from a model that won't stop.
+The agent loop is a **state machine**, not a recursion. Each turn is a state; the transition is "ask the model what to do next." It moves forward one turn at a time and stops on one of two conditions: a terminal state (the model produces text with no tool calls) or a hard iteration cap. That cap is what separates it from an unbounded loop — and it's the part that breaks catastrophically if you remove it.
 
 ```
-  Pattern — bounded iterative state machine (recursion unrolled)
+  the agent loop as a bounded state machine
 
-  state = [userPrompt]
-  ┌──────────────────────────────────────────────┐
-  │ turn 0: model.complete(state)                 │
-  │   tool_use? → run tools → append → continue   │──┐
-  │   no tool?  → finalText, BREAK                │  │
-  └──────────────────────────────────────────────┘  │ loop, not recurse
-  ┌──────────────────────────────────────────────┐  │
-  │ turn 1..maxTurns-1: same                      │◄─┘
-  │   last turn → forceFinal: strip tools,        │
-  │               demand the answer               │
-  └──────────────────────────────────────────────┘
-  termination: no-tool-use  OR  turn == maxTurns-1  OR  budget spent
+  ┌──────┐  tool calls?  ┌──────────┐  results   ┌──────┐
+  │ MODEL│──── yes ──────▶│ RUN TOOLS│───────────▶│ MODEL│ ─┐
+  │ TURN │               └──────────┘             │ TURN │  │ loop
+  └───┬──┘                                        └──────┘ ◀┘
+      │ no tool calls (text only)        ▲
+      ▼                                  │ turn == maxTurns−1
+   ┌──────┐                              │ → FORCE FINAL (drop tools)
+   │ DONE │ ◀────────────────────────────┘
+   └──────┘     two exits: terminal state OR hard cap
 ```
 
-### Move 2 — the walkthrough
+Compare it to your `reincodes` recursion visualizers: a recursive descent pushes frames and pops them, and its depth is bounded by the input. The agent loop has no frames to pop — it's a flat `for` loop whose bound is a *constant you set*, not a property of the input. That difference is the whole point: with an LLM deciding each transition, the input can't bound the loop, so you bound it yourself.
 
-#### The bounded loop and its three termination conditions
+### Move 2 — walking the agent loop's state-space iteration
 
-The whole control structure is a counted loop with explicit exits — no recursion, no implicit base case:
+**The hard iteration cap — the single load-bearing part.** `run-agent-loop.ts:98`:
 
 ```ts
-// packages/runtime/src/run-agent-loop.ts:98-109, 131-135
-for (let turn = 0; turn < maxTurns; turn += 1) {     // HARD bound (default 8)
-  signal?.throwIfAborted();
-  const budgetSpent = maxToolCalls !== undefined && toolCalls.length >= maxToolCalls;
-  const forceFinal = turn === maxTurns - 1 || budgetSpent;   // ← the escape
-  const response = await model.complete({
-    system: forceFinal && synthesisInstruction ? `${system}\n\n${synthesisInstruction}` : system,
-    messages,
-    tools: forceFinal ? undefined : toolSchemas,     // ← strip tools on final turn
-    maxTokens, signal,
-  });
-  // ...
-  const toolUses = toolUsesFromContent(response.content);
-  if (toolUses.length === 0) { finalText = text; break; }   // ← natural exit
-}
+  for (let turn = 0; turn < maxTurns; turn += 1) {   // ← maxTurns defaults to 8 (line 87)
+    signal?.throwIfAborted();
+    const budgetSpent = maxToolCalls !== undefined && toolCalls.length >= maxToolCalls;
+    const forceFinal = turn === maxTurns - 1 || budgetSpent;   // ← last turn OR budget gone
 ```
 
-Three ways the "recursion" stops: (1) the model emits no tool call → it answered, `break`; (2) `turn` reaches `maxTurns - 1` → forced final; (3) the tool-call budget is spent → forced final. Recursion would rely on the model "knowing" to stop (a base case). aptkit doesn't trust that — it caps the depth in code.
+Read what breaks without the cap. The model decides each turn whether to call more tools. A confused or adversarial model can call tools forever — search, search again, never conclude. There's no input-derived bound, because the *model* drives the transition, not the data. So `maxTurns` is the termination guarantee. **Strip line 98's bound and the loop is unbounded — the agent can spin until it times out or burns the token budget.** This is the exact analog of BFS's empty-frontier termination (file 05): the condition people forget, that makes the difference between "terminates" and "hangs."
 
-#### The load-bearing part: the forced-final turn (the base case the model can't be trusted to reach)
-
-Here's the skeleton, named by what breaks without each part:
-
-```
-  agent loop kernel        what breaks if removed
-  ───────────────────────  ────────────────────────────────────────────
-  turn counter (maxTurns)  no bound → model loops forever, never answers
-  forceFinal flag          model keeps calling tools, never synthesizes
-  strip tools on final     model calls a tool when it MUST answer → no text
-  synthesisInstruction     model says "I need more data" instead of answering
-  no-tool-use break        natural early exit when the model is done
-```
-
-The part people forget is **forceFinal stripping the tools** (`run-agent-loop.ts:108`). Setting `tools: undefined` on the last turn *removes the option to call a tool*, so the model has no choice but to produce text. Without it, an agent can hit the turn cap still trying to call tools and return *no answer*. This is the iterative analog of a recursion's base case — except the code imposes it, because the model won't impose it on itself. Naming this in an interview signals you built a real agent loop, not a toy.
-
-#### The recovery turn: one bounded retry, NOT recursive backtracking
-
-When the final text won't parse into the required shape, there's a *single* recovery attempt — and it's pointedly not a recursive retry tree:
+**The forced-final turn — guaranteed progress to an answer.** Lines 102-108:
 
 ```ts
-// packages/runtime/src/run-agent-loop.ts:192-201
-let parsed: T | null = null;
-if (options.parseResult) {
-  parsed = options.parseResult(finalText);
-  if (parsed === null && options.recoveryPrompt) {
-    const recoveryText = await runRecoveryTurn(options, options.recoveryPrompt(toolCalls));
-    parsed = recoveryText === null ? null : options.parseResult(recoveryText);  // ONE retry
-  }
-}
+    const response = await model.complete({
+      system: forceFinal && synthesisInstruction ? `${system}\n\n${synthesisInstruction}` : system,
+      messages,
+      tools: forceFinal ? undefined : toolSchemas,   // ← on the last turn, REMOVE the tools
+      ...
 ```
 
-Backtracking would explore alternatives, fail, undo, and try another branch — potentially many times. This does *one* extra turn and then gives up (`parsed` stays `null`). That's a deliberate non-backtracking choice: an LLM retry tree is unbounded cost with no convergence guarantee, so aptkit caps it at one. The contrast teaches backtracking by its absence — aptkit's "search" has no undo and no branch exploration because the cost model (each step is an expensive model call) makes exhaustive search the wrong shape.
+On the final allowed turn, the loop *removes the tools* from the request. The model physically cannot call another tool — it has to produce text. This converts "ran out of turns" from a failure (loop exits with no answer) into a graceful conclusion (model is forced to synthesize what it has). The boundary condition it fixes: without it, hitting the cap could leave `finalText` empty. With it, the cap always yields an answer. This is hardening *on top of* the skeleton — the cap guarantees termination, the forced-final guarantees a *useful* termination.
 
-#### The tolerant parser: recursion-free bounded scan
-
-`parseAgentJson` is where you might expect a recursive descent parser — and aptkit deliberately doesn't write one:
+**The terminal state — the natural exit.** Lines 131-135:
 
 ```ts
-// packages/runtime/src/json-output.ts:7-28
-export function parseAgentJson(text: string): unknown {
-  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);   // 1. strip fences
-  const candidate = (fence ? fence[1] : text).trim();
-  try { return JSON.parse(candidate); } catch { /* fall through */ }   // 2. fast path
-  const objectStart = candidate.indexOf('{');                  // 3. bounded scan
+    const toolUses = toolUsesFromContent(response.content);
+    if (toolUses.length === 0) {   // ← model produced text, no tool calls
+      finalText = text;
+      break;                        // ← terminal state reached, exit early
+    }
+```
+
+The *normal* exit: the model stops asking for tools and just answers. This is the agent reaching a terminal state before the cap — the happy path. The cap is the safety net for when this never happens.
+
+**No backtracking — and that's deliberate.** The loop appends to `messages` and moves forward (line 124, 189). It never undoes a turn, never explores an alternative branch, never maintains a frontier of unexplored states. A backtracking search (N-queens, your river-crossing BFS) tries a choice, recurses, and *unwinds* on a dead end. The agent loop commits to each turn permanently. If a tool call was a mistake, the model has to *recover forward* (the `recoveryPrompt`/`runRecoveryTurn` path, line 195-217 — a one-shot retry, not a backtrack). The lesson: this is a *linear* state-space walk, not a *tree* search. Calling it backtracking would be wrong.
+
+**parseAgentJson — bounded scanning, not recursion.** `json-output.ts:17`:
+
+```ts
+  const objectStart = candidate.indexOf('{');
   const arrayStart = candidate.indexOf('[');
-  const start = /* min of the two non-negative starts */;
+  ...
   const end = Math.max(candidate.lastIndexOf('}'), candidate.lastIndexOf(']'));
-  if (start >= 0 && end > start) return JSON.parse(candidate.slice(start, end + 1));
-  throw new Error('no parseable json in model output');
-}
+  if (start >= 0 && end > start) {
+    return JSON.parse(candidate.slice(start, end + 1));   // ← grab outermost bracket span
 ```
 
-It tries `JSON.parse` (the standard library's parser does the real recursion), and on failure does a *bounded* substring scan — first brace/bracket to last — then parses that slice. No hand-rolled recursive grammar walk: it leans on `JSON.parse` for the recursion and adds only a tolerant outer envelope. The boundary condition it handles: a model wrapping JSON in prose or markdown fences. The lesson — don't write a recursive parser when a bounded scan plus the platform parser does the job.
+You might expect a recursive-descent parser here. It isn't one — it's a bounded substring scan: find the first opening bracket, the last closing bracket, slice the span, hand it to `JSON.parse`. No recursion, no stack, `O(n)` over the text. The lesson: a full recursive parser is overkill when you just need to *extract* a JSON blob from chatty model output — the simplest bounded scan that survives the common failure (prose wrapped around the JSON) wins. The fenced-block regex (line 8) handles the ` ```json ` case first; the substring scan is the fallback.
+
+**No dynamic programming — `not yet exercised`.** There's no overlapping-subproblem structure anywhere in aptkit or buffr. No edit distance, no knapsack, no memoized recursion over a table. The closest *conceptual* neighbor is the chunker's overlap (file 01) — but that's amortization, not DP. If aptkit ever did, say, optimal chunk-boundary placement to minimize fact-splitting, that'd be a DP problem. Today: nothing. Don't invent it.
 
 ### Move 3 — the principle
 
-**When the "recursion" is driven by an untrusted decider, unroll it into a bounded loop with an enforced base case.** aptkit's agent loop is recursion's shape — advance until done — but because the LLM decides whether to continue, the termination guarantee has to be a hard counter and a *forced* final turn, not a base case the recursion hopes to reach. Backtracking and DP are absent for the same cost reason: when each "step" is an expensive model call, you can't afford to explore-and-undo or fill a table of subproblems. The structure you reach for is shaped by who controls continuation and what each step costs.
-
----
+When a loop's transitions are decided by something you don't control — an LLM, external input, a network — you cannot let the *input* bound it; you bound it yourself with a hard cap and a forced terminal state. The agent loop is the cleanest example: a state machine that goes forward only, never backtracks, and *always* terminates because the cap and forced-final turn are non-negotiable. Termination you can prove beats cleverness you can't.
 
 ## Primary diagram
 
-The full control flow — the bounded state machine and its non-recursive recovery.
-
 ```
-  runAgentLoop — bounded iterative state machine (recursion unrolled)
+  recursion/backtracking/DP across aptkit — one frame
 
-  messages = [userPrompt]
-  ┌─ for turn in 0..maxTurns ───────────────────────────────────┐
-  │  forceFinal = (turn==maxTurns-1) OR budgetSpent              │
-  │  resp = model.complete(tools = forceFinal ? none : schemas)  │
-  │  append assistant message                                    │
-  │  toolUses empty? ──yes──► finalText = text; BREAK            │
-  │       │ no                                                   │
-  │       ▼                                                      │
-  │  run each tool → append tool_result → next turn             │
-  └──────────────────────────────────────────────────────────────┘
-       │ after loop
-       ▼
-  parseResult(finalText)
-       null? ──► runRecoveryTurn (ONE shot) ──► parseResult again
-                 (NOT backtracking — no branch tree, no undo)
+  CONCEPT          where                       status
+  ──────────────────────────────────────────────────────────────
+  bounded iter   ★ run-agent-loop.ts:98       EXERCISED
+    hard cap        maxTurns (line 87)          load-bearing: no cap → hangs
+    forced final    tools=undefined (line 105)  always yields an answer
+    terminal exit   no tool_use → break (132)   the happy path
+  bounded scan     json-output.ts:17           exercised (not recursion)
+  backtracking     —                           not exercised (loop is LINEAR)
+  recursion        —                           incidental only
+  dynamic prog     —                           not exercised anywhere
 
-  absent by design: memoization/DP table · backtracking search tree
-  termination guarantee: HARD turn counter + forced-final (not a base case)
+  you've BUILT: recursion + call-stack visualizers (reincodes/Tree.ts),
+  state-space BFS (PG.ts) → drill targets, not aptkit evidence
 ```
-
----
 
 ## Elaborate
 
-Tail-recursion-to-iteration is a classic transform: any "call myself on the rest" can become a loop with explicit state. aptkit applies it for a non-classic reason — not stack-depth optimization, but *trust*. A recursive agent (`runTurn` calling `runTurn`) would let a misbehaving model drive arbitrary depth; the explicit `for (turn < maxTurns)` makes the bound a visible constant. This is the same instinct behind iterative-deepening and depth-limited search: cap the depth when you can't trust the search to terminate.
-
-Dynamic programming earns its place when subproblems *overlap* — the same sub-input recomputed many times (Fibonacci, edit distance, knapsack). aptkit has no such structure: each turn's input is the growing conversation, never a repeated sub-input, so there's nothing to memoize. Backtracking earns its place when a search has *cheap* steps and you need to explore-and-undo (N-queens, sudoku, the river-crossing search you built in `PG.ts`). aptkit's steps are *expensive* (model calls), so exhaustive exploration is the wrong shape — hence one bounded recovery, not a retry tree. The honest framing: DP and backtracking aren't missing because the author didn't know them; they're absent because the problem shape (no overlapping subproblems, expensive steps) doesn't call for them.
-
----
+Backtracking (try-recurse-undo) and DP (cache overlapping subproblems) are the two heavyweight state-space techniques — and aptkit needs neither because its state space is a *line*, not a tree or a lattice. That's a design choice with teeth: a forward-only agent loop is simpler to reason about and trivially terminating, at the cost of never re-exploring a bad decision. Some agent frameworks *do* add tree search (tree-of-thoughts, beam search over reasoning paths) — that's where backtracking and the priority-queue frontier (file 03, 05) re-enter the picture. aptkit deliberately stays linear. The reasoning-pattern view of the loop (ReAct, when the model should search vs answer) belongs to **study-agent-architecture**; this file owns only the *control-structure* view — it's a bounded state machine.
 
 ## Interview defense
 
-**Q: Is the agent loop recursive?**
-
-> No — it's a bounded iterative state machine. It's recursion's *shape* ("advance until done") unrolled into `for (turn = 0; turn < maxTurns; turn++)`, because the LLM, not the code, decides whether to continue. You can't trust an untrusted decider to hit a base case, so termination is a hard turn counter plus a forced-final turn, not a recursive base case. Each turn calls the model, runs any tools it requested, appends results, and loops; it breaks early when the model emits no tool call.
+**Q: What's the load-bearing part of the agent loop, the one people forget?**
+The hard iteration cap. The model decides each turn whether to call more tools, so the input can't bound the loop — a confused model would call tools forever. `maxTurns` (default 8) is the termination guarantee, and the forced-final turn (removing tools on the last iteration) makes sure hitting the cap still produces an answer instead of an empty result.
 
 ```
-  recursion:  solve(state) → solve(smaller)   base case stops it
-  aptkit:     for turn<maxTurns: advance       counter stops it
+  for turn < maxTurns:           ← cap = termination guarantee
+    if last turn: drop tools     ← forced final = useful termination
+    if no tool calls: break      ← terminal state = happy exit
+  drop the cap → unbounded spin (the BFS empty-frontier of agent loops)
 ```
 
-**Q: What's the part of that loop people forget?**
+Anchor: "When an LLM drives the transitions, you bound the loop yourself — the cap is the same role as BFS's empty-frontier check: the difference between terminates and hangs."
 
-> The forced-final turn — on the last iteration it sets `tools: undefined`, removing the model's option to call a tool, so it *must* produce an answer. Without it, an agent can burn through all its turns still calling tools and return no answer at all. It's the base case the code imposes because the model won't impose it on itself.
+**Q: Is the agent loop backtracking or a search?**
+No — it's forward-only bounded iteration. No branching, no undo, no frontier of alternatives. It commits to each turn and can only recover *forward* (a one-shot recovery prompt), never unwind a bad choice. A real backtracking search (like a constraint puzzle) explores a tree and undoes dead ends; this walks a line.
 
-**Q: Why no backtracking or DP in the retry logic?**
-
-> Cost. Backtracking and DP make sense when steps are cheap — explore, fail, undo, or fill a memo table. Here each step is an expensive model call with no convergence guarantee, so an LLM retry tree is unbounded cost for unclear gain. aptkit does exactly *one* recovery turn and then gives up. And there's no DP because no subproblem repeats — each turn's input is the growing conversation, never a recomputed sub-input, so there's nothing to memoize.
-
-Anchor: *the agent loop is recursion unrolled into a bounded loop with a forced base case, because an untrusted model drives continuation and each step is expensive.*
-
----
+**Q: Any dynamic programming in here?**
+None. No overlapping-subproblem structure to memoize anywhere in aptkit or buffr. The chunker's overlap is amortization, not DP. If you wanted optimal chunk boundaries that minimize fact-splitting, *that* would become a DP problem — it isn't built.
 
 ## See also
 
-- **01-complexity-and-cost-models.md** — the `O(maxTurns)` × (model-call cost) analysis of this loop.
-- **03-stacks-queues-deques-and-heaps.md** — why the loop isn't a work queue.
-- **05-graphs-and-traversals.md** — the traversal kernel (frontier/visited/terminate) the loop's termination echoes.
-- `study-agent-architecture` — the ReAct/agentic-retrieval reasoning pattern this loop implements.
+- `01-complexity-and-cost-models.md` — why the capped loop is `O(maxTurns)`, a constant
+- `05-graphs-and-traversals.md` — why the loop isn't a state-space graph search
+- `03-stacks-queues-deques-and-heaps.md` — the PQ frontier tree-search would need (and the loop avoids)
+- **study-agent-architecture** — the ReAct reasoning view of the same loop

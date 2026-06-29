@@ -1,249 +1,221 @@
 # Vector databases
+> ANN storage · Industry standard
 
-**Subtitle:** Vector store · ANN / similarity search storage · *Industry standard*
+You've already run one of these — pgvector in AdvntrCue. A vector database is just the thing that stores your embeddings and answers "give me the *k* closest to this query vector" fast. aptkit ships two implementations behind one contract: a from-scratch in-memory store that does a linear cosine scan (great for a prototype, O(n)), and buffr's pgvector store that uses an HNSW index for sublinear search at scale. Same `VectorStore` interface, two bodies. The swap from one to the other is the entire point of the contract — it's drop-in, and buffr proves it with shipped code.
 
 ## Zoom out, then zoom in
 
-The vector store is the one stateful box in the retrieval pipeline. Everything
-above it is stateless glue; the store owns the corpus. aptkit ships an in-memory
-implementation; buffr fills a Postgres one — both behind the same contract.
+The vector store is the bottom of the retrieval stack — it owns the durable state and answers the only question that matters at query time.
 
 ```
-  Zoom out — where the store sits
-
-  ┌─ Pipeline (stateless) ──────────────────────────────────────┐
-  │  index → embed → upsert        query → embed → search        │
-  └───────────────────────────┬─────────────────────────────────┘
-                              │ VectorStore contract
-  ┌─ Storage (stateful) ──────▼─────────────────────────────────┐
-  │  ★ InMemoryVectorStore ★      |      ★ buffr PgVectorStore ★ │ ← we are here
-  │  Map<id,chunk>, cosine scan   |      pgvector + HNSW index   │
-  └──────────────────────────────────────────────────────────────┘
+where the vector store sits, and its two bodies
+┌──────────────────────────────────────────────────────────┐
+│  pipeline / search_knowledge_base   (vendor-agnostic)       │
+└───────────────┬────────────────────────────────────────────┘
+                ▼  store.upsert(chunks) / store.search(vec, k)
+┌──────────────────────────────────────────────────────────┐
+│  ★ VectorStore contract ★   { dimension, upsert, search }   │
+└───────┬─────────────────────────────────────────┬──────────┘
+        ▼ aptkit                                    ▼ buffr (SHIPPED)
+┌───────────────────────┐               ┌───────────────────────────┐
+│ InMemoryVectorStore   │               │ PgVectorStore             │
+│ Map + cosine scan O(n)│  ◄── swap ──► │ pgvector + HNSW, SQL       │
+│ zero-cloud prototype  │               │ durable, sublinear, prod   │
+└───────────────────────┘               └───────────────────────────┘
 ```
 
-Now zoom in. You think of a vector store the way you think of a DB table — rows
-you write and query — except the "query" isn't `WHERE id = ?`, it's "the k rows
-*closest* to this vector." aptkit's pick is deliberate: an in-memory cosine scan
-that needs zero infrastructure, with a real pgvector store as a drop-in behind the
-same interface. The choice is "what's the smallest persistent thing that fills the
-contract," not "which managed vector DB."
+The contract is four members. Both stores implement exactly those four, so the pipeline above never knows which one it's talking to. You develop against the in-memory store with no infra, then point the same pipeline at Postgres for production — that's the line `in-memory-vector-store.ts:7-8` makes explicit ("`PgVectorStore` is a later drop-in behind the same contract — no pipeline change").
 
 ## Structure pass
 
-**Layers.** Contract (`VectorStore`) → implementation (in-memory or pg) → physical
-storage (a `Map` or a Postgres table with an HNSW index).
+Pick the **cost** axis: what does a single `search` cost as the corpus grows?
 
-**Axis — cost.** What does a search cost? Trace it: in-memory = O(n) full scan over
-every chunk (fine under ~10k chunks); pgvector with HNSW = approximate O(log n)
-graph walk (fine into millions). The axis "is search exact or approximate?" flips
-across the implementations — in-memory is exact cosine, HNSW is approximate.
+```
+cost of search(vector, k) as n chunks grows
+  InMemoryVectorStore               PgVectorStore (HNSW)
+  ┌──────────────────┐              ┌──────────────────────┐
+  │ score EVERY chunk │              │ walk a navigable graph│
+  │ O(n) cosine ops   │              │ ~O(log n) hops        │
+  │ sort all, take k  │              │ index returns ~k      │
+  └────────┬─────────┘              └──────────┬───────────┘
+   n=100   instant                   n=100      instant
+   n=10k   ~fine                      n=10k      fast
+   n=10M   melts                      n=10M      still fast
+           ▲ seam: this is where you MUST swap stores ▲
+```
 
-**Seam.** The `VectorStore` contract (`contracts.ts:33`): `upsert(chunks)` +
-`search(vector, k)` + a `dimension`. That's the entire surface. The cost/exactness
-axis flips below it; nothing above it knows or cares.
+The seam is corpus size. Below ~tens of thousands of chunks, the linear scan is genuinely fine and the simplicity wins — no index to tune, no Postgres to run. Past that, scoring every chunk per query stops being free and you cross over to the indexed store. The contract is designed so crossing that seam is a wiring change, not a rewrite.
 
 ## How it works
 
-### Move 1 — the mental model
-
-A vector store is a table where the primary lookup is "nearest neighbors," not
-"exact key." You know how a DB index turns `WHERE email = ?` from a scan into a
-B-tree seek? An ANN index (HNSW) does the same for "closest vector" — turns an
-O(n) scan into a graph walk. The in-memory store skips the index and just scans.
+**Move 1 — the contract is the whole design.** A vector store is two operations over a dimension-pinned space:
 
 ```
-  Two stores, one contract
-
-  ┌─ VectorStore ──────────────────────────────────┐
-  │  dimension: number                              │
-  │  upsert(chunks): Promise<void>                  │
-  │  search(vector, k): Promise<VectorHit[]>        │
-  └───────────────┬─────────────────────┬───────────┘
-        implements │                     │ implements
-   ┌───────────────▼───┐       ┌─────────▼─────────────┐
-   │ InMemoryVectorStore│       │ buffr PgVectorStore   │
-   │ Map + cosine scan  │       │ pgvector + HNSW       │
-   └────────────────────┘       └───────────────────────┘
+VectorStore — four members, two verbs
+┌──────────────────────────────────────────────┐
+│ dimension: number                ← the door    │
+│ upsert(chunks: VectorChunk[]) → void  (write)  │
+│ search(vector, k) → VectorHit[]       (read)   │
+└──────────────────────────────────────────────┘
 ```
-
-### Move 2 — the two implementations
-
-**In-memory: a Map and a cosine scan.** `InMemoryVectorStore`
-(`in-memory-vector-store.ts:10`) is the zero-cloud adapter. `search` is a full scan:
 
 ```ts
+// packages/retrieval/src/contracts.ts:33-37
+export type VectorStore = {
+  dimension: number;                                       // carries its own dimension
+  upsert(chunks: VectorChunk[]): Promise<void>;            // idempotent by chunk id
+  search(vector: number[], k: number): Promise<VectorHit[]>; // ranked, top-k
+};
+```
+
+That's it. Any backend that can store `{id, vector, meta}` and return the top-k by similarity satisfies it.
+
+**Body 1 — the in-memory cosine scan.** aptkit's store is a `Map` and a loop:
+
+```ts
+// packages/retrieval/src/in-memory-vector-store.ts:25-33
 async search(vector: number[], k: number): Promise<VectorHit[]> {
-  this.assertDimension(vector, 'query vector');     // fail loud on wrong dim
+  this.assertDimension(vector, 'query vector');            // gate (file 02)
   const hits: VectorHit[] = [];
-  for (const chunk of this.chunks.values()) {        // O(n) over the whole corpus
+  for (const chunk of this.chunks.values()) {              // ← O(n): touch every chunk
     hits.push({ id: chunk.id, score: cosineSimilarity(vector, chunk.vector), meta: chunk.meta });
   }
-  hits.sort((a, b) => b.score - a.score);            // rank by similarity, desc
-  return hits.slice(0, Math.max(0, k));              // top-k
+  hits.sort((a, b) => b.score - a.score);                  // sort DESC by score
+  return hits.slice(0, Math.max(0, k));                    // top k
 }
+// cosineSimilarity (:46-57): dot/magA/magB loop, denom===0 ? 0 : dot/denom
 ```
 
-Exact, simple, correct, and fine until the corpus gets big. No index — every query
-touches every chunk. That's the right default for "build the whole pipeline with
-zero cloud."
-
 ```
-  In-memory search — O(n) scan
-
-  qv ─► for each chunk: cosine(qv, chunk.vector) ─► [0.81, 0.42, 0.77, …]
-                                                         │ sort desc
-                                                         ▼
-                                                   slice top-k
+in-memory search: brute force, exact
+  query vec ──► [score vs chunk 0][score vs chunk 1]...[score vs chunk n]
+                         │ sort all DESC │
+                         ▼ slice(0, k)
+                    top-k hits (EXACT — no approximation)
 ```
 
-**Postgres: pgvector + HNSW.** buffr's `PgVectorStore`
-(`/Users/rein/Public/buffr/src/pg-vector-store.ts:67`) implements the *same*
-contract against a real index. The search is one SQL query:
+Note it's *exact* nearest neighbor — every chunk is scored, so the top-k is provably correct. That's the in-memory store's quiet advantage: no recall loss. The cost is O(n) per query.
+
+**Body 2 — pgvector + HNSW (buffr, shipped).** The production store pushes the work into Postgres:
 
 ```ts
-async search(vector, k) {
+// buffr/src/pg-vector-store.ts:67-78
+async search(vector: number[], k: number): Promise<Hit[]> {
   this.assertDim(vector);
-  // <=> is cosine DISTANCE; similarity score = 1 - distance.
+  // <=> is cosine DISTANCE; similarity score = 1 - distance
   const { rows } = await this.pool.query(
     `select id, content, chunk_index, document_id, meta,
-            1 - (embedding <=> $1::vector) as score
+            1 - (embedding <=> $1::vector) as score      -- ← convert distance → similarity
      from agents.chunks
      where app_id = $2
-     order by embedding <=> $1::vector       -- HNSW index serves this ORDER BY
+     order by embedding <=> $1::vector                   -- ← HNSW index serves this ORDER BY
      limit $3`,
     [toVectorLiteral(vector), this.appId, k],
   );
-  return rows.map((r) => ({                  // rebuild the in-memory meta shape
-    id: r.id, score: Number(r.score),
-    meta: { ...(r.meta ?? {}), docId: r.document_id, chunkIndex: r.chunk_index, text: r.content },
-  }));
+  // rebuild meta so citations work identically to in-memory (:80-84)
+  return rows.map((r) => ({ id: r.id, score: Number(r.score),
+    meta: { ...(r.meta ?? {}), docId: r.document_id, chunkIndex: r.chunk_index, text: r.content } }));
 }
 ```
 
-Two things to notice. The `<=>` operator is cosine *distance*, so the score is
-`1 - distance` to match the in-memory store's similarity convention. And the
-returned `meta` is rebuilt to carry `docId`/`chunkIndex`/`text` — so the
-`search_knowledge_base` tool's citation logic works identically on both stores.
+The index that makes the `ORDER BY` sublinear:
+
+```sql
+-- buffr/sql/001_agents_schema.sql:22-30
+embedding vector(768) not null,                            -- pinned dimension (the door)
+embedding_model text not null default 'nomic-embed-text:v1.5',
+-- ...
+create index if not exists chunks_embedding_hnsw
+  on agents.chunks using hnsw (embedding vector_cosine_ops); -- ← HNSW, cosine ops
+create index if not exists chunks_app_id on agents.chunks (app_id);
+```
 
 ```
-  Postgres search — HNSW-indexed nearest neighbor
-
-  qv ─► SQL: order by embedding <=> qv limit k
+HNSW = Hierarchical Navigable Small World (a navigable graph index)
+   query ──► enter at top layer (few nodes, long jumps)
+              │ greedily hop toward nearest
+              ▼ descend layers (more nodes, shorter jumps)
               │
-        HNSW index (created in sql/001_agents_schema.sql:28
-        using hnsw (embedding vector_cosine_ops))
-              ▼
-        rows ─► rebuild meta {docId, chunkIndex, text} ─► VectorHit[]
+              ▼ bottom layer → ~k nearest neighbors
+   ~O(log n) hops instead of O(n) scans — APPROXIMATE (tiny recall loss for huge speed)
 ```
 
-**The storage layout that makes the swap honest.** buffr's schema
-(`sql/001_agents_schema.sql:14`) stores chunks as `embedding vector(768)` with the
-HNSW index and an `app_id` partition. Crucially, `document_id` is a *soft* link
-(no FK) — because the `VectorStore` contract upserts chunks with no notion of a
-`documents` row, a hard FK would break drop-in parity. The schema bends to the
-contract, not the other way around.
+Two things to clock. First, `<=>` is cosine *distance* (0 = identical), so the query computes `1 - distance` to get back the same similarity score the in-memory store returns — the contract returns *score*, so the SQL converts. Second, `search` rebuilds `meta` into the exact `{docId, chunkIndex, text}` shape the in-memory store produces (`:80-84`), so the `search_knowledge_base` tool's citation code (file 11) doesn't care which store it ran against. Drop-in means *behaviorally* drop-in, not just type-compatible.
 
-### Move 2.5 — current state vs future state
-
-```
-  Phase A (aptkit default)        Phase B (buffr, shipped)
-  ┌──────────────────────┐        ┌───────────────────────────┐
-  │ InMemoryVectorStore  │        │ PgVectorStore             │
-  │ exact cosine, O(n)    │  same  │ approximate HNSW, O(log n)│
-  │ no infra, forgets     │contract│ Supabase pg, persists     │
-  │ good < ~10k chunks    │        │ good into millions        │
-  └──────────────────────┘        └───────────────────────────┘
-   verified live against reindb 2026-06-19 (buffr design doc)
-```
-
-### Move 3 — the principle
-
-Don't pick a vector DB; pick a *contract*, then fill it with the smallest thing
-that works. The "which managed vector store" question is the wrong one at small
-scale — managed stores add latency, cost, and a network dependency you don't need
-under ~100k chunks. aptkit's in-memory scan is the right default; buffr's pgvector
-is the right graduation, and the agent never learns the difference.
+**Move 3 — the principle.** The vector store is an adapter, and the contract is the load-bearing decision. Get the contract right — dimension + upsert + search returning scored hits with citation-ready meta — and you can start on a `Map`, ship on Postgres, and never touch the pipeline. The HNSW index isn't magic; it trades a sliver of recall (approximate, not exact) for log-time search. You buy that trade exactly when the linear scan stops being free, and not a day before.
 
 ## Primary diagram
 
 ```
-  One contract, two stores, the same citations
-
-  pipeline.query(q, k)
-        │ embed q
-        ▼
-  store.search(qv, k) ──────────────┬───────────────────────────┐
-        │                            │                           │
-  ┌─ InMemory ───────────┐    ┌─ PgVector (buffr) ──────────────┐│
-  │ Map<id,chunk>        │    │ agents.chunks                   ││
-  │ cosineSimilarity()   │    │ embedding vector(768)           ││
-  │ sort desc, slice k   │    │ hnsw (vector_cosine_ops)        ││
-  │ exact, O(n)          │    │ 1 - (embedding <=> qv), limit k ││
-  └──────────────────────┘    └─────────────────────────────────┘│
-        │                            │                            │
-        └──────────► VectorHit[] {id, score, meta{docId,text}} ◄──┘
-                     identical shape → citations work on both
+two bodies, one contract
+                    pipeline.query(q, k)
+                          │
+                          ▼  store.search(vec, k)
+              ┌───────────┴───────────┐
+              ▼                        ▼
+  InMemoryVectorStore         PgVectorStore (buffr)
+  ┌────────────────────┐      ┌──────────────────────────┐
+  │ Map<id, chunk>      │      │ agents.chunks (Postgres)  │
+  │ for-loop cosine     │      │ embedding vector(768)     │
+  │ sort + slice(k)     │      │ HNSW index, <=> cosine    │
+  │ EXACT, O(n)         │      │ APPROX, ~O(log n)         │
+  └─────────┬──────────┘      └────────────┬─────────────┘
+            ▼                                ▼
+       VectorHit[]  ◄── identical shape ──►  VectorHit[]
+       { id, score, meta:{docId,chunkIndex,text} }
 ```
+
+Same return shape from both bodies — that identical `VectorHit` is what makes the swap invisible upstream.
 
 ## Elaborate
 
-The reason aptkit doesn't reach for Pinecone is the same reason AdvntrCue
-co-located vectors and relational data in one Postgres: at this scale a separate
-vector service is overhead, not leverage. buffr's design doc frames the whole
-graduation as "fill a contract aptkit already drew, from inside buffr" — the
-persistence problem became an adapter problem, not a feature. Read `11-rag.md` for
-how the store fits the pipeline and `09-stale-embeddings.md` for the
-`embedding_model` column that makes re-embedding safe.
+The storage landscape: dedicated vector DBs (Pinecone, Weaviate, Qdrant, Milvus), Postgres-as-vector-DB (pgvector — what you and buffr use), and embedded libraries (FAISS, the original from Meta). The index families: **HNSW** (graph-based, great recall/speed, more memory — buffr's choice) vs **IVFFlat** (clustered, cheaper memory, needs training, pgvector's other option). Adjacent knobs you'd tune in prod: HNSW's `m` and `ef_construction` (recall vs build cost) and `ef_search` (recall vs query latency). Bridge: in AdvntrCue you used pgvector with — most likely — IVFFlat or a flat scan; buffr's HNSW choice is the upgrade for larger corpora. Read next: `01-embeddings.md` (what's stored) and `11-rag.md` (who calls `search`).
 
 ## Project exercises
 
-### Add a metadata-predicate search to the contract
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** extend `VectorStore.search` (or add `searchWhere`) to accept a
-  metadata filter pushed into the query — in pgvector a `where meta @> $filter`,
-  in-memory a post-filter — so memory recall and scoped retrieval don't have to
-  over-fetch-then-filter in application code.
-- **Why it earns its place:** the current contract has no metadata predicate, which
-  forces the over-fetch hack in both the search tool and memory recall; closing it
-  shows you can evolve a load-bearing contract without breaking either store.
-- **Files to touch:** `packages/retrieval/src/contracts.ts`,
-  `packages/retrieval/src/in-memory-vector-store.ts`,
-  `/Users/rein/Public/buffr/src/pg-vector-store.ts`.
-- **Done when:** both stores pass the same filtered-search test, and
-  `conversation-memory.recall` no longer over-fetches.
+### Benchmark InMemory vs Pg on a 10k-chunk corpus
+
+- **Exercise ID:** `EX-RAG-04a`
+- **What to build:** A harness that indexes ~10k chunks into both stores, runs the same 100 queries against each, and reports p50/p95 latency and top-5 agreement (recall of HNSW vs the exact in-memory baseline).
+- **Why it earns its place:** The O(n) → O(log n) crossover is theory until you watch the in-memory p95 climb while pgvector stays flat — and the recall number tells you exactly what HNSW's approximation costs. This is the measurement that justifies the swap. Phase 2B.
+- **Files to touch:** new bench script under `packages/retrieval/` or `buffr/`; exercise `InMemoryVectorStore.search` (`packages/retrieval/src/in-memory-vector-store.ts:25`) vs `PgVectorStore.search` (`buffr/src/pg-vector-store.ts:67`).
+- **Done when:** a report shows in-memory exact top-5 as ground truth, pgvector's recall@5 against it, and a latency crossover you can point at.
 - **Estimated effort:** `1–2 days`
+
+### Prove drop-in parity with a contract conformance test
+
+- **Exercise ID:** `EX-RAG-04b`
+- **What to build:** One test suite parameterized over both stores asserting identical `VectorHit` shape and ranking order on a fixed small corpus (use deterministic vectors).
+- **Why it earns its place:** "Drop-in" is a claim until a single test runs green against both bodies. It also pins the meta-rebuild in `pg-vector-store.ts:80-84` so a schema change can't break citations silently.
+- **Files to touch:** shared test alongside `packages/retrieval/src/in-memory-vector-store.ts`; import `PgVectorStore` from buffr (or a test double honoring the same SQL contract).
+- **Done when:** the same assertions pass for both stores; meta carries `docId`, `chunkIndex`, `text` from each.
+- **Estimated effort:** `1–4hr`
 
 ## Interview defense
 
-**Q: "In-memory vs pgvector — when do you switch, and what changes?"**
-Switch when the corpus outgrows a single-node scan (~10k+ chunks) or you need
-persistence across runs. What changes is *only the store* — both implement
-`VectorStore.search(vector, k)`, both return `VectorHit{id,score,meta}` with the
-same rebuilt meta, so the pipeline and agent are untouched. In-memory is exact
-cosine O(n); pgvector is approximate HNSW O(log n).
+**Q: When do you move off the in-memory store, and what do you lose?**
 
 ```
-  search outgrows the scan ─► drop in PgVectorStore (same contract)
-  pipeline + agent: zero changes   │   store: O(n) scan → O(log n) HNSW
+corpus size ──►  small: linear scan, EXACT, simple
+                 large: HNSW, ~O(log n), APPROXIMATE (recall < 100%)
+   you trade exact top-k for log-time search at the size where O(n) hurts
 ```
-Anchor: *pick a contract, not a vendor; the store is the only thing that swaps.*
 
-**Q: "Why is the score `1 - (embedding <=> $1)` in the SQL?"**
-pgvector's `<=>` is cosine *distance* (0 = identical, 2 = opposite); the in-memory
-store returns cosine *similarity* (1 = identical). To keep one ranking convention
-across both stores, the SQL converts distance back to similarity with `1 - distance`,
-so a `VectorHit.score` means the same thing regardless of backend.
+Anchor: the in-memory store is exact and simple but O(n); you swap to HNSW when scan cost bites, accepting a small recall loss for sublinear latency.
+
+**Q: pgvector's `<=>` returns distance but the contract wants a score — how does that not break callers?**
 
 ```
-  pgvector <=>  = distance (lower = closer)
-  contract score = similarity (higher = closer)  ─► score = 1 - distance
+<=> → cosine DISTANCE (0 = identical)
+score = 1 - distance → cosine SIMILARITY (1 = identical)
+   the SQL converts so VectorHit.score means the same thing from both stores
 ```
-Anchor: *the contract promises similarity; pgvector speaks distance; convert at the boundary.*
+
+Anchor: the Pg store computes `1 - (embedding <=> q)` so its `score` matches the in-memory cosine — the contract returns similarity, and each body is responsible for producing it.
 
 ## See also
 
-- `11-rag.md` — the pipeline the store plugs into
-- `01-embeddings.md` — what the 768-dim vector is
-- `09-stale-embeddings.md` — the `embedding_model` column
-- `04-agents-and-tool-use/05-agent-memory.md` — memory reuses this store
-- `01-llm-foundations/08-provider-abstraction.md` — the same swap discipline for models
+- [01-embeddings.md](01-embeddings.md) — what gets stored
+- [02-embedding-model-choice.md](02-embedding-model-choice.md) — where `dimension` is enforced
+- [10-incremental-indexing.md](10-incremental-indexing.md) — `upsert` on-conflict and re-indexing
+- [11-rag.md](11-rag.md) — the search tool that calls into the store

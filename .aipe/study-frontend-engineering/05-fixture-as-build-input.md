@@ -1,249 +1,242 @@
-# 05 — Fixture as build input
+# Fixture as build input
 
-**Industry name(s):** build-time data inlining / static-fixture bundling.
-**Type:** Project-specific (the agents' recorded JSON fixtures imported straight
-into the frontend bundle).
+**Industry name(s):** static asset / JSON module import resolved at build; embedded test
+fixtures as the demo data source. **Type:** Industry standard (bundler JSON imports),
+project-specific in how the same fixtures feed both the dev middleware and the static demo.
 
 ## Zoom out, then zoom in
 
-The recorded agent fixtures — JSON files that live next to each agent package —
-are *imported* into the Studio bundle, not fetched. That single decision is what
-lets the deployed GitHub Pages demo run every agent with no backend at all.
-Here's where it sits.
+Studio has no database and, in the Pages build, no server. Its demo data — the recorded model
+turns, workspaces, tool results that drive every replay — are JSON files that live next to the
+agents in `packages/agents/*/fixtures/`. They reach the running app by being **imported as
+modules at build time**, so they end up embedded in the bundle. Here's where fixture imports
+sit.
 
 ```
-  Where fixtures enter the frontend
+  Zoom out — where fixtures enter the frontend
 
-  ┌─ packages/agents/*/fixtures/*.json ─────────────────────────┐
-  │  recorded ModelResponse[] + workspace + tools (correctness  │
-  │  baselines — also the agents' test inputs)                  │
-  └───────────────────────────┬─────────────────────────────────┘
-                              │  import (build time, Vite)
-  ┌─ Build (Vite) ───────────▼──────────────────────────────────┐
-  │  fixtures.ts re-exports them as typed JS arrays              │
-  │  vite.config.ts imports the SAME files for the dev API       │
-  └───────────────────────────┬─────────────────────────────────┘
-                              ▼  inlined in the one JS chunk
-  ┌─ UI (browser, zero backend) ────────────────────────────────┐
-  │  StudioHome counts them · workspaces replay them            │
-  └──────────────────────────────────────────────────────────────┘
+  ┌─ Repo (source of truth) ─────────────────────────────────┐
+  │  packages/agents/*/fixtures/*.json   apps/studio/src/*.ts │
+  └───────────────────────────────┬──────────────────────────┘
+                                  │ import …json  /  literal TS
+  ┌─ Build layer (Vite) ──────────▼──────────────────────────┐
+  │  ★ JSON → JS module, baked into the bundle ★  ← we're here│
+  └───────────────────────────────┬──────────────────────────┘
+                                  │ used by
+  ┌─ App layer ───────────────────▼──────────────────────────┐
+  │  StudioHome counts · runners replay · vite middleware runs│
+  └───────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: the question is *"how does the Pages demo replay real agent runs with
-no model server and no database?"* Same answer as the docs (file 02) and the
-RAG corpus (file 03): the data is known at build time, so import it and let the
-bundler inline it. The twist here is that these JSON files have a *second life*
-— they're the agents' test fixtures — so the frontend and the test suite share
-one source of truth.
+Zoom in: the question is *"where does Studio's data come from when there's no API and no DB,
+and how does the same fixture serve both the dev server's live middleware and the static
+browser-only demo?"* The answer: fixtures are build inputs — imported as JSON modules (or
+authored as TS literals) and embedded — so they're available identically in both builds.
 
 ## Structure pass
 
-**Layers:** (1) the fixture JSON (authored / promoted from real runs);
-(2) the import boundary (`fixtures.ts` for UI, `vite.config.ts` for dev API);
-(3) the consumers (home counts, workspaces replay).
+**Layers:** repo files → Vite (resolves the import to a module) → the three consumers
+(`StudioHome` counts, the in-browser runners, the dev middleware).
 
-**Axis — *where does the data come from at runtime* (lifecycle/source):**
+**One axis — *where does this data live at runtime?*** Trace it:
 
 ```
-  axis: runtime data source
+  Axis: "where is the fixture data at runtime?"
 
-  ┌ deployed (pages) ─┐  inlined JSON only — NO fetch, NO server
-  │ STATIC_DEMO=1     │  workspaces replay the bundled fixtures
-  └──────────┬────────┘
-  ┌ dev ──────▼───────┐  inlined JSON for fixture mode +
-  │ STATIC_DEMO unset │  live /api/* stream for openai/anthropic mode
-  └───────────────────┘
+  ┌─ dev build ──────────────────────────────────────────────┐
+  │  in the JS bundle (imported)  AND  on disk (middleware     │  → both: middleware can
+  │  reads packages/.../promoted/*.json via fs at request time)│    re-read disk live
+  └───────────────────────────────────────────────────────────┘
+  ┌─ pages build (VITE_STATIC_DEMO=1) ───────────────────────┐
+  │  ONLY in the JS bundle — no fs, no middleware              │  → must be embedded;
+  │                                                            │    disk reads gated off
+  └───────────────────────────────────────────────────────────┘
 ```
 
-**Seam:** the `import … from '…/fixtures/*.json'` line. On one side the file is
-a package artifact (and a test baseline); on the other it's a frontend constant.
-The axis flips at the bundler: a file that is "test data on disk" becomes "UI
-state in the bundle" with no copy step, no API. That's the seam worth seeing.
+**The seam that matters:** the `STATIC_DEMO` flag (`env.ts:1`). It's the boundary that
+decides whether a fixture is read from disk (dev) or only from the bundle (pages). Any code
+path that reads disk — `loadSavedReplays`, `loadPromotedFixtures`, save/promote — is gated
+behind it (`useReplayArtifacts.ts:77,94,100`). The embedded import is the part that works in
+both worlds.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know `import data from './data.json'` gives you a parsed object at build
-time — no `fetch`, no `await`. Studio does exactly that with the agents'
-fixtures, then treats the imported arrays as the app's seed data. The pattern is
-"the network request that never happens because the answer was compiled in."
+You've `import data from './thing.json'` and gotten a typed object back — the bundler turned
+the file into a module. That's the whole pattern: agent fixtures are JSON files, and importing
+them inlines their contents into the bundle, same as the markdown in
+`02-build-time-markdown-docs.md`. No fetch, no DB query — the data is *in the code* by the
+time the browser runs.
 
 ```
-  The kernel — import replaces fetch
+  The pattern — three kinds of build-time data, one bundle
 
-   fixtures/*.json ──import──► JS object (parsed at build)
-                                  │
-                  ┌───────────────┴───────────────┐
-                  ▼                                ▼
-        fixtures.ts (typed arrays)        vite.config.ts (dev API)
-                  │                                │
-                  ▼                                ▼
-        StudioHome counts · workspace      dev /api runs the real agent
-        replays (no fetch)                 over the same fixture
+  packages/agents/recommendation/fixtures/*.json ──import──┐
+  apps/studio/src/rag-query-fixtures.ts (TS literal) ──────┤──► bundle
+  docs/*.md (?raw, see file 02) ──────────────────────────┘
+                                                             │
+                     ┌───────────────────────────────────────┤
+                     ▼                  ▼                      ▼
+              StudioHome counts   in-browser runners    vite middleware
+              (fixtures.length)   (replay)              (also re-reads disk in dev)
 ```
 
-### Move 2 — the walkthrough
+### Move 2 — the step-by-step walkthrough
 
-**The import boundary — `fixtures.ts`.**
-Seven JSON files are imported and re-exported as typed arrays. This is the one
-place the frontend names the fixtures.
+**JSON imported straight into the dev middleware.** `vite.config.ts` imports the analytics
+fixtures as JSON modules and casts them to typed arrays — the middleware then replays *these*
+on a fixture-mode request.
 
 ```ts
-// apps/studio/src/fixtures.ts:2-14 (trimmed)
-import monitoringFixture from '../../../packages/agents/anomaly-monitoring/fixtures/sp-revenue-monitoring.json';
-import spRevenueDropFixture from '../../../packages/agents/recommendation/fixtures/sp-revenue-drop.json';
-// …five more…
-export const fixtures = [ spRevenueDropFixture, electronicsSpikeFixture, voucherDropoffFixture ]
-  as RecommendationFixture[];
-export const monitoringFixtures = [ monitoringFixture ] as MonitoringFixture[];
+// vite.config.ts:53-59, 170-174
+import monitoringFixture from '../../packages/agents/anomaly-monitoring/fixtures/sp-revenue-monitoring.json';
+import electronicsSpikeFixture from '../../packages/agents/recommendation/fixtures/electronics-spike.json';
+// …
+const fixtures = [spRevenueDropFixture, electronicsSpikeFixture, voucherDropoffFixture] as RecommendationFixture[];
 ```
 
-The `as RecommendationFixture[]` cast is the boundary condition: JSON imports
-are typed `any`/inferred, so the cast asserts the shape the rest of the UI
-relies on. If a fixture's schema drifts from the type, this is where it should
-be caught — but a cast *asserts* rather than *checks*, so a malformed fixture
-slips through to a runtime error in the workspace. (Honest weakness; a parse +
-validate would catch it at the seam.)
+The boundary condition: the import path reaches across package boundaries into sibling
+packages. That's deliberate — Studio is the *consumer* of fixtures the agent packages own, so
+the dependency points the right way (Studio → agents), not the reverse.
 
-**Consumer one — the home screen counts them.**
-`StudioHome` shows live counts by reading `.length` off the imported arrays —
-the card stats are derived from build-time data, not a config number that can go
-stale.
+**Fixtures authored as TS literals for the in-browser RAG demo.** The RAG corpus and recorded
+Gemma turns aren't separate JSON files — they're a typed TS module (`rag-query-fixtures.ts`),
+so they get full type-checking and inline editing. Same build-input idea, different spelling.
+
+```ts
+// rag-query-fixtures.ts:5-18 (the corpus)
+const NOTES_CORPUS = [
+  { id: 'work.md',   text: 'I work as a software engineer focused on AI agents…' },
+  { id: 'stack.md',  text: 'My preferred stack is TypeScript, Node, and Supabase…' },
+  { id: 'coffee.md', text: 'I take my coffee as a flat white with oat milk…' },
+];
+export const ragQueryFixtures: RagQueryFixture[] = [ /* question + relevant + modelResponses */ ];
+```
+
+**The embedded fixtures drive the home page's live counts.** `StudioHome` doesn't hardcode
+"6 fixtures" — it reads `.length` off the embedded arrays, so the UI stays truthful when a
+fixture is added. It even runs a coverage computation at render from embedded data.
 
 ```tsx
-// apps/studio/src/StudioHome.tsx:118 and :162
-details={[`${fixtures.length} fixtures`, 'fixture/openai compare', 'replay promotion']}
+// StudioHome.tsx:60-65, 162
+const monitoringCoverage = coverageReport(ECOMMERCE_ANOMALY_CATEGORIES,
+  schemaCapabilities(monitoringFixtures[0].workspace));     // computed from embedded fixture
 // …
 details={[`${ragQueryFixtures.length} fixtures`, 'embed → search → cite', 'in-browser rag']}
 ```
 
-Add a fixture file to the array and the home card count updates itself. That's
-the small payoff of deriving UI from the real data instead of hardcoding "3".
-
-**Consumer two — workspaces replay them in-browser.**
-In fixture mode, the runner feeds the imported `modelResponses` into a
-`FixtureModelProvider` and runs the real agent, no network (the recommendation
-runner shown; all five follow the shape).
+**The dev/pages split — the same fixture, two runtime sources.** In dev, the middleware can
+*also* read fixtures and saved artifacts from disk at request time (`listPromotedFixtureSummaries`
+reads `packages/.../promoted/*.json`, `vite.config.ts:987-1031`). In pages, there's no
+middleware and no fs — so any disk-reading action short-circuits with a "local dev only" note.
 
 ```ts
-// apps/studio/src/agent-runners.ts:20, 28-36 (trimmed)
-const model = new FixtureModelProvider(fixture.modelResponses);   // recorded turns
-const agent = new RecommendationAgent({ model, tools, workspace: fixture.workspace, … });
-return agent.propose(fixture.anomaly, fixture.diagnosis).then((recommendations) => { … });
+// useReplayArtifacts.ts:76-79  — don't even try to fetch saved replays in the static demo
+React.useEffect(() => {
+  if (STATIC_DEMO) return;          // pages: no server to ask
+  void refreshReplayHistory();
+}, [refreshReplayHistory]);
 ```
 
-**Consumer three — the dev API imports the SAME files.**
-The Vite dev middleware imports the identical JSON (`vite.config.ts:53-59`) so
-that `runServer` (live openai/anthropic mode) replays against the same fixture
-the browser uses for fixture mode. One source of truth across the two run paths.
-
-**The deploy cut — `build:pages` flips `STATIC_DEMO` (layers-and-hops).**
-The whole zero-backend story comes down to one env flag set in one CI step.
-
 ```
-  build → deploy, the static cut
+  Layers-and-hops — same fixture, two paths
 
-  ┌ CI (deploy-studio-pages.yml) ───────────────────────────────┐
-  │ hop 1: npm run build:pages -w @aptkit/studio                 │
-  │        → --mode pages → loads .env.pages (VITE_STATIC_DEMO=1)│
-  └───────────────────────────┬──────────────────────────────────┘
-  ┌ Vite (vite.config.ts:196) ▼──────────────────────────────────┐
-  │ hop 2: base = '/aptkit/'  (subpath for Pages)                │
-  │        dev /api middleware NOT included in the build         │
-  └───────────────────────────┬──────────────────────────────────┘
-  ┌ Browser (env.ts:1) ───────▼──────────────────────────────────┐
-  │ hop 3: STATIC_DEMO=true → useReplayArtifacts skips all fetch │
-  │        workspaces replay inlined fixtures only               │
-  └────────────────────────────────────────────────────────────────┘
+  ┌─ Repo fixture (electronics-spike.json) ─────────────────────────────┐
+  │                                                                      │
+  │  path A (both builds): import → bundle → StudioHome count, runners   │
+  │  path B (dev only):    fs.readFile at /api/* request → middleware    │
+  └──────────────────────────────────┬──────────────────────────────────┘
+                                     │ STATIC_DEMO decides which paths exist
+            ┌────────────────────────┴────────────────────────┐
+            ▼ dev                                              ▼ pages
+   bundle import + live disk reads                    bundle import ONLY
+   (save / promote / history work)                    (disk actions → "local dev only")
 ```
 
-`STATIC_DEMO` is read once (`env.ts:1`) and checked at every network seam:
-`useReplayArtifacts.ts:77/:94/:100/:120`, `AgentReplayShell.tsx:139`. The flag
-is the difference between "demo with a server behind it" and "demo that is just
-a static file."
+### Move 2 variant — the load-bearing skeleton
+
+The kernel: **demo data is a build input, and the runtime source is gated by one flag.**
+
+1. **Build-time import of fixtures** (JSON modules + TS literals) — drop it and the static
+   demo has no data at all; nothing replays.
+2. **The `STATIC_DEMO` gate** — drop it and the Pages build tries to `fetch('/api/...')` against
+   a server that isn't there, so every history/save/promote call errors instead of showing a
+   graceful note.
+3. **Reading counts from the embedded data, not hardcoding** — drop it and the home page lies
+   the moment a fixture is added or removed.
+
+The dev-only disk re-reads (live saved-replay history, promotion) are hardening — they make
+the dev experience richer but aren't needed for the demo to function.
 
 ### Move 3 — the principle
 
-If the data is known at build time and the host has no backend, inline it — an
-import is a fetch whose answer was already computed. The extra leverage here:
-the inlined files are *also* the agents' test fixtures and promoted correctness
-baselines, so the demo can't drift from what the tests assert — they're the same
-bytes. The cost is a static data set (each fixture is an explicit import) and a
-`as`-cast trust boundary that asserts rather than validates.
+If your "data" is fixed per deploy, make it a build input and the network seam disappears for
+free — no fetch, no loading state, no server. Then gate the *richer* runtime behaviors (disk
+reads, mutations) behind a single flag so one source tree produces both a full dev app and a
+stripped static demo, without forking the code. The flag is the seam; the embedded data is the
+floor that always works.
 
 ## Primary diagram
 
 ```
-  Fixture as build input — the complete picture
+  Fixture as build input — full picture
 
-  ┌─ packages/agents/*/fixtures/*.json ──────────────────────────┐
-  │  (recorded runs · also test baselines · promoted fixtures)    │
-  └───────┬───────────────────────────────────┬──────────────────┘
-          │ import (UI)                        │ import (dev API)
-          ▼                                    ▼
-  ┌ fixtures.ts ───────────────┐      ┌ vite.config.ts ───────────┐
-  │ typed arrays (as-cast)     │      │ dev /api/* replays same    │
-  └───────┬────────────────────┘      └────────────────────────────┘
-          ▼
-  ┌─ Consumers ──────────────────────────────────────────────────┐
-  │ StudioHome: `${fixtures.length} fixtures`                     │
-  │ Workspaces: FixtureModelProvider(fixture.modelResponses)      │
-  │ build:pages → STATIC_DEMO=1 → all fetch seams short-circuit   │
-  └────────────────────────────────────────────────────────────────┘
+  ┌─ Repo ────────────────────────────────────────────────────────────────┐
+  │ packages/agents/*/fixtures/*.json   src/rag-query-fixtures.ts (TS)      │
+  └───────────────┬──────────────────────────────────┬─────────────────────┘
+                 │ import (build)                    │ import (build)
+  ┌─ Vite bundle ▼──────────────────────────────────▼──────────────────────┐
+  │  embedded fixture objects + recorded modelResponses                     │
+  └───────┬───────────────────────┬────────────────────────────┬───────────┘
+          ▼                       ▼                            ▼
+   StudioHome counts       in-browser runners          vite middleware (dev)
+   (fixtures.length,       (runRagQueryFixtureReplay,  (runReplay + fs reads of
+    coverageReport)         runFixtureReplay)           promoted/*.json + artifacts)
+                                                            │ STATIC_DEMO=1 → these
+                                                            ▼ paths gated OFF (pages)
 ```
 
 ## Elaborate
 
-This is the same build-time-inlining technique as the markdown docs (file 02)
-and the RAG corpus (file 03) — three faces of one idea, all driven by the
-zero-backend static-host constraint that also forced the hash router (file 01).
-What's distinctive about fixtures is the dual life: they're authored or
-*promoted* from real agent runs (the replay → artifact → promote → fixture loop
-that is aptkit's testing backbone, owned by `study-system-design` and
-`study-testing`), so the same JSON is a test input, a correctness baseline, and
-the frontend's seed data. The `STATIC_DEMO` flag is the small but crucial bit
-that makes one codebase serve both a server-backed dev experience and a pure
-static deploy.
+This is the storage story for a frontend that has no storage: the same `bundledDependencies`
+discipline that lets `@rlynjb/aptkit-core` ship as one tarball is mirrored here — fixtures are
+inlined so the artifact is self-contained. It's the sibling of `02-build-time-markdown-docs.md`
+(markdown via `?raw`) — both convert repo files into build-time modules. It also feeds the two
+patterns that consume the data: `04-generic-trace-replay-shell.md` (the shell's `fixtures`
+prop) and `03-deterministic-in-browser-rag.md` (the RAG corpus + recorded turns). The
+fixtures themselves are the output of the replay→artifact→promote→fixture loop, which is the
+`study-system-design` / `study-testing` testing backbone — here we only care that they arrive
+as build inputs. The `STATIC_DEMO` gate is also a `study-security` touchpoint: it's what keeps
+the static build from exposing filesystem-reading endpoints (there are none in pages).
 
 ## Interview defense
 
-**Q: How does the deployed demo run real agents with no backend?**
-The agents' recorded JSON fixtures are imported, not fetched, so Vite inlines
-them into the bundle (`fixtures.ts`). In fixture mode the runner feeds the
-recorded `modelResponses` into a `FixtureModelProvider` and runs the real agent
-in the browser — no model server, no DB. The `build:pages` step sets
-`VITE_STATIC_DEMO=1`, which makes `base` the `/aptkit/` subpath and makes the app
-skip every network call, so the artifact is a pure static site.
+**Q: Where does the demo get its data with no DB and no backend?**
+Fixtures — recorded model turns, workspaces, tool results — are JSON files (and some TS
+literals) imported at build time, so they're embedded in the bundle. The home page reads
+counts and coverage off those embedded arrays rather than hardcoding, so the UI never drifts
+from the data.
 
-**Q: Why import the fixtures instead of fetching them?**
-The host (GitHub Pages) is static with no backend; a fetch would need a server
-or copied public assets and a network hop. Importing makes the answer a compiled
-constant. Bonus: the same files are the agents' test fixtures, so the demo and
-the test suite share one source of truth and can't drift.
+Anchor: *"the data is in the bundle; importing it is the fetch."*
 
-**Q: What's the risk in `as RecommendationFixture[]`?**
-It's an assertion, not a check. JSON imports are loosely typed, so the cast tells
-the compiler "trust me, this matches" without validating it. A fixture whose
-schema drifted would compile fine and blow up at runtime in the workspace.
-The fix is to parse-and-validate at the import boundary (a schema check) so a
-bad fixture fails loudly at the seam, not deep in a render.
+**Q: How does one codebase serve both a full dev app and a static browser-only demo?**
+A single `VITE_STATIC_DEMO` flag (`.env.pages` sets it). The embedded fixtures work in both.
+The richer behaviors that need the dev middleware — saving artifacts, reading saved-replay
+history from disk, promoting fixtures — are gated behind that flag and degrade to a "local dev
+only" note in pages, instead of erroring against a missing server.
 
 ```
-  the trust boundary
-
-  *.json (any) ──as RecommendationFixture[]──► trusted by all consumers
-                       ↑ asserts, doesn't validate — drift slips through
+  STATIC_DEMO=0 (dev):   bundle data + live disk reads + mutations
+  STATIC_DEMO=1 (pages): bundle data only; disk actions → graceful note
 ```
 
-**Anchor:** *"Import replaces fetch — and the imported files double as the
-agents' test baselines, so the demo can't drift from the tests."*
+Anchor: *"embedded data is the floor; the flag gates everything that needs a server."*
 
 ## See also
 
-- `02-build-time-markdown-docs.md` — same inlining, markdown not JSON.
-- `03-deterministic-in-browser-rag.md` — the RAG corpus is inlined the same way.
-- `04-generic-replay-shell.md` — the `fixtures` prop these arrays feed.
-- `audit.md` → lens 7 (build), lens 4 (the `STATIC_DEMO` cut).
-- `study-system-design` / `study-testing` — the replay → promote → fixture loop
-  that produces these files.
+- `02-build-time-markdown-docs.md` — the `?raw` sibling pattern
+- `03-deterministic-in-browser-rag.md` — consumes the RAG corpus + recorded turns
+- `04-generic-trace-replay-shell.md` — the shell's `fixtures` come from here
+- `audit.md` — lens 7 (build) and lens 4 (the dev-only network seam)
+- `study-system-design` / `study-testing` — the replay→promote→fixture loop that makes them

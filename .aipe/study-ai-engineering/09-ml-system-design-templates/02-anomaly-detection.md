@@ -1,54 +1,63 @@
-# Design an anomaly-detection system
+# Design an Anomaly Detection System
 
-- **The prompt:** "Design a system that detects anomalous behavior in a stream of metrics and alerts when something is wrong."
+- **The prompt:** "Design an anomaly detection system that flags unusual events in a stream of data."
 
-- **Standard architecture:** The whiteboard is a streaming path from metric ingestion through baseline modeling to a scorer that flags deviations, with an alerting layer that suppresses noise.
+- **Standard architecture:**
 
-  ```
-  Anomaly detection — baseline, score, alert
-  ┌────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌────────┐
-  │ metrics│ → │ feature  │ → │ baseline │ → │  scorer  │ → │ alert  │
-  │ stream │   │ extract  │   │  model   │   │ + thresh │   │ + dedup│
-  └────────┘   └──────────┘   └────┬─────┘   └────┬─────┘   └───┬────┘
-                                   ▲              │             │
-                              ┌────┴─────┐        │             ▼
-                              │ historical│       │       ┌──────────┐
-                              │  windows  │       │       │  human   │
-                              └───────────┘       │       │ feedback │
-                                   ▲              │       └────┬─────┘
-                                   └──────────────┴────────────┘
-                                     drift detection (PSI) retrains baseline
-  ```
-
-  The baseline is the design point: an anomaly is only defined relative to a learned notion of normal, and that normal drifts.
+```
+         event stream
+              │
+              ▼
+   ┌──────────────────────────┐
+   │ Feature extraction        │  windowed aggregates, per-entity normalize
+   └────────────┬─────────────┘
+                │
+                ▼
+   ┌──────────────────────────┐
+   │ Anomaly scoring           │  statistical (z/EWMA) or ML
+   └────────────┬─────────────┘
+                │
+                ▼
+   ┌──────────────────────────┐
+   │ Threshold / severity tier │
+   └────────────┬─────────────┘
+                │ above threshold
+                ▼
+   ┌──────────────────────────┐
+   │ Alert + log + human review │
+   └────────────┬─────────────┘
+                │ human labels
+                ▼
+   ┌──────────────────────────┐
+   │ Feedback → next training   │
+   └──────────────────────────┘
+```
 
 - **Data model:**
-  - Metric stream — timestamped metric values per entity, the input.
-  - Baseline statistics — per-metric rolling mean/variance/seasonal profile, defining "normal."
-  - Scorer thresholds — learned or configured cutoffs per metric, separating noise from signal.
-  - Alert log — fired alerts with score, context, and resolution, for dedup and precision tuning.
-  - Feedback labels — human "real/false-alarm" judgments, the only ground truth in an otherwise unlabeled problem.
+  - event stream `{entity_id, ts, metrics...}` — the raw signal, partitioned by entity.
+  - per-entity baseline `{entity_id, mean, variance, window, updated_at}` — the "normal" each event is compared against; per-entity because one global baseline drowns small entities.
+  - anomaly log `{ts, entity_id, score, threshold, severity, action, human_label?}` — every flag and its disposition; the `human_label` is the future training signal.
+  - alert state `{entity_id, last_alert_ts, suppressed_until}` — debounce so one incident isn't 500 alerts.
 
 - **Key components:**
-  - Feature extraction turns raw metrics into features (deltas, ratios, rolling windows); choice: rolling-window features over raw values so the scorer sees rate-of-change, where anomalies actually live.
-  - Baseline model learns per-metric normal, with seasonality; choice: per-metric baselines over one global model because metrics have wildly different scales and rhythms.
-  - Scorer flags deviations — statistical (z-score, IQR) or model-based (isolation forest, autoencoder reconstruction error); choice: start with statistical scorers because they're interpretable and need no labels, escalating to a model only when statistics miss multivariate anomalies.
-  - Alerting layer thresholds, deduplicates, and groups; choice: dedup and rate-limit at the alert layer so one incident isn't a hundred pages.
+  - Feature extraction — turns raw events into windowed, per-entity-normalized features; choice: normalize per entity, not globally — a value normal for entity A is an anomaly for entity B.
+  - Anomaly scoring — assigns an outlier score; choice: start statistical (z-score / EWMA residual) before ML — it needs no labels, is explainable to the on-call, and sets the baseline ML must beat.
+  - Threshold + severity tiering — converts score to action; choice: tiers (info/warn/critical) over a single cutoff, so high-volume low-severity flags don't page a human.
+  - Human review + feedback — labels a sampled top-N of flags; choice: review only the top-N by severity — humans are the scarce resource, spend them on the flags most likely to be real.
 
 - **Scale concerns:**
-  - At ~100 metrics per entity multivariate anomalies (correlated shifts) appear that per-metric scorers miss; you need a joint model.
-  - At ~1k entities the baseline-retraining job dominates compute; schedule incremental updates rather than full recompute.
-  - At seasonal boundaries (daily/weekly cycles) a naive baseline fires false alarms every cycle; the baseline must model seasonality or alert precision collapses.
-  - At gradual drift the baseline silently follows the drift and stops flagging a slow degradation; you need PSI drift detection separate from the anomaly scorer.
+  - At ~10k events/sec stream processing is the bottleneck → shard the stream by entity_id so scoring parallelizes and per-entity state stays local.
+  - At ~1M entities per-entity baselines blow memory → tier baselines hot/cold, keep active entities in memory and page the long tail from store.
+  - At a high false-positive rate the *humans* become the bottleneck → tighten for precision first, route only top-N severity to review; alert fatigue kills the system faster than missed anomalies.
 
-- **Eval framing:** The problem is mostly unlabeled, so eval leans on the feedback log. Offline, against whatever labeled incidents exist, measure precision@k (of the top-k flagged, how many were real) and recall (of real incidents, how many were flagged). Online, track alert precision (fired alerts that were genuine) and time-to-detection. The tension is always precision vs recall: a scorer that catches everything pages constantly.
+- **Eval framing:** Offline: precision, recall, F1 on a labeled anomaly set — anomalies are imbalanced by default, so report macro-F1, not accuracy (a "never anomalous" model scores 99% accuracy and is useless). aptkit's anomaly-monitoring output is scored by a detection-scorer (`/Users/rein/Public/aptkit/packages/evals/src/detection-scorer.ts`) — that's the offline detection harness. Online: human-review agreement rate and time-to-acknowledge. LLM analog: hallucination detection *is* anomaly detection — same precision/recall framing over "is this output an outlier".
 
 - **Common failure modes:**
-  - Alert fatigue — too many false positives and operators stop reading; mitigate by tuning the threshold against alert precision and deduping at the alert layer.
-  - Seasonal false alarms — the baseline doesn't model cycles and fires every Monday; mitigate with seasonal baselines.
-  - Concept drift — normal shifts and the baseline either lags or absorbs the anomaly; mitigate with PSI drift detection that retrains on real shifts but not on incidents.
-  - Cold-start metric — a new metric has no baseline; mitigate by widening thresholds until enough history accumulates.
+  - Concept drift — "normal" shifts, baselines lag → PSI on the feature distribution triggers a baseline refresh / retrain.
+  - Alert fatigue — too many false positives, humans stop looking → tune for precision early, severity-tier aggressively.
+  - New-entity cold-start — no baseline yet, everything looks anomalous → grace period plus a population prior until the entity accrues history.
+  - Threshold staleness — a fixed cutoff that drifts out of calibration → periodically recalibrate thresholds against recent labeled flags.
 
-- **Applies to this codebase:** `partially`. The anomaly-monitoring agent (`packages/agents/anomaly-monitoring/`) does flag unusual behavior — it scans metrics against 10 ecommerce anomaly categories and returns a severity-sorted list. But it does this by LLM-scoring metrics against prose category descriptions, not by any statistical or ML scorer. There is no per-metric baseline, no z-score or isolation forest, no PSI drift detection, no learned threshold, and no seasonality model. It's pattern-matching by a language model, which catches things a naive z-score would miss but gives you no calibrated score and no drift handling. Worth noting the LLM analog: hallucination detection in the RAG path is itself a form of anomaly detection (the cited-claim check in `search-knowledge-base-tool.ts:101` flags outputs that deviate from grounded evidence).
+- **Applies to this codebase:** `partially`. aptkit's anomaly-monitoring agent (`/Users/rein/Public/aptkit/packages/agents/anomaly-monitoring/`) scans metrics across 10 fixed ecommerce categories and returns severity-sorted anomalies, scored by the detection-scorer (`/Users/rein/Public/aptkit/packages/evals/src/detection-scorer.ts`). But it is LLM-driven over analytics tools inside a bounded `runAgentLoop` with a tool-policy allowlist — *not* a statistical or ML anomaly model. There are no per-entity baselines, no EWMA/z-score scoring, no PSI, no learned detector, and no human-label feedback loop. The output shape (severity-sorted flags) and the offline scorer are right; the detection mechanism is an LLM judgment, not a model.
 
-- **How to make it apply:** Add a statistical pre-scorer in front of the anomaly-monitoring agent: compute per-metric rolling baselines (mean/variance, seasonal profile) and a PSI drift score over historical windows, persisted to buffr's `agents` schema (`/Users/rein/Public/buffr/sql/001_agents_schema.sql`). Feed the statistically-flagged metrics into the existing LLM agent for categorization and explanation — statistics for detection, LLM for the narrative. Then the detection-scorer eval (`packages/evals/src/detection-scorer.ts`) measures precision/recall against labeled incidents. Statistical anomaly detection and drift scoring are `not yet exercised`; the LLM-over-categories flagging is real.
+- **How to make it apply:** Add per-entity baseline statistics and a statistical scorer (z-score / EWMA residual) as a *pre-LLM gate* in `/Users/rein/Public/aptkit/packages/agents/anomaly-monitoring/` — heuristic-before-LLM, so cheap statistics flag candidates and the LLM only explains the survivors. Add a PSI check on category metric distributions to trigger baseline refresh. Wire a human-review / feedback log into buffr's `agents` schema (store layer `/Users/rein/Public/buffr/src/pg-vector-store.ts`) so labels accumulate, and keep scoring with the existing `detection-scorer.ts`. The statistical gate is the change that turns "LLM eyeballs the metrics" into "a detector the LLM annotates."

@@ -1,102 +1,95 @@
 # Shared State and Message Passing
 
-**Industry standard.** "Shared state / blackboard," "message passing," "context routing." Type label: coordination mechanism. **In this codebase: message-passing-shaped, not yet a multi-agent system.** aptkit's pipeline stages pass *typed messages* (`Anomaly`, `Diagnosis`) between agents via function arguments — that's message passing in the small. There's no shared blackboard, because there's no concurrent topology to share one.
+**Industry term:** shared state (blackboard) vs message passing (agent communication models). *Industry standard.*
 
 ## Zoom out, then zoom in
 
-How agents communicate. Two models: shared state (a blackboard every agent reads and writes) or message passing (each agent sees only what's passed to it). aptkit's stage handoffs are message passing — explicit, typed, scoped — which is the production-favored model.
+How agents communicate. Two models: a shared blackboard all agents read and write, or scoped messages passed between them. aptkit has no inter-agent communication — but its one cross-agent connection (the typed handoff) is firmly message-passing, and that's the model it would extend.
 
 ```
-  Zoom out — aptkit passes typed messages, holds no blackboard
+  Zoom out — aptkit's only cross-agent link is a typed message
 
-  Shared state (blackboard):       Message passing (aptkit's stages):
-  ┌──────────────────────┐         diagnostic ──Diagnosis──► recommendation
-  │   shared context     │         (each agent gets ONLY its typed input)
-  │  (all agents R/W)    │
-  └──────────────────────┘         ← APTKIT IS HERE (in the small)
+  ┌─ Host app ──────────────────────────────────────────────────┐
+  │  Anomaly ─msg─► Diagnosis ─msg─► Recommendation[]            │  message-passing
+  └───────┬───────────────┬───────────────┬──────────────────────┘
+  ┌─ aptkit ──────────────────────────────────────────────────────┐
+  │  no shared blackboard; each agent gets only its typed inputs   │ ← we are here
+  └────────────────────────────────────────────────────────────────┘
+```
+
+Zoom in: **Not implemented as multi-agent communication in aptkit** (there's no second agent to talk to). But the design instinct is clear: each agent receives exactly its typed inputs (`Anomaly`, `Diagnosis`) and nothing else. No agent reads a global blackboard. That's message-passing by construction.
+
+## How it works
+
+**Use case it would fit:** any multi-agent topology aptkit adopted — the supervisor passing role-specific context to each worker rather than handing every worker the whole conversation.
+
+### Move 1 — the two models
+
+```
+  Shared state (blackboard):       Message passing:
+  ┌──────────────────────┐         agent A ──msg──► agent B
+  │   shared context      │        agent B ──msg──► agent C
+  │  (all agents read      │       (each agent sees only
+  │   and write here)      │        what's passed to it)
+  └──────────────────────┘
    ▲      ▲       ▲
    A      B       C
 ```
 
-## Structure pass
+### Move 2 — the walkthrough
 
-**Axis: what does each agent see?** Shared state: everything (every agent reads the whole blackboard). Message passing: only what's passed. Trace it through aptkit's stages: the recommendation agent sees a `Diagnosis` and an `Anomaly` — not the monitoring agent's full scan, not raw metrics it doesn't need. The seam is the typed handoff (`propose(anomaly, diagnosis)`), which scopes each agent's context to exactly its inputs. That scoping is message passing's whole advantage.
+**aptkit's handoff is scoped message-passing.** The recommendation agent gets `(anomaly, diagnosis)` — exactly what it needs, nothing more:
 
-## How it works
-
-### Move 1 — the mental model
-
-Shared state is a global variable every function reads and writes; message passing is function arguments. You know the difference — a global the whole app mutates vs passing exactly the props a component needs. Message passing is props; shared state is a global store every agent can touch.
-
-```
-  Two communication models
-
-  Shared state (blackboard):       Message passing:
-  all agents R/W one context       agent A ──msg──► agent B
-  → simple, but everyone sees      agent B ──msg──► agent C
-    everything (context bloat)     → scoped, but you decide what to pass
-```
-
-### Move 2 — aptkit's typed message passing, and the tradeoff it sidesteps
-
-**aptkit passes typed messages between stages.** The recommendation agent receives exactly its inputs:
-
-```typescript
-// packages/agents/recommendation/src/recommendation-agent.ts:64
+```ts
+// recommendation-agent.ts:64 — scoped message, not a shared blackboard
 async propose(anomaly: Anomaly, diagnosis: Diagnosis, ...): Promise<Recommendation[]>
-//            ^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^ ← the messages; nothing more
 ```
 
-It does *not* get a shared blackboard with the monitoring agent's full output, the raw metrics, or every other agent's state. It gets a typed `Anomaly` and a typed `Diagnosis`. That's message passing with a compile-time contract — the type *is* the message schema.
+It does not get the monitoring agent's full reasoning trace, its other anomalies, or a global state object. Each agent's context is scoped to its typed inputs. That's the message-passing model: cheaper, less noise, but you must decide what to pass.
 
-**The tradeoff message passing wins here.** Shared state is simple to reason about but every agent sees everything — and that causes context bloat: the lost-in-the-middle problem scales with the number of agents, because each agent's context window fills with other agents' output it doesn't need. Message passing scopes each agent's context to what it needs (cheaper, less noise) but requires *deciding what to pass* — and a bug there means an agent acts on missing information. aptkit dodges the bug risk by making the messages *typed*: you can't forget to pass the `diagnosis`, because `propose` won't compile without it.
+**The tradeoff that matters.** A shared blackboard is simple to reason about — everyone sees everything — but every agent sees everything, so context bloats and the lost-in-the-middle problem scales with the number of agents. Message passing scopes each agent's context to what it needs (cheaper, less noise) but requires deciding what to pass, and a bug there means an agent acts on missing information. aptkit's typed contracts make "what to pass" explicit and checkable — the `Diagnosis` type *is* the message contract.
 
-**The production answer is multi-agent context routing**, and it's a direct application of SECTION D's context engineering: pass role-specific context to each agent. aptkit's typed signatures are context routing in miniature — each agent's input type defines its context scope. If aptkit built a supervisor-worker topology, the supervisor would route each worker's slice of context, and the existing typed I/O is the contract for that routing.
+**Multi-agent context routing is the production answer.** Passing role-specific context to each agent — the supervisor sends the retrieval worker the query, the synthesis worker the findings, not everything to everyone — is a direct application of SECTION D's context engineering ([../04-agent-infrastructure/01-context-engineering.md](../04-agent-infrastructure/01-context-engineering.md)). aptkit's `injectProfile` and per-agent prompt packages are the single-agent version of the same instinct: curate what fills *this* agent's window.
 
-**What aptkit lacks: a shared store for a concurrent topology.** Message passing works for a sequential pipeline (one message at a time, in order). A fan-out topology where workers need a *shared findings store* keyed by sub-question (SECTION F template 1) would need something blackboard-shaped — and aptkit's vector store could serve that (the memory engine already writes to a shared store, partitioned by a `kind` tag). But no agent does this yet.
+**What it would cost aptkit.** Nothing new structurally for message-passing — the typed contracts already scope it. A blackboard would be the *new* thing (a shared store all agents read/write), and aptkit's design actively avoids it. **Not yet exercised** as multi-agent communication.
 
 ### Move 3 — the principle
 
-Shared state is simple but bloats context as agents multiply; message passing scopes context but needs you to decide what to pass. The production answer is context routing — role-specific context per agent — and typed messages are the cheap, safe version because the type system catches a forgotten message. aptkit's typed stage handoffs are message passing done right; it just hasn't needed a shared store yet.
+Shared state is simple but bloats every agent's context; message passing is cheaper but you must decide what to pass. The typed contract *is* the message — and making it explicit (as aptkit's `Anomaly`/`Diagnosis`/`Recommendation` types do) is what keeps message-passing safe. Context routing — role-specific context per agent — is the production answer and a direct application of context engineering.
 
 ## Primary diagram
 
 ```
-  aptkit's typed message passing — full frame
+  aptkit's communication model — scoped message-passing
 
-  ┌─ monitoring agent ──► Anomaly ──────────────────────────┐
-  │                                                          │
-  │  ┌─ diagnostic agent.diagnose(anomaly) ──► Diagnosis ──┐ │
-  │  │                                                     │ │
-  │  │  ┌─ recommendation.propose(anomaly, diagnosis) ──┐ │ │
-  │  │  │  sees ONLY its typed inputs (scoped context)  │ │ │
-  │  │  └────────────────────────────────────────────────┘ │ │
-  │  └──────────────────────────────────────────────────────┘ │
-  └────────────────────────────────────────────────────────────┘
-  type = message schema; can't forget to pass (won't compile)
-  NO shared blackboard (no concurrent topology needs one yet)
+  monitor ──Anomaly──► diagnose ──Diagnosis──► recommend
+            (typed)              (typed)
+  each agent's context = its typed inputs ONLY (no shared blackboard)
+  the TYPE is the message contract; validate.ts checks it
+
+  (a blackboard — all agents read/write one store — is deliberately avoided)
 ```
 
 ## Elaborate
 
-The shared-state-vs-message-passing choice is the multi-agent version of an old systems question (shared memory vs message-passing concurrency). The field's lesson for agents is sharp: shared blackboards bloat context and trigger lost-in-the-middle as agents multiply, so production multi-agent systems route scoped context per agent. aptkit's typed I/O is a head start — the messages are already defined and type-checked. The only missing piece for a concurrent topology is a shared findings store, and the vector store (with its `kind`-tag partitioning, see the memory engine) is the natural substrate.
+The shared-state-vs-message-passing choice is the same one distributed systems made decades ago (shared memory vs message passing between processes), and the tradeoffs rhyme: shared state is easy until contention and bloat bite; message passing is disciplined but demands you define the protocol. For agents, the bloat cost is sharper because context is expensive and lost-in-the-middle degrades quality as the window fills. aptkit's typed-contract message-passing is the disciplined choice, and it composes cleanly into a multi-agent system: the supervisor would route role-specific messages, never a global blackboard.
 
 ## Interview defense
 
-**Q: How do your agents share data?**
-Typed message passing, not a shared blackboard. The recommendation agent's signature is `propose(anomaly, diagnosis)` — it receives exactly its inputs as typed messages and sees nothing else. That scopes each agent's context to what it needs and dodges the bug message passing usually risks (forgetting to pass something) because the type won't compile without it. No shared store, because I have no concurrent topology that needs one.
+**Q: How would agents share information if aptkit went multi-agent?**
+
+Message passing with typed contracts — the model it already uses for the host pipeline. Each agent gets exactly its typed inputs (`Anomaly`, `Diagnosis`), not a shared blackboard. That keeps each agent's context small and avoids the lost-in-the-middle bloat a blackboard causes when every agent sees everything. The type *is* the message contract, and `validate.ts` checks it.
 
 ```
-  type = message schema → scoped context + can't-forget-to-pass
+  blackboard:  all see all  → simple but bloats context with N agents
+  message-passing: scoped typed inputs → cheaper, must define the contract
+  aptkit: typed contracts already do message-passing
 ```
-*Anchor: typed message passing is context routing done cheaply and safely.*
 
-**Q: When would you need a shared store?**
-A fan-out where workers contribute to a shared findings store keyed by sub-question. My vector store could serve that — the memory engine already writes a shared store partitioned by a `kind` tag — but no agent does it yet.
+*Anchor: the typed contract is the message; making it explicit is what keeps message-passing safe.*
 
 ## See also
 
-- `03-sequential-pipeline.md` — the typed handoffs as pipeline dependencies
-- `04-agent-infrastructure/01-context-engineering.md` — context routing as a discipline
-- `04-agent-infrastructure/02-agent-memory-tiers.md` — the shared `kind`-partitioned store
-- `study-ai-engineering/` — lost-in-the-middle mechanics (cross-ref)
+- [03-sequential-pipeline.md](03-sequential-pipeline.md) — the typed handoffs that are message-passing.
+- [../04-agent-infrastructure/01-context-engineering.md](../04-agent-infrastructure/01-context-engineering.md) — context routing, the production answer.
+- [09-coordination-failure-modes.md](09-coordination-failure-modes.md) — context bloat as a failure mode.

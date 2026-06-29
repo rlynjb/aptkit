@@ -1,172 +1,142 @@
 # DSA Foundations — Practice Map
 
-**Industry name(s):** learning plan · spaced practice schedule — *Project-specific*
-
-The ranked plan. Exercised-in-aptkit concepts first (deepen what's load-bearing and shippable), missing foundations second (curriculum you've built before but the repo doesn't run). This is calibrated to *you* — you've already shipped graphs, heaps, BSTs, and five sorts from scratch, so the gaps aren't "learn BFS"; they're "see where the structures you own would re-enter this codebase."
-
----
+**A ranked learning plan: exercised concepts first, missing foundations second** — Project-specific.
 
 ## Zoom out, then zoom in
 
-Where every DSA topic sits relative to aptkit's actual code — what's load-bearing, what's latent, what's absent.
+This is the file that turns the other seven into a plan. It ranks what to practice by *leverage for you specifically* — given your strong `reincodes` portfolio and your AI-engineering pivot, the highest-value work is not re-drilling graphs; it's mastering the exact-vs-approximate retrieval seam that aptkit and buffr straddle.
 
 ```
-  Zoom out — the practice landscape, ranked by repo leverage
+  Zoom out — the practice map's two tiers
 
-  ┌─ TIER 1: exercised + load-bearing (deepen these) ───────────┐
-  │  arrays/strings/maps  → the spine (file 02)                 │
-  │  sorting/selection    → the ranking sort (file 06)          │
-  │  complexity/cost      → the lens over both (file 01)        │
-  │  bounded state machine→ the agent loop (file 07)            │
-  └───────────────────────────┬─────────────────────────────────┘
-                              │
-  ┌─ TIER 2: latent — the problem is here, structure isn't ─────┐
-  │  heaps / top-k        → would replace the full sort (file 03)│
-  │  trees / indexes      → would replace the scan (file 04)    │
-  │  graphs / ANN         → HNSW lives in buffr (file 05)       │
-  └───────────────────────────┬─────────────────────────────────┘
-                              │
-  ┌─ TIER 3: absent by problem-shape (curriculum only) ─────────┐
-  │  backtracking · DP    → wrong shape for expensive LLM steps │
-  │  tries · union-find   → no prefix / disjoint-set query      │
-  │  segment trees        → no range-aggregate query            │
-  └──────────────────────────────────────────────────────────────┘
+  ┌─ TIER 1: exercised in aptkit — master the production shape ──┐
+  │  cosine rank + top-k     (file 06, 02)  ← the load-bearing   │
+  │  cost model of the scan  (file 01)                           │
+  │  bounded agent loop      (file 07)                           │
+  │  Set/Map membership jobs (file 02)                           │
+  └───────────────────────────────────────────────────────────────┘
+                                   │ then
+  ┌─ TIER 2: not in aptkit — keep sharp / extend ───────────────┐
+  │  HNSW (exact→approx seam) (file 04, 05)  ← cross-repo, HIGH  │
+  │  heap / priority queue    (file 03)      ← you built it      │
+  │  graphs BFS/DFS/Dijkstra  (file 05)      ← you built it      │
+  │  trees / tries            (file 04)                          │
+  │  dynamic programming      (file 07)      ← genuine gap       │
+  └───────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: the plan isn't "study DSA." It's "make the Tier-1 structures so reflexive you can defend the design tradeoffs, then practice the Tier-2 structures *as the scaling answer to aptkit's specific bottleneck*, then keep Tier-3 sharp as portfolio breadth — knowing the repo doesn't need it."
-
----
+Zoom in: the ranking principle is leverage = (how often it appears in the work you're pivoting toward) × (how far it is from what you've already shipped). The cosine-rank seam scores high on both — it's the heart of every RAG system *and* it connects to your existing heap/graph work through HNSW. DP scores high on distance (genuine gap) but lower on AI-engineering frequency. The plan ranks accordingly.
 
 ## Structure pass
 
-**Axis — repo leverage:** how directly does practicing this concept improve your grip on *this* codebase?
-
 ```
-  One axis — "does practicing this deepen my grip on aptkit?"
+  layers:  what aptkit runs  →  what buffr runs  →  what you've built elsewhere
+  axis held constant: "what's the highest-leverage thing to practice next?"
 
-  Tier 1 → YES, directly — it's the code you ship and defend
-  Tier 2 → YES, as the scaling story — the swap when n grows
-  Tier 3 → NO for aptkit — portfolio breadth, not repo depth
-```
-
-**Seam — Tier 1→2 is the scaling boundary.** Tier 1 is "aptkit as it runs today (small `n`)." Tier 2 is "aptkit at scale" — the exact point where the full sort becomes a heap, the scan becomes an index, the array becomes a graph. Practicing Tier 2 *as the answer to a Tier-1 bottleneck* is higher-leverage than practicing it abstractly.
-
----
-
-## The ranked plan
-
-### Tier 1 — exercised + load-bearing (do first)
-
-These are in the hot path. The goal isn't to learn them — you know them — it's to *defend the tradeoffs* fluently.
-
-**1. Cost models over the two hot paths (file 01).**
-- *Drill:* For `InMemoryVectorStore.search`, write the cost in terms of `n` (chunks) and `d` (768) separately, then state which term dominates at `n=50` vs `n=50,000`. Then do the same for `runAgentLoop` and explain why the model call dwarfs the scan.
-- *Done when:* you can say, without notes, "the scan is `O(n·d)` but the leading recurring cost in a real run is `O(maxTurns)` model calls, each >> the scan."
-
-**2. The ranking sort + top-k selection (file 06).**
-- *Drill:* Rewrite `search`'s top-k three ways — full sort + slice (current), bounded min-heap (`O(n log k)`), quickselect (`O(n)` unordered) — and write down the exact condition (`k`, `n`, ordered-vs-not) under which each wins. You've built the heap (`BinaryHeap.ts`); wire it in and benchmark against the sort at `n=10`, `n=1000`, `n=100000`.
-- *Done when:* you can justify the full sort at small `n` and name the crossover where the heap wins.
-
-**3. The array/map/set primitive choices (file 02).**
-- *Drill:* Explain why the store is `Map` for storage but `Array` for ranking, why tool policy is a `Set`, and why `recall` uses a `Map` counter — each in one sentence tied to the access pattern.
-- *Done when:* you can predict, for a new feature, which primitive its access pattern demands.
-
-**4. The bounded agent loop as a state machine (file 07).**
-- *Drill:* Diagram `runAgentLoop`'s three termination conditions from memory and explain what breaks if you remove the forced-final tool-stripping.
-- *Done when:* you can name the forced-final turn as the loop's enforced base case unprompted.
-
-### Tier 2 — latent (do second, as the scaling story)
-
-The problem is in aptkit; the structure isn't (yet). Practice these *as aptkit's scaling answer*, not abstractly.
-
-**5. Heaps for top-k at scale (file 03).**
-- *Drill:* Take your `PriorityQueue.ts` and build the size-k min-heap top-k; prove it returns the same top-k as the sort on random data; benchmark the crossover `n`.
-- *Why it earns its place:* it's the first thing you'd reach for if profiling showed the sort hot — and you've already built the heap.
-
-**6. The HNSW graph traversal (file 05) — the highest-value Tier-2 item.**
-- *Drill:* Read buffr's `chunks_embedding_hnsw` index and the `order by embedding <=> $1` query. Then sketch the greedy best-first traversal it runs and map each part to your `Graph.ts` BFS kernel (frontier/visited/expand/terminate). Articulate exactly what HNSW gives up (exactness) and gains (sub-linear lookup).
-- *Why it earns its place:* this is the single most important DSA fact about the production system — the one real graph — and it's a small step from the traversals you've animated.
-
-**7. Indexes vs scans (file 04).**
-- *Drill:* Explain why a B-tree can't index the 768-dim embedding (no scalar order) but does index buffr's `id`/`app_id` columns, and why that forces the vector index to be a graph.
-- *Why it earns its place:* it's the conceptual bridge that makes file 05 click — the "why a graph and not a tree" answer.
-
-### Tier 3 — absent by problem-shape (keep sharp, low repo leverage)
-
-Portfolio breadth, not aptkit depth. The honest note: aptkit's problem shape (no overlapping subproblems, expensive steps, no prefix/disjoint/range queries) means these would *not* improve your grip on this repo. Keep them for general interview readiness, not for understanding aptkit.
-
-```
-  topic            why absent in aptkit                practice for
-  ───────────────  ──────────────────────────────────  ─────────────
-  backtracking     steps are expensive model calls →   general DSA
-                   one bounded retry, no search tree    interviews
-  dynamic prog.    no subproblem repeats (each turn's   general DSA
-                   input is the growing conversation)   interviews
-  tries            no prefix query over a string set    general DSA
-  union-find       no disjoint-set / connectivity query general DSA
-  segment trees    no range-aggregate query             general DSA
+  ┌─ aptkit (exercised) ────────┐   master it cold — it's your demo surface
+  │  cosine top-k, loop, maps    │   → you'll be asked to defend this
+  └──────────────┬───────────────┘
+                 │  seam: exact O(n) ═══► approximate O(log n)
+  ┌─ buffr (cross-repo) ────────┐   the HIGHEST-leverage stretch
+  │  HNSW graph index            │   → connects your heap/graph work to RAG
+  └──────────────┬───────────────┘
+                 │  seam: production ═══► curriculum
+  ┌─ reincodes (built) ─────────┐   keep warm, don't re-learn
+  │  heaps, graphs, BST, sorts   │   → interview muscle memory
+  └──────────────────────────────┘
 ```
 
-For these, your existing portfolio (`Graph.ts`, `Tree.ts`, the recursion visualizers, `PG.ts`'s state-space BFS) is the right reference — they just don't map onto aptkit.
+The load-bearing seam — exact scan to approximate graph — is *the* thing to be able to walk on a whiteboard. It's where your existing DSA (priority queues, graph traversal) meets the AI-engineering work you're moving into. Everything else ranks around it.
 
----
+## How it works — the ranked plan
+
+### Move 1 — the shape of the plan
+
+```
+  the practice plan — ranked by leverage for an AI-engineering pivot
+
+  RANK  WHAT                          WHY IT'S HERE              EFFORT
+  ──────────────────────────────────────────────────────────────────────
+  1     defend the cosine top-k       it's aptkit's load-bearing  low
+        algorithm cold                 algorithm + your demo       (you know
+        (files 06, 02, 01)             surface                     it)
+  2     walk HNSW as exact→approx      the highest-leverage        med
+        seam on a whiteboard           stretch; bridges your       (new framing
+        (files 04, 05)                 graph/heap work to RAG      of known DSA)
+  3     implement a size-k heap        closes the "why full sort"  low
+        top-k, compare to full sort    loop; you have BinaryHeap   (port it)
+        (file 03)                                                  
+  4     keep graphs/heaps warm         interview muscle; already   low
+        (files 03, 05)                 shipped, don't re-learn     (review)
+  5     drill dynamic programming      genuine gap, lower AI-eng    high
+        (file 07)                      frequency but real          (new)
+```
+
+### Move 2 — the plan, item by item
+
+**Rank 1 — defend the cosine top-k algorithm cold (TIER 1, exercised).** This is `in-memory-vector-store.ts:25` and you should be able to recite its complexity, its exactness, and its scale ceiling without looking. It's the load-bearing algorithm in aptkit (file 06) and the thing any interviewer probing your RAG work will push on. Done when: you can whiteboard the scan→sort→slice, state `O(n·d + n log n)`, and explain *why* it's exact and *when* it breaks — in under two minutes. Effort: low (you already understand it; this is rehearsal).
+
+**Rank 2 — walk HNSW as the exact→approximate seam (TIER 2, cross-repo, HIGHEST leverage).** From `buffr/sql/001_agents_schema.sql:28`. This is the single highest-leverage item because it sits exactly on your pivot: it's Dijkstra's priority-queue frontier (file 05, your `PriorityQueue.ts`) aimed at "closest to query," layered for `O(log n)` (file 04), trading exactness for speed. You already own every piece — the work is *connecting* them into "here's how vector search actually scales." Done when: you can draw the layered greedy descent, name the PQ frontier and visited set, and explain the recall/latency trade vs aptkit's exact scan. Effort: medium (new framing of DSA you've already built).
+
+**Rank 3 — implement a size-k heap top-k and benchmark vs the full sort (TIER 2, you built the heap).** Port your `reincodes/BinaryHeap.ts` into a bounded size-k top-k, run it against aptkit's `.sort().slice(k)` at varying `n`, and *find the crossover point* where the heap starts winning. This closes the loop on file 03/06's "why does aptkit use the full sort" — you'll have measured the answer, not just argued it. Done when: you have a chart (or a number) showing where `O(n log k)` overtakes `O(n log n)` for `k=5`. Effort: low (you have the heap; this is wiring + measurement). This is the kind of hands-on proof that makes the fundamental real for you (your learning loop).
+
+**Rank 4 — keep graphs/heaps/sorts warm (TIER 2, already shipped).** Files 03, 05. You've built BFS, DFS, Dijkstra, BinaryHeap, PriorityQueue, five sorts. Don't re-learn — *review*. A weekly pass re-implementing one from memory keeps the interview muscle warm. Done when: you can re-implement BFS + a min-heap from a blank file in 15 minutes. Effort: low (maintenance, not acquisition).
+
+**Rank 5 — drill dynamic programming (TIER 2, genuine gap).** File 07 named this honestly: DP beyond classic memoized recursion is your thinnest area, and aptkit doesn't exercise it. It ranks *fifth* not because it's unimportant but because it's the *least* connected to your AI-engineering pivot — RAG and agent loops rarely need DP. Still worth closing for general interview coverage (edit distance, knapsack, LIS, the classics). Done when: you can derive the recurrence + tabulation for edit distance and longest-common-subsequence unprompted. Effort: high (genuine new work).
+
+### Move 3 — the principle
+
+Practice ranks by leverage, not by syllabus order. For your pivot, the highest-value DSA work is the exact→approximate retrieval seam — because it's where the algorithms you've already shipped (heaps, graph traversal) meet the systems you're moving toward (RAG at scale). The genuine gap (DP) ranks last not because it's easy but because it's farthest from the work. Don't re-drill what you've shipped; connect it forward.
 
 ## Primary diagram
 
-The full plan in one frame, ranked by leverage.
-
 ```
-  aptkit DSA practice map — ranked by repo leverage
+  the practice map — one frame, ranked
 
-  DO FIRST (Tier 1 — shipped, defend the tradeoffs)
-   1. cost models (01)        ── two hot paths, dominant term
-   2. ranking sort/top-k (06) ── 3 ways, name the crossover
-   3. array/map/set (02)      ── primitive per access pattern
-   4. bounded loop (07)       ── forced-final = enforced base case
+  TIER 1 (aptkit runs it — DEFEND IT)
+  ┌────────────────────────────────────────────────────────┐
+  │ 1. cosine top-k cold        files 06,02,01   low effort │ ← your demo surface
+  └────────────────────────────────────────────────────────┘
+            │ the seam: exact O(n) ═══► approximate O(log n)
+            ▼
+  TIER 2 (not in aptkit — RANKED BY LEVERAGE)
+  ┌────────────────────────────────────────────────────────┐
+  │ 2. HNSW exact→approx walk   files 04,05      med  ★HIGH │ ← bridges your work
+  │ 3. size-k heap + benchmark  file 03          low       │ ← port + measure
+  │ 4. graphs/heaps warm        files 03,05      low       │ ← review only
+  │ 5. dynamic programming      file 07          high      │ ← genuine gap, last
+  └────────────────────────────────────────────────────────┘
 
-  DO SECOND (Tier 2 — the scaling story, structures you own)
-   5. heap top-k (03)         ── wire your PriorityQueue, benchmark
-   6. HNSW traversal (05) ★   ── the one real graph; map to your BFS
-   7. indexes vs scans (04)   ── why vectors need a graph not a tree
-
-  KEEP SHARP (Tier 3 — breadth, NOT aptkit depth)
-   backtracking · DP · tries · union-find · segment trees
-   absent because aptkit's problem shape doesn't call for them
-
-  ★ = highest-value single item: the production vector index is a graph
+  you already own ranks 3–4's primitives (reincodes); the work is
+  connecting them to the retrieval seam, not re-learning them
 ```
-
----
 
 ## Elaborate
 
-The reason Tier 1 sits above Tier 2 even though Tier 2 is "harder": interview and design value comes from defending the *choices in the code that ships*, not from reciting structures the code doesn't use. "Why a full sort here and not a heap" is a stronger signal than "I can implement a red-black tree" — it shows you reason about `n`, `k`, and simplicity-vs-asymptotics in context. Tier 2 is ranked by its connection to a *real bottleneck* (the scan), which is why HNSW is the standout: it's the actual production answer, one short hop from traversals you've already built and animated.
-
-Tier 3's honesty is the point of this guide. A DSA study guide that pretended aptkit exercises DP or tries would be inventing findings to fill a template. It doesn't, and saying so — with the problem-shape reason (expensive steps, no overlapping subproblems, no prefix/range/disjoint queries) — is more useful than a fake anchor. Your portfolio already covers these; this repo just isn't where they live.
-
----
+The reason this plan inverts the textbook order (which would teach DP as advanced and retrieval as a niche application) is that *your* leverage is different from a generic CS student's. You've shipped the fundamentals; what you haven't done is wire them into production AI systems and defend that wiring under pressure. So the plan front-loads the production seam (cosine scan ↔ HNSW) and back-loads the gap (DP) — because for an AI-engineering pivot, being able to say "here's how vector search scales, and here's the priority-queue graph traversal underneath it" is worth more than another DP pattern. The hands-on benchmark at rank 3 is the move that makes it real for you — the same way the Dijkstra animation made your PriorityQueue real. Pair this with **study-ai-engineering**'s retrieval-quality work (precision@k, eval harness) and you have both halves: how the ranking is computed (here) and whether it's good (there).
 
 ## Interview defense
 
-**Q: What DSA does this repo actually exercise, and what would you study to scale it?**
-
-> Exercised and load-bearing: arrays/maps/sets as the spine, a cosine-keyed full sort with top-k slice as the ranking, and a bounded iterative state machine as the agent loop. To scale it I'd study the Tier-2 trio in order: a size-k heap to replace the full sort once `n` is large and `k << n`; then the real answer, an HNSW proximity graph — the one actual graph in the system, which lives in the companion repo and runs a greedy best-first traversal to get sub-linear lookup at the cost of exactness; and the index-vs-scan reasoning that explains why vectors need a graph, not a B-tree.
+**Q: You've built graphs and heaps. What's the highest-value DSA thing to learn next for AI engineering?**
+The exact-vs-approximate nearest-neighbor seam — specifically HNSW. It's not new machinery; it's the priority-queue graph traversal I've already built (Dijkstra-style frontier) aimed at "closest to a query vector," layered for `O(log n)`. The leverage is that it connects my existing DSA to how RAG actually scales — aptkit does the exact `O(n)` scan, the production path (pgvector HNSW) does the approximate graph walk, and I can defend the whole spectrum.
 
 ```
-  Tier1 (ship/defend) → Tier2 (scale: heap → HNSW → indexes) → Tier3 (breadth)
+  what I've shipped:   heaps, BFS/DFS, Dijkstra, sorts
+  what aptkit runs:    exact cosine top-k (O(n))
+  the bridge to learn: HNSW = my Dijkstra frontier + layers (O(log n))
+  → highest leverage: it's the seam, not a new structure
 ```
 
-**Q: Why isn't there DP or backtracking?**
+Anchor: "I'm not missing the structures — I'm connecting them to production retrieval. The gap is the seam, not the primitives."
 
-> Problem shape. DP needs overlapping subproblems — each agent turn's input is the growing conversation, never a recomputed sub-input, so there's nothing to memoize. Backtracking needs cheap steps to explore-and-undo — each step here is an expensive model call, so aptkit does one bounded recovery turn, not a retry tree. They're absent because the shape doesn't call for them, not because they were overlooked.
-
-Anchor: *Tier 1 is defending the code that ships; Tier 2 is the scaling swap (sort→heap→HNSW); Tier 3 is breadth the repo's problem shape doesn't reach for.*
-
----
+**Q: What's your weakest DSA area honestly?**
+Dynamic programming beyond classic memoized recursion — segment trees, union-find, harder DP. It hasn't shown up in my projects because RAG and agent loops don't need it, so it ranks last in my practice plan by *leverage*, not importance. I'm closing it with the standard set (edit distance, LCS, knapsack) for interview coverage.
 
 ## See also
 
-- **00-overview.md** — the repo-grounded map and the repo-grounded-vs-curriculum table.
-- **01–07** — each tiered concept in full.
-- `study-performance-engineering` — when to actually trigger the Tier-2 scaling swaps (measured, not guessed).
-- `study-database-systems` — the HNSW / index mechanics behind Tier-2 items 6 and 7.
+- `00-overview.md` — the repo-grounded vs curriculum-only split this plan ranks
+- `06-sorting-searching-and-selection.md` — rank 1's algorithm
+- `04-trees-tries-and-balanced-indexes.md` / `05-graphs-and-traversals.md` — rank 2's HNSW seam
+- `03-stacks-queues-deques-and-heaps.md` — rank 3's size-k heap
+- **study-ai-engineering** — the retrieval-quality half of the same work
+- **study-performance-engineering** — measuring rank 3's crossover point

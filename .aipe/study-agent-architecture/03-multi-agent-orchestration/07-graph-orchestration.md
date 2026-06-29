@@ -1,14 +1,30 @@
 # Graph Orchestration
 
-**Industry standard.** "Graph orchestration," "stateful agent graph," "LangGraph-style," "agent state machine." Type label: orchestration topology. **In this codebase: not yet exercised.** aptkit has no explicit agent graph — no nodes, edges, or checkpointed state. Its control flow is a single `for` loop (`runAgentLoop`), not a state machine over agent turns.
+**Industry term:** graph orchestration (control flow as an explicit, checkpointed state machine). *Industry standard.*
 
 ## Zoom out, then zoom in
 
-Control flow as an explicit state machine: nodes (agent steps), edges (transitions), conditional edges (branches), and checkpointed state (so you can pause for human review and resume). It's the topology that makes the others *inspectable* — supervisor-worker, pipeline, and debate can all be expressed as a graph. aptkit doesn't have it, but the reader builds state machines daily (multi-step form UI states), so the shape is home turf.
+Control flow as an explicit state machine — nodes, edges, conditional transitions, checkpointed state. This is the topology that makes the others inspectable. aptkit does not use a graph framework; its control flow is the imperative `for` loop in `runAgentLoop`.
 
 ```
-  Zoom out — graph orchestration (the shape, not in aptkit)
+  Zoom out — not built; aptkit's control flow is an imperative loop
 
+  ┌─ Runtime layer ─────────────────────────────────────────────┐
+  │  runAgentLoop: a for-loop, not a node/edge graph             │ ← we are here
+  └──────────────────────────────────────────────────────────────┘
+```
+
+Zoom in: **Not yet implemented in aptkit.** There's no graph definition, no conditional edges, no checkpoint/resume. The loop's control flow is plain TypeScript. This file teaches the graph model and names what it would buy aptkit (and what it would cost).
+
+## How it works
+
+**Use case it would fit:** any aptkit flow that needs a human-in-the-loop pause — e.g. recommendation pausing for human approval before a high-stakes action, then resuming. Graphs make pause/resume natural; an imperative loop doesn't.
+
+### Move 1 — the topology
+
+It's a state machine — the same shape you'd use for a multi-step form's UI states, except the state is the shared agent context and the transitions are agent turns.
+
+```
   ┌──────┐    ┌──────┐    ┌──────┐
   │ node │───►│ node │───►│ node │
   │  A   │    │  B   │    │  C   │
@@ -21,88 +37,54 @@ Control flow as an explicit state machine: nodes (agent steps), edges (transitio
               └──────┘
 ```
 
-## Structure pass
+### Move 2 — the walkthrough
 
-**Axis: is control flow explicit and checkpointed?** aptkit's control is *implicit* — it lives in a `for turn` loop with `break` conditions (`run-agent-loop.ts:98`), and state is the in-memory `messages` array, gone when the run ends. A graph makes control *explicit* (you define the nodes and edges) and state *durable* (checkpointed between nodes). The seam: implicit-loop-with-ephemeral-state (aptkit) vs explicit-graph-with-checkpointed-state (graph orchestration).
+**A graph makes the other topologies inspectable.** Supervisor-worker, pipeline, and debate can all be expressed as a graph with explicit state, conditional edges, and checkpointing. The win is two-fold: you can *see* the control flow as data (a graph you can render), and you can *pause* at a node for human review and resume later — because the state is checkpointed, not trapped in a call stack.
 
-## How it works
+**Where aptkit's imperative loop falls short.** `runAgentLoop` is a `for` loop with the state in a local `messages` array. You can't pause it mid-run, persist the state, and resume next week — the state lives in the call stack, not a checkpoint store. For aptkit's short, synchronous agent runs that's fine. For a long-running approval flow it isn't, and a graph is the fix.
 
-### Move 1 — the mental model
+**What aptkit DOES have that's graph-adjacent.** The `CapabilityEvent` trace (`step`, `tool_call_start/end`, `model_usage`) is an *observability* record of the flow — you can replay what happened. But it's a log, not a resumable state machine: you can see the path taken, you can't re-enter it at node B. The trace is the inspection half of graph orchestration without the checkpoint-resume half.
 
-A state machine — the same shape you use for a multi-step form's UI states (`idle → filling → submitting → success/error`), except the state is the shared agent context and the transitions are agent turns. You define the graph; the model moves through it.
-
-```
-  Graph orchestration = a state machine over agent turns
-
-  state: { context, step }
-    ┌──────┐  edge   ┌──────┐  conditional edge  ┌──────┐
-    │ plan │ ──────► │ act  │ ──────────────────►│ done │
-    └──────┘         └──┬───┘  (if not done)     └──────┘
-                        └────────► loop back to act
-    (state CHECKPOINTED between nodes → pause for human, resume)
-```
-
-### Move 2 — aptkit's implicit loop vs an explicit graph
-
-**What aptkit has: an implicit loop.** `runAgentLoop` is a `for turn in 0..maxTurns` with `break` on the success exit and the budget exit baked into the condition (`run-agent-loop.ts:98-102`). The "graph" is two implicit nodes — *call model* and *run tools* — with edges hardcoded as control flow. State is the `messages` array, in-memory, discarded at the end.
-
-```typescript
-// packages/runtime/src/run-agent-loop.ts:98 — the implicit "graph"
-for (let turn = 0; turn < maxTurns; turn += 1) {
-  // node: call model
-  const response = await model.complete({...});
-  if (toolUses.length === 0) { finalText = text; break; }  // edge: → done
-  // node: run tools, then implicit edge back to top
-}
-```
-
-**What a graph would add: explicit nodes, conditional edges, checkpoints.** You'd define `plan`, `retrieve`, `synthesize`, `human_review` as named nodes, with conditional edges (`if confidence < threshold → human_review`). The payoffs aptkit can't get today:
-- **Human-in-the-loop pause.** Checkpoint state before a gated action, surface it for approval, resume. aptkit's loop runs start-to-finish with no pause point — it can't stop mid-run for a human and resume.
-- **Inspectability.** A graph is a diagram you can render; aptkit's control flow is a `for` loop you have to read.
-- **Resumability.** Checkpointed state survives a crash; aptkit's `messages` array doesn't.
-
-**The interesting part: aptkit's trace is half a graph already.** Its `CapabilityEvent` stream (`step`, `tool_call_start/end`) records the transitions a graph would make explicit — so aptkit can *replay* a run (the replay-eval pipeline) even though it can't *pause* one. It has the observation half of graph orchestration (the trace) without the control half (checkpointed pause/resume).
+**What it would cost aptkit.** Adopting a graph framework (or building a minimal node/edge runner) plus a checkpoint store for the shared state. That's a significant rewrite of `runAgentLoop`'s control flow. **Not yet implemented**, and only justified if a capability needed human-in-the-loop pause/resume.
 
 ### Move 3 — the principle
 
-Graph orchestration's win is debuggability and human-in-the-loop pauses; its cost is up-front structure (you define the graph instead of letting the model freewheel). aptkit chose the freewheel — an implicit loop with a budget — because its tasks run start-to-finish without needing a human pause. The day a task needs a human approval gate mid-run, the implicit loop can't do it and a graph becomes the right refactor. The trace already gives aptkit the observability half.
+A graph is a state machine where the state is the shared agent context and the transitions are agent turns. It buys debuggability (control flow as inspectable data) and human-in-the-loop pauses (checkpointed, resumable state), at the cost of up-front structure — you define the graph instead of letting the model freewheel. aptkit's imperative loop trades that structure for simplicity, correct for short synchronous runs.
 
 ## Primary diagram
 
 ```
-  aptkit's implicit loop vs an explicit graph
+  Graph orchestration vs aptkit's imperative loop
 
-  APTKIT (implicit):                  GRAPH (would-be):
-  for turn:                           ┌─plan─┐→┌─retrieve─┐→┌─synth─┐
-    call model ─┐                       │         │ conditional   │
-    tools? ─yes─┘ loop                  │         ▼ (low conf)     │
-    no → break (done)                   │    ┌─human_review─┐      │
-  state = messages (ephemeral)          │    (checkpoint, pause,   │
-                                        │     resume)              │
-  trace = CapabilityEvent ◄─────────────┘ aptkit HAS this half
-  (observation without pause/resume control)
+  graph:   nodes + conditional edges + CHECKPOINTED state
+           → render the flow, pause at a node for human review, resume
+           (the inspectable form of every other topology)
+
+  aptkit:  runAgentLoop = for-loop; state in a local messages[] array
+           → CapabilityEvent trace records the path (inspect)
+           → but NOT resumable (no checkpoint store)
+  (Not yet implemented)
 ```
 
 ## Elaborate
 
-Graph orchestration (LangGraph and similar) emerged because freewheeling agent loops are hard to debug and impossible to pause for human review. Modeling the agent as a state machine with checkpointed state solves both — and lets you express supervisor-worker, pipeline, and debate as one inspectable formalism. aptkit deliberately stayed with the implicit loop because its tasks don't need a mid-run human gate, and the replay trace gives it post-hoc inspectability. The honest gap: no pause/resume, no human-in-the-loop checkpoint. That's the capability a graph would unlock.
+Graph orchestration (the model LangGraph and similar frameworks popularized) won mindshare because it solved the two hardest multi-agent problems at once: observability (the flow is a graph you can draw) and human-in-the-loop (checkpoint at a node, get approval, resume). The cost is that you give up the model's freewheeling and commit to an explicit structure up front. aptkit's `CapabilityEvent` trace is the observability half done cheaply (a log of the path); the resumable-checkpoint half is the work a graph would add, justified only by a pause/resume requirement aptkit doesn't have yet.
 
 ## Interview defense
 
-**Q: Do you use a graph orchestration framework?**
-No — my control flow is an implicit `for` loop in `runAgentLoop`, with state as an in-memory messages array. A graph would make the nodes and edges explicit and checkpoint state between them, which buys two things I don't have: a human-in-the-loop pause (checkpoint before a gated action, resume after approval) and resumability across a crash. I haven't needed them — my tasks run start-to-finish. Interestingly, my trace stream already gives me the *observation* half of a graph; I just can't pause and resume.
+**Q: aptkit uses a plain loop, not a graph framework. When would you switch?**
+
+When a capability needs to pause for human approval and resume later. An imperative loop keeps state in the call stack — you can't checkpoint and re-enter it. A graph keeps state in a checkpoint store, so you can pause at a node, get sign-off, and resume. aptkit's runs are short and synchronous, so the loop is the right call; a human-in-the-loop approval flow would flip that.
 
 ```
-  implicit loop + ephemeral state (aptkit)
-    vs explicit nodes + checkpointed state (graph: pause/resume/inspect)
+  loop:  state in call stack  → can't pause/resume   (fine for short runs)
+  graph: state checkpointed    → pause at node, resume (human-in-the-loop)
 ```
-*Anchor: I have the trace (observability) without the checkpoint (pause/resume control).*
 
-**Q: When would you adopt a graph?**
-The first task that needs a human approval gate mid-run. My loop runs to completion with no pause point, so it physically can't stop for a human and resume — a checkpointed graph is the right refactor there.
+*Anchor: the graph's payoff is checkpointed, resumable state — reach for it when you need a human-in-the-loop pause, not before.*
 
 ## See also
 
-- `02-agent-loop-skeleton.md` — the implicit loop a graph would make explicit
-- `04-agent-infrastructure/05-guardrails-and-control.md` — the human-in-the-loop gate a graph enables
-- `04-agent-infrastructure/04-agent-evaluation.md` — the trace that's aptkit's observability half
+- [../01-reasoning-patterns/02-agent-loop-skeleton.md](../01-reasoning-patterns/02-agent-loop-skeleton.md) — the imperative loop a graph would replace.
+- [08-shared-state-and-message-passing.md](08-shared-state-and-message-passing.md) — the state a graph checkpoints.
+- [../04-agent-infrastructure/05-guardrails-and-control.md](../04-agent-infrastructure/05-guardrails-and-control.md) — the human-in-the-loop gate graphs enable.

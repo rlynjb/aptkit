@@ -1,176 +1,151 @@
 # Problem Brief
 
-*The core: who hurts, what proves it, why now, who benefits, what constrains.*
+The core case, in the spec's answer order: pain → evidence → why now → beneficiaries → constraints. Coach posture — every claim is labelled **EVIDENCE** (grounded in a repo file or context) or **INFERENCE** (a reasonable read that a reviewer could push on). Where the evidence is thin, the brief produces the **discovery question** instead of inventing the answer.
 
-This file covers brief-answers 1–5 (pain · evidence · why-now · beneficiaries
-· constraints). Options live in `03`, scope in `02`, metrics in `04`.
-
----
-
-## 1. The problem — who experiences what pain
-
-One person: Rein. The pain is operational, and it repeats.
+## 1. The operational problem — who feels what pain
 
 ```
-  The recurring pain — re-wiring + vendor-welding, per app
+  THE PAIN — re-wiring the same plumbing, welded to one vendor
 
-  app 1 (AdvntrCue)        app 2 (next)            app 3 (next)
-  ┌──────────────────┐    ┌──────────────────┐    ┌──────────────────┐
-  │ bespoke RAG      │    │ bespoke RAG      │    │ bespoke RAG      │
-  │ pgvector         │    │ ??? rewire       │    │ ??? rewire       │
-  │ GPT-4 (welded)   │    │ vendor (welded)  │    │ vendor (welded)  │
-  └──────────────────┘    └──────────────────┘    └──────────────────┘
-         │                       │                       │
-         └── nothing reused ─────┴── nothing reused ──────┘
-                    every app pays the plumbing cost again
+  app #1 (AdvntrCue)        app #2 (buffr)         app #N (next one)
+  ┌──────────────────┐     ┌──────────────────┐    ┌──────────────────┐
+  │ Next.js          │     │ React Native     │    │ ???              │
+  │ pgvector         │     │ ???              │    │ ???              │
+  │ GPT-4 (welded)   │     │ ???              │    │ ???              │
+  │ bespoke RAG loop │     │ bespoke RAG loop │    │ bespoke RAG loop │  ← rebuilt
+  │ bespoke tool-call│     │ bespoke tool-call│    │ bespoke tool-call│    every
+  └──────────────────┘     └──────────────────┘    └──────────────────┘    time
+        ▲                         ▲                        ▲
+        └──── no shared layer; each app re-derives the substrate ────┘
 ```
 
-Two distinct pains stacked on each other:
+**The pain:** Every AI app Rein builds re-derives its own RAG pipeline, its own agent loop, its own tool-calling glue — and each one is welded to a single cloud vendor's SDK. Swap the vendor and you rewrite the app; start a new app and you rebuild the plumbing.
 
-▸ **Re-wiring.** The RAG/agent plumbing — embed, chunk, store, retrieve,
-  rank, loop, parse — gets rebuilt from scratch in each new app. None of
-  it carries forward.
+- **EVIDENCE:** AdvntrCue is a bespoke `Next.js + pgvector + GPT-4 + Drizzle + Netlify Functions` stack with a hand-rolled RAG + tool-calling + session-memory layer (`me.md` system-design portfolio table; `context.md` "extracted from working apps"). The vendor is welded in — GPT-4 is the model, not *a* model behind a contract.
+- **INFERENCE:** that the *next* app would repeat the cost. This is a forward-looking claim, not yet a second data point at the time the decision was made. The discovery question that retires it: *does a second app actually reuse the layer without re-wiring?* — and `02`/`04` show buffr now answers it.
 
-▸ **Vendor-welding.** Each app is soldered to one cloud vendor (GPT-4 in
-  AdvntrCue). Swapping the model or the vector store means a rewrite, not
-  a config change. There is no seam to swap at.
+▸ The pain is concrete and singular at decision time: **one app proved the welded-bespoke pattern; the cost of repeating it is the problem.**
 
-The second pain is the worse one, because it's the one a framework
-*doesn't* fully solve and a from-scratch contract *does*.
+## 2. Evidence and current cost — what the repo proves
 
----
-
-## 2. Evidence vs inference
-
-The spec demands these be distinguished. They are.
+The honest split. Some of this is hard repo evidence; some is the inference the evidence supports.
 
 ```
-  EVIDENCE (in the repos, verifiable)        INFERENCE (labeled, not faked)
-  ─────────────────────────────────         ──────────────────────────────
-  AdvntrCue = bespoke Next.js +              "every future app would
-    pgvector + GPT-4, none reusable          re-wire" — INFERENCE from one
-    (me.md system-design portfolio;          data point (AdvntrCue). Honest:
-    docs/personal-agent-packages.md)         n=1, not a trend line.
+  EVIDENCE LADDER — strongest at the bottom (shipped + verified)
 
-  aptkit ships ONE bundle                    "this saves time across apps"
-    @rlynjb/aptkit-core@0.4.1,               — INFERENCE. Only ONE consumer
-    16 internal packages                     (buffr) exists today. The
-    (packages/core/package.json)             second app hasn't been built.
-
-  buffr consumes the published bundle:       "the contract is the right
-    "@rlynjb/aptkit-core": "^0.4.1"          boundary" — EVIDENCE, not
-    (buffr/package.json)                     inference: @aptkit/memory reuses
-                                             the SAME EmbeddingProvider/
-  PgVectorStore implements VectorStore       VectorStore contracts with zero
-    (buffr/src/pg-vector-store.ts:19),       new infra (context.md, seams).
-    wired in buffr/src/session.ts:41         A second consumer of the
-                                             contract already exists.
+  ┌─ inference ───────────────────────────────────────────────┐
+  │  "future apps will keep paying the re-wiring tax"          │  weakest
+  ├─ evidence (decision-time) ────────────────────────────────┤
+  │  AdvntrCue is bespoke + vendor-welded (one data point)     │
+  ├─ evidence (built) ────────────────────────────────────────┤
+  │  provider-neutral core exists: ModelProvider.complete()    │
+  │  + EmbeddingProvider / VectorStore contracts               │
+  ├─ evidence (built + reused) ───────────────────────────────┤
+  │  memory pkg reuses the SAME retrieval contracts, zero new  │
+  │  infra (the contracts were the right boundary)             │
+  ├─ evidence (shipped + verified) ───────────────────────────┤
+  │  buffr consumes @rlynjb/aptkit-core@^0.4.1 and swaps        │  strongest
+  │  InMemoryVectorStore → PgVectorStore on the SAME contract  │
+  └────────────────────────────────────────────────────────────┘
 ```
 
-┃ The strongest evidence isn't the second *app* — it's the second
-┃ *consumer of the contract*. `@aptkit/memory` reuses
-┃ `EmbeddingProvider`/`VectorStore` (`remember` = the index path, `recall`
-┃ = the query path) with no new infrastructure. That's the contract
-┃ proving it was drawn at the right seam, inside the same repo, today.
+- **EVIDENCE (built):** the provider-neutral core exists. Everything depends on `ModelProvider.complete()`, never a vendor SDK directly; RAG runs behind `EmbeddingProvider` + `VectorStore` contracts (`packages/retrieval/src/contracts.ts`, lines 22 + 33). `context.md` "Architecture seams."
+- **EVIDENCE (built + reused):** the episodic memory package is a *second consumer* of the exact same `EmbeddingProvider`/`VectorStore` contracts — `remember` is the index path, `recall` is the query path — with **zero new infrastructure** (`packages/memory`, `context.md` calls this "the strongest evidence the contracts were the right boundary"). A contract reused without modification by an unplanned second consumer is the clearest signal the boundary was real, not speculative.
+- **EVIDENCE (shipped + verified):** buffr depends on `"@rlynjb/aptkit-core": "^0.4.1"` (`/Users/rein/Public/buffr/package.json`) and implements the durable `PgVectorStore` against the same `VectorStore` contract (`/Users/rein/Public/buffr/src/pg-vector-store.ts`), tested at `/Users/rein/Public/buffr/test/pg-vector-store.test.ts`.
 
-**Discovery question still open** (where evidence is thin):
-
-▸ *Does a genuinely different second app reuse the bundle without forking
-  it?* buffr is the only external consumer. Until app #2 adopts
-  `@rlynjb/aptkit-core` unmodified, "reusable across apps" stays an
-  inference. The non-goal `>1 consumer` (see `02`) deliberately defers
-  answering this.
-
----
+**Current cost (honest):** the cost is *not* dollars or user churn — there are no users. The cost is **Rein's engineering time, paid once per app, to re-derive plumbing**, plus the **lock-in cost** of a vendor-welded app that can't move models. Both are real; neither is large in absolute terms, because the portfolio is small.
 
 ## 3. Why now
 
-Two things changed at once.
-
 ```
-  The timing — why build it now, not before or later
+  WHY NOW — three clocks that line up
 
-  ┌─ pull: the pivot ────────────┐   ┌─ push: local models matured ──┐
-  │ frontend → AI engineering    │   │ Gemma runs locally via Ollama │
-  │ needs a portfolio artifact   │   │ (no key, no TLS, :11434)      │
-  │ that is substrate, not       │   │ → local-first RAG is now      │
-  │ another vendor-glued demo    │   │   actually viable             │
-  └──────────────┬───────────────┘   └───────────────┬───────────────┘
-                 └──────────────┬────────────────────┘
-                                ▼
-                    build the substrate now:
-                    the pivot needs the artifact AND
-                    local models make local-first real
+  career clock   ──►  the frontend → AI pivot needs a portfolio
+                      artifact NOW, not after the next job
+  capability clock ─► local models (Gemma via Ollama) became
+                      good enough to run an agent loop offline
+  cost clock     ──►  AdvntrCue proved the welded pattern; the
+                      next app would compound it if not stopped
 ```
 
-▸ **The pivot is active now** (me.md: "this is where you are"). The
-  portfolio needs an artifact that signals AI-engineering depth — a
-  from-scratch RAG pipeline + eval harness + provider-neutral contracts
-  reads stronger than a fifth CRUD-plus-LLM app.
+- **EVIDENCE:** the deliberate frontend → AI pivot is the spine of `me.md` ("now → next: AI engineer"). The portfolio is explicitly the case for the combination. A portfolio artifact has a *deadline shape* — it's worth most before the next role, not after.
+- **EVIDENCE:** local Gemma via Ollama is wired and working (`packages/providers/gemma/src/gemma-provider.ts`; emulated tool-calling because Gemma has none — `context.md`). The local-first option is only viable *because* local models crossed a usability line; building this two years earlier would have meant a cloud-only substrate.
+- **INFERENCE:** that "the next app would compound the cost" is forward-looking — the same inference flagged in §1, surfaced here as the *why-now* pressure. Discovery question already answered by buffr.
 
-▸ **Local models crossed the viability line.** Gemma-via-Ollama
-  (`@aptkit/provider-gemma`, local HTTP `:11434`, emulated tool-calling)
-  makes "local-first, provider-neutral" a buildable target, not a wish.
-  The compounding cost: every additional welded app makes the eventual
-  un-welding more expensive. Build the seam before app #2, not after.
-
----
+▸ The why-now that holds hardest in a review room is the **career clock**: the pivot is happening, and a build-from-scratch substrate is a sharper proof of AI-engineering depth than a wired-together framework demo.
 
 ## 4. Beneficiaries and exclusions
 
 ```
-  Who benefits — and who is deliberately outside the line
+  WHO BENEFITS — all three are Rein, in different roles
 
-  IN SCOPE (benefits)                    OUT OF SCOPE (deliberate)
-  ─────────────────                      ──────────────────────────
-  ▸ Rein's own apps that consume         ▸ external users / customers
-    @rlynjb/aptkit-core                    (NONE exist — by design)
-    (today: buffr)                       ▸ multi-tenant SaaS tenants
-  ▸ Rein as portfolio owner              ▸ a team of contributors
-    (the pivot artifact)                 ▸ anyone needing RLS/auth or a
-  ▸ future Rein apps (INFERENCE —          hosted default
-    not yet built)                       ▸ >1 consumer (deferred, see 02)
+  ┌─ Rein the app-builder ─────┐   reuses aptkit across apps;
+  │  buffr already consumes it │   no re-wiring per app
+  └────────────────────────────┘
+  ┌─ Rein the candidate ───────┐   portfolio artifact proving the
+  │  frontend → AI pivot proof │   AI-engineering pivot
+  └────────────────────────────┘
+  ┌─ Rein the learner ─────────┐   built the substrate to
+  │  RAG / agent loop / evals  │   understand the substrate
+  │  from scratch              │   (me.md: hands-on = real)
+  └────────────────────────────┘
+
+  EXCLUDED ON PURPOSE:
+  ✗ external users / customers      ✗ a team of other engineers
+  ✗ multi-tenant SaaS tenants       ✗ open-source contributors at scale
 ```
 
-The honest beneficiary count is **one person, one consuming app**. The
-brief does not inflate this.
+- **EVIDENCE:** the only live consumer is buffr — one repo, Rein's (`context.md` companion-repo note; buffr `package.json`). `me.md` establishes the pivot and the hands-on learning loop ("the RAG pattern isn't real until you shipped AdvntrCue").
+- **Honest exclusion:** there are **no external beneficiaries**, and that is the design, not a gap. The brief does not invent them.
 
----
-
-## 5. Constraints
-
-Visible from the repos and supplied context — not invented.
+## 5. Constraints — what's actually fixed
 
 ```
-  The constraints box — what bounds the build
+  CONSTRAINTS — the walls the solution had to fit inside
 
   ┌─ TECHNICAL ──────────────────────────────────────────────┐
-  │ • TS monorepo, ESM-only, NodeNext, strict (tsconfig.base) │
-  │ • published API is a SEMVER compatibility contract        │
-  │   (@rlynjb/aptkit-core 0.4.x) — re-exported names frozen  │
-  │ • core must NOT import app-specific product logic         │
-  │   (the whole reason the monorepo exists)                  │
-  │ • ModelProvider / EmbeddingProvider / VectorStore are     │
-  │   load-bearing — shape changes ripple across packages     │
-  │   AND across the repo boundary into buffr's PgVectorStore │
+  │  • published API is a compatibility contract (semver      │
+  │    0.4.x) — re-exported names can't break host apps       │
+  │  • core must NOT import app-specific product logic         │
+  │  • ModelProvider / VectorStore / EmbeddingProvider shape   │
+  │    changes ripple across packages + buffr's PgVectorStore  │
+  │  • embedding dimension is a one-way door (768; mismatch    │
+  │    throws at wiring time)                                  │
   └────────────────────────────────────────────────────────────┘
   ┌─ TIME / PEOPLE ──────────────────────────────────────────┐
-  │ • solo developer, building alongside IK frontend program  │
-  │ • no team, no on-call, no SLA                             │
+  │  • one engineer, part-time, alongside IK frontend program │
   └────────────────────────────────────────────────────────────┘
-  ┌─ PRODUCT ────────────────────────────────────────────────┐
-  │ • deployment-agnostic core; buffr fills the deploy slots  │
-  │   (Supabase/pgvector, agents schema, persistence)         │
+  ┌─ MIGRATION ──────────────────────────────────────────────┐
+  │  • buffr binds the slots at runtime; aptkit stays          │
+  │    deployment-agnostic — the seam must survive the swap    │
   └────────────────────────────────────────────────────────────┘
 ```
 
-┃ The tightest constraint is the published-API contract. Once
-┃ `@rlynjb/aptkit-core@0.4.x` shipped and buffr pinned `^0.4.1`, the
-┃ re-exported surface became a one-way door — buffr's `PgVectorStore
-┃ implements VectorStore` breaks if the `VectorStore` shape changes. That
-┃ constraint is *self-imposed* and it's the point: it's what forced the
-┃ contract to be good before it was published.
+- **EVIDENCE:** the must-not-change list — published API as compatibility contract, no app logic in core, the load-bearing contracts that ripple to buffr, the one-way dimension door — is all in `context.md` "Must-not-change constraints" + "Data model."
+- **EVIDENCE (people/time):** one engineer, pivoting, in parallel with IK's frontend program (`me.md`).
+- **No org constraints invented.** There is no team, no roadmap, no compliance regime. A reviewer who asks "what did the org require?" gets: *there is no org — this is personal tooling.*
 
-There is **no organizational constraint** to report — no compliance, no
-approval gate, no migration deadline. Saying so is more honest than
-inventing one.
+## The discovery questions that remain
+
+Where evidence was thin, these are the questions a reviewer should ask — and where each now stands:
+
+```
+  Q: will a SECOND app reuse the layer without re-wiring?
+     → ANSWERED. buffr consumes the bundle + swaps one contract.
+  Q: is provider-neutrality real or cosmetic?
+     → ANSWERED (internally). memory reuses the contracts with
+        zero new infra; local Gemma runs the loop with no cloud call.
+  Q: does the published bundle install clean in a fresh consumer?
+     → PARTIALLY OPEN. tracked as a success metric in 04 (clean-clone
+        npm install builds in buffr) — verify, don't assume.
+  Q: will a THIRD app ever exist to justify "reusable"?
+     → OPEN BY DESIGN. >1 consumer is a non-goal (see 02). The
+        premise is validated at two repos, not promised at N.
+```
+
+## See also
+
+- `02-scope-cuts-and-non-goals.md` — the slice that validated this, and what was cut
+- `03-options-and-opportunity-cost.md` — the build-vs-adopt fork
+- `/Users/rein/Public/aptkit/packages/retrieval/src/contracts.ts` — the load-bearing contracts
+- `/Users/rein/Public/buffr/src/pg-vector-store.ts` — the live swap

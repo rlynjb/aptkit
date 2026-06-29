@@ -1,11 +1,13 @@
-# 05 — Production Serving for Agents
+# E — Production Serving for Agents
 
-**Anchor: single-agent + multi-agent (both).**
+What single-call serving becomes once the unit is an autonomous loop or a topology — the same problems compound across turns and concurrent agents.
 
-`study-ai-engineering/06-production-serving/` covers caching, cost, backpressure, and circuit-breaking for a *single LLM call*. This sub-section does **not** re-teach those — it covers the three places where the single-call version is insufficient because the unit of execution is a loop or a topology that issues many calls, often repeatedly against the same tool.
+Anchor: single-agent + multi-agent (both).
 
-aptkit has the building blocks (a usage ledger, truncation, per-loop caps, swappable providers, a fallback chain) but is honest about what it doesn't have yet (no cross-turn cache, no fan-out limiter, no per-tool breaker) — because it runs one agent at a time against a local model where these pressures are mild.
+Single-call serving (caching, cost, backpressure, retry/breaker) lives in `.aipe/study-ai-engineering/06-production-serving/`. This sub-section covers the three places that version is insufficient because the unit issues many calls. aptkit has one of the relevant controls (tool-result truncation); the rest are `not yet exercised`.
 
-1. `01-cross-turn-caching.md` — caching across turns and runs (not yet exercised; prefix-cache-ready).
-2. `02-fan-out-backpressure.md` — concurrency caps for parallel agents (not yet exercised; no fan-out).
-3. `03-per-tool-circuit-breaking.md` — bounding a flaky tool inside a loop (the loop has the hook; no breaker yet).
+## Files
+
+1. [01-cross-turn-caching.md](01-cross-turn-caching.md) — caching across turns and runs, not one request. Not yet exercised.
+2. [02-fan-out-backpressure.md](02-fan-out-backpressure.md) — a concurrency cap on a supervisor's fan-out. Not exercised (no fan-out).
+3. [03-per-tool-circuit-breaking.md](03-per-tool-circuit-breaking.md) — a breaker per tool, fed back to the agent. Not yet exercised; truncation is the one real serving control aptkit has.

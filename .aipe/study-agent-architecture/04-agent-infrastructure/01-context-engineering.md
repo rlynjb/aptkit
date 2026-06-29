@@ -1,125 +1,112 @@
 # Context Engineering
 
-**Industry standard.** "Context engineering," "context assembly," "prompt assembly." Type label: discipline (the superset of prompt engineering + RAG). **In this codebase: yes — `injectProfile` and `schemaSummary` are aptkit's context-assembly primitives.**
+**Industry term:** context engineering (curating everything the model sees at inference). *Industry standard.*
 
 ## Zoom out, then zoom in
 
-Context engineering is the discipline RAG and prompt engineering are subsets of: it's *everything the model sees at inference time*, and the job is curating what fills the window for the next step. aptkit has two pure context-assembly functions — `injectProfile` (splices the user profile) and `schemaSummary` (renders workspace metadata) — that decide what goes in the window before the loop ever runs.
+The discipline RAG and prompt engineering are subsets of: everything the model sees at inference time, deliberately curated. aptkit's clearest instance is `injectProfile` — composing a user profile into the system prompt before rendering.
 
 ```
-  Zoom out — context engineering is the superset
+  Zoom out — context engineering is the superset over the whole input
 
-  ┌───────────────────────────────────────────────┐
-  │            Context engineering                │
-  │  (everything the model sees at inference time)│
-  │   ┌─────────────┐  ┌─────────────┐            │
-  │   │   prompt    │  │     RAG     │            │
-  │   │ (template)  │  │ search_kb   │            │
-  │   └─────────────┘  └─────────────┘            │
-  │   ┌─────────────┐  ┌─────────────┐            │
-  │   │ ★injectProfile│ │★schemaSummary│           │ ← we are here
-  │   │ (user state) │  │ (workspace) │            │
-  │   └─────────────┘  └─────────────┘            │
-  └───────────────────────────────────────────────┘
+  ┌─ Context engineering (the discipline) ──────────────────────┐
+  │  ┌─ prompt ─┐ ┌─ RAG ─┐ ┌─ memory ─┐ ┌─ tool outputs ─┐     │ ← we are here
+  │  │ template │ │chunks │ │ recall   │ │ search results │     │
+  │  └──────────┘ └───────┘ └──────────┘ └────────────────┘     │
+  │  ┌─ profile (injectProfile) ─┐ ┌─ message history ─┐         │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-## Structure pass
+Zoom in: aptkit assembles a system prompt from parts — a profile (`injectProfile`, `packages/context/src/profile-injector.ts`), a prompt template (`renderPromptTemplate`), and the retrieved chunks the agent pulls at runtime. Context engineering is the discipline of deciding *what* goes in the window and *in what order*.
 
-**Axis: what fills the window, and who decides?** Trace the rag-query agent's system prompt assembly: a template + an injected profile + (at runtime) retrieved chunks. Each piece is a context decision made by *code* before the model sees it. The seam is between context-assembly (code curates the window) and the loop (model consumes it). aptkit's context functions are *pure string→string* — no `fs`, no side effects — which makes the assembly testable and deterministic.
+## The structure pass
+
+**Layers.** The window's contents as bands: system prompt (profile + template) at the top, message history, tool outputs accumulating during the run.
+
+**Axis: cost/quality — what fills the window for the next step?** Every token in the window costs money and risks lost-in-the-middle; the job is curation.
+
+**The seam.** The boundary between *static* context (profile, template — set once) and *dynamic* context (retrieved chunks, tool results — grow per turn). aptkit assembles the static part before the loop and lets the loop accumulate the dynamic part.
 
 ## How it works
 
+**Use case in aptkit:** the rag-query agent personalizing answers. The reader's profile (me.md-style text) is injected so the assistant knows who it's helping, before any retrieval happens.
+
 ### Move 1 — the mental model
 
-Prompt engineering writes the instructions; context engineering decides *everything else* in the window — user state, retrieved facts, workspace schema, tool outputs. You know how a component's render depends on its props *and* its context *and* fetched data? Context engineering is assembling all of those into the model's input.
+It's component composition for the prompt. You build a React view by composing `<Header/>`, `<Body/>`, `<Footer/>` in order; you build a context window by composing profile + template + history + tool outputs in order. The order and the budget are the design.
 
 ```
-  Context engineering = assembling the whole window, not just the prompt
+  Context window assembly (rag-query)
 
-  template (instructions)
-     + injectProfile(user me.md)      ← who it's serving
-     + schemaSummary(workspace)        ← what data exists
-     + retrieved chunks (at runtime)   ← grounding
-     ───────────────────────────────
-     = the system prompt the model sees
+  ┌─ system ────────────────────────────────────────┐
+  │  [profile]   ← injectProfile, position: 'start'  │
+  │  [template]  ← "call search first, cite sources" │
+  └──────────────────────────────────────────────────┘
+  ┌─ messages (grows per turn) ─────────────────────┐
+  │  user question → assistant tool_use → tool_result│
+  └──────────────────────────────────────────────────┘
 ```
 
-### Move 2 — aptkit's two assembly primitives
+### Move 2 — the walkthrough
 
-**`injectProfile` — splice the user's profile into the system template.** Pure string-in/string-out; the caller reads the file, this function never touches `fs`.
+**`injectProfile` is pure string composition — and the order is deliberate.** It prepends the profile to the template, then `renderPromptTemplate` resolves placeholders:
 
-```typescript
-// packages/context/src/profile-injector.ts:25, 33-37
-export function injectProfile(systemTemplate, profileText, opts?) {
-  const block = heading ? `${heading}\n${profileText}` : profileText;
-  return position === 'end'
-    ? `${systemTemplate}\n\n${block}`
-    : `${block}\n\n${systemTemplate}`;   // ← default: prepend the profile
-}
+```ts
+// rag-query-agent.ts:54 — C then render: inject profile, then resolve placeholders
+const withProfile = options.profile
+  ? injectProfile(template, options.profile, { position: 'start', heading: PROFILE_HEADING })
+  : template;
+this.system = renderPromptTemplate(withProfile, {});
 ```
 
-The subtle, important detail: injection happens *before* template rendering (the docstring, line 15-18), so `{placeholder}`s in the template survive untouched for `renderPromptTemplate` to fill later. The rag-query agent uses it to make answers personal (`rag-query-agent.ts:55`): the user's `me.md` becomes a `# About the person you are assisting` block at the top of the system prompt. That's context engineering — the model now answers *for this user*, not generically.
+The profile goes at the `start` (`profile-injector.ts:35`) so the model reads *who it's helping* before *what to do*. And injection happens *before* rendering, so the template's `{placeholder}`s survive (`profile-injector.ts:13`) — the two steps compose without fighting.
 
-**`schemaSummary` — render workspace metadata into the window.** The analytics agents (recommendation, monitoring, diagnostic) get a deterministic summary of the workspace's schema (events, catalogs, totals, data horizon) so the model knows what data it can reason about.
+**Why this is context engineering, not prompt engineering.** Prompt engineering is wording the template well. Context engineering is deciding the profile belongs in the window at all, where it sits relative to the instructions, and that it's injected before rendering so both survive. The wording is one band; the assembly is the discipline.
 
-```typescript
-// packages/agents/recommendation/src/recommendation-agent.ts:71-75
-const system = renderPromptTemplate(this.prompt, {
-  schema: schemaSummary(this.options.workspace),   // ← workspace shape → window
-  project_id: this.options.workspace.projectId,
-  diagnosis: JSON.stringify(diagnosis),            // ← upstream context (the pipeline message)
-});
-```
+**The dynamic half: retrieved chunks.** During the loop, `search_knowledge_base` results enter the window as tool-result messages. That's context too — and the `minTopK` floor / tolerant filter ([../02-agentic-retrieval/01-agentic-rag.md](../02-agentic-retrieval/01-agentic-rag.md)) plus the 16k-char tool-result truncation (`run-agent-loop.ts:52`) are context-engineering controls: they bound *how much* retrieved context fills the window, so a flood of chunks can't push the instructions out.
 
-Three context pieces assembled: the schema (what data exists), the project id, and the diagnosis (the upstream agent's output). The model sees exactly the context it needs to propose grounded actions.
-
-**The reframe to hold onto.** Most agent failures are not model failures — they're *context* failures: stale retrieval, lost-in-the-middle on a bloated window, no user state loaded, the wrong tool outputs in the window. Prompt engineering gets the first good output; context engineering keeps the thousandth good. Bigger context windows don't solve this — they make room for more noise. aptkit's pure assembly functions are the discipline applied: each one is a deliberate decision about what fills the window, testable in isolation.
+**The reframe.** Most agent failures are context failures, not model failures — stale retrieval, lost-in-the-middle on a bloated window, no user state loaded, the wrong tool outputs present. Bigger context windows don't fix this; they make room for more noise. aptkit's truncation cap and retrieval floors are the curation that keeps the window's signal-to-noise high.
 
 ### Move 3 — the principle
 
-The job is curating what fills the window for the next step — and in a multi-agent system, *which agent sees what* (the context routing from SECTION C file 08). aptkit's `injectProfile` and `schemaSummary` are the single-agent version: deterministic, pure, testable assembly of user state and workspace shape into the window. The discipline is the same whether you're filling one agent's window or routing context across a topology.
+Prompt engineering gets the first good output; context engineering keeps the thousandth good. The job is curating what fills the window for the *next* step — and, in a multi-agent system, *which agent sees what* ([../03-multi-agent-orchestration/08-shared-state-and-message-passing.md](../03-multi-agent-orchestration/08-shared-state-and-message-passing.md)). aptkit's profile injection plus retrieval/truncation caps are that curation in single-agent form.
 
 ## Primary diagram
 
 ```
-  Context assembly for the rag-query agent — full frame
+  Context engineering in rag-query — static + dynamic bands
 
-  ┌─ assembly (code, pure, before the loop) ────────────────┐
-  │  DEFAULT_SYSTEM_TEMPLATE ("search first, ground, cite")  │
-  │       + injectProfile(me.md, position: start)            │ profile-injector.ts:25
-  │       → renderPromptTemplate(withProfile, {})            │
-  │  = this.system                                           │
-  └───────────────────────────┬──────────────────────────────┘
-                              ▼ (at runtime, the loop adds)
-  ┌─ runtime context ─────────────────────────────────────────┐
-  │  + retrieved chunks (search_knowledge_base results)        │
-  │  + tool results (accumulated in messages)                  │
-  └─────────────────────────────────────────────────────────────┘
-              = everything the model sees at inference time
+  STATIC (assembled once, before the loop):
+    injectProfile(template, profile, {start}) → renderPromptTemplate
+    = [profile heading + profile] + [instructions]
+
+  DYNAMIC (accumulates in the loop, bounded):
+    + tool_result chunks  (capped: minTopK floor, 16k truncation)
+    + message history
+
+  → the window = curated assembly, not "everything available"
 ```
 
 ## Elaborate
 
-Context engineering is the name the field landed on once it became clear that prompt wording was a small part of the problem — what *else* is in the window (retrieval, memory, user state, history, tool outputs) determines quality far more than phrasing. aptkit's design choice to make context assembly *pure functions* (no `fs`, string→string) is the right one: it makes the window contents deterministic and unit-testable, and it keeps the assembly logic out of the agent loop. The injection-before-rendering order is a small but real piece of engineering — it lets profile injection and template rendering compose without fighting over `{placeholders}`.
+Context engineering is the reframe the field landed on after "prompt engineering" turned out to be too narrow — the prompt is one input among many, and the failures were coming from the *other* inputs (stale RAG, bloated history, missing user state). The discipline is treating the whole window as something you compose and budget, not something you fill. aptkit embodies it modestly: `injectProfile` composes the static part deliberately, and the retrieval floors plus truncation cap budget the dynamic part. The multi-agent extension — context routing, per-agent windows — is the same discipline at a larger scope.
 
 ## Interview defense
 
-**Q: How do you control what the model sees?**
-Context engineering — pure assembly functions that run before the loop. `injectProfile` splices the user's profile into the system template (so answers are personalized), and `schemaSummary` renders the workspace's data shape into the window (so the model knows what it can reason about). Both are string→string, no side effects, so the window contents are deterministic and testable. The key detail: injection happens before template rendering, so `{placeholders}` survive.
+**Q: What's the difference between prompt engineering and context engineering here?**
+
+Prompt engineering is wording the template. Context engineering is the assembly: aptkit injects the user profile at the *start* of the system prompt (so the model reads who it's helping before its instructions), does it *before* template rendering (so both survive), and bounds the dynamic context — retrieved chunks — with a `minTopK` floor and a 16k truncation cap so a flood of chunks can't push the instructions out of the window.
 
 ```
-  template + injectProfile(user) + schemaSummary(data) + retrieved chunks
-  = the window (curated by code, consumed by the model)
+  prompt eng:   word the template well       (one band)
+  context eng:  compose + order + budget all bands  (the discipline)
 ```
-*Anchor: most agent failures are context failures, not model failures.*
 
-**Q: Doesn't a bigger context window solve this?**
-No — it makes room for more noise. The job is curating *what* fills the window, not fitting more in. Lost-in-the-middle gets worse with a fuller window, not better.
+*Anchor: most agent failures are context failures; bigger windows make room for more noise, not less.*
 
 ## See also
 
-- `02-agentic-retrieval/01-agentic-rag.md` — injectProfile as Package C
-- `02-agent-memory-tiers.md` — memory as another context source
-- `03-multi-agent-orchestration/08-shared-state-and-message-passing.md` — context routing across agents
-- `study-prompt-engineering/` — the prompt-template mechanics (cross-ref)
-- `study-ai-engineering/` — context-window and lost-in-the-middle mechanics (cross-ref)
+- [02-agent-memory-tiers.md](02-agent-memory-tiers.md) — memory as another context band.
+- [../02-agentic-retrieval/01-agentic-rag.md](../02-agentic-retrieval/01-agentic-rag.md) — retrieved chunks as dynamic context.
+- Context-window and lost-in-the-middle mechanics: `.aipe/study-ai-engineering/`.
+- Prompt template construction: `.aipe/study-prompt-engineering/`.

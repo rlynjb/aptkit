@@ -1,287 +1,234 @@
-# Cold start
+# Cold-start
 
-**Subtitle:** the system that has no data yet · *Language-agnostic*
+> cold-start problem · recommender/personalization failure mode
+
+Let me be blunt before we start: aptkit trains no model. There is no recommender, no collaborative-filtering matrix, no learned user embedding anywhere in `packages/`. This file is new ground — you are learning a failure mode you have *not* yet hit in this codebase, so I am going to scaffold it heavily rather than point at shipped code. Every concept here is `not yet exercised in aptkit`, and I will say so where it counts.
+
+You already understand the shape of this problem from contrl, even if you never named it. Before a single rep is logged, your rep counter has nothing personal to lean on — it has to behave reasonably for a user it knows nothing about. That "behave reasonably with zero history" requirement *is* cold-start. We are just going to generalize it.
 
 ## Zoom out, then zoom in
 
-Before any fix, here's where the problem lives. A recommender is a pipeline that
-turns *who you are* plus *what you've done* into a ranked list. Cold start is the
-single failure mode where the interaction box — the one that feeds everything —
-is empty.
+Cold-start is not a stage in the pipeline. It is a *condition* that strikes at the boundary between training data and serving — specifically, the case where the entity you must serve (a user, an item, a whole system) has no rows in the data that the model was trained on. So the star sits on the seam, not inside a box.
 
 ```
-  Zoom out — the personalization pipeline (generic; aptkit has none)
-
-  ┌─ Identity layer ───────────────────────────────────────────────┐
-  │  user id · declared preferences · demographics                  │
-  └───────────────────────────┬─────────────────────────────────────┘
-                              │ join
-  ┌─ Interaction layer ───────▼─────────────────────────────────────┐
-  │  ★ clicks · ratings · queries · history ★  ← cold start = EMPTY │
-  └───────────────────────────┬─────────────────────────────────────┘
-                              │ build signal
-  ┌─ Candidate layer ─────────▼─────────────────────────────────────┐
-  │  item pool + item content features / embeddings                 │
-  └───────────────────────────┬─────────────────────────────────────┘
-                              │ score + sort
-  ┌─ Ranking layer ───────────▼─────────────────────────────────────┐
-  │  ranked list → user; grade with precision@k (file 10)           │
-  └──────────────────────────────────────────────────────────────────┘
+Where cold-start bites in a supervised-ML / recommender pipeline
+┌──────────┐   ┌──────────┐   ┌──────────────────┐   ┌────────┐   ┌─────────────────┐
+│  Data    │──▶│ Features │──▶│ Train / Val / Test│──▶│ Model  │──▶│ Deploy / Serve  │
+│ (history)│   │          │   │                   │   │        │   │  (predictions)  │
+└──────────┘   └──────────┘   └──────────────────┘   └────────┘   └────────┬────────┘
+      ▲                                                                     │
+      │  new user / new item / new system has NO rows here                  │ request arrives
+      │                                                                     ▼
+      └─────────────────────────────────────────────────── ★ COLD-START ───┘
+                          model is asked to predict for an entity
+                          it has zero training signal about
 ```
 
-Now zoom in. Every recommender that *learns* from behavior assumes the starred
-box is full. Cold start is the day-one reality where it isn't — no clicks, no
-ratings, no query history. The signal you'd normally lean on is absent, and a
-collaborative model trained on "users like you also liked…" has no *you* and no
-*like you* to work with. The fix is never "train harder"; it's "use a different
-signal until the behavior signal exists."
+Read the diagram as a loop. The model learns from `Data`. At serve time a request arrives for an entity. If that entity contributed nothing to `Data`, the learned parameters have no purchase on it — the star marks that mismatch. Cold-start is a *coverage gap between training distribution and serving population*, surfaced at request time.
 
 ## Structure pass
 
-**Layers.** Identity → interaction → candidates → ranking. Collaborative methods
-live or die on the interaction layer; content-based methods route *around* it by
-scoring on the candidate layer's item features instead. Cold start is the rule
-for which detour you take.
+One axis organizes this whole topic: **how much history does the entity have, and whose history is missing?** Slide along that axis and you get the three canonical flavors, each with a different missing party.
 
-**Axis — which input is missing.** Trace what's empty and you get three distinct
-problems, not one. The *user* row is new (no history for this person). The *item*
-is new (no one has touched this thing). The *whole system* is new (the
-interaction table itself is empty). Same headline, three different mitigations —
-conflating them is the beginner error.
+```
+Axis: what has no interaction history yet?
+ less signal ◀──────────────────────────────────────────────────────▶ more signal
 
-**Seam.** The load-bearing boundary is **the scoring function** — the code that
-turns a request into a ranked list. A collaborative scorer reads the interaction
-matrix; a content scorer reads item embeddings. Cold start forces you to ship a
-scorer that does *not* depend on the empty box, then swap it once the box fills.
-The seam is "what does `score(request) → ranked[]` read from?"
+ NEW SYSTEM            NEW USER                NEW ITEM            WARM
+ (no data at all)      (no rows for THIS user) (no rows for THIS   (history exists
+                                                item)              for user+item)
+ ───┬───────────────── ───┬─────────────────── ───┬─────────────── ───┬───────────
+    │ bootstrap rules     │ onboarding +          │ content features  │ learned
+    │ + popularity priors │ population priors      │ + popularity      │ personalization
+```
+
+The seams between these are sharp because the *fallback* differs at each. A new user can ride on the crowd's popularity priors; a new item cannot ride on a crowd it has never met; a new system has no crowd at all. Same word, three different repairs.
 
 ## How it works
 
-### Move 1 — the mental model
+### Move 1 — mental model
 
-A fresh buffr install is the cleanest cold start you'll ever see. buffr is
-single-user; its corpus is `work.md`, `stack.md`, `coffee.md` — and on a
-brand-new install that corpus is *empty*. `PgVectorStore.search(vector, k)`
-(`/Users/rein/Public/buffr/src/pg-vector-store.ts`) returns `Hit[]` of
-`{id, score, meta}`, but with nothing indexed it returns `[]`. There is no
-history to personalize from and nothing to retrieve. That is new-system *and*
-new-user at once.
+The mental model: **personalization is earned, not granted.** A recommender's quality is a function of accumulated signal. At zero signal you are not allowed to personalize, so you must degrade gracefully to something that needs no per-entity history. Think of it as a ladder you climb as evidence arrives.
 
 ```
-  Pattern — cold start is an empty box, not a broken model
-
-  request ──► score(request) ──► ranked[]
-                  │
-                  ├─ reads interaction history ──► EMPTY ──► [] (collaborative fails)
-                  │
-                  └─ reads item content/embedding ──► still works ──► ranked[]
-                            (content-based bridges the empty box)
+PATTERN: the cold-start fallback ladder (climb as signal accumulates)
+                                          signal
+   ┌───────────────────────────────────┐   │
+   │ rung 4: full personalization      │   │  many interactions
+   │  (learned model, per-user)        │   ▲
+   ├───────────────────────────────────┤   │
+   │ rung 3: content-based similarity  │   │  some item/profile features
+   │  (match features, not behavior)   │   ▲
+   ├───────────────────────────────────┤   │
+   │ rung 2: onboarding answers / rules│   │  explicit user input
+   │  (ask, don't infer)               │   ▲
+   ├───────────────────────────────────┤   │
+   │ rung 1: popularity priors         │   │  population-level only
+   │  (what works for everyone)        │   ▲
+   └───────────────────────────────────┘   │  zero per-entity signal
 ```
 
-You don't fix the empty box by waiting. You route the scorer through a signal
-that exists on day one — item content — and let behavior accumulate behind it.
+You always serve from the highest rung you have evidence for. Start everyone at rung 1, promote them as their history grows. The art is the promotion thresholds.
 
-### Move 2 — the three cold starts, one box at a time
+### Move 2 — step by step
 
-Each case is a *different empty cell* in the same table. The mitigation matches
-the cell.
-
-**New user — no interaction history.** The user exists but has done nothing.
-Collaborative filtering has no neighbors to borrow from. Bridge with signals you
-*can* collect at signup: declared preferences, onboarding answers, demographic
-priors, and a global popularity fallback.
+**The three flavors, named precisely.** Get the vocabulary exact, because the repair depends on which party is cold.
 
 ```
-  New user — borrow from what they told you, not what they did
-
-  ┌─ user (history = ∅) ─┐
-  │ declared: ["typescript","postgres"]   ← onboarding question
-  │ demographic prior: backend-leaning                            │
-  └──────────┬───────────┘
-             │ embed declared prefs → query vector
-             ▼
-  content-based recs ──► ranked[]
-             │
-             └─ if even declared prefs are empty ──► global popularity (prior)
+Three flavors of cold-start
+┌──────────────┬──────────────────────────────┬───────────────────────────────┐
+│ flavor       │ what's missing               │ primary repair                │
+├──────────────┼──────────────────────────────┼───────────────────────────────┤
+│ NEW USER     │ no history for THIS user;    │ onboarding questionnaire +    │
+│              │ population data exists       │ population popularity priors  │
+├──────────────┼──────────────────────────────┼───────────────────────────────┤
+│ NEW ITEM     │ no interactions for THIS     │ content features of the item  │
+│              │ item; users + model exist    │ (match to similar warm items) │
+├──────────────┼──────────────────────────────┼───────────────────────────────┤
+│ NEW SYSTEM   │ no data anywhere; brand-new  │ hand-written rules + explicit │
+│              │ deployment                   │ preferences, earn signal      │
+└──────────────┴──────────────────────────────┴───────────────────────────────┘
 ```
 
-```text
-function recommendForNewUser(user, itemStore, popularity):
-    if user.declaredPrefs is empty:
-        return popularity.topK(k)          # global prior: safest default
-    q = embed(user.declaredPrefs)          # content signal, not behavior
-    return itemStore.search(q, k)          # nearest items by content
-```
+`Not yet exercised in aptkit`: there is no recommender to suffer any of these. I am defining the terms so the exercise below has language to use.
 
-**New item — nobody has interacted with it.** The item exists but has zero
-clicks, so collaborative methods never surface it (it has no co-occurrence with
-anything). Bridge with the item's *own* content: embed its features and place it
-near similar, already-known items. Content-based recs make a new item
-recommendable the moment it's created, before a single interaction.
+**The new-system case is the one that matters for a personal agent.** Here is the key reframe for your work. A single-user, self-hosted personal agent — buffr standing up fresh for exactly one person — is not the new-*user* case dressed up. It is the new-*system* case. There is no crowd to borrow popularity priors from. There is no population. There is exactly one human and a blank database.
 
 ```
-  New item — place it by content, near items that DO have history
-
-  new item (clicks = 0)
-   │ embed(item.contentFeatures)
-   ▼
-  item embedding ──► nearest known items ──► inherit their audience
-   │
-   └─ recommendable on day 0, no interactions required
+Single-user personal agent = the NEW SYSTEM case
+┌─────────────────────────────────────────────────────────────┐
+│  fresh self-hosted buffr instance                            │
+│                                                              │
+│   population of users ......... = 1   (no crowd to average)  │
+│   interaction history ......... = ∅   (empty agents schema)  │
+│   learnable per-user signal ... = none yet                   │
+│                                                              │
+│   ▼ only rungs available at t=0                              │
+│   rung 2: explicit preferences the user states               │
+│   rung 1: hand-written default rules                         │
+└─────────────────────────────────────────────────────────────┘
+        │  user interacts over days/weeks
+        ▼
+┌─────────────────────────────────────────────────────────────┐
+│  warming buffr instance                                      │
+│   interaction history ......... grows in agents schema       │
+│   ▼ now reachable                                            │
+│   rung 3: content similarity over past interactions          │
+│   rung 4: personalization tuned to this one person           │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-```text
-function placeNewItem(item, itemStore):
-    v = embed(item.contentFeatures)        # title, tags, text — no behavior
-    neighbors = itemStore.search(v, k)     # who is this item LIKE?
-    # surface `item` to users who engaged with `neighbors`
-    return neighbors
-```
-
-**New system — no data at all.** The interaction table itself is empty; there
-is no model to serve. Bootstrap with rules and heuristics, editorial curation,
-and a *pre-trained* embedding model for similarity. Serve content-based results
-from day one, log every interaction, and retrain once enough has accumulated
-(file 16).
+Pseudocode for the policy — `not yet exercised in aptkit`, this is the exercise target:
 
 ```
-  New system — bootstrap on a pre-trained embedding + rules, then collect
-
-  day 0                              later
-  ┌─ pre-trained embedding model ─┐  ┌─ enough logged interactions ─┐
-  │ similarity over item content  │  │ retrain a real recommender   │
-  │ + heuristic rules / editorial │  │ (file 16) — swap the scorer  │
-  └──────────────┬────────────────┘  └──────────────▲───────────────┘
-                 │ serve + LOG every interaction ────┘
-                 ▼
-            ranked[]  (grade with precision@k once you have labels)
+function pick_response_strategy(user_state):
+    n = count_interactions(user_state)           # from agents schema
+    if n == 0:
+        return RULES + EXPLICIT_PREFERENCES        # rung 1+2: bootstrap
+    if n < WARM_THRESHOLD:
+        return CONTENT_SIMILARITY(user_state)      # rung 3: thin signal
+    return PERSONALIZED(user_state)                # rung 4: earned
 ```
 
-```text
-function bootstrapSystem(request, itemStore, rules):
-    candidates = itemStore.search(embed(request), k)   # pre-trained embedding
-    candidates = rules.apply(candidates)               # editorial / heuristics
-    log(request, candidates)                            # collect for retrain
-    return candidates
-```
+**Promotion thresholds are the whole game.** A threshold too low and you personalize on noise — three clicks is not a personality. Too high and the user feels the agent never learns. Pick a `WARM_THRESHOLD` you can defend, log it, and revisit it once you have real interaction volume. For a one-user system, "personalize" mostly means "respect stated preferences and recent patterns," not "fit a model."
 
-This is exactly the fresh-buffr story: empty corpus, single user, no history.
-The mitigation is content-based similarity over a pre-trained embedding plus
-heuristic rules, run until enough personal data accumulates — then you retrain
-(file 16). You are never blocked; you are just on the bootstrap scorer.
+### Move 3 — principle
 
-**Move 2.5 — the aptkit reality.** Not yet exercised in aptkit — aptkit runs
-pre-trained LLMs, not trained models. The pattern is taught here as study ground.
-aptkit's "recommendation" is LLM-over-context — the model reads the retrieved
-documents and reasons — not a fitted recommender, so it has no interaction matrix
-to start cold against. The closest real artifact is buffr's empty-corpus install:
-the same content-based-similarity bootstrap, with no learned model anywhere.
-
-### Move 3 — the principle
-
-Cold start is an *absence of one signal*, not a broken system. Name which input
-is missing — user, item, or the whole table — and substitute a signal that
-exists without behavior: content embeddings, declared preferences, global priors,
-editorial rules. Serve the substitute, log everything, and let the behavior
-signal earn its way in. The collaborative model is the destination, never the
-day-one product.
+The principle: **never fail blank.** A cold entity is not an error state; it is the default state every entity passes through. Design the zero-signal behavior *first*, as a deliberate product surface, then treat personalization as a strict improvement layered on top. If your system only works once it is warm, it does not work.
 
 ## Primary diagram
 
 ```
-  The three empty cells and their bridges
-
-                 interaction history present?
-                          NO              YES
-              ┌───────────────────┬───────────────────┐
-   new user?  │ NEW USER          │ (normal:          │
-              │ → declared prefs  │  collaborative     │
-              │   + popularity    │  filtering works)  │
-              ├───────────────────┼───────────────────┤
-   new item?  │ NEW ITEM          │ (item has         │
-              │ → item content    │  co-occurrence)    │
-              │   embedding       │                    │
-              └───────────────────┴───────────────────┘
-   whole table empty ──► NEW SYSTEM
-     → pre-trained embedding + rules + editorial, LOG, retrain (file 16)
-
-   every bridge routes AROUND the empty box via content, not behavior
+Cold-start decision flow for a single-user personal agent (buffr)
+                         request arrives
+                               │
+                               ▼
+                   ┌───────────────────────┐
+                   │ interactions in agents │
+                   │ schema for this user?  │
+                   └───────────┬───────────┘
+              none             │ some            │ many
+        ┌──────────────────────┼─────────────────┼─────────────────────┐
+        ▼                      ▼                  ▼                     │
+┌───────────────┐    ┌──────────────────┐   ┌────────────────────┐    │
+│ NEW SYSTEM     │    │ thin signal       │   │ WARM               │    │
+│ rules +        │    │ content           │   │ full               │    │
+│ explicit prefs │    │ similarity        │   │ personalization    │    │
+└───────┬────────┘    └────────┬─────────┘   └─────────┬──────────┘    │
+        │                      │                       │               │
+        └──────────────────────┴───────────────────────┴───────────────┘
+                               │
+                               ▼
+                    serve response + LOG interaction
+                    (this log is what warms the next request)
 ```
+
+The load-bearing edge is the bottom one: every served response writes back to the history, so today's cold-start request is part of tomorrow's signal. Cold-start fixes itself only if you remember to record.
 
 ## Elaborate
 
-The hard-won lesson: content-based and collaborative methods are not rivals — one
-is the cold-start scaffolding for the other. Content gets you to day-one
-recommendations with zero behavior; collaborative takes over once behavior exists
-and usually wins on relevance because it captures taste no content feature
-encodes. Mature systems run both and blend by confidence. The trap is treating
-cold start as a modeling problem (it isn't — there's no data to model) instead of
-a *signal-substitution* problem. And the moment you have even a handful of labeled
-queries, you measure: precision@k (`scorePrecisionAtK` /`scoreRecallAtK` in
-`packages/evals/src/precision-at-k.ts`) grades the bootstrap scorer exactly as it
-will grade the trained one — same metric, swapped model. Read `10-recommender-systems.md`
-for the collaborative destination and `16-retraining-pipelines.md` for the swap.
+A few sharp edges. First, **the new-item problem has no population escape hatch** — you cannot average over users who have used an item nobody has used. Content features (the item's own attributes) are your only purchase, which is why content-based methods are the standard new-item repair while collaborative filtering handles warm items. Second, **onboarding questionnaires are cold-start mitigations dressed as UX** — every "tell us your goals" screen is a deliberate purchase of rung-2 signal before any behavior exists. Third, **popularity priors are quietly biased**: "what's popular" entrenches whatever was already popular, so a cold user nudged toward the crowd's favorites generates more crowd-favorite signal. For a single-user agent this bias is muted (there is no crowd) but the analogous trap is anchoring too hard on the user's *first stated* preference and never re-checking it.
+
+Cross-reference: this file is the failure-mode companion to `10-recommender-systems.md`. The recommender is the machine; cold-start is what that machine does the moment before it has anything to chew on.
 
 ## Project exercises
 
-### Build the new-system bootstrap recommender on an empty buffr corpus
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a function that, given a fresh (empty-corpus) buffr install,
-  embeds the request and returns `PgVectorStore.search(vector, k)` results,
-  falling back to a hard-coded heuristic/editorial list when `search` returns
-  `[]` because nothing is indexed yet.
-- **Why it earns its place:** forces you to handle the empty box explicitly
-  instead of crashing on `[]` — the literal new-system cold start.
-- **Files to touch:** new `/Users/rein/Public/buffr/src/cold-start.ts`, reading
-  `/Users/rein/Public/buffr/src/pg-vector-store.ts`.
-- **Done when:** with an empty corpus the function returns the heuristic list,
-  and after indexing `work.md` it returns real `Hit[]` from `search`.
-- **Estimated effort:** `1–4hr`
+### Cold-start fallback policy for buffr
 
-### Grade the bootstrap scorer with precision@k once labels exist
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a script that runs the cold-start recommender against the
-  labeled queries and scores it with `scorePrecisionAtK`, so the bootstrap
-  scorer's day-one quality is measured before any retrain.
-- **Why it earns its place:** proves the same metric grades the cold-start scorer
-  and the eventual trained one — the bridge to file 16.
-- **Files to touch:** new `/Users/rein/Public/buffr/eval/score-cold-start.ts`,
-  reading `/Users/rein/Public/buffr/eval/queries.json` and
-  `packages/evals/src/precision-at-k.ts`.
-- **Done when:** the script prints a precision@k number per query against
-  `queries.json` using `scorePrecisionAtK`.
-- **Estimated effort:** `1–4hr`
+- **Exercise ID:** EX-ML-11a — slot this in Phase 2C, before any personalization work, because the fallback is what ships first and the personalization layers on top.
+- **What to build:** A `pick_response_strategy`-style policy module in buffr that reads interaction count from the shared `agents` schema and returns one of `{bootstrap_rules, content_similarity, personalized}`, with an explicit, documented `WARM_THRESHOLD`. Wire the strategy choice into a structured log line on every request.
+- **Why it earns its place:** A fresh self-hosted agent is the new-system case; without this it would either crash on empty history or pretend to personalize on noise. It also forces you to design zero-signal behavior as a deliberate surface, which is the whole principle of this file.
+- **Files to touch:** `/Users/rein/Public/buffr/src/personalization/cold-start.ts` (Case B (new)); `/Users/rein/Public/buffr/src/personalization/cold-start.test.ts` (Case B (new)); a query helper for interaction counts at `/Users/rein/Public/buffr/src/db/interactions.ts` (Case B (new)).
+- **Done when:** A new user with zero history is served from `bootstrap_rules`, crossing `WARM_THRESHOLD` flips the returned strategy, the chosen strategy appears in logs, and tests cover the n=0, n<threshold, and n>=threshold boundaries.
+- **Estimated effort:** 1–4hr
+
+### Onboarding-preference capture as rung-2 signal
+
+- **Exercise ID:** EX-ML-11b — also Phase 2C, paired with 11a; the questionnaire is the deliberate purchase of explicit signal the fallback policy reads.
+- **What to build:** A tiny onboarding step that records 3–5 explicit user preferences into the `agents` schema, and have the bootstrap-rules branch of EX-ML-11a consume them instead of pure defaults.
+- **Why it earns its place:** It makes the abstract "rung 2" concrete and shows you understand that questionnaires *are* cold-start mitigation, not just UX polish — explicit signal short-circuits the cold period.
+- **Files to touch:** `/Users/rein/Public/buffr/src/onboarding/preferences.ts` (Case B (new)); extend `/Users/rein/Public/buffr/src/personalization/cold-start.ts` (Case B (new)) to merge explicit prefs into bootstrap rules.
+- **Done when:** Completing onboarding writes preferences to the schema, and a zero-history user with stored preferences gets a bootstrap response shaped by those preferences rather than raw defaults.
+- **Estimated effort:** 1–4hr
 
 ## Interview defense
 
-**Q: "Your recommender has zero data on launch day. What do you ship?"**
-Name which box is empty first — for a brand-new system it's the whole interaction
-table, so collaborative filtering is impossible. Ship a content-based scorer over
-a pre-trained embedding plus editorial/heuristic rules, serve from day one, and
-log every interaction. Once enough behavior accumulates, retrain a real
-recommender and swap the scorer. You're never blocked; you're on the bootstrap.
+**Q: Your single-user personal agent has no other users. Isn't cold-start a non-issue for you?**
+
+The opposite — it is the hardest flavor. With many users you borrow popularity priors from the crowd. A single-user system *is* the new-system case: no crowd, empty database.
 
 ```
-  empty table ─► content + rules (pre-trained embedding) ─► serve + LOG ─► retrain
-                          day 0                                    later
+many users          one user (buffr)
+┌────────┐          ┌────────┐
+│ crowd  │──priors─▶│   ∅    │  no crowd to borrow from
+└────────┘          └────────┘
 ```
-*Anchor: cold start is signal substitution, not a modeling problem.*
 
-**Q: "How do new users and new items differ — aren't they the same problem?"**
-No — different empty cells, different bridges. A new *user* has no history, so you
-borrow from what they declared (onboarding, demographics) and a popularity prior.
-A new *item* has no interactions, so you embed its content and place it near
-similar known items. One substitutes user signal, the other substitutes item
-signal; conflating them ships the wrong fix.
+Anchor: contrl behaves sanely before the first rep is logged — same blank-start discipline, one user, no history.
+
+**Q: How do you pick the threshold for switching from rules to personalization?**
+
+You don't pick it cleverly up front; you pick a defensible number, log every strategy decision, and tune once you have real interaction volume. Too low personalizes on noise, too high feels like the agent never learns.
 
 ```
-  new user → declared prefs + popularity   (substitute USER signal)
-  new item → content embedding → neighbors (substitute ITEM signal)
+n: 0 ──── WARM_THRESHOLD ──── many
+   rules      ▲ tune here     personalize
 ```
-*Anchor: which input is missing decides the mitigation.*
+
+Anchor: a rep counter that "adapted" after one ambiguous frame would be worse than one that waits — same logic.
+
+**Q: New user vs new item — why can't the same fix cover both?**
+
+A new user has no history but the population does, so you fall back to popularity. A new item has no history *and no population of itself* to average over, so its own content features are the only purchase.
+
+```
+new user ─▶ borrow crowd (popularity)
+new item ─▶ borrow nothing; use item's own features
+```
+
+Anchor: a never-seen exercise type in a rep counter can't be inferred from other users' reps of *that* exercise — only from the motion's own features.
 
 ## See also
 
-- `10-recommender-systems.md` — the collaborative destination cold start bridges to
-- `16-retraining-pipelines.md` — swapping the bootstrap scorer once data accumulates
-- `01-supervised-pipeline.md` — the generic arc the eventual recommender follows
+- [10-recommender-systems.md](./10-recommender-systems.md) — the machine cold-start sits in front of
+- [12-on-device-inference.md](./12-on-device-inference.md) — where the personal agent actually runs

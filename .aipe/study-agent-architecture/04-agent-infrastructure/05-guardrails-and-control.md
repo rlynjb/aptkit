@@ -1,121 +1,125 @@
 # Guardrails and Control
 
-**Industry standard.** "Guardrails," "the control envelope," "agent safety controls." Type label: infrastructure. **In this codebase: partially — aptkit has a strong loop-control envelope (caps, budgets, least-privilege, read-only tools), but no input/output content guardrail and no human-in-the-loop pause.**
+**Industry term:** guardrails / the control envelope around an autonomous loop. *Industry standard.*
 
 ## Zoom out, then zoom in
 
-The controls that bound an autonomous loop. Three points: an input guardrail (validate/sanitize), the loop controls (caps, budgets, human gates), and an output guardrail (schema, safety, no direct side effects). aptkit invests heavily in the *loop* controls and the *least-privilege* boundary; it's thinner on input/output content guardrails.
+The controls that bound an autonomous loop. aptkit has the core envelope: iteration caps, a forced synthesis turn, a least-privilege tool allowlist, and output validators. The human-in-the-loop gate is `not yet exercised`.
 
 ```
-  Zoom out — aptkit's control envelope
+  Zoom out — the control envelope wraps the loop
 
-  ┌─ Input guardrail ───────────────────────────────────────┐
-  │  (validate / sanitize)  ← THIN in aptkit (no content     │
-  │   sanitizer; relies on read-only tools)                  │
-  └───────────────────────────┬──────────────────────────────┘
-                              ▼
-  ┌─ Agent loop (STRONG controls) ────────────────────────────┐
-  │  iteration cap (maxTurns) · tool-call cap (maxToolCalls)  │ ← we are here
-  │  token budget (maxTokens) · least-privilege tool policy    │
-  └───────────────────────────┬──────────────────────────────┘
-                              ▼
-  ┌─ Output guardrail ────────────────────────────────────────┐
-  │  schema validation (parseResult + validators)             │
-  │  NO direct side effects (all tools are read-only)          │
-  └─────────────────────────────────────────────────────────────┘
+  ┌─ Capability layer ──────────────────────────────────────────┐
+  │  ToolPolicy allowlist (input-side trust boundary)            │ ← we are here
+  └───────────────────────────────┬──────────────────────────────┘
+  ┌─ Runtime layer ─────────────────▼───────────────────────────┐
+  │  agent loop: maxTurns · maxToolCalls · forced synthesis turn │
+  └───────────────────────────────┬──────────────────────────────┘
+  ┌─ Capability layer ──────────────▼───────────────────────────┐
+  │  output validator (validate.ts) before trusting is_final     │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-## Structure pass
+Zoom in: aptkit bounds the loop on three sides. On the way in, `filterToolsForPolicy` scopes which tools the agent can even see. Inside, `maxTurns`/`maxToolCalls` plus the forced synthesis turn cap the spend. On the way out, per-agent validators check the output before it's trusted. The missing side is a human-in-the-loop pause.
 
-**Axis: where is the loop bounded, and where could it cause harm?** Trace aptkit's controls: the loop is bounded by three caps; harm is pre-empted by read-only tools + least-privilege policy (the agent has no write tool to misuse). The seam: aptkit controls the loop's *resource* envelope (caps) and *capability* envelope (read-only allowlist) tightly, but has no *content* envelope (input sanitization, output safety check) — because its agents can't take destructive actions, so a content guardrail is lower priority.
+## The structure pass
+
+**Layers.** Input guardrail (what the agent can reach) → loop guardrail (how long it can run) → output guardrail (what's trusted out).
+
+**Axis: trust — at each control point, what's prevented?** Input: the agent can't reach a tool outside its role. Loop: it can't run forever. Output: malformed/unsafe output isn't trusted.
+
+**The seam.** Each guardrail is a seam between "the model freewheeling" and "your code constraining it." The most important: the model's output never triggers a side effect directly — it goes through your code.
 
 ## How it works
 
-### Move 1 — the mental model
+**Use case in aptkit:** every agent runs inside this envelope. The clearest is the least-privilege allowlist — the rag-query agent can call exactly one tool, no matter what it tries.
 
-The control envelope is a sandbox around the loop: bound the resources (caps), bound the capabilities (what tools exist), and gate the dangerous outputs. You've built this — a rate limiter + a permissions check + input validation around an endpoint. The agent version is the same three layers around the loop.
+### Move 1 — the control points
 
 ```
-  The control envelope — three points
-
-  input guardrail ─► [ agent loop: caps + budget + policy ] ─► output guardrail
-   (validate)          (bound resources + capabilities)         (schema, no side fx)
+  ┌───────────────────────────────────────────────┐
+  │  Input guardrail   (ToolPolicy allowlist)      │
+  └────────────────────┬──────────────────────────┘
+                       ▼
+  ┌───────────────────────────────────────────────┐
+  │  Agent loop                                    │
+  │   • iteration cap (maxTurns)                   │
+  │   • tool-call budget (maxToolCalls)            │
+  │   • forced synthesis turn (no tools at budget) │
+  │   • human-in-the-loop pause (NOT YET)          │
+  └────────────────────┬──────────────────────────┘
+                       ▼
+  ┌───────────────────────────────────────────────┐
+  │  Output guardrail  (validate.ts schema check;  │
+  │  output never triggers a side effect directly) │
+  └───────────────────────────────────────────────┘
 ```
 
-### Move 2 — the controls aptkit has, and the two it doesn't
+### Move 2 — the walkthrough
 
-**Loop controls — strong.** Every agent sets the three caps:
+**Input: least-privilege tool allowlist.** Each agent declares exactly which tools it may call; `filterToolsForPolicy` hands the loop only those:
 
-```typescript
-// rag-query-agent.ts:76 / recommendation-agent.ts:86-87 / rubric-improvement-agent.ts:76-77
-maxTurns: 6, maxToolCalls: 4,   // iteration + tool-call caps
-maxTokens: 2400,                // token/cost ceiling (rubric agent)
+```ts
+// tool-policy.ts:11 — the model only ever SEES the allowed tools
+export function filterToolsForPolicy(allTools, policy): ModelTool[] {
+  const allowed = new Set(policy.allowedTools);
+  return allTools.filter((tool) => allowed.has(tool.name)).map(...);
+}
+// rag-query-agent.ts:15 — this agent's allowlist is exactly one tool
+allowedTools: [SEARCH_KNOWLEDGE_BASE_TOOL_NAME],
 ```
 
-`maxTurns` bounds total iterations; `maxToolCalls` bounds tool-call cost; `maxTokens` caps per-call output. The forced synthesis turn (`run-agent-loop.ts:104`) is the control that makes the budget exit *produce an answer* rather than just halt. Without these, an agent without caps loops silently and burns tokens — the most common production cost-blowup.
+The agent can't call a tool it wasn't granted, because it never sees it in the schema list. That's the trust boundary — not "we asked the model nicely," but "the tool isn't in the menu." The recommendation agent's allowlist is 13 read-only tools; none mutate anything. Least-privilege by construction.
 
-**Capability control — least-privilege, strong.** The tool policy is a control: an agent can only call tools in its allowlist, and *all aptkit agent tools are read-only* (recommendation's 13 tools are all `list_*`/`get_*`; rag-query's one tool is search). So even a fully hijacked agent can't write, delete, or take a destructive action — there's no such tool in scope.
+**Loop: caps plus the forced synthesis turn.** Covered in [../01-reasoning-patterns/02-agent-loop-skeleton.md](../01-reasoning-patterns/02-agent-loop-skeleton.md) — `maxToolCalls` caps the spend, and at the budget the loop withholds tools and demands an answer (`run-agent-loop.ts:101`). An agent without caps loops silently and burns tokens; this is the control that prevents it.
 
-```typescript
-// recommendation-agent.ts:21-35 — every tool is read-only
-allowedTools: ['list_scenarios', 'get_scenario', 'list_initiatives', ... 'get_anomaly_context']
-//             ^^^^ all reads; no write/delete/send in any agent's policy
-```
+**Output: validate before trusting.** Per-agent validators (`validate.ts`) check the output shape before it's returned; the parse-recovery turn retries on failure. And critically — the agent's output is *data the host acts on*, not a side effect the agent triggers. aptkit's agents return validated values (`Recommendation[]`, a string answer); they don't directly write to a database or call an external API as a side effect of generation. That's the prompt-injection defense: an agent whose output triggers side effects directly is a liability; one whose output is validated data your code then acts on is bounded.
 
-This is the heart of "never let agent output trigger side effects directly — go through your code." aptkit's version: the agent's *tools* are read-only, so its output can't trigger a side effect because no tool does one. Any write happens in the consuming app's code, after validating the agent's structured output.
-
-**Output control — schema validation, present.** `parseResult` + the per-agent validators (`tryParseRecommendations`, `validateRubricImprovementResult`) ensure the agent's output matches a schema before anything trusts it. The recovery turn salvages a parse failure. So malformed output is caught at the boundary.
-
-**The two gaps, named honestly:**
-- **No input content guardrail.** No sanitizer scrubs prompt-injection attempts from user input. aptkit's mitigation is structural (read-only tools mean injection can't cause a destructive action), not a content filter. A consuming app that adds write tools would need a real input guardrail.
-- **No human-in-the-loop pause.** The loop runs start-to-finish; there's no checkpoint to gate a high-stakes action for human approval. This is the capability graph orchestration (SECTION C file 07) would unlock — aptkit's implicit loop can't pause and resume.
+**The missing side: human-in-the-loop.** There's no pause-for-approval gate in `runAgentLoop`. A high-stakes action (the recommendation agent suggesting a real campaign change) is returned as data for a human to approve in the host — but the *loop itself* can't pause mid-run and resume after sign-off. That requires the checkpointed state of graph orchestration ([../03-multi-agent-orchestration/07-graph-orchestration.md](../03-multi-agent-orchestration/07-graph-orchestration.md)). `not yet exercised` as an in-loop gate; handled today by returning data to the host.
 
 ### Move 3 — the principle
 
-An agent without caps loops silently and burns tokens; an agent whose output triggers side effects directly is a prompt-injection liability. aptkit handles the first with the three loop caps and the second *structurally* — read-only tools mean there's no side effect to trigger, so the agent's output is always inert until the app's code acts on validated output. The gaps (input sanitizer, human gate) are lower priority precisely because the read-only boundary already neutralizes the highest-stakes risk.
+An agent without caps loops silently and burns tokens; an agent whose output triggers side effects directly is a prompt-injection liability. The control envelope bounds both — least-privilege on the way in (the tool isn't in the menu), caps inside (it can't run forever), validated data on the way out (your code acts, not the model). aptkit has all three; the human-in-the-loop pause is the one piece that needs checkpointed state it doesn't have yet.
 
 ## Primary diagram
 
 ```
-  aptkit's control envelope — full frame
+  aptkit's control envelope around runAgentLoop
 
-  user input ──► [ NO content sanitizer — relies on read-only tools ]
-                              │
-                              ▼
-  ┌─ Agent loop (the controls aptkit has) ────────────────────┐
-  │  maxTurns (iterations) · maxToolCalls (tool cost) ·         │
-  │  maxTokens (output cap) · forced synthesis (budget→answer) │
-  │  filterToolsForPolicy → READ-ONLY allowlist only           │
-  └───────────────────────────┬──────────────────────────────┘
-                              ▼
-  ┌─ Output ───────────────────────────────────────────────────┐
-  │  parseResult + validators (schema) → recovery turn on fail  │
-  │  output is INERT: no write tool exists, so no direct side fx │
-  │  (NO human-in-the-loop pause — loop runs to completion)     │
-  └─────────────────────────────────────────────────────────────┘
+  INPUT     filterToolsForPolicy → agent sees ONLY its allowlist
+            (rag-query: 1 tool · recommendation: 13 read-only)   ✓
+
+  LOOP      maxTurns + maxToolCalls + forced synthesis turn        ✓
+            human-in-the-loop pause                               ✗ not yet exercised
+
+  OUTPUT    validate.ts (schema) + recovery turn                  ✓
+            output = DATA the host acts on, NOT a direct side effect ✓
+            (the prompt-injection boundary)
 ```
 
 ## Elaborate
 
-The control envelope is what separates a demo agent from a shippable one — the demo runs once and looks great; the shipped one runs ten thousand times and must not loop forever, blow the budget, or take an unsafe action. aptkit's strongest control is the read-only-tools-plus-least-privilege boundary, which is the architecturally cleanest version of "go through your code for side effects": the agent simply has no destructive tool. That's a stronger guarantee than an output filter, because there's nothing to filter. The honest gaps — input sanitization and a human gate — are exactly the controls a consuming app must add when it grants the agent write tools.
+Guardrails are what separate a demo from a shipped agent. The two failures they prevent are the silent token burn (no cap) and the unsafe side effect (output wired straight to an action). aptkit's design closes both structurally: least-privilege allowlists mean an injected prompt can't make the agent call a tool it wasn't granted, and returning validated data instead of triggering side effects means a manipulated output is just bad data your code can reject, not an executed action. The human-in-the-loop gate — pause, get approval, resume — is the one control that needs more than a loop; it needs the checkpointed state graphs provide, which is why it's the honest gap.
 
 ## Interview defense
 
-**Q: What stops your agent from looping forever or taking an unsafe action?**
-Two things. For runaway loops: three caps — `maxTurns`, `maxToolCalls`, `maxTokens` — plus a forced synthesis turn so hitting the budget produces an answer instead of a hang. For unsafe actions: every agent's tool policy is a read-only allowlist. There's no write, delete, or send tool in any agent's scope, so the agent's output is inert — it can't trigger a side effect because no tool does one. Any write happens in the app's code after validating the structured output.
+**Q: What stops an aptkit agent from doing something unsafe?**
+
+Three controls. The tool allowlist — the agent only sees the tools its `ToolPolicy` grants, so an injected prompt can't make it call something it wasn't given. The loop caps — `maxToolCalls` plus a forced synthesis turn, so it can't burn tokens in a silent loop. And the output is validated *data the host acts on*, not a side effect the agent triggers — so a manipulated output is rejectable bad data, not an executed action.
 
 ```
-  caps (no runaway) + read-only tool policy (no side effects) + schema validation
+  input:  tool not in menu  → can't call it      (least-privilege)
+  loop:   cap + forced synthesis → can't run forever
+  output: validated data, host acts → no direct side effect (injection boundary)
 ```
-*Anchor: "go through your code for side effects" — my version is the agent has no side-effecting tool at all.*
 
-**Q: What about prompt injection?**
-I have no content sanitizer — my mitigation is structural. Even a fully hijacked agent can only call read-only tools, so injection can't cause a destructive action. The day a consuming app grants write tools, it needs a real input guardrail and a human-in-the-loop gate — and my loop can't pause for a human yet, which is what graph orchestration would add.
+I'd flag the gap: there's no in-loop human-approval pause yet — high-stakes outputs are returned for the host to approve, but the loop can't checkpoint and resume. That needs graph-style state.
+
+*Anchor: the strongest guardrail isn't a prompt plea — it's that the tool isn't in the menu and the output is data, not an action.*
 
 ## See also
 
-- `02-agent-loop-skeleton.md` — the budget exit these caps enforce
-- `03-tool-calling-and-mcp.md` — the least-privilege policy
-- `03-multi-agent-orchestration/07-graph-orchestration.md` — the human-in-the-loop pause aptkit lacks
-- `05-production-serving/03-per-tool-circuit-breaking.md` — bounding a flaky tool inside the loop
-- `study-security/` — trust boundaries, LLM/agent security (cross-ref)
+- [../01-reasoning-patterns/02-agent-loop-skeleton.md](../01-reasoning-patterns/02-agent-loop-skeleton.md) — the caps as part of the loop skeleton.
+- [03-tool-calling-and-mcp.md](03-tool-calling-and-mcp.md) — the allowlist as a trust boundary.
+- [../03-multi-agent-orchestration/07-graph-orchestration.md](../03-multi-agent-orchestration/07-graph-orchestration.md) — the checkpointing a human gate needs.
+- Prompt-injection and per-call error recovery: `.aipe/study-ai-engineering/`.

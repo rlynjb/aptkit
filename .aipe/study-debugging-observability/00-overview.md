@@ -1,71 +1,105 @@
-# Debugging & Observability — the map
+# Overview — Debugging & Observability in aptkit
 
-> How aptkit reveals its own behavior. Read this first, then the audit, then the pattern files in order.
+The question this guide answers: **when an agent gives a wrong answer, what
+evidence exists to explain it quickly and stop it recurring?**
 
-The question this whole guide answers: **when an agent does something wrong, what evidence exists to explain it quickly — and to stop it recurring?**
+For aptkit the answer is one mechanism doing almost all the work: the
+structured event log (the `CapabilityEvent` trace). The agent loop emits it,
+three consumers read it, and the one production incident on record was solved
+entirely by reading the persisted version of it backward. There are no
+metrics, no spans, no alerting — and for a single-process toolkit that mostly
+replays deterministically, that's the right scope. The honest gaps are real
+and named at the bottom.
 
-For a normal web app the answer is "logs + a stack trace." For an LLM agent it's different. There's no stack trace for "the model decided to pass a filter that wiped the results." The bug lives in a *decision the model made mid-run*, and the only way to see it is to have recorded every decision as it happened. That recording is the spine of aptkit's observability, and it has a name: the **CapabilityEvent trace**.
-
-## The whole system in one frame
-
-Everything below hangs off one stream of events. The agent loop emits it; three sinks consume it.
+## The evidence map — what can be observed, and where
 
 ```
-  Observability spine — one event stream, three sinks
+  Observability spine — one emitter, three readers
 
-  ┌─ Runtime layer (packages/runtime) ───────────────────────────────┐
-  │  runAgentLoop()  ── emits ──►  CapabilityEvent                    │
-  │  run-agent-loop.ts:112-179      (step · tool_call_start ·        │
-  │                                  tool_call_end · model_usage ·    │
-  │                                  warning · error)                 │
-  └───────────────────────────┬──────────────────────────────────────┘
-                              │  trace?.emit(event)   (sync, fire-and-forget)
-          ┌───────────────────┼────────────────────────────┐
-          ▼                   ▼                            ▼
-  ┌─ Studio (apps) ──┐ ┌─ buffr (durable) ──────┐ ┌─ Runtime (derived) ──┐
-  │ TracePanel       │ │ SupabaseTraceSink      │ │ summarizeUsage()     │
-  │ components.tsx   │ │ → agents.messages      │ │ usage-ledger.ts:25   │
-  │ :131 visual      │ │ (Postgres, ordered by  │ │ tokens + USD cost    │
-  │ replay = the     │ │  event timestamp)      │ │ folded from trace    │
-  │ dev-time debugger│ │ the war-story evidence │ │                      │
-  └──────────────────┘ └────────────────────────┘ └──────────────────────┘
-   ephemeral, in-browser  durable, queryable          a pure reduction
+  ┌─ Runtime layer (the emitter) ──────────────────────────────┐
+  │  runAgentLoop()                                            │
+  │  run-agent-loop.ts                                         │
+  │    emits → step | tool_call_start | tool_call_end          │
+  │            | model_usage | warning | error                 │
+  │            (CapabilityEvent, events.ts)                     │
+  └───────────────────────────┬────────────────────────────────┘
+                              │ trace.emit(event)   one sink interface:
+                              │                     CapabilityTraceSink
+        ┌─────────────────────┼─────────────────────┐
+        │                     │                     │
+        ▼ (dev)               ▼ (cost)              ▼ (prod, in buffr)
+  ┌─ Studio UI ────┐   ┌─ Usage ledger ─┐   ┌─ Storage layer ──────┐
+  │ AgentReplay-   │   │ summarizeUsage  │   │ SupabaseTraceSink    │
+  │ Shell + Trace- │   │ estimateCost    │   │ → agents.messages     │
+  │ Panel; NDJSON  │   │ usage-ledger.ts │   │ (Postgres, buffr repo)│
+  │ when streamed  │   └─────────────────┘   └──────────────────────┘
+  └────────────────┘
+   visual replay        cost per run         durable, queryable trail
 ```
 
-One event type, three readers. The same `CapabilityEvent[]` array drives a live visual timeline in Studio, gets written row-by-row into Postgres by buffr, and folds into a token/cost summary by a pure function. Learn the event shape once (`packages/runtime/src/events.ts:1-24`) and you understand all three.
+The interface is the seam. `CapabilityTraceSink.emit(event)` is the only
+contract a consumer implements (`packages/runtime/src/events.ts:26-28`).
+Anything that wants to observe a run implements that one method. Studio's
+in-memory collector, buffr's Postgres writer, and a no-op all satisfy it
+identically — the emitter never knows which it's talking to.
 
-## Ranked findings — what's interesting here
+## Ranked findings
 
-1. **The trace IS the observability system — there is no separate logger.** aptkit emits zero `console.log` lines from its agent loop. Instead every consequential moment (a model turn, a tool call's args, its result, its duration, a token count, a warning) is a typed event on one stream. This is the single most important thing to understand: debugging this codebase means *reading the trace*, not grepping logs. → `01-capability-event-trace.md`
+**1. The trace IS the observability system — and it's well-designed.**
+`CapabilityEvent` is a discriminated union of six event types
+(`packages/runtime/src/events.ts:1-24`), emitted at every meaningful boundary
+of the agent loop: each model turn (`model_usage`), each assistant message
+(`step`), each tool call's start and end with `durationMs` and `error`
+(`tool_call_start` / `tool_call_end`), plus `warning` and `error`. Because the
+emitter writes to an *interface*, not a logger, the same event stream becomes a
+dev-time replay UI, a cost ledger, and a durable production trajectory with no
+change to the loop. → `01-capability-event-trace.md`, `02-trace-fan-out-three-consumers.md`.
 
-2. **A real bug was diagnosed by reading the persisted trajectory backward — and the fix shipped with a regression test.** The agent answered "not available" on a corpus that clearly contained the answer. Reading the durable trajectory from the final answer *backward*, the `tool_call_start` event showed Gemma had passed a hallucinated `{textContains: ...}` filter; the exact-match filter then zeroed every result. The fix (`matchesFilter`, commit `c5dbf1a`) ignores filter keys no chunk carries, locked by a regression test. → `03-persisted-trajectory-backward-read.md`, `04-silent-empty-result-blind-spot.md`
+**2. The durable trajectory is what made the signature incident solvable.**
+buffr's trace sink (`SupabaseTraceSink`,
+`/Users/rein/Public/buffr/src/supabase-trace-sink.ts:49-94`) persists *every*
+event variant — including tool-call args, the cause — to `agents.messages`,
+stamping each row with the event's own `timestamp` so replay order matches emit
+order. An agent answered "not available" on a corpus that clearly contained the
+answer. The fix came from reading that persisted trajectory *backward*:
+final answer → empty tool result → the `tool_call_start` args showed Gemma had
+passed a hallucinated `{textContains}` filter that exact-matched to zero hits.
+→ `03-durable-trajectory-supabase-sink.md`, `04-reading-the-trajectory-backward.md`.
 
-3. **The same trace makes bugs reproducible without a network.** Live runs are recorded as fixtures (`ModelResponse[]`); `FixtureModelProvider` replays them deterministically. The "not available" bug can be reproduced offline, in a unit test, with no Ollama running. → `05-deterministic-replay-reproduction.md`
+**3. Empty retrieval is SILENT — the one real diagnostic blind spot.**
+The `search_knowledge_base` tool returns `{ query, results: [] }` on zero hits
+(`packages/retrieval/src/search-knowledge-base-tool.ts:92-95`) and emits no
+`warning` event. A zero-hit retrieval and a one-hit retrieval look identical in
+the trace except for an empty array you have to notice. The fix that *was*
+shipped hardened the filter so a hallucinated key can't zero results
+(`matchesFilter`, line 101-106) plus a regression test. The fix that is **not**
+shipped is a zero-hit `warning` event that would have flagged the incident the
+moment it happened instead of after a user complaint. → `audit.md` lens 8,
+`06-hallucination-tolerant-retrieval-guard.md`.
 
-## The honest gaps — `not yet exercised`
+## not yet exercised
 
-This is a single-process toolkit and a laptop runtime, not a fleet of services. So large swaths of production observability simply aren't here, and the audit says so plainly:
+These are absent by deliberate scope, not oversight. Each becomes relevant only
+at a shape this repo hasn't reached.
 
-- **No metrics system.** No counters, gauges, or histograms; no Prometheus/OpenTelemetry/Datadog. Token totals are computed *after* a run from the trace, not emitted as a live metric. `not yet exercised`.
-- **No distributed tracing / spans.** `CapabilityEvent` has a `capabilityId` and a `timestamp` but no `traceId`/`spanId` and no parent links. One process, one run — there's nothing to correlate *across*. `not yet exercised`.
-- **No log aggregation.** No structured log shipper, no searchable index beyond ad-hoc SQL over `agents.messages`. `not yet exercised`.
-- **No alerting or incident tooling.** No thresholds, no pages, no runbooks, no on-call. `not yet exercised`.
-- **No per-call timeout instrumentation.** The loop honors an `AbortSignal` (`run-agent-loop.ts:99`) but nothing sets a deadline or records a timeout as a distinct, observable failure. `not yet exercised`.
-- **The teachable one — empty retrieval is silent.** A zero-hit search emits *no* warning event. That silence is exactly what made the war-story bug hard. The unbuilt fix is one line: emit a `warning` event when retrieval returns nothing. → `04-silent-empty-result-blind-spot.md`.
-
-## Reading order
-
-1. `audit.md` — the 8-lens sweep; what each observability boundary actually exposes.
-2. `01-capability-event-trace.md` — the event spine. **Read this before any other pattern file.**
-3. `02-trace-replay-as-debugger.md` — Studio's visual timeline as the dev-time debugger.
-4. `03-persisted-trajectory-backward-read.md` — the war story, told as a debugging arc.
-5. `04-silent-empty-result-blind-spot.md` — the root-cause blind spot and the unbuilt fix.
-6. `05-deterministic-replay-reproduction.md` — making the bug reproducible offline.
-7. `06-model-usage-accounting.md` — turning trace into tokens and dollars.
-
-## See also (neighboring guides)
-
-- `study-testing` — owns the fixture/replay *correctness* mechanism (eval scorers, promotion). This guide borrows it for *reproduction*; the eval semantics live there.
-- `study-performance-engineering` — owns latency/throughput *measurement*. `durationMs` on `tool_call_end` is shared evidence; the budgets live there.
-- `study-system-design` — owns the provider/retrieval seams. This guide reads what crosses them.
-- `study-ai-engineering` — owns RAG retrieval quality (precision@k). The war story's *fix quality* lives there; its *diagnosis* lives here.
+- **Metrics system (Prometheus / OpenTelemetry / StatsD).** No counters,
+  gauges, or histograms. A grep for `prometheus|opentelemetry|otel|datadog`
+  across both repos returns nothing. Relevant when the toolkit runs as a
+  long-lived service with aggregate behavior to watch, not per-run traces.
+- **Distributed tracing / spans / trace-correlation IDs.** No `traceId`,
+  `correlationId`, `requestId`, or span propagation. The agent loop is one
+  process; there's no cross-service call to correlate. Relevant when a request
+  fans out across services.
+- **Log aggregation / structured log levels.** No log shipper, no log levels —
+  the trace replaces logs. Relevant at multi-instance scale where you can't
+  read one process's output.
+- **Alerting / incident tooling / on-call.** No thresholds, no pages. The one
+  incident was found by a human noticing a wrong answer. Relevant once the
+  system serves traffic nobody is watching live.
+- **Per-call timeout instrumentation.** `runAgentLoop` threads an `AbortSignal`
+  (`run-agent-loop.ts:99`) but there's no per-tool timeout budget emitted as an
+  event. Relevant when a hung provider call needs to be observable, not just
+  abortable.
+- **Cost coverage beyond gpt-4.1.** `pricingForModel` only prices `gpt-4.1*`
+  (`packages/runtime/src/usage-ledger.ts:71-78`); Anthropic and Gemma runs
+  return `undefined` cost. The cost signal exists but is partial.

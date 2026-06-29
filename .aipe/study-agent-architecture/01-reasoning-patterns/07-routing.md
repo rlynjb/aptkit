@@ -1,125 +1,143 @@
 # Routing
 
-**Industry standard.** "Intent routing," "LLM router," "classify-then-dispatch." Type label: reasoning pattern (the bridge to multi-agent). **In this codebase: yes — the query agent's `classifyIntent` is an LLM router.**
+**Industry term:** routing / intent classification (pick the handler before committing to a loop). *Industry standard.*
 
 ## Zoom out, then zoom in
 
-Routing picks the right handler *before* committing to a loop. aptkit's query agent does exactly this: it classifies a natural-language question into one of three intents, then dispatches. It's also the bridge from single-agent to multi-agent — in a single-agent system routing picks a *tool*; in a multi-agent system the same pattern picks which *agent* runs (the supervisor's core job).
+Pick the right handler before you run a loop. In a single-agent system, routing picks a tool; in a multi-agent system, the same pattern picks which *agent* handles the request — which is the supervisor's core job. aptkit has a real instance of this in the query agent.
 
 ```
-  Zoom out — routing in aptkit's query agent
+  Zoom out — routing lives at the front of the query capability
 
-  ┌─ Caller layer ──────────────────────────────────────────┐
-  │  ★ classifyIntent ★  query/src/intent.ts:13              │ ← we are here
-  │  one model call → "monitoring" | "diagnostic" |          │
-  │                   "recommendation"                       │
-  └───────────────────────────┬──────────────────────────────┘
-                              │ parseIntent maps word → route
-  ┌─ Dispatch layer ──────────▼──────────────────────────────┐
-  │  picks which capability/answer path handles the query     │
-  └────────────────────────────────────────────────────────────┘
+  ┌─ Capability layer ──────────────────────────────────────────┐
+  │  query agent: classifyIntent() ─► route to a handler         │ ← we are here
+  │  (monitoring / diagnostic / recommendation)                  │
+  └───────────────────────────────┬──────────────────────────────┘
+                                   │ then the agent loop runs
+  ┌─ Runtime layer ─────────────────▼───────────────────────────┐
+  │  the agent loop skeleton                                      │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-## Structure pass
+Zoom in: aptkit's query agent (`packages/agents/query/src/intent.ts`) uses an LLM router to classify a natural-language question into one of three intents, with a deterministic parser turning the model's word into an enum. It's a clean two-tier router — and it's the bridge from this sub-section to multi-agent orchestration.
 
-**Layers:** classify → dispatch. **Axis: who decides, and how cheaply?** aptkit's router is a single 16-token model call (`intent.ts:25`) — deterministic dispatch, model-decided classification. The seam: classification is *model* judgment (handles paraphrase), dispatch is *code* (deterministic). That split is the production routing pattern — let the model handle ambiguity, let code handle the branch.
+## The structure pass
+
+**Layers.** A fast deterministic tier (parse the model's word) over the model tier (classify intent).
+
+**Axis: control — who decides the route?** A heuristic decides when the input is unambiguous; the model decides when it isn't.
+
+```
+  "who decides the route?" — traced across the two tiers
+
+  ┌─ heuristic tier ─┐   seam    ┌─ model tier ──────┐
+  │ string match     │ ═══╪═════► │ classify intent   │
+  │ (deterministic)  │ (it flips) │ (model-decided)   │
+  └──────────────────┘           └───────────────────┘
+```
+
+**The seam.** The boundary between deterministic matching and model classification. aptkit actually inverts the textbook order here — see the walkthrough.
 
 ## How it works
 
+**Use case in aptkit:** the query agent. A user asks a free-text question; the agent must route it to the right analytical lens (what changed / why / what to do) before answering.
+
 ### Move 1 — the mental model
 
-Routing is a switch statement where the model fills in the case. You know how a form might `switch (field.type)` to pick a renderer? Same shape — except the model reads the user's natural language and returns which case to take.
+It's a `switch` statement where the case is decided by a model instead of by your code. You know the handlers; you just need to pick one. The fast path is a string match; the slow path asks a model to classify.
 
 ```
-  Routing — heuristic-first, LLM-fallback (the production pattern)
-
   Input
     │
     ▼
   ┌─────────────────────┐
-  │ Heuristic router    │  fast, deterministic (parseIntent: substring match)
+  │ Heuristic router    │ fast, deterministic
+  │ (regex, rules)      │
   └─────────┬───────────┘
-            │ ambiguous / no clear match
+            │ no clear match
             ▼
   ┌─────────────────────┐
-  │ LLM router          │  classify intent, pick the handler
+  │ LLM router          │ classify intent, pick
+  │ (model-decided)     │ the handler/agent/tool
   └─────────────────────┘
 ```
 
-### Move 2 — aptkit's two-piece router
+### Move 2 — the walkthrough
 
-**Piece 1 — the LLM classifier.** One tiny model call, constrained to one word, with a tight token budget so it can't ramble.
+**aptkit's router runs the tiers in the other order — and that's deliberate.** The model classifies first, then a deterministic parser turns its word into an enum:
 
-```typescript
-// packages/agents/query/src/intent.ts:13
+```ts
+// intent.ts:12 — model classifies the intent
 const response = await model.complete({
   system: 'Classify the user query as exactly one word: monitoring (what changed / what is new), '
         + 'diagnostic (why did something happen), or recommendation (what should I do). '
         + 'Reply with ONLY the one word.',
   messages: [{ role: 'user', content: query }],
-  maxTokens: 16,   // ← can't produce more than the one word
+  maxTokens: 16,           // ← tiny budget; this is a cheap classify, not a loop
 });
-```
-
-**Piece 2 — the deterministic parser (the heuristic).** `parseIntent` maps the model's word to a route by substring match, with a safe default — so even a noisy model answer routes somewhere sane.
-
-```typescript
-// packages/agents/query/src/intent.ts:4
+// intent.ts:4 — deterministic parse with a safe default
 export function parseIntent(raw: string): Intent {
   const text = raw.trim().toLowerCase();
   if (text.includes('monitoring')) return 'monitoring';
   if (text.includes('recommendation')) return 'recommendation';
   if (text.includes('diagnostic')) return 'diagnostic';
-  return 'diagnostic';   // ← default: don't crash on an off-format answer
+  return 'diagnostic';     // ← the floor: a garbled model reply still routes
 }
 ```
 
-The interesting choice is the **default to `diagnostic`** (line 10). The model might return "I think this is a diagnostic question" instead of just "diagnostic" — the substring match catches it. And if it returns garbage, it routes to diagnostic rather than throwing. That's the heuristic guarding the LLM, the production pattern in miniature: model for the ambiguous classification, code for the robust dispatch.
+Two things to notice. First, `maxTokens: 16` — routing is a *cheap* single call, not an agent loop. You don't spend loop budget to pick a handler. Second, `parseIntent` is the deterministic guard *after* the model: it tolerates a messy reply (`"monitoring."`, `"Monitoring intent"`) via substring match, and defaults to `diagnostic` when the model says something off-script. That default is the load-bearing part — it means a weak model's garbled output still routes somewhere sane instead of throwing.
 
-**The boundary condition.** A pure-LLM router with no parsing fallback breaks the first time the model returns "monitoring." or "Monitoring:" or a full sentence. `parseIntent`'s substring-match-plus-default is what makes the router survive a weak local model — the same defensive instinct as the `minTopK` floor and the Gemma retry nudge.
+**The textbook order vs aptkit's.** Textbook routing puts the cheap deterministic tier *first* (regex catches high-volume predictable routes) and the model *behind* it for ambiguous ones. aptkit puts the model first because the routes are all natural-language intents with no clean regex — there's no "high-volume predictable" route to short-circuit. The deterministic tier here is a *normalizer + floor*, not a front-line filter. Name the difference: aptkit's heuristic tier guards the model's output rather than pre-empting the model.
+
+**Routing as the bridge to multi-agent.** This same pattern is what a supervisor uses to pick a worker. `classifyIntent` picks an intent; a supervisor would pick an *agent*. aptkit stops at intent-picks-handler because it's single-agent — there's no second agent to route *to*. That's the seam where this sub-section hands off to SECTION C.
 
 ### Move 3 — the principle
 
-Routing is the bridge from SECTION A to SECTION C. Here it picks an answer path; in a supervisor-worker topology the identical pattern picks which *agent* handles the request. The production shape is heuristic-at-the-front for the predictable high-volume routes, LLM-at-the-back for the ambiguous ones — and aptkit's classify-then-parse is the two-call version of that.
+Route before you loop, and route cheap. The production pattern is heuristic-at-the-front for predictable high-volume routes, model-at-the-back for ambiguous ones — but invert it (model first, deterministic floor behind) when there's no clean heuristic to pre-empt the model, as aptkit does. Either way, the deterministic guard with a safe default is what keeps a weak model's bad classification from breaking the route.
 
 ## Primary diagram
 
 ```
-  aptkit's query router — classify then dispatch
+  aptkit's query-agent router — model first, deterministic floor
 
-  ┌─ NL question ────────────────────────────────────────────┐
-  └───────────────────────────┬──────────────────────────────┘
-                              ▼
-  classifyIntent ─model call (16 tok)─► raw word    [Caller→Provider hop]
-                              │
-                              ▼
-  parseIntent ─substring match + default─► 'monitoring' |
-                                           'diagnostic' (default) |
-                                           'recommendation'
-                              │
-                              ▼
-  dispatch to the matching answer path
+  free-text question
+        │
+        ▼
+  ┌──────────────────────────────┐
+  │ classifyIntent (model)        │  maxTokens: 16, cheap single call
+  │ "monitoring|diagnostic|       │
+  │  recommendation" (one word)   │
+  └──────────────┬────────────────┘
+                 │ raw word (possibly messy)
+                 ▼
+  ┌──────────────────────────────┐
+  │ parseIntent (deterministic)   │  substring match
+  │ default → 'diagnostic'        │  ← the floor against a garbled reply
+  └──────────────┬────────────────┘
+                 ▼
+       handler for that intent runs
 ```
 
 ## Elaborate
 
-Routing is the cheapest way to specialize a system without going multi-agent: instead of one giant agent that handles everything, classify first and run a focused path. aptkit's three intents (what changed / why / what to do) map onto the three analytics concerns its agents cover — so the router is also a map of the capability surface. If aptkit ever composed those agents into one multi-agent system, `classifyIntent` is exactly the supervisor's routing step, lifted unchanged.
+Routing is the cheapest high-leverage pattern in agent design: a tiny classify call up front saves a wrong-handler loop downstream. The two-tier shape (deterministic + model) is everywhere — spam filters, support-ticket triage, query planners. aptkit's inversion (model first because no clean regex exists) is the honest adaptation when the inputs don't have a predictable surface. The same pattern scales straight into a supervisor's worker-selection, which is why it sits at the SECTION A → SECTION C seam.
 
 ## Interview defense
 
-**Q: How does your query agent decide what to do?**
-A two-piece router. An LLM classifier — one 16-token call constrained to a single word (monitoring/diagnostic/recommendation) — then `parseIntent`, a deterministic substring match with a safe default. The model handles the ambiguity of natural language; the code handles robust dispatch. The default-to-diagnostic is deliberate: a weak local model that returns a full sentence still routes somewhere sane instead of crashing.
+**Q: How does aptkit route a natural-language query?**
+
+A two-tier router: a cheap model call (`maxTokens: 16`) classifies the query into one of three intents, then a deterministic `parseIntent` normalizes the reply and defaults to `diagnostic` if the model goes off-script.
 
 ```
-  classify (model, ambiguity) → parseIntent (code, robust dispatch + default)
+  question → model classify (cheap) → deterministic parse + default floor → handler
 ```
-*Anchor: heuristic guards the LLM — same defensive pattern as the top_k floor.*
 
-**Q: How does this become a supervisor in a multi-agent system?**
-Unchanged. In single-agent it picks an answer path; in supervisor-worker the same classify step picks which worker agent runs. The router IS the supervisor's routing half — the other half is synthesis, which aptkit doesn't have yet because the agents don't compose.
+I'd note it inverts the textbook order — model first, deterministic guard behind — because the intents have no clean regex to pre-empt the model with. The default-to-diagnostic floor is what makes it safe against a weak model.
+
+*Anchor: route cheap, and put a deterministic floor with a safe default behind the model so a garbled classification still routes somewhere sane.*
 
 ## See also
 
-- `01-chains-vs-agents.md` — the router is the chain-side step
-- `03-multi-agent-orchestration/02-supervisor-worker.md` — routing as the supervisor's core job
-- `02-agentic-retrieval/03-retrieval-routing.md` — the same pattern applied to picking a knowledge source
+- [02-agent-loop-skeleton.md](02-agent-loop-skeleton.md) — what runs after the route is picked.
+- [../02-agentic-retrieval/03-retrieval-routing.md](../02-agentic-retrieval/03-retrieval-routing.md) — the same pattern applied to picking a knowledge source.
+- [../03-multi-agent-orchestration/02-supervisor-worker.md](../03-multi-agent-orchestration/02-supervisor-worker.md) — routing as a supervisor's worker-selection.

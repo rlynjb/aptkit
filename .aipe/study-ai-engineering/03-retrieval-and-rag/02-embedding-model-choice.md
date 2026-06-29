@@ -1,238 +1,193 @@
-# Embedding model choice — the one-way door
+# Embedding model choice
+> The one-way door · Industry standard
 
-**Subtitle:** Model selection · which embedder, and the cost of changing it · *Language-agnostic*
+Here's the thing nobody tells you when you pick an embedding model: you're not picking a library you can swap on a Tuesday. You're picking the coordinate system your entire corpus lives in. Switch models and every vector you've stored is suddenly in the wrong space — your query points at coordinates that mean nothing to the old data. That's why aptkit treats the model choice as a *one-way door* and guards it with two loud assertions. Pick nomic, you've committed the corpus to nomic until you re-embed all of it.
 
 ## Zoom out, then zoom in
 
-Picking the embedding model is the one retrieval decision you cannot cheaply undo.
-It sits at the same seam as the embedder, but the consequence ripples down into the
-store: every vector in the corpus carries the fingerprint of the model that made
-it, and they all have to match.
+The model choice fixes one number — `dimension` — and that number propagates through every layer below it.
 
 ```
-  Zoom out — the choice ripples down the stack
-
-  ┌─ Choice: which EmbeddingProvider? ──────────────────────────┐
-  │  ★ nomic-embed-text, 768-dim, local via Ollama ★            │ ← we are here
-  └───────────────────────────┬─────────────────────────────────┘
-              embeds at 768    │
-  ┌─ Corpus (every chunk) ─────▼────────────────────────────────┐
-  │  v0[768]  v1[768]  v2[768] …  all in ONE embedding space     │
-  └───────────────────────────┬─────────────────────────────────┘
-              query must match │
-  ┌─ Query ────────────────────▼────────────────────────────────┐
-  │  embedded by the SAME 768-dim provider, or cosine is garbage │
-  └──────────────────────────────────────────────────────────────┘
+where the model choice locks the stack
+┌──────────────────────────────────────────────────────────┐
+│  ★ EmbeddingProvider   id="nomic-embed-text", dim=768  ★   │  ← the decision
+└───────────────┬────────────────────────────────────────────┘
+                │ dimension flows DOWN and must match
+                ▼
+┌──────────────────────────────────────────────────────────┐
+│  assertWiring()   embedder.dimension === store.dimension   │  ← gate 1 (wiring)
+├──────────────────────────────────────────────────────────┤
+│  VectorStore.dimension   InMemory(768) / PgVector(768)     │
+│  assertDimension()   every vector length === 768           │  ← gate 2 (every op)
+└──────────────────────────────────────────────────────────┘
 ```
 
-Now zoom in. You have made one-way decisions before — pick a primary key type, a
-database collation, an id scheme, and migrating off it later means rewriting every
-row. The embedding model is that kind of decision. aptkit picks
-nomic-embed-text for a specific reason: it runs locally through Ollama with no API
-key and no cloud bill, which fits the "build the whole pipeline with zero cloud"
-constraint. The price of that choice is the door it closes behind you.
+The model decision is one line — `readonly dimension = 768` — but it's the most expensive line to change in the whole retrieval package. aptkit's design accepts that and makes the cost *visible*: rather than letting a mismatch corrupt rankings silently, both gates throw. You can't accidentally walk back through this door.
 
 ## Structure pass
 
-**Layers.** Choice (which provider) → embedding space (a 768-dim coordinate system)
-→ corpus (every chunk lives in that space) → query (must enter the same space).
+Pick the **failure** axis: what happens when the model behind the door changes but the corpus doesn't?
 
-**Axis — lifecycle.** Trace a corpus across its life: indexed once at 768-dim, queried
-thousands of times at 768-dim, and — if you ever switch models — re-indexed *from
-scratch* at the new dimension. There is no incremental migration. The axis "can I
-mix old and new vectors?" is always *no*: a corpus is single-model by construction.
+```
+failure mode across the door
+   index time                    query time
+  ┌──────────────┐              ┌──────────────┐
+  │ corpus @ 768  │              │ query @ 1536  │  (someone swapped the model)
+  └──────┬───────┘              └──────┬───────┘
+         │ stored                       │ search(vector, k)
+         ▼                              ▼
+  ┌─────────────────────────────────────────────┐
+  │ ★ assertDimension: 1536 ≠ 768 → THROW ★      │  ← seam where it flips
+  └─────────────────────────────────────────────┘
+   without the gate: cosine over mismatched dims = garbage scores, silently
+```
 
-**Seam.** The dimension guard `assertWiring` (`pipeline.ts:22`). This is where the
-one-way door is enforced: if `embedder.dimension !== store.dimension`, it throws at
-wiring time with a message that literally says "re-index the corpus." The seam
-turns a silent ranking-corruption bug into a loud startup failure.
+The seam is the dimension check. The danger isn't a crash — a crash is fine, you fix the wiring. The danger is the *silent* version: if cosine ran over vectors of different lengths (or worse, same length but different model), you'd get plausible-looking scores that rank nonsense. aptkit chose loud failure on purpose; the in-memory store's comment names it: "a silent mismatch corrupts ranking."
 
 ## How it works
 
-### Move 1 — the mental model
-
-You know that two strings hashed by different hash functions can't be compared —
-the bucket numbers are meaningless across functions. Two embeddings from different
-models are exactly that: numbers in incompatible coordinate systems. A 768-dim
-nomic vector and a 1536-dim OpenAI vector don't just differ in length; even at the
-same length the axes mean different things. You cannot cosine-compare across models.
+**Move 1 — the decision tree.** aptkit's choice is local-first, and the tree is short:
 
 ```
-  Two models, two spaces — no shared ruler
-
-  nomic space (768)              OpenAI space (1536)
-  ┌──────────────┐               ┌──────────────────┐
-  │ "auth bug" ● │               │ "auth bug"   ●   │
-  │  dim 0..767  │   NO MEANING   │  dim 0..1535     │
-  └──────────────┘ ◄── cosine ──► └──────────────────┘
-        the axes don't line up — comparison is noise
+embedding model decision tree (aptkit's path in ★)
+                  need embeddings
+                        │
+         ┌──────────────┴──────────────┐
+      privacy /                      best raw
+      zero-cloud?                    quality?
+         │                              │
+       ★ YES ★                         no
+         │                              │
+   run locally?                   hosted API
+         │                       (OpenAI 3-large,
+       ★ Ollama ★                 Cohere, Voyage)
+         │                              │
+   ★ nomic-embed-text ★          1536+ dims, $/token,
+   768-dim, free, fast            network on every embed
 ```
 
-### Move 2 — the choice and its enforcement
+aptkit takes the left spine every time: **local, 768-dim, free, private, zero-cloud.** No token bill, no data leaving the laptop, no network on the hot path. The tradeoff is raw quality — a hosted 3072-dim model edges out nomic on hard benchmarks — but for a from-scratch pipeline you're optimizing for "build the whole thing with zero dependencies," and nomic delivers that.
 
-**The choice: local, zero-cloud, 768-dim.** `OllamaEmbeddingProvider` hard-codes the
-decision (`ollama-embedding-provider.ts:39`):
+**The dimension is the door.** The provider pins it as a constant, not a discovered value:
 
 ```ts
-export class OllamaEmbeddingProvider implements EmbeddingProvider {
-  readonly id = 'nomic-embed-text';
-  readonly dimension = 768;          // FIXED by the model — not a tuning knob
-  // ...
-}
+// packages/retrieval/src/ollama-embedding-provider.ts:39-40
+readonly id = 'nomic-embed-text';
+readonly dimension = 768;          // ← this is the door. change it = re-embed everything
 ```
 
-`id` and `dimension` are `readonly` because they are not configuration — they are
-facts about the model. nomic was chosen for local-first operation: Ollama serves it
-on localhost, no key, no per-call cost.
-
 ```
-  Why nomic-embed-text
-
-  ┌─ constraint: zero cloud, no API key ─┐
-  │  nomic via Ollama  ── local, free    │ ◄── chosen
-  │  OpenAI / Voyage   ── key + per-call │ ◄── later drop-in (not yet exercised)
-  └──────────────────────────────────────┘
+the door: corpus and query share ONE coordinate system
+   model A (768) ──► corpus vectors live in 768-space
+   model A (768) ──► query vector lives in 768-space   ✓ comparable
+   model B (1536)──► query vector lives in 1536-space  ✗ NOT comparable to corpus
 ```
 
-**The enforcement: fail loud at the seam.** `assertWiring` (`pipeline.ts:22`) runs
-before any index or query and rejects a dimension mismatch:
+**Gate 1 — at wiring time.** `assertWiring` runs the instant you build a pipeline, before any data flows:
 
 ```ts
+// packages/retrieval/src/pipeline.ts:22-29
 function assertWiring(wiring: RetrievalWiring): void {
-  if (wiring.embedder.dimension !== wiring.store.dimension) {
+  if (wiring.embedder.dimension !== wiring.store.dimension) {   // door check
     throw new Error(
       `dimension mismatch: embedder "${wiring.embedder.id}" is ${wiring.embedder.dimension}-dim ` +
         `but store is ${wiring.store.dimension}-dim — re-index the corpus with a matching provider`,
+    );                                                          // ← tells you the fix
+  }
+}
+// createRetrievalPipeline (:73-81) calls this BEFORE binding index/query
+```
+
+The error message names the cure: "re-index the corpus with a matching provider." That's the migration, spelled out in the throw.
+
+**Gate 2 — at every operation.** The store re-checks each vector's length on upsert and search:
+
+```ts
+// packages/retrieval/src/in-memory-vector-store.ts:36-42
+private assertDimension(vector: number[], label: string): void {
+  if (vector.length !== this.dimension) {                       // per-vector, every call
+    throw new Error(
+      `dimension mismatch: ${label} has length ${vector.length}, store expects ${this.dimension}`,
     );
   }
 }
+// called in upsert (:20) and search (:26) — belt and suspenders
 ```
 
-Both stores re-check every vector too (`in-memory-vector-store.ts:36`,
-`pg-vector-store.ts:32`). The mismatch is treated as a *wiring bug*, not a runtime
-input — caught at startup, not in production.
+Why two gates? Gate 1 catches misconfiguration. Gate 2 catches a *provider* that returns the wrong shape at runtime — a model update, a malformed response. Defense in depth on the thing that corrupts silently.
 
-```
-  The dimension guard — one-way door, locked loud
-
-  createRetrievalPipeline(wiring)
-        │ assertWiring
-        ▼
-  embedder.dim 768  ==  store.dim 768  ─► OK, proceed
-  embedder.dim 768  !=  store.dim 1536 ─► THROW "re-index the corpus"
-```
-
-**The fingerprint that survives the choice.** buffr's chunks table records which
-model embedded each row — `embedding_model text not null default
-'nomic-embed-text:v1.5'` (`/Users/rein/Public/buffr/sql/001_agents_schema.sql:23`).
-That column is the hook: it lets you detect a corpus embedded by an old model and
-schedule a re-embed (the staleness story, `09-stale-embeddings.md`).
-
-### Move 2.5 — current state vs future state
-
-aptkit runs only nomic today. An OpenAI or Voyage adapter is a `not yet exercised`
-drop-in — and crucially, swapping it is *not* free, because the corpus changes
-dimension.
-
-```
-  Phase A (now)                    Phase B (switch models)
-  ┌──────────────────────┐         ┌────────────────────────────┐
-  │ nomic, 768-dim        │         │ OpenAI, 1536-dim            │
-  │ corpus all 768        │  NOT a  │ corpus must be RE-EMBEDDED  │
-  │ query 768             │ swap →  │ every chunk re-indexed      │
-  └──────────────────────┘         │ no incremental migration    │
-   provider abstraction is real    └────────────────────────────┘
-   BUT the vectors are not portable across the door
-```
-
-The provider is swappable in *code* (one adapter). The *data* is not portable —
-that asymmetry is the whole lesson.
-
-### Move 3 — the principle
-
-A model abstraction makes the code swappable but not the corpus. Choose the
-embedding model for the deployment you actually have (local-first → nomic), record
-the model on every row so you can detect drift, and guard the dimension at the seam
-so a wrong swap fails at startup instead of silently ranking noise. Switching models
-is a re-index, not a config flip — budget for it accordingly.
+**Move 3 — the principle.** The model choice is the one-way door of RAG. Everything else in the stack is reversible: re-chunk, swap the store, change `topK`, all cheap. The embedding model is not — changing it invalidates every stored vector, so the migration is "re-embed the entire corpus," not "change a config flag." Design for that: pin the dimension, assert it loudly, and treat a model upgrade as a corpus rebuild with a cutover, never an in-place edit.
 
 ## Primary diagram
 
 ```
-  The one-way door
-
-  decision: nomic-embed-text, 768-dim, local
-        │
-        ▼  index whole corpus at 768
-  ┌─ corpus: every chunk in nomic's 768-dim space ─┐
-  │  embedding_model = 'nomic-embed-text:v1.5'      │ ◄── fingerprint per row
-  └───────────────────────────┬────────────────────┘
-        query at 768 ──────────┘  guarded by assertWiring (pipeline.ts:22)
-
-  switch to a 1536-dim model? ─► re-embed EVERY chunk. no partial migration.
+the one-way door, with both gates
+   PICK MODEL ──► dimension = 768 ──┐
+                                     │ flows down
+                                     ▼
+   wiring ──► [assertWiring] ── 768==768? ──► pipeline lives
+                  │ NO                              │
+                  ▼                                 ▼ index/query
+              THROW (config)                  [assertDimension]
+                                              len==768 per vector?
+                                                  │ NO
+                                                  ▼
+                                            THROW (runtime)
+   to walk back through the door:  re-embed ALL chunks with the new model
 ```
+
+Two gates, two failure classes (config vs runtime), one cure (re-embed the corpus).
 
 ## Elaborate
 
-The "build vs buy" instinct says reach for the best embedding model. At aptkit's
-scale the better instinct is "what runs with zero infrastructure," because the
-retrieval quality ceiling is set by chunking and ranking long before the model
-matters. nomic local clears the bar and costs nothing per query. When the corpus
-and quality bar grow, the `embedding_model` column
-(`/Users/rein/Public/buffr/sql/001_agents_schema.sql:23`) and the dimension guard
-make the upgrade a deliberate, detectable re-index rather than a silent corruption.
-Read `01-embeddings.md` for what the 768-dim vector is and `09-stale-embeddings.md`
-for using the fingerprint column to detect model drift.
+The "one-way door" framing is Amazon's (Bezos's reversible-vs-irreversible-decisions memo) — embedding choice is the canonical irreversible one in RAG. Adjacent: **Matryoshka embeddings** (models like nomic-v1.5 and OpenAI 3 let you truncate dims — a *partial* escape hatch from the door), and **MTEB**, the benchmark you'd consult to justify a model pick. Note buffr already carries the migration metadata: `agents.chunks.embedding_model` (`sql/001_agents_schema.sql:23`) stamps each row with the model that produced it — the slot a re-embed migration reads to know what's stale (file 09). Read next: `01-embeddings.md` (what the model produces) and `09-stale-embeddings.md` (the freshness side of the same door).
 
 ## Project exercises
 
-### Add an OpenAI embedding adapter and prove the door is one-way
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a second `EmbeddingProvider` (e.g. `OpenAIEmbeddingProvider`,
-  `dimension = 1536`) and a test that wires it to a 768-dim store and asserts
-  `assertWiring` throws.
-- **Why it earns its place:** it makes the one-way door concrete — a passing test
-  that the wrong swap fails loud is the clearest proof you understand the dimension
-  invariant interviewers probe for.
-- **Files to touch:** a new `packages/retrieval/src/openai-embedding-provider.ts`,
-  `packages/retrieval/src/contracts.ts` (implement existing type), a new test in
-  `packages/retrieval/test/`.
-- **Done when:** the adapter passes the `EmbeddingProvider` contract and a test
-  confirms a 1536-dim embedder against a 768-dim store throws "re-index the corpus."
-- **Estimated effort:** `1–4hr`
+### Document and script the re-embed migration path
+
+- **Exercise ID:** `EX-RAG-02a`
+- **What to build:** A migration script + runbook that re-embeds buffr's `agents.chunks` with a new model: read every chunk's `content`, re-embed with the new provider, upsert with the new vector and updated `embedding_model`, behind a feature flag / new `app_id` namespace so you can cut over atomically.
+- **Why it earns its place:** The one-way door is only survivable if the migration is *written down and tested*. The error message says "re-index the corpus" — this exercise turns that sentence into a runnable, reversible procedure. Phase 2B: making the irreversible decision reversible-with-effort.
+- **Files to touch:** new script under `buffr/src/` (or `buffr/scripts/`); reads `agents.chunks` (`buffr/sql/001_agents_schema.sql:14-25`); reuses `PgVectorStore.upsert` (`buffr/src/pg-vector-store.ts:38-65`).
+- **Done when:** running the script against a seeded DB produces a parallel set of re-embedded chunks under a new model tag, queries against the new namespace return sane rankings, and the old namespace is untouched until cutover.
+- **Estimated effort:** `1–2 days`
+
+### Add a dimension-mismatch regression test at the tool seam
+
+- **Exercise ID:** `EX-RAG-02b`
+- **What to build:** A test proving `createSearchKnowledgeBaseTool` over a pipeline whose embedder/store dimensions disagree fails at wiring, not mid-query.
+- **Why it earns its place:** The gates exist; pin them so a future refactor that moves the assert can't regress to a silent mismatch.
+- **Files to touch:** `packages/retrieval/src/` test files alongside `pipeline.ts`; exercise `assertWiring` (`packages/retrieval/src/pipeline.ts:22-29`).
+- **Done when:** the test asserts the throw message includes both dimensions and the "re-index" hint.
+- **Estimated effort:** `<1hr`
 
 ## Interview defense
 
-**Q: "Can you swap embedding models without re-indexing?"**
-No. The corpus lives in one model's coordinate space; a different model produces
-incompatible vectors, often at a different dimension. Swapping the *adapter* is one
-file, but the *data* must be re-embedded from scratch — there's no incremental
-migration. aptkit guards this with `assertWiring` (`pipeline.ts:22`), which throws
-"re-index the corpus" on a dimension mismatch, and records `embedding_model`
-per chunk so drift is detectable.
+**Q: Why does changing the embedding model invalidate the whole corpus — can't you just embed new docs with the new model?**
 
 ```
-  swap adapter = 1 file        swap model = re-embed every chunk
-  the door is one-way: corpus and query must share one space
+mixed-model corpus = mixed coordinate systems
+  old chunks @ model A      new chunks @ model B
+       ●  ●  ●                   ◆  ◆  ◆
+        \  query @ B  →  close to ◆, random vs ●
+   cosine across A and B is meaningless — rankings interleave garbage
 ```
-Anchor: *the provider is swappable; the corpus is not — switching models is a re-index.*
 
-**Q: "Why nomic-embed-text specifically?"**
-Local-first, zero cloud: Ollama serves it on localhost with no API key and no
-per-call cost, which fits aptkit's "build the whole pipeline with zero
-infrastructure" constraint. The 768 dimension is fixed by the model, not chosen.
-OpenAI/Voyage are later drop-ins for when the quality bar outgrows local — a
-deliberate re-index, not a default.
+Anchor: cosine only compares vectors from the same model; a mixed corpus ranks new and old chunks on incomparable scales. It's all-or-nothing — re-embed everything or none.
+
+**Q: Two dimension gates seems redundant. Why both?**
 
 ```
-  constraint (zero cloud) ─► nomic local ─► no key, no bill, 768-dim fixed
+assertWiring  → catches WRONG WIRING (config, once, at startup)
+assertDimension → catches WRONG SHAPE (runtime, every vector)
+   different failures, same corruption if missed
 ```
-Anchor: *choose the embedder for the deployment you have — local-first means nomic.*
+
+Anchor: the wiring gate catches a misconfigured pipeline; the per-vector gate catches a provider that returns the wrong shape at runtime. Both guard the one thing that fails silently — corrupted rankings.
 
 ## See also
 
-- `01-embeddings.md` — what the 768-dim vector means
-- `04-vector-databases.md` — the store that carries the dimension
-- `09-stale-embeddings.md` — the `embedding_model` column and model drift
-- `11-rag.md` — the dimension guard inside the pipeline
-- `01-llm-foundations/08-provider-abstraction.md` — swappable code vs non-portable data
+- [01-embeddings.md](01-embeddings.md) — what the model produces
+- [04-vector-databases.md](04-vector-databases.md) — where `dimension` is enforced on storage
+- [09-stale-embeddings.md](09-stale-embeddings.md) — `embedding_model` and freshness

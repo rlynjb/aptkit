@@ -1,279 +1,208 @@
 # Retry & circuit breaker
 
-**Subtitle:** Try again vs. stop trying · they are not the same pattern · *Industry standard*
+*Retry & circuit breaker · transient vs sustained failure (Industry standard)*
+
+aptkit has *some* of this, and it's important to be exact about which parts. There's a bounded retry (`generateStructured` retries up to `maxAttempts`), and there's failover across providers (the fallback chain). What there isn't: exponential backoff with jitter, and a circuit breaker. The clean way to hold it: retry is for *transient* failures (a blip — try again in a moment), a circuit breaker is for *sustained* failures (the provider is down — stop hammering it). aptkit handles transient at a crude grain and has nothing for sustained. This file draws the line precisely.
 
 ## Zoom out, then zoom in
 
-Before mechanism: a retry re-attempts a failed call; a circuit breaker *stops*
-retrying once a downstream is clearly dead, so you don't hammer a corpse. Here's
-where both sit in aptkit — it has three flavors of the first and none of the
-second.
+Two failure regimes, two tools. ★ Retry assumes the next attempt might work; the breaker assumes it won't and stops trying. aptkit owns a blunt version of the first regime and none of the second.
 
 ```
-  Zoom out — retry layers in aptkit (and the breaker that's missing)
-
-  ┌─ generateStructured ──── parse retry (maxAttempts 2, strict suffix) ┐
-  │  ┌─ runAgentLoop ─────── recovery turn (one extra call to conclude) │
-  │  │  ┌─ FallbackProvider ─ failover (try next provider on error)     │
-  │  │  │  ┌─ GemmaProvider ─ tool-call nudge (retry JSON, default 2)    │
-  │  │  │  │     ▼ complete()  → local Ollama                            │
-  │  │  │  └──────────────────────────────────────────────────────────┘ │
-  │  │  └────────────────────────────────────────────────────────────── ┘
-  │  └─────────────────────────────────────────────────────────────────┘
-  └──────────────────────────────────────────────────────────────────────┘
-   ★ CIRCUIT BREAKER (open/half-open state) = not yet exercised
-   ★ EXPONENTIAL BACKOFF (growing delays)   = not yet exercised
+Failure regimes and their tools (★ = the dividing line)
+┌────────────────────────────────────────────────────────────────────────────┐
+│  TRANSIENT failure (a blip: timeout, one 503)                                │
+│   ┌──────────────────────────────────────────────────────────────────┐     │
+│   │ RETRY ── try again, ideally with growing delay + jitter            │     │
+│   │   aptkit: bounded retry (generateStructured maxAttempts=2)         │     │
+│   │           BUT no delay, no backoff, no jitter   ── NOT YET         │     │
+│   └──────────────────────────────────────────────────────────────────┘     │
+│  ★────────────────────────────────────────────────────────────────────────★│
+│  SUSTAINED failure (provider down for minutes)                               │
+│   ┌──────────────────────────────────────────────────────────────────┐     │
+│   │ CIRCUIT BREAKER ── stop calling; fail fast; probe occasionally     │     │
+│   │   aptkit: NONE ── retries keep hammering a dead provider           │     │
+│   └──────────────────────────────────────────────────────────────────┘     │
+│  (failover across providers — the fallback chain — is SHIPPED, sits across   │
+│   both: it switches provider on failure, but doesn't back off or trip)       │
+└────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Now zoom in. aptkit retries at four nested layers — but every one is a *fixed,
-bounded* retry: try again immediately, a capped number of times, then give up. It
-has no exponential backoff (no growing delay between tries) and no circuit breaker
-(no state that says "this provider is down, stop trying for a while"). The
-fallback provider is the *nearest* thing to a breaker — it fails *over* on error
-— but failover is not breaking. Be precise about that.
+The danger of having retry without a breaker: under a sustained outage, retries become a self-inflicted DDoS on a service that's already struggling.
 
 ## Structure pass
 
-**Layers.** Four retry shells nested around `complete()`, each catching a
-different failure: bad JSON (Gemma nudge), off-schema output
-(`generateStructured`), an unparseable final answer (recovery turn), a dead
-provider (fallback). The breaker would be a *fifth* shell with memory — and it's
-absent.
+One axis: **how long the failure lasts.**
 
-**Axis — failure.** Trace what each retry recovers from. Gemma's nudge recovers a
-*botched tool-call format*. `generateStructured` recovers *invalid JSON against a
-schema*. The recovery turn recovers an *unparseable conclusion*. Fallback
-recovers a *provider error*. None of them recovers a *persistently dead
-downstream gracefully* — they'd just retry into the same wall, because no state
-remembers the wall is there.
-
-**Seam.** The retry seams are the `for` loops inside each function; the breaker
-seam *would* be a stateful wrapper at `complete()`
-(`packages/runtime/src/model-provider.ts:54`). The axis "do we remember past
-failures?" flips at a breaker — and aptkit has nothing on that axis. Every retry
-here is memoryless.
+- **Bounded retry (shipped — `generateStructured`).** A fixed attempt count (default 2). On a failed *validation*, it appends a strict-JSON suffix and tries again. It's a retry, but a *crude* one: no delay between attempts, no exponential growth, no jitter. Good for "the model returned slightly-off JSON," wrong for "the network hiccuped" (instant retry hits the same hiccup).
+- **Failover (shipped — `FallbackModelProvider`).** On an *exception*, switch to the next provider. Sits across both regimes — it reacts to failure by changing provider — but it has no backoff and no concept of "this provider is dead, stop including it."
+- **Exponential backoff + jitter (the gap).** Wait `base · 2^attempt` ± random jitter between retries. Spreads retry load so a recovering provider isn't re-flooded by everyone retrying in lockstep.
+- **Circuit breaker (the gap).** Track failures per provider; after a threshold, *open* the circuit (fail fast without calling); after a cooldown, go *half-open* (let one probe through); on success, *close*. Stops the retry-storm against a sustained outage.
 
 ## How it works
 
-### Move 1 — the mental model
-
-You know how a flaky `fetch` gets wrapped in a retry loop — try up to 3 times,
-then throw? That's aptkit's retries: bounded, memoryless, immediate. A circuit
-breaker is the *next* idea you learn after retries bite you: once failures pile
-up, the breaker "opens" and fails fast *without* calling the downstream at all,
-then after a cooldown goes "half-open" to test one request. Retry asks "did this
-call work?"; a breaker asks "is this downstream even worth calling right now?"
+**Move 1 — the mental model: retry is optimism, the breaker is learned pessimism.** Retry says "that was probably a fluke." The breaker says "I've seen this fail N times in a row; I'm not asking again until I've waited."
 
 ```
-  Retry (memoryless) vs. Circuit breaker (stateful)
-
-  RETRY                          CIRCUIT BREAKER  ← not in aptkit
-  ┌──────────────────┐          ┌────────────────────────────────┐
-  │ try → fail → try  │          │ CLOSED  → calls flow            │
-  │ → fail → try → ✗  │          │   too many fails ──►            │
-  │ (forgets each time)│          │ OPEN    → fail fast, no call    │
-  │                    │          │   cooldown ──►                  │
-  │                    │          │ HALF-OPEN → test one, decide    │
-  └──────────────────┘          └────────────────────────────────┘
-   asks: did THIS call work?      asks: is the downstream worth calling?
+The breaker state machine (the piece aptkit lacks entirely)
+        ┌─────────┐  failures ≥ threshold   ┌────────┐
+        │ CLOSED  │ ──────────────────────▶ │  OPEN  │
+        │ (calls  │                          │ (fail  │
+        │  flow)  │ ◀──── probe succeeds ─┐  │  fast) │
+        └────┬────┘                       │  └───┬────┘
+             ▲                            │      │ cooldown elapsed
+             │                       ┌────┴──────▼──┐
+             └──── probe succeeds ───│  HALF-OPEN   │
+                                     │ (one probe)  │
+                  probe fails ──────▶│  → back to OPEN
+                                     └──────────────┘
 ```
 
-### Move 2 — aptkit's three retries and the failover that isn't a breaker
+**Move 2 — step by step.**
 
-**Retry 1 — Gemma's tool-call nudge.** Gemma has no native tool-calling, so it's
-asked to emit JSON; when the JSON is botched, aptkit re-asks with a corrective
-nudge, up to `maxToolCallAttempts` (default 2). `packages/providers/gemma/src/gemma-provider.ts:62`:
+**Part A — what's shipped: the bounded retry.** `generateStructured` loops up to `maxAttempts` (default 2), and the retry's only adaptation is a strict suffix on the prompt — no wait:
 
 ```ts
-for (let attempt = 0; attempt < maxAttempts; attempt += 1) {     // bounded: default 2 (:49)
-  request.signal?.throwIfAborted();
-  const messages =                                               // on retry, append the nudge
-    attempt === 0 ? baseMessages : [...baseMessages, { role: 'user', content: RETRY_NUDGE }];
-  lastResponse = await this.chat({ model: this.defaultModel, messages, stream: false, ... });
-  raw = lastResponse.message?.content ?? '';
-  if (wantsTool) {
-    const call = parseToolCall(raw);
-    if (call) return this.toResponse([{ type: 'tool_use', ... }], lastResponse);  // good JSON, done
-    if (looksLikeToolAttempt(raw)) continue;                     // botched → retry with nudge
-  }
-  break;                                                         // plain prose is a real answer
-}
-```
-
-The `RETRY_NUDGE` (`:35`) literally tells Gemma "your previous reply was not a
-valid tool call." No delay, no backoff — immediate re-ask, capped at 2.
-
-**Retry 2 — `generateStructured` parse retry.** When structured output fails
-validation, it re-asks once more with a strict JSON-only suffix, `maxAttempts`
-default 2. `packages/runtime/src/structured-generation.ts:62`:
-
-```ts
-const maxAttempts = Math.max(1, options.retry?.maxAttempts ?? 2);   // bounded: default 2
+// packages/runtime/src/structured-generation.ts:57-64, 92-95
+const maxAttempts = Math.max(1, options.retry?.maxAttempts ?? 2);      // ← fixed count, default 2
+// ...
 for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-  const messages = attempt === 1 ? baseMessages : appendStrictSuffix(baseMessages, strictSuffix);  // nudge on retry
-  // ...call model, parse, validate...
-  if (parsed.ok) return { ok: true, value: parsed.value, rawText, attempts };
-  // else record and loop with the strict suffix
+  options.signal?.throwIfAborted();
+  const messages = attempt === 1 ? baseMessages : appendStrictSuffix(baseMessages, strictSuffix); // ← only adaptation
+  // ... call model, parse, validate ...
+  attempts.push({ attempt, rawText, error: parsed.error });
+  if (attempt < maxAttempts) emitWarning(/* ... */);                   // ← retries IMMEDIATELY, no delay
 }
 ```
 
-Same shape as Gemma's: re-ask with a stricter instruction, capped, no delay.
+Read it precisely: this is a **bounded retry** (capped attempts), **not** exponential backoff (no growing delay) and **not** a circuit breaker (no cross-call failure memory). It's tuned for *output-shape* failures — the model's JSON was slightly off — where an instant retry with a firmer instruction genuinely helps. For *transport* failures it's the wrong tool: an instant retry hits the same network blip.
 
-**Retry 3 — the loop's recovery turn.** If the agent's final answer can't be
-parsed into the expected shape, the loop fires *one* extra call dedicated to
-producing the structured conclusion. `packages/runtime/src/run-agent-loop.ts:204`:
+**Part B — what's shipped: failover.** The fallback chain switches provider on an exception. Its gate, `shouldFallback`, decides whether to continue — but it defaults to "always continue" and has no delay or trip logic:
 
 ```ts
-async function runRecoveryTurn<T>(options, userPrompt): Promise<string | null> {
-  try {
-    options.signal?.throwIfAborted();
-    const response = await options.model.complete({
-      system: 'You are concluding a completed investigation. Output ONLY the structured answer ...',
-      messages: [{ role: 'user', content: userPrompt }],   // a single corrective attempt
-      maxTokens: 2048,
-      signal: options.signal,
-    });
-    return textFromContent(response.content);
-  } catch (error) { /* warn, return null */ }
-}
-```
-
-One shot, no backoff. Three retries, three failures, one pattern: bounded
-immediate re-ask.
-
-**The failover that is *not* a breaker.** `FallbackModelProvider` tries providers
-in order and moves to the next *on error*. That's failover. `packages/providers/fallback/src/fallback-provider.ts:47`:
-
-```ts
-for (let index = 0; index < this.providers.length; index += 1) {
-  const provider = this.providers[index];
-  try {
-    return { ...await provider.complete(request), model: ... };   // success → return
-  } catch (error) {
-    if (isAbortError(error) || request.signal?.aborted) throw error;
-    attempts.push({ providerId: provider.id, model: provider.defaultModel, error: ... });
-    if (!this.shouldFallback(error, provider)) throw error;
-    // else fall through to the next provider — NO state remembered for next time
+// packages/providers/fallback/src/fallback-provider.ts:64-85
+} catch (error) {
+  if (isAbortError(error) || request.signal?.aborted) throw error;
+  attempts.push(attempt);
+  if (!this.shouldFallback(error, provider)) throw error;   // ← gate, default () => true
+  if (index < this.providers.length - 1) {
+    this.trace?.emit({ type: 'warning', /* ... */            // ← warn, then immediately try next
+      message: `Provider ${provider.id} failed (...); trying fallback provider.` });
   }
 }
-throw new ProviderFallbackError(attempts);
+// no backoff between providers; no memory that provider A is DOWN
 ```
 
-Here's the precise distinction: a breaker would *remember* that provider A keeps
-failing and skip it on the *next* request without trying. This chain has no
-memory — every request starts fresh at provider A, retries it, fails, and falls
-to B again. It fails *over* (sideways to another provider) but never *opens*
-(stops trying the bad one). No open/half-open state → not a circuit breaker.
+Failover is real resilience — if provider A is down, you reach provider B. But it re-includes A on the *next* request even if A has failed the last fifty times. A breaker would short-circuit A and go straight to B.
+
+**Part C — the gaps, drawn.** Two distinct moves:
 
 ```
-  Fallback chain (no memory)        vs.   Circuit breaker (has memory)
-  req1: A fails → try B ✓                 req1: A fails → try B ✓ (A's fail counted)
-  req2: A fails → try B ✓                 req2: A is OPEN → skip A, straight to B
-  req3: A fails → try B ✓                 ...cooldown... → half-open → test A once
-   always retries the dead provider        stops calling the dead provider
+Move 2.5 — current vs future for the fallback chain
+CURRENT (immediate failover)             FUTURE (backoff + per-provider breaker)
+┌────────────────────────────────┐      ┌──────────────────────────────────────┐
+│ for p in providers:            │      │ for p in providers:                   │
+│   try: return p.complete(req)  │      │   if breaker[p].isOpen(): continue ◀── skip dead provider
+│   catch e:                     │ ───▶ │   try: r = p.complete(req)            │
+│     continue immediately       │      │        breaker[p].recordSuccess()     │
+│                                │      │        return r                       │
+│ // re-tries dead provider      │      │   catch e:                            │
+│ //   every request, no wait    │      │        breaker[p].recordFailure()     │
+│                                │      │        await backoff(attempt) ± jitter │
+└────────────────────────────────┘      │        continue                       │
+                                         └──────────────────────────────────────┘
 ```
 
-### Move 3 — the principle
+Backoff goes *between* attempts: `delay = base · 2^attempt`, then add random jitter so a fleet of clients doesn't retry in a synchronized thundering herd. The breaker is per-provider state: count failures, open after a threshold, skip the provider while open, probe after a cooldown.
 
-A retry is memoryless: it re-attempts *this* call and forgets. A circuit breaker
-is stateful: it remembers a downstream is failing and stops calling it to protect
-both sides. aptkit built three bounded memoryless retries plus failover because
-its downstream is local Gemma — failures are usually a botched response (fix with
-a nudge), not a dead server (which needs a breaker). Exponential backoff and a
-breaker earn their place against a *remote, rate-limited, sometimes-down*
-provider. Until that's in the chain, they're `not yet exercised` — and calling
-the fallback chain a "circuit breaker" in an interview would be wrong.
+**Move 3 — the principle.** Match the tool to the failure's duration. Transient → retry, and retry *politely* (growing delay + jitter) so you don't re-flood a recovering service. Sustained → trip a breaker and fail fast, because retrying a dead service wastes your latency budget and worsens its outage. aptkit's bounded retry is fine for *output-shape* misses; it has neither the backoff for transient *transport* failures nor the breaker for sustained ones.
 
 ## Primary diagram
 
 ```
-  Four retries (built, memoryless) and the breaker (absent, stateful)
-
-  BUILT — bounded, immediate, no backoff:
-   ┌ Gemma nudge        ─ re-ask botched tool JSON  · cap 2 · :62
-   ├ generateStructured ─ re-ask off-schema JSON    · cap 2 · :62
-   ├ recovery turn      ─ one call to conclude       · cap 1 · :204
-   └ fallback failover  ─ try next provider on error · :47   (NO memory)
-
-  NOT YET EXERCISED — stateful / timed:
-   ┌ exponential backoff ─ growing delay between tries
-   └ circuit breaker     ─ open / half-open / closed state at complete()
+What aptkit has, what it lacks, and which failure each addresses
+┌──────────────────────────┬──────────────────┬──────────────────────────────┐
+│ Tool                     │ Status           │ Failure it's for             │
+├──────────────────────────┼──────────────────┼──────────────────────────────┤
+│ Bounded retry (maxAtt=2) │ SHIPPED          │ output-shape (bad JSON)      │
+│ Failover (fallback chain)│ SHIPPED          │ provider A down → use B      │
+│ Backoff + jitter         │ NOT YET EXERCISED│ transient transport blip     │
+│ Circuit breaker          │ NOT YET EXERCISED│ sustained outage (stop hammer)│
+└──────────────────────────┴──────────────────┴──────────────────────────────┘
+   retry = optimism (try again) · breaker = pessimism (stop trying)
 ```
 
 ## Elaborate
 
-The reason aptkit stops at retries is the failure profile of a local model: the
-common failure is "the model returned the wrong *shape*," which a corrective
-re-ask fixes, not "the server is down for 30 seconds," which is what backoff and
-breakers exist for. Hammering `localhost` with immediate retries costs nothing and
-usually works on attempt 2. The moment a remote provider with real outages joins
-the fallback chain, immediate memoryless retries become a liability — they'd
-amplify load on a struggling downstream — and that's exactly when a breaker (and
-backoff) slot in as a stateful `complete()` wrapper. Read
-`04-rate-limiting-backpressure.md` for the complementary downstream-respect
-pattern aptkit also skipped for the same local-first reason.
+- **Retry without backoff amplifies an outage.** When a provider is struggling, a fleet of clients retrying instantly and in lockstep is a thundering herd — the retries *are* the load that keeps it down. Exponential growth spreads attempts out; jitter de-synchronizes the fleet so they don't all retry on the same tick.
+- **The breaker protects YOUR latency too.** It's not only about being kind to the provider. While the circuit is open, you fail fast (microseconds) instead of waiting out a timeout (seconds) on every call. Under a sustained outage, fail-fast is what keeps your own system responsive.
+- **aptkit's retry is correctly scoped, just narrow.** Don't read "no backoff" as a bug in `generateStructured` — it's tuned for the failure it sees most on-device: the local model returning malformed JSON, where instant-retry-with-stricter-prompt is exactly right. The gap is that the *transport* and *sustained* regimes have no tool, not that the existing retry is wrong.
+- **Local-first softens the urgency.** Gemma on Ollama rarely throws transient transport errors (no network), and a local process being "sustained down" is a different incident than a cloud outage. The backoff/breaker pair earns its keep the moment a cloud provider is in the chain.
 
 ## Project exercises
 
-### Add exponential backoff to one existing retry
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** add a configurable delay between attempts in
-  `generateStructured`'s retry loop that grows per attempt (e.g. 100ms, 200ms,
-  400ms), honoring the abort signal during the wait.
-- **Why it earns its place:** turns a memoryless immediate retry into a
-  load-respecting one — the first upgrade a remote provider forces.
-- **Files to touch:** `packages/runtime/src/structured-generation.ts` (the loop
-  at `:62`).
-- **Done when:** a test asserts the second attempt is delayed and that an abort
-  mid-wait throws promptly.
+Phase 5. Case B — bounded retry and failover exist; backoff and the breaker do not.
+
+### Exponential backoff with jitter
+
+- **Exercise ID:** `EX-SERVE-05a` — backoff-with-jitter
+- **What to build:** A `backoff(attempt)` helper (`base · 2^attempt` capped at a max, plus full jitter) and a delay between failover attempts in the fallback chain, so a transient blip isn't retried instantly.
+- **Why it earns its place:** It's the difference between polite retry and a thundering herd — the single most-cited retry mistake in interviews.
+- **Files to touch:** new `packages/providers/fallback/src/backoff.ts`, applied in the catch branch of `packages/providers/fallback/src/fallback-provider.ts:64-85`.
+- **Done when:** delays grow exponentially across attempts, include jitter (two runs differ), are capped, and respect the abort signal during the wait; tests assert growth and the cap.
 - **Estimated effort:** `1–4hr`
 
-### (Case B) Build a circuit-breaker provider decorator
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a `CircuitBreakerModelProvider implements ModelProvider`
-  wrapping an inner provider with closed/open/half-open state: count failures,
-  open after a threshold (fail fast without calling), half-open after a cooldown
-  to test one request.
-- **Why it earns its place:** builds the exact thing the fallback chain is *not*,
-  proving you can articulate failover ≠ breaking with running code.
-- **Files to touch:** new
-  `packages/providers/breaker/src/circuit-breaker-provider.ts`, reusing
-  `ModelProvider` from `packages/runtime/src/model-provider.ts`; reference
-  `packages/providers/fallback/src/fallback-provider.ts:47` for the contrast.
-- **Done when:** a test drives the inner provider to fail past the threshold and
-  asserts the breaker then *fails fast* (inner `complete` not called) until the
-  cooldown elapses.
+### Per-provider circuit breaker
+
+- **Exercise ID:** `EX-SERVE-05b` — per-provider-circuit-breaker
+- **What to build:** A `CircuitBreaker` (closed/open/half-open) tracked per provider in the fallback chain: open after a failure threshold, skip the open provider, half-open after a cooldown to probe, close on a successful probe. Wire it into the chain so a dead provider is short-circuited instead of retried every request.
+- **Why it earns its place:** It's the missing tool for sustained failure and forces you to implement the state machine that defines the concept.
+- **Files to touch:** new `packages/providers/fallback/src/circuit-breaker.ts`, integrated in `packages/providers/fallback/src/fallback-provider.ts`.
+- **Done when:** after the threshold, the open provider is skipped without a call (spy assertion); after cooldown one probe is allowed; a successful probe closes the circuit. Tests cover all three transitions.
 - **Estimated effort:** `1–2 days`
+
+### Transport-vs-shape retry split
+
+- **Exercise ID:** `EX-SERVE-05c` — classify-retryable-failures
+- **What to build:** Classify failures in `generateStructured` so output-shape misses retry instantly (current behavior) while transport errors retry with backoff — different failures, different retry policy.
+- **Why it earns its place:** It makes explicit the distinction this file rests on: the existing retry is right for shape, wrong for transport.
+- **Files to touch:** `packages/runtime/src/structured-generation.ts:62-95`, reuse the `backoff` helper from `EX-SERVE-05a`.
+- **Done when:** a validation failure retries with no delay; a thrown transport error retries with backoff; a test distinguishes the two paths.
+- **Estimated effort:** `1–4hr`
 
 ## Interview defense
 
-**Q: "Walk me through aptkit's retry strategy."**
-Four layers, all bounded and memoryless. Gemma re-asks a botched tool-call with a
-nudge (cap 2). `generateStructured` re-asks off-schema JSON with a strict suffix
-(cap 2). The agent loop fires one recovery turn if the final answer won't parse.
-And `FallbackModelProvider` fails over to the next provider on error. No backoff,
-no state — each just re-attempts and forgets.
+**Q: aptkit retries. Why is that not enough for a provider outage?**
 
 ```
-  Gemma nudge → generateStructured → recovery turn → fallback failover
-   all: try again, capped, immediate, no memory of past failures
+transient blip:   retry → next attempt likely works
+sustained outage: retry → retry → retry … all fail, all wait out a timeout
+   ★ need a breaker: after N failures, STOP calling, fail fast, probe later
 ```
-Anchor: *`gemma-provider.ts:62`, `structured-generation.ts:62`, `run-agent-loop.ts:204`.*
 
-**Q: "Isn't the fallback chain a circuit breaker?"**
-No — and the distinction matters. The chain fails *over*: on error it tries the
-next provider, but it keeps no memory, so every request re-tries the dead provider
-from the top. A breaker *opens* — it remembers the failures and stops calling the
-bad provider until a cooldown. Failover is sideways; breaking is stateful.
+Anchor: retry is for blips; a breaker is for "it's actually down" — aptkit has the first and not the second.
+
+**Q: Why exponential backoff *with jitter* — isn't a fixed delay simpler?**
 
 ```
-  fallback:  req1..N each retry dead provider A → fall to B   (no memory)
-  breaker:   A trips OPEN → skip A entirely → half-open later (memory)
+fixed delay, many clients: all retry on the same tick → thundering herd
+exp backoff + jitter:      delays grow AND de-synchronize → load spreads out
 ```
-Anchor: *`fallback-provider.ts:47` has no open/half-open state — failover, not breaking.*
+
+Anchor: jitter de-synchronizes the fleet so a recovering provider isn't re-flooded the instant it comes back.
+
+**Q: Is the fallback chain a circuit breaker?**
+
+```
+fallback chain: A fails → try B   (per-request failover, no memory)
+circuit breaker: A failed 50x → SKIP A entirely until cooldown
+   the chain re-tries dead A every request; a breaker remembers
+```
+
+Anchor: failover switches provider on failure; a breaker *remembers* the failure and stops asking — the chain has the first, lacks the second.
 
 ## See also
 
-- `04-rate-limiting-backpressure.md` — the complementary downstream-respect gap
-- `02-llm-cost-optimization.md` — the fallback chain's availability job
-- `01-llm-foundations/08-provider-abstraction.md` — the `complete()` seam all retries wrap
+- [`02-llm-cost-optimization.md`](./02-llm-cost-optimization.md) — the fallback chain's other axis: availability vs cost routing.
+- [`04-rate-limiting-backpressure.md`](./04-rate-limiting-backpressure.md) — backoff is what a caller does with a backpressure reject.
+- [`01-llm-caching.md`](./01-llm-caching.md) — the decorator-provider family the breaker would join.

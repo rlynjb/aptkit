@@ -1,238 +1,167 @@
-# Structured outputs — turning prose into a typed value
+# Structured outputs
 
-**Subtitle:** generateStructured + validators + retry · text → validated T · *Industry standard*
+Structured outputs · constrained decoding / validated JSON (Industry standard)
+
+You want the model to return `{revenue: 1200, currency: "USD"}`, not a paragraph that mentions revenue. Structured output is putting a typed contract at the LLM boundary and refusing to proceed until the model honors it. aptkit does this with `generateStructured` — prompt for JSON, parse it, validate it, and retry with a stricter nudge if it's malformed. It's TypeScript's "this function returns a `User`" enforced against a thing that emits prose.
 
 ## Zoom out, then zoom in
 
-Before you trust a model's JSON, see where the parsing-and-validating machinery
-sits: it wraps the raw model call so your capability only ever sees a typed value
-or a clean failure.
+Structured generation wraps `complete()` and sits between a capability and the raw model call.
 
 ```
-  Zoom out — where structured generation sits
-
-  ┌─ Capability ────────────────────────────────────────────────┐
-  │  rubric judge / any "give me JSON" task                     │
-  └───────────────────────────┬─────────────────────────────────┘
-                              │ generateStructured({ validate })
-  ┌─ Runtime ─────────────────▼─────────────────────────────────┐
-  │  ★ generateStructured ★  prompt → parse → validate → retry  │ ← we are here
-  └───────────────────────────┬─────────────────────────────────┘
-                              │ complete()
-  ┌─ The model ───────────────▼─────────────────────────────────┐
-  │  emits text that is SUPPOSED to be JSON (maybe fenced, maybe │
-  │  with prose around it)                                       │
-  └──────────────────────────────────────────────────────────────┘
+aptkit — where outputs get typed
+┌─────────────────────────────────────────────┐
+│ Capability (analytics: "extract these fields")│
+├─────────────────────────────────────────────┤
+│ ★ generateStructured<T>() — prompt+parse+retry│  ← you are here
+│      └ parseValidatedJson<T>(text, validate)  │
+├─────────────────────────────────────────────┤
+│ ModelProvider.complete()                       │
+├─────────────────────────────────────────────┤
+│ Model — emits text that hopefully is JSON      │
+└─────────────────────────────────────────────┘
 ```
 
-The model returns *text*, not a typed object — even when you beg it for JSON.
-Structured output is the discipline of treating that text as untrusted input:
-extract the JSON substring, parse it, validate it against a schema you wrote, and
-if any step fails, nudge the model and try again a bounded number of times. The
-output is a discriminated result: `{ok:true, value}` or `{ok:false, error}`. No
-exceptions thrown into your capability for a model that mumbled.
+The pattern is "validated decoding via parse-and-retry." The question: *how do you trust unstructured output enough to hand it to typed code?* You don't trust it — you validate it, and you retry on failure. Same instinct as `const data = schema.parse(await res.json())` after a `fetch`: the wire gives you `any`, the validator gives you a `T` or an error. Here the "wire" is a language model, which is messier, so you also retry.
 
 ## Structure pass
 
-**Layers.** Capability (defines the validator) → `generateStructured` (orchestrates
-parse/validate/retry) → `parseAgentJson` (extracts JSON from messy text) →
-validator (your typed gate) → result.
+Three layers: the capability that wants a `T`, `generateStructured` that enforces it, and `complete()` that returns raw text. Trace the **failure** axis.
 
-**Axis — trust.** Trace how trusted the data is as it climbs. Raw model text:
-zero trust. After `parseAgentJson`: it's at least valid JSON. After the
-validator: it's a typed `T` you can hand to the rest of the program. Trust is
-*manufactured* by each layer, never assumed.
+```
+FAILURE axis — what happens when output is wrong-shaped?
+Layer                    on bad output
+─────────────────────────────────────────────────────
+Capability               receives {ok:false, error} — never a half-parsed T
+generateStructured       parse fails → append strict suffix → retry ←★ seam
+  parseValidatedJson      extract JSON, JSON.parse, run validator → throw or T
+complete()               returns whatever text; doesn't care about shape
+```
 
-**Seam.** The flip is the validator. Below it, `unknown` from a stochastic model.
-Above it, a concrete `T`. That single function is where "the model said
-something" becomes "the program has a value."
+The seam is `generateStructured`. Below it, `complete()` happily returns "Sure! Here's the JSON: ```{...}```" — prose, fences, the works. Above it, the capability only ever sees a clean `{ok:true, value:T}` or a clean failure. The retry loop is where a soft failure (malformed text) becomes either a success or a hard, typed failure — it never leaks a half-valid object.
 
 ## How it works
 
-### Move 1 — the mental model
-
-You already do this at every TypeScript boundary: data crosses in as `unknown`
-(an API response, a form), and you narrow it with a type guard before using it.
-`generateStructured` is a type guard for a function whose "API" is a language
-model — same pattern, except the source can be wrong in creative new ways, so you
-add retries.
+**Mental model.** It's a `fetch`-with-validation loop, but the server occasionally ignores the schema, so you re-ask more firmly. Prompt → get text → strip fences → parse → validate. If any step fails and you have attempts left, append "Return ONLY valid JSON" and go again.
 
 ```
-  The boundary you already know vs the one here
-
-  fetch().json()  : unknown ─► guard ─► T          (you do this daily)
-  model.complete(): text    ─► parse ─► guard ─► T  (+ retry if it lies)
-                              parseAgentJson  validator
+generateStructured — the validated-decode loop
+  attempt 1: complete() ─▶ raw text ─▶ extract+parse+validate
+                                          │
+                          ok? ────────────┤
+                          yes ─▶ {ok:true, value, attempts}
+                          no  ─▶ append strict suffix, attempt 2
+  attempt 2: complete() ─▶ raw text ─▶ extract+parse+validate
+                          no  ─▶ {ok:false, error, attempts}   (give up)
 ```
 
-### Move 2 — the moving parts
-
-**Extracting JSON from messy text.** Models wrap JSON in ```json fences or sandwich
-it in prose. `parseAgentJson` strips fences, tries a straight parse, then falls
-back to a bounded substring scan for the first `{`/`[` to the last `}`/`]`. From
-`packages/runtime/src/json-output.ts:7`:
+**The retry loop with the strict nudge.** Two attempts by default; on retry it bolts a hard instruction onto the prompt.
 
 ```ts
-export function parseAgentJson(text: string): unknown {
-  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);  // ← strip ```json fences
-  const candidate = (fence ? fence[1] : text).trim();
-  try {
-    return JSON.parse(candidate);                             // ← happy path
-  } catch { /* fall through to substring scan */ }
-  const start = /* first { or [ */ …;
-  const end = Math.max(candidate.lastIndexOf('}'), candidate.lastIndexOf(']'));
-  if (start >= 0 && end > start) return JSON.parse(candidate.slice(start, end + 1));
-  throw new Error('no parseable json in model output');
+// packages/runtime/src/structured-generation.ts:54-101  (generateStructured<T>)
+const maxAttempts = options.maxAttempts ?? 2;                       // :57
+const STRICT = '\n\nReturn ONLY valid JSON - no prose, no markdown fences.'; // :58
+for (let attempt = 0; attempt < maxAttempts; attempt += 1) {        // :62
+  const system = attempt === 0 ? base : base + STRICT;             // :64 stricter on retry
+  const res = await provider.complete({ system, messages, ... });
+  const parsed = parseValidatedJson<T>(res.content..., validate);  // :84-90
+  if (parsed.ok) return { ok: true, value, rawText, attempts };    // :87-89
 }
+return { ok: false, error, attempts };                              // :100
 ```
 
-```
-  parseAgentJson fallback ladder
+The strict suffix is the "I asked nicely, now I'm asking firmly" move — most malformed outputs are prose wrappers or stray fences, and the firmer instruction usually fixes it on attempt 2. Two attempts is the deliberate ceiling: cheap insurance, not infinite retries.
 
-  fenced ```json block ──► strip ──┐
-  raw JSON.parse ──────────────────┼─► success
-  substring scan {…} / […] ────────┘
-  none of the above ──► throw "no parseable json"
-```
-
-**Validating into a typed value.** `parseValidatedJson` runs the parse, then hands
-the result to a `JsonValidator<T>` you supply. The rubric judge's validator
-(`rubric-judge.ts:170`) checks every dimension is a number in range, the verdict
-is allowed, and `fix` is a string — rejecting anything off-shape:
+**The validator turns text into a `T` or throws.** Parsing is split out so it's reusable and testable on its own.
 
 ```ts
-return (value: unknown): JsonValidation<RubricJudgment> => {
-  if (!isRecord(value)) return { ok: false, error: 'judgment must be an object' };
-  // every dimension must be a number within its declared min..max
-  if (typeof score.score !== 'number') return { ok: false, error: `dimensions.${id}.score must be a number` };
-  if (range && (score.score < range.min || score.score > range.max))
-    return { ok: false, error: `dimensions.${id}.score must be between …` };
-  if (!verdicts.has(value.verdict)) return { ok: false, error: 'verdict not allowed' };
-  return { ok: true, value: { dimensions, verdict: value.verdict, fix: value.fix.trim() } };
-};
+// packages/runtime/src/json-output.ts:30-45  (parseValidatedJson<T>)
+const obj = parseAgentJson(text);       // extract JSON from possibly-messy text
+return validate(obj);                   // your type guard: returns T or throws
 ```
-
-```
-  validator = your schema as code
-
-  unknown ─► shape? ─► types? ─► ranges? ─► allowed enums? ─► T
-            any NO ──────────────────────────────────────► {ok:false,error}
-```
-
-**The bounded retry with a strict nudge.** If validation fails, `generateStructured`
-appends a strict suffix and tries again — default twice. From
-`packages/runtime/src/structured-generation.ts:62`:
 
 ```ts
-for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {        // ← default maxAttempts = 2
-  const messages = attempt === 1 ? baseMessages
-    : appendStrictSuffix(baseMessages, strictSuffix);                // ← only on retry
-  const response = await options.model.complete({ system, messages, … });
-  const parsed = parseValidatedJson(textFromResponse(response), options.validate);
-  if (parsed.ok) return { ok: true, value: parsed.value, rawText, attempts };
-  attempts.push({ attempt, rawText, error: parsed.error });          // ← record every miss
-}
-return { ok: false, error, attempts };                               // ← never throws for bad JSON
+// packages/runtime/src/json-output.ts:7-28  (parseAgentJson — the extractor)
+const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);  // :8 strip markdown fences
+try { return JSON.parse(candidate); } catch {}              // :11-15 direct parse
+// :17-25 bounded substring scan for the first {...} or [...]
+throw new Error('no parseable json in model output');       // :27 give up
 ```
 
-The strict suffix is literally `'\n\nReturn ONLY valid JSON - no prose, no
-markdown fences.'` (`structured-generation.ts:47`).
+This is the messy reality of "JSON mode" by hand: the model loves to wrap JSON in ```json fences or chatter, so the extractor peels those off, tries a direct parse, then scans for a brace-balanced substring before admitting defeat. `validate` is your own type guard — exactly the runtime check you'd write after a `fetch` to prove the wire data matches your TS type.
 
-```
-  Retry loop (maxAttempts = 2)
+**aptkit emulates JSON mode; it doesn't use a native one.** OpenAI and Anthropic have provider-native JSON/grammar modes that constrain decoding so invalid JSON literally can't be emitted. Gemma (local, via Ollama) has none. So aptkit picks the lowest common denominator — prompt + parse + retry — which works on *every* provider including the local one. That's a real design choice: portability over the fast path. The cost is the occasional retry and the extractor's brace-scanning.
 
-  attempt 1 ─► parse+validate ─► ok? ─► return {ok:true,value}
-       │ no
-  append DEFAULT_STRICT_SUFFIX
-       ▼
-  attempt 2 ─► parse+validate ─► ok? ─► return / else {ok:false,error,attempts}
-```
-
-### Move 3 — the principle
-
-Treat model output as untrusted input crossing a boundary, exactly like a network
-response. Extract, parse, validate against a schema you own, and give the model
-one bounded second chance with a sharper instruction. Return a result type, never
-throw — the caller decides what a malformed model does to the program.
+**The principle.** Put a validator at every boundary where untyped data meets typed code, and make the failure mode explicit (`{ok:false}`), not a thrown surprise or a half-filled object. An LLM is just the least trustworthy such boundary you'll meet — so it also gets a retry. Constrain, validate, retry, then degrade cleanly.
 
 ## Primary diagram
 
-```
-  Structured generation end to end
+The full Move 2 walk: capability asks for a `T`, the loop prompts/parses/validates with a stricter retry, and the capability gets a clean result either way.
 
-  capability                generateStructured                   model
-  ┌──────────┐ validate     ┌─────────────────────────────┐ text ┌────────┐
-  │ rubric   │ ───────────► │ 1 prompt → complete()       │ ───► │ "{…}"  │
-  │ judge    │              │ 2 parseAgentJson (strip,scan)│ ◄─── │ (maybe │
-  │          │ ◄─────────── │ 3 validate → T?             │      │ fenced)│
-  └──────────┘ {ok,value}   │ 4 fail → +strict suffix,retry│     └────────┘
-                            └─────────────────────────────┘
-   above: a typed RubricJudgment  │  below: stochastic text, up to 2 tries
 ```
+generateStructured<T> — full path
+  Capability: "give me {revenue, currency}"  + validate()
+        │
+        ▼
+  ┌─ attempt loop (max 2) ───────────────────────────────┐
+  │  system = base [+ STRICT suffix if retry]             │
+  │     │ complete()                                       │
+  │     ▼                                                  │
+  │  raw text  ── parseAgentJson ──▶ strip fences /        │
+  │                                  JSON.parse / brace-scan│
+  │     │ object                                           │
+  │     ▼ validate(obj)                                    │
+  │  T ──▶ {ok:true, value, attempts} ──────────────▶ done│
+  │  throw ──▶ retry with STRICT, or after last:           │
+  │           {ok:false, error, attempts} ──────────▶ done│
+  └────────────────────────────────────────────────────────┘
+```
+
+Either branch returns a typed result object — the capability never touches raw model text.
 
 ## Elaborate
 
-Some vendors offer native "JSON mode" or schema-constrained decoding that
-guarantees parseable output. aptkit can't rely on that because its default model
-is local Gemma with no such guarantee — so it builds the safety net in code:
-extract, validate, retry. This is the same shape as `04-agents-and-tool-use`
-tool-call parsing (Gemma emits tool calls as JSON it then parses). Read
-`03-sampling-parameters.md` for why this retry net lets aptkit skip a hard
-temperature lock, and `09-user-override-locks.md` for validating fields a human
-may have edited.
+Provider-native structured output ("JSON mode," "function calling with strict schemas," grammar-constrained decoding like llama.cpp's GBNF) constrains the *decoder* so malformed JSON can't be produced — strictly better than parse-and-retry when available. aptkit's emulation is the universal fallback. This concept is the sibling of tool calling (a tool call *is* a structured output — see Gemma's emulated tool calling in `08-provider-abstraction.md`). Temperature 0 (see `03-sampling-parameters.md`) is its quiet partner: deterministic decoding makes the retry loop converge. Read `08-provider-abstraction.md` next.
 
 ## Project exercises
 
-### Add a third attempt with an even stricter nudge
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** extend the retry to optionally include a "here is the exact
-  shape: {…}" example on attempt 3, behind `retry.maxAttempts`, with a test using
-  a fixture that fails twice then succeeds.
-- **Why it earns its place:** teaches escalation strategy — each retry should add
-  information, not just repeat — and exercises the result/attempts contract.
-- **Files to touch:** `packages/runtime/src/structured-generation.ts`,
-  `packages/runtime/test/structured-generation.test.ts`.
-- **Done when:** the test proves attempt 3 fires with the example and succeeds.
-- **Estimated effort:** `1–4hr`
+### Add a provider-native JSON fast path
 
-### Write a validator for a brand-new structured task
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a `JsonValidator<T>` for a small new shape (e.g. a tagging
-  result `{tags: string[], confidence: number}`) plus a `generateStructured` call
-  and tests covering a good response, a fenced response, and an out-of-range one.
-- **Why it earns its place:** you can't claim to do structured output until you've
-  written the validator that manufactures the trust.
-- **Files to touch:** new file under `packages/runtime/src` or an agent package,
-  plus a matching `test/` file.
-- **Done when:** all three fixture cases pass/fail as designed.
-- **Estimated effort:** `1–4hr`
+- **Exercise ID:** `EX-LLM-04a`
+- **What to build:** This is implemented (Case A) — the next step is a fast path. Detect when the provider supports native JSON mode (Anthropic/OpenAI) and, when the caller passes a JSON schema, use the native constrained-decoding mode instead of prompt+parse+retry; keep the emulated loop as the fallback for Gemma.
+- **Why it earns its place:** Phase 1 mastery is knowing when to drop the portable-but-slow path for the native-and-strict one. You'll learn capability detection on the provider and how to keep one call site that branches on what the adapter can do.
+- **Files to touch:** `packages/runtime/src/structured-generation.ts` (54-101); `packages/providers/anthropic/src/anthropic-provider.ts` (28-61); `packages/providers/openai/src/openai-provider.ts`. Optionally add a `supportsJsonMode` flag to the `ModelProvider` type in `packages/runtime/src/model-provider.ts`.
+- **Done when:** an Anthropic/OpenAI call with a schema returns valid JSON in one attempt (no retry needed), Gemma still uses the emulated loop, and both paths return the same `{ok, value}` shape.
+- **Estimated effort:** `1–2 days`
 
 ## Interview defense
 
-**Q: "The model returned `Sure! Here's the JSON: ```json {…}```` — how do you handle it?"**
-`parseAgentJson` strips the ```json fence first; if that fails it scans from the
-first `{` to the last `}`. Then the validator narrows it to a typed value. If both
-fail, retry once with a strict "JSON only" suffix.
+**Q: The model returned ```json {...}``` with prose around it — how do you not choke?**
 
 ```
-  prose + ```json fence + braces ──► strip fence ──► parse ──► validate ──► T
-                                  └─ fail ─► substring {…} scan ─► parse
+  raw: "Sure! ```json\n{\"x\":1}\n``` hope that helps"
+        │ parseAgentJson
+        ▼
+  1. fence regex  → "{\"x\":1}"
+  2. JSON.parse   → {x:1}        (or fall to step 3)
+  3. brace-scan   → first {...}  (last resort)
+  4. else throw "no parseable json"
 ```
-Anchor: *model output is untrusted input; extract, validate, retry.*
 
-**Q: "Why return a result object instead of throwing on bad JSON?"**
-Because a model mumbling is an *expected* outcome, not an exceptional one. A
-`{ok:false, error, attempts}` lets the caller branch — fall back, degrade,
-surface a warning — instead of unwinding the stack on routine flakiness.
+A three-stage extractor: strip fences, direct parse, then scan for a brace-balanced substring; only then give up. Anchor: *peel the wrapper before you parse.*
+
+**Q: Why emulate JSON mode instead of using the provider's native one?**
 
 ```
-  throw       ─► caller must try/catch everywhere, easy to forget
-  result type ─► caller MUST handle ok:false, attempts visible for tracing
+  native JSON mode:  Anthropic ✓  OpenAI ✓  Gemma ✗
+  prompt+parse+retry: works on ALL three   ← aptkit picks this
+                                            (portability over the fast path)
 ```
-Anchor: *a malformed model is a value to handle, not an exception to catch.*
+
+Because Gemma (local) has no native mode, and aptkit must work across every provider; the emulated loop is the only universal option. The cost is the occasional retry. Anchor: *lowest common denominator buys you the local model.*
 
 ## See also
 
-- `03-sampling-parameters.md` — the retry net that offsets unset temperature
-- `06-token-economics.md` — each retry is another `model_usage` event (more tokens)
-- `01-what-an-llm-is.md` — why `content` is text blocks you must parse
+- [`03-sampling-parameters.md`](./03-sampling-parameters.md) — temperature 0, the partner of the retry loop.
+- [`08-provider-abstraction.md`](./08-provider-abstraction.md) — tool calls as structured output, emulated on Gemma.
+- [`01-what-an-llm-is.md`](./01-what-an-llm-is.md) — the typed boundary this enforces.

@@ -1,331 +1,217 @@
 # Class imbalance
 
-**Subtitle:** when one class dwarfs the other and accuracy stops meaning anything · *Language-agnostic*
+> industry name: **class imbalance** · type: **evaluation/training pitfall**
+
+This is the pitfall that has burned more ML engineers than any other, because it doesn't crash, doesn't error, and produces a number that looks *great*. You train a fraud detector, it reports 95% accuracy, you ship it, and it has never once flagged fraud — because 95% of transactions are legit and "always say legit" is a 95%-accurate model that does nothing. Class imbalance is what happens when one class dominates the data, and the trap is trusting accuracy when it's quietly lying to you. New ground: aptkit trains no model and computes no metrics, so this is the playbook, not a code tour.
 
 ## Zoom out, then zoom in
 
-aptkit has no trained classifier, so the layers below are the *generic*
-supervised pipeline again — but this file only cares about two boxes: the
-**model** that emits predictions and the **metric** that grades them. The
-starred box is where imbalance bites. It does not corrupt your data or your
-features; it quietly poisons the *score you read off the test set*, so a useless
-model looks excellent.
+Imbalance isn't one stage — it leaks across three. It originates in **Data** (the raw class distribution is skewed), it must be *handled* during **Train** (weights, sampling), and it must be *measured correctly* at evaluation (the val/test read). Miss it at any of the three and the other two can't save you.
+
+Pipeline placement (★ = where imbalance bites)
 
 ```
-  Zoom out — where imbalance bites (generic pipeline; aptkit has none)
-
-  ┌─ Data layer ───────────────────────────────────────────────────┐
-  │  raw rows + LABELS — but 99% are class 0, 1% are class 1        │ ◄ skew starts here
-  └───────────────────────────┬─────────────────────────────────────┘
-                              │ features
-  ┌─ Feature layer ───────────▼─────────────────────────────────────┐
-  │  numeric X, label vector y (still 99:1)                         │
-  └───────────────────────────┬─────────────────────────────────────┘
-                              │ split (stratified, file 03)
-  ┌─ Split layer ─────────────▼─────────────────────────────────────┐
-  │  train · val · test  (each must keep the 99:1 ratio)            │
-  └───────────────────────────┬─────────────────────────────────────┘
-                              │ fit + score
-  ┌─ Model + Metric layer ────▼─────────────────────────────────────┐
-  │  ★ f(X) → ŷ, graded by a metric ★  ACCURACY LIES HERE           │ ◄ the trap
-  └──────────────────────────────────────────────────────────────────┘
+┌──────────┐   ┌────────────┐   ┌─────────────────────┐   ┌──────────────┐   ┌─────────┐
+│  Data    │──▶│  Features  │──▶│  Train / Val / Test │──▶│    Model     │──▶│ Deploy  │
+│  ★ skew  │   │            │   │   ★ measure right   │   │              │   │         │
+│  born    │   │            │   │   ★ handle in train │   │              │   │         │
+└──────────┘   └────────────┘   └─────────────────────┘   └──────────────┘   └─────────┘
+     │                                    ▲
+     │  95% negative / 5% positive        │  the same skew must survive
+     └────────────────────────────────────┘  into val/test — never balance test
 ```
 
-Now zoom in. The danger is not exotic. A model that learns *nothing* and predicts
-the majority class for every row scores 99% accuracy on 99:1 data — and catches
-zero of the cases you actually built it for. The fix is never a fancier model
-first; it's a metric that can't be fooled, then a handful of training-time
-levers. An LLM person meets this the moment they grade retrieval: one relevant
-doc against a corpus of thousands is the same 1:N skew.
+The key insight from the diagram: imbalance is born in Data but is *fought* in Train and *exposed* in evaluation. And critically — you may rebalance the *training* data, but the val/test split must keep the real-world skew, or your reported metric won't predict production.
 
 ## Structure pass
 
-**Layers.** Data → features → split → model → metric. Imbalance is born in the
-data layer (the class ratio), travels untouched through features and split, and
-detonates at the metric layer. Every layer must *preserve* the ratio honestly
-(stratified split) so the test score reflects production.
+Lay it out along one axis — where in the pipeline you intervene — and the seams are clear:
 
-**Axis — where does the metric lie?** Trace what a single number hides. Accuracy
-aggregates over all rows, so it is dominated by the majority class — it answers
-"how often am I right?" when the question you actually have is "how many of the
-rare cases did I catch, and at what cost in false alarms?" Per-class recall and
-per-class precision refuse to aggregate; macro-F1 averages the classes *equally*
-instead of by population. The axis is **does this metric weight by row count
-(lies under skew) or by class (survives skew)?**
+```
+  WHERE YOU INTERVENE  ──────────────────────────────────────────────────────▶
 
-**Seam.** The load-bearing boundary is the **decision threshold** — the line
-that turns a continuous score `p ∈ [0,1]` into a hard label. Defaulting it to
-`0.5` is an unexamined choice. Above the seam: your model emits calibrated-ish
-probabilities. Below it: a business decision about how many false positives a
-true positive is worth. On imbalanced data, `0.5` is almost always the wrong
-line, and moving it (on validation data, never test) is the cheapest lever you
-have.
+  ┌───────────────────┐  seam A  ┌───────────────────┐  seam B  ┌────────────────────┐
+  │ DATA-LEVEL        │          │ TRAINING-LEVEL    │          │ DECISION-LEVEL     │
+  │ oversample,       │          │ class weights,    │          │ threshold tuning   │
+  │ undersample,      │          │ focal loss        │          │ (move the cutoff)  │
+  │ SMOTE             │          │                   │          │                    │
+  └───────────────────┘          └───────────────────┘          └────────────────────┘
+    changes the data              changes the loss               changes the readout
+    (risk: overfit copies)        (no new data needed)           (cheapest, post-hoc)
+```
+
+- **Seam A** separates "make the data look balanced" from "tell the loss function to care more about the rare class." Data-level changes the inputs; training-level changes the objective.
+- **Seam B** separates training from the decision threshold. Threshold tuning is the cheapest intervention and the one people forget — you don't always need a new model, sometimes you just move the cutoff from 0.5 to 0.2.
+
+These compose. You can class-weight *and* threshold-tune. But the first thing to fix isn't any of these — it's the *metric*, because a wrong metric hides whether anything you did worked.
 
 ## How it works
 
-### Move 1 — the mental model
+### Move 1 — Mental model: the lazy student
 
-You already grade retrieval in this repo, and you already refuse to use accuracy
-for it. `scorePrecisionAtK` and `scoreRecallAtK`
-(`packages/evals/src/precision-at-k.ts`) never divide by the corpus size — they
-divide by `min(k, retrieved)` and by `|relevantIds|`. That is not an accident.
-A query has *one* relevant doc against thousands of irrelevant ones; "accuracy
-over the corpus" would be 99.9%+ for a retriever that returns garbage, because
-it gets all the irrelevant docs "right" by leaving them out. Classification on a
-99:1 dataset is the identical problem wearing different clothes.
+Picture a student taking a true/false test where 95% of answers are "false." A lazy student who writes "false" on every line scores 95% and learns nothing. Accuracy rewards the lazy student. You need a metric that asks "but how did you do on the *true* questions?" — that's recall on the rare class.
+
+The lie pattern
 
 ```
-  Pattern — the same 1:N skew, two surfaces
-
-  RETRIEVAL                          CLASSIFICATION
-  1 relevant doc                     1% positive class
-  ───────────────                    ────────────────
-  ╔═══╗ · · · · · · · · ·            ╔═╗ · · · · · · · · ·
-  ║ ★ ║ thousands irrelevant         ║+║ 99 negatives
-  ╚═══╝ · · · · · · · · ·            ╚═╝ · · · · · · · · ·
-        │                                  │
-        ▼ accuracy over all = ~99.9%       ▼ accuracy over all = ~99%
-        ▼ and MEANINGLESS                  ▼ and MEANINGLESS
-  use precision@k / recall@k         use macro-F1 / per-class recall / PR-AUC
-   (graded on the rare set)           (graded per class, not per row)
+                 ┌─────────────────────────────────────────┐
+   model:        │  predict "negative" for EVERYTHING       │
+   "always neg"  └─────────────────────┬───────────────────┘
+                                       │
+              ┌────────────────────────┼────────────────────────┐
+              ▼                        ▼                         ▼
+      ┌───────────────┐       ┌────────────────┐       ┌──────────────────┐
+      │ accuracy 95%  │       │ rare-class      │       │ macro-F1 ≈ 0.49  │
+      │  LOOKS GREAT  │       │ recall = 0%     │       │  TELLS THE TRUTH │
+      └───────────────┘       └────────────────┘       └──────────────────┘
+            LIAR                  the real story            honest summary
 ```
 
-You don't *write* a new metric for the classifier. You reach for the same family
-the retrieval evals already use: ones that score the rare class on its own terms.
+Same model, three numbers, wildly different stories. The job is to stop reading the leftmost box.
 
-### Move 2 — accuracy lies, and what to use instead
+### Move 2 — Step by step
 
-**Part A — watch accuracy lie.** Take a fraud detector: 10,000 transactions, 100
-fraudulent. A model that predicts "not fraud" for *everything* — a constant
-function, zero learning — produces this confusion matrix:
+**Part 1: Detect the imbalance before you trust any score.** Count classes first. If the majority class is >80%, accuracy is on the suspect list.
 
-```
-  Confusion matrix — the "predict all negative" model
-
-                 predicted
-                 neg        pos
-              ┌──────────┬──────────┐
-   actual neg │  9 900   │     0    │  ← TN          (all correct, for free)
-              │  (TN)    │   (FP)   │
-              ├──────────┼──────────┤
-   actual pos │    100   │     0    │  ← FN          (every fraud MISSED)
-              │  (FN)    │   (TP)   │
-              └──────────┴──────────┘
-
-   accuracy = (TN + TP) / total = (9900 + 0) / 10000 = 99.0%   ← looks great
-   recall(pos) = TP / (TP + FN)  = 0 / 100            = 0.0%   ← catches nothing
-```
-
-99% accuracy, zero fraud caught. The single aggregate number is not just
-optimistic — it is actively pointing the wrong way. Optimize accuracy and the
-trainer will *converge toward this exact degenerate model*, because predicting
-the majority is the fastest way to be "right" most of the time.
-
-**Part B — the metrics that survive skew.** Compute them per class and refuse to
-collapse them into one population-weighted average.
+Class census
 
 ```
-  The imbalance-aware metric stack
-
-  per-class precision  =  TP / (TP + FP)   "of what I flagged, how much was real?"
-  per-class recall     =  TP / (TP + FN)   "of what was real, how much did I catch?"
-            │
-            ▼  harmonic mean, PER CLASS
-  F1(class) = 2 · (P · R) / (P + R)
-            │
-            ▼  average the CLASSES equally (not the rows)
-  macro-F1  = mean( F1(neg), F1(pos) )     ← the degenerate model scores LOW here
-            │
-            ▼  sweep the threshold across [0,1], plot P vs R, area under
-  PR-AUC    = threshold-independent quality on the RARE class
+  count labels
+  ┌──────────────────────────────┐
+  │ negative: 9500   ███████████  │
+  │ positive:  500   █            │   ratio 19:1 → accuracy is suspect
+  └──────────────────────────────┘
 ```
 
-Annotated pseudocode — note macro-F1 averages classes, so the rare class can no
-longer hide behind the common one:
+**Part 2: Switch to honest metrics.** Macro-F1 (averages F1 across classes, so the rare class counts equally), per-class recall (catches "never predicts positive"), and the confusion matrix (the ground truth behind all of it — see `08-confusion-matrices.md`).
 
-```
-  # PSEUDOCODE — not aptkit code; study ground only
-  def macro_f1(y_true, y_pred):
-      scores = []
-      for c in classes(y_true):          # treat EACH class as "the positive"
-          tp = count(y_true == c and y_pred == c)
-          fp = count(y_true != c and y_pred == c)
-          fn = count(y_true == c and y_pred != c)
-          p  = tp / (tp + fp)            # precision for class c
-          r  = tp / (tp + fn)            # recall for class c
-          scores.append(2 * p * r / (p + r))
-      return mean(scores)                # ← classes weighted EQUALLY, ratio ignored
+```python
+# PSEUDOCODE — not yet exercised in aptkit (no metrics layer exists)
+acc        = accuracy(y_true, y_pred)          # the liar
+macro_f1   = mean(f1_per_class(y_true, y_pred)) # honest summary
+recall_pos = recall(y_true, y_pred, cls="positive")  # catches the lazy student
+cm         = confusion_matrix(y_true, y_pred)   # the source of truth
 ```
 
-Prefer **PR-AUC over ROC-AUC** under heavy skew: ROC's x-axis (false-positive
-rate) has a giant denominator of negatives, so it stays flattering even when the
-positive class is a disaster. PR-AUC puts the rare class on both axes and tells
-the truth.
+**Part 3: Mitigate, then re-measure.** Apply class weights / oversampling / SMOTE / focal loss / threshold tuning — then re-run the *honest* metrics on the val set that still carries real-world skew.
 
-**Part C — the four mitigations, at training time.** Once the metric is honest,
-these are the levers. Each changes a different part of the pipeline.
+Mitigation → re-measure loop
 
 ```
-  Where each mitigation acts
-
-  ┌─ data ──────────────┐   ┌─ loss / fit ───────────┐   ┌─ decision seam ──┐
-  │ RESAMPLE            │   │ CLASS WEIGHTS          │   │ THRESHOLD TUNE   │
-  │ • oversample minor  │   │ • penalize rare-class  │   │ • move off 0.5   │
-  │ • undersample major │   │   errors heavier       │   │   using VAL data │
-  │ • SMOTE: synthesize │   │ FOCAL LOSS             │   │ • pick point on  │
-  │   new minority pts  │   │ • down-weight easy     │   │   the P–R curve  │
-  │   between neighbors │   │   negatives, focus on  │   │   you can defend │
-  │                     │   │   hard / rare cases    │   │                  │
-  └─────────────────────┘   └────────────────────────┘   └──────────────────┘
-       acts on y ratio          acts on the gradient          acts on ŷ cutoff
+  ┌──────────────┐   ┌────────────────────┐   ┌─────────────────────┐
+  │ pick lever:  │──▶│ retrain or re-      │──▶│ re-measure on val   │
+  │ weights /    │   │ threshold           │   │ (REAL skew kept)    │
+  │ SMOTE / etc. │   └────────────────────┘   └──────────┬──────────┘
+  └──────────────┘            ▲                           │
+                              │   recall up? precision     │
+                              └───  still acceptable? ──────┘
+                                    if no, pick another lever
 ```
 
-- **Class weights** — tell the loss that one positive error costs as much as ~99
-  negative errors. One line in most libraries (`class_weight="balanced"`); the
-  fit still sees all data, just values the rare class more.
-- **Resampling** — oversample the minority (duplicate or **SMOTE**: synthesize
-  new minority points by interpolating between near neighbors), or undersample
-  the majority (throw away common rows). Do this on **train only**, *after* the
-  split — resampling before splitting leaks synthetic neighbors into test.
-- **Focal loss** — reshapes the loss to down-weight easy, confidently-correct
-  majority examples so the gradient is dominated by the hard, rare ones.
-- **Threshold tuning** — leave the model alone; move the `0.5` cutoff. Pick the
-  threshold that hits your target recall on the **validation** set, then report
-  on test. This is the seam from the Structure pass.
+> **Not yet exercised in aptkit.** There is no `accuracy`, `macro_f1`, `recall`, class-weighting, SMOTE, or focal loss anywhere in `packages/`. aptkit has no labeled dataset, no training loop, and no metrics module. The above is the shape to build.
 
-Annotated threshold-tuning pseudocode:
+### Move 3 — The principle
 
-```
-  # PSEUDOCODE — not aptkit code; study ground only
-  probs = model.predict_proba(X_val)[:, POSITIVE]   # continuous scores, not labels
-  best_t = 0.5
-  for t in arange(0.01, 0.99, 0.01):                # sweep on VALIDATION, never test
-      preds = probs >= t
-      if recall(y_val, preds) >= TARGET_RECALL:      # business floor, e.g. catch 90%
-          best_t = t                                 # then take the highest-precision t
-  # freeze best_t; apply it to test/prod. 0.5 was never sacred.
-```
-
-**Move 2.5 — the aptkit reality.** Not yet exercised in aptkit — aptkit runs
-pre-trained LLMs, not trained models. The pattern is taught here as study
-ground. The closest real artifact is the eval layer: `scorePrecisionAtK` /
-`scoreRecallAtK` (`packages/evals/src/precision-at-k.ts`) and `scoreDetections`
-(`packages/evals/src/detection-scorer.ts`) already grade an inherently
-imbalanced surface — retrieval and detection — with imbalance-aware metrics
-rather than accuracy. They are the same medicine, applied to LLM outputs instead
-of a fitted `f`.
-
-### Move 3 — the principle
-
-On imbalanced data, **the metric is the product decision.** Pick the metric
-before the model: aggregate metrics (accuracy, ROC-AUC) flatter the majority and
-will steer training toward a model that ignores the class you care about. Choose
-per-class recall, macro-F1, and PR-AUC; then reach for weights, resampling, focal
-loss, and a tuned threshold — in that order of cheapness. A learned reranker is
-imbalanced *by construction* (one relevant doc per query), which is exactly why
-aptkit grades retrieval with precision@k / recall@k and never with "accuracy."
+**Match the metric to the cost of being wrong.** When one class is rare *and* matters (fraud, disease, a missed rep), accuracy averages it into invisibility. Pick metrics that refuse to let the rare class disappear — macro-F1 and per-class recall — and only then judge whether a mitigation worked.
 
 ## Primary diagram
 
-The whole trap and its escape, on one surface:
+The full imbalance-aware evaluation flow:
 
 ```
-  Imbalanced classification — the lie and the fix
-
-  99:1 data ─► fit ─► f(X)=p ─┬─► [ p ≥ 0.5 ? ] ─► ŷ
-                              │        ▲
-                              │        └── THE SEAM: move this line on val data
-                              ▼
-                     ┌─────────────────────────────┐
-            grade by │  ✗ accuracy   → 99%, LIES    │  weights by ROW count
-                     │  ✓ recall(pos)→ catches rare │  per CLASS
-                     │  ✓ macro-F1   → classes even │  per CLASS
-                     │  ✓ PR-AUC     → rare on both  │  threshold-free
-                     └─────────────────────────────┘  axes
-                              │
-   levers (cheap → costly):   ▼
-   threshold tune ─► class weights ─► focal loss ─► resample / SMOTE
+                       CLASS-IMBALANCE-AWARE EVALUATION
+  ┌──────────────────┐
+  │ raw data         │  count classes ──▶ ratio 19:1 ──▶ FLAG: accuracy suspect
+  └────────┬─────────┘
+           │
+           ▼
+  ┌──────────────────────────────┐       ┌──────────────────────────────┐
+  │ TRAIN split                  │       │ VAL / TEST split             │
+  │ (may rebalance: weights /    │       │ KEEP real 19:1 skew —        │
+  │  SMOTE / oversample)         │       │ never balance this           │
+  └──────────┬───────────────────┘       └──────────────┬───────────────┘
+             │                                            │
+             ▼                                            ▼
+       fit model                              ┌────────────────────────────┐
+             │                                │ predict on val               │
+             └───────────────────────────────▶ │                            │
+                                              └──────────────┬───────────────┘
+                                                             ▼
+                              ┌───────────────────────────────────────────────┐
+                              │ REPORT (honest):                               │
+                              │  • accuracy        ← show, but flag as liar    │
+                              │  • macro-F1        ← headline number           │
+                              │  • per-class recall← catches the lazy model    │
+                              │  • confusion matrix← the source of truth       │
+                              └───────────────────────────────────────────────┘
 ```
+
+The two split boxes carry the whole lesson: rebalance *train* if you like, but the val/test split keeps the real skew, because that's the world you'll deploy into.
 
 ## Elaborate
 
-The hard-won lesson: imbalance is a *metric and objective* problem before it is a
-*data* problem. Teams reflexively reach for SMOTE first; the higher-leverage
-moves are usually (1) stop reading accuracy, and (2) move the threshold. Two
-subtleties trip people. First, **stratify the split** — if your test set happens
-to draw few or zero positives, every per-class number becomes noise; keep the
-99:1 ratio in each fold. Second, **resample inside the training fold only** —
-SMOTE before the split synthesizes minority points whose neighbors land in test,
-which is leakage that inflates the score exactly the way file 03 warns about.
-And calibrate before you tune a threshold: if `p` isn't a real probability,
-`p ≥ t` is comparing against a meaningless scale. The retrieval evals sidestep
-all of this by never having a threshold-at-0.5 in the first place — they score
-the rare set directly.
+What trips people up:
+
+- **Balancing the test set is self-deception.** If you oversample positives into the test set, your reported recall is measured on a world that doesn't exist. Rebalance train only.
+- **SMOTE synthesizes, it doesn't conjure signal.** SMOTE interpolates between rare examples to create new ones. It can help, but on high-dimensional or image-like data it often makes nonsense points. Try class weights first — they're simpler and need no new data.
+- **Precision and recall trade off.** Threshold tuning that lifts recall usually drops precision. Decide which error is costlier *before* you tune. Missing fraud vs. annoying a customer with a false flag — that's a product call, not a math one.
+- **Macro vs. weighted F1.** Macro-F1 averages classes equally (rare class gets a full vote). Weighted F1 weights by class size — which quietly re-buries the rare class. For imbalance, you almost always want *macro*.
+
+The contrl anchor: contrl's rep counter has a natural imbalance baked into the data stream. Across a workout video, the vast majority of frames are "not a rep boundary" — the body is mid-motion, holding, or resting. The "rep completed" event is rare. If you'd evaluated a rep-detection model on frame-level accuracy, "this frame is not a rep boundary" would score in the high 90s while catching zero reps. The honest read was always per-event recall — did we catch the actual reps? — which is exactly the rare-class-recall instinct, applied to a body in a living room instead of a spreadsheet.
 
 ## Project exercises
 
-### Prove accuracy lies on the reranker's labeled data
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a script that loads a labeled `(query_id, doc_id,
-  is_relevant)` dataset built from buffr retrieval, then prints two scorecards
-  for a baseline that labels *every* candidate "not relevant": plain accuracy
-  vs. per-class recall + macro-F1. Show accuracy near 99% while positive recall
-  is 0.
-- **Why it earns its place:** makes the central lie concrete on *your* data, not
-  a textbook toy — the fastest way to internalize why this section exists.
-- **Files to touch:** new `/Users/rein/Public/buffr/eval/imbalance-demo.ts`,
-  reading `/Users/rein/Public/buffr/eval/queries.json` and
-  `/Users/rein/Public/buffr/src/pg-vector-store.ts`.
-- **Done when:** the script prints both scorecards and a one-line note that the
-  high-accuracy baseline caught zero relevant docs.
-- **Estimated effort:** `1–4hr`
+### Build an imbalance-aware eval report
 
-### Tune the decision threshold for a learned intent classifier
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a design note + threshold-sweep pseudocode for a learned
-  replacement of `packages/agents/query/src/intent.ts`, treating the rarest
-  intent as the positive class. Define a target recall, sweep the threshold on a
-  held-out validation slice, and pick the highest-precision threshold that meets
-  it — annotated, no training required.
-- **Why it earns its place:** moves the conversation from "the model" to "the
-  decision seam," which is the senior framing for any imbalanced classifier.
-- **Files to touch:** new
-  `/Users/rein/Public/buffr/docs/intent-threshold-tuning.md`, referencing
-  `/Users/rein/Public/aptkit/packages/agents/query/src/intent.ts`.
-- **Done when:** the note states the target recall, shows the val-only sweep, and
-  explains why `0.5` is rejected.
-- **Estimated effort:** `<1hr`
+- **Exercise ID:** EX-ML-05a — slots into Phase 3 (the ML-evals reporting layer), building on the harness from EX-ML-04a.
+- **What to build:** A report function that, given true and predicted labels, prints accuracy *flagged as unreliable when the class ratio crosses a threshold*, plus macro-F1 and per-class recall, and refuses to emit a green "pass" on accuracy alone.
+- **Why it earns its place:** It bakes the "accuracy is a liar under imbalance" lesson into tooling, so no future aptkit model can be declared good on a vanity metric. It's the reporting half of model selection done honestly.
+- **Files to touch:** Case B (new) — `packages/ml-evals/src/imbalance-report.ts` (the report), `packages/ml-evals/src/metrics.ts` (macro-F1, per-class recall — shared with the confusion-matrix work). No existing aptkit file is touched; aptkit has no metrics today.
+- **Done when:** Feeding the report a 95%-negative fixture and an "always predicts negative" prediction prints accuracy ≈ 0.95 *with a loud unreliable flag*, macro-F1 ≈ 0.49, and positive-class recall = 0.0 — and the function returns "fail."
+- **Estimated effort:** 1–4hr
+
+### Add a threshold-tuning sweep
+
+- **Exercise ID:** EX-ML-05b — Phase 3, with a forward link to the Phase 5 ML-hardening pass.
+- **What to build:** A sweep that, given model scores on val, walks the decision threshold from 0 to 1 and reports precision/recall at each step, surfacing the threshold that maximizes macro-F1 (or hits a target recall).
+- **Why it earns its place:** Threshold tuning is the cheapest imbalance lever and the one most often skipped. Making it a one-call sweep means the decision-level fix is always on the table before anyone retrains.
+- **Files to touch:** Case B (new) — `packages/ml-evals/src/threshold-sweep.ts`, reusing `packages/ml-evals/src/metrics.ts`.
+- **Done when:** Given val scores, the sweep prints a precision/recall table across thresholds and names the macro-F1-optimal cutoff, defaulting to 0.5 only if nothing beats it.
+- **Estimated effort:** 1–4hr
 
 ## Interview defense
 
-**Q: "A model reports 99% accuracy on a fraud dataset. Are you impressed?"**
-No — that is the number a model gets for free on 99:1 data by predicting "not
-fraud" for everything, catching zero fraud. I'd ask for per-class recall, macro-F1,
-and the PR-AUC, because those grade the rare class on its own terms instead of
-letting it hide behind the majority.
+**Q: Your model reports 95% accuracy on a fraud dataset. Are you happy?**
 
 ```
-  predict-all-negative:  accuracy 99%  │  recall(fraud) 0%
-                         ↑ lies        │  ↑ the number that matters
+  accuracy 95% ──┐
+                 ├─ what's the base rate? ──▶ 95% legit ──▶ "always legit" = 95% too
+  fraud recall ──┘──▶ check this ──▶ 0%? then the model is useless
 ```
-*Anchor: accuracy weights by row count, so the majority class drowns the metric.*
 
-**Q: "Your recall on the positive class is too low. What do you change, and in
-what order?"**
-Cheapest first: move the decision threshold off `0.5` using validation data —
-no retraining. If that's not enough, add class weights so rare-class errors cost
-more, then focal loss, then resampling/SMOTE on the training fold only. I tune
-the threshold on val and report on test, and I never resample before the split.
+No — I'd ask the base rate immediately. If 95% of rows are legit, 95% accuracy might mean the model never catches fraud. I'd report macro-F1 and fraud-class recall instead. Anchor: *accuracy averages the rare class into invisibility.*
+
+**Q: When do you reach for SMOTE vs. class weights?**
 
 ```
-  threshold ─► class weights ─► focal loss ─► SMOTE (train fold only)
-   no retrain                                  ↑ leakage risk if done pre-split
+  class weights ──▶ change loss, no new data ──▶ TRY FIRST (simpler)
+  SMOTE         ──▶ synthesize rare points  ──▶ try if weights aren't enough
+                                                 (risky on high-dim data)
 ```
-*Anchor: the threshold is a business seam, not a constant — `0.5` is a default, not a law.*
+
+Class weights first — they're simpler and add no synthetic data. SMOTE only if weighting isn't enough, and never on data where interpolated points are nonsense. Anchor: *prefer the lever that adds no fake data.*
+
+**Q: Why not just rebalance everything, train and test, so it's clean?**
+
+```
+  rebalance TRAIN ──▶ fine, helps learning
+  rebalance TEST  ──▶ measures a world that doesn't exist ──▶ lie
+```
+
+Rebalancing test makes your reported recall meaningless because production won't be balanced. Rebalance train only; keep test at the real skew. Anchor: *test must mirror the world you deploy into.*
 
 ## See also
 
-- `08-confusion-matrices.md` — TP/FP/FN/TN and the metrics derived from them
-- `01-supervised-pipeline.md` — the arc this metric layer sits at the end of
-- `03-train-val-test.md` — stratified splits, and why resampling happens after the split
-- `05-evals-and-observability/` — how aptkit grades imbalanced surfaces today
+- [`04-model-selection.md`](./04-model-selection.md) — the metric you select on must be the honest one from this file
+- [`06-domain-gap.md`](./06-domain-gap.md) — even an honest metric won't survive a distribution shift at deploy
+- [`08-confusion-matrices.md`](./08-confusion-matrices.md) — the source of truth behind macro-F1 and per-class recall, and the one file here with real aptkit code

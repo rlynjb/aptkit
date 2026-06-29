@@ -1,11 +1,11 @@
-# 06 — Orchestration System Design Templates
+# F — Orchestration System Design Templates
 
-**Anchor: codebases reframed as interview templates.**
+The studied codebase reframed as the answer to "design an agentic X system." Same code, interview framing. All three templates appear regardless of current applicability; the "Applies to this codebase" bullet is honest, and "How to make it apply" names the concrete refactor.
 
-These reframe aptkit as the answer to "design an agentic X system." Same code, interview framing. All three templates appear regardless of current applicability — the **Applies to this codebase** bullet is honest (`yes` / `partially` / `no`), and **How to make it apply** names the concrete refactor in aptkit's files.
+These use the nine-bullet system-design template shape (the prompt, standard architecture, data model, key components, scale concerns, eval framing, common failure modes, applies-to-this-codebase, how-to-make-it-apply) — NOT the per-concept template.
 
-These use the **nine-bullet template shape** (the prompt / standard architecture / data model / key components / scale / eval / failure modes / applies / how-to-apply), not the per-concept file template — no Zoom out, no How it works.
+## Files
 
-1. `01-multi-agent-research-assistant.md` — fan-out + synthesis. Applies: partially.
-2. `02-agentic-support-system.md` — single agent + tools + guardrails + escalation. Applies: partially.
-3. `03-agentic-coding-system.md` — plan-execute + verifier-critic. Applies: no.
+1. [01-multi-agent-research-assistant.md](01-multi-agent-research-assistant.md) — supervisor + parallel workers + synthesis. Applies: **partially** (aptkit has the per-worker RAG, not the supervisor).
+2. [02-agentic-support-system.md](02-agentic-support-system.md) — router + single agent + guardrails + escalation. Applies: **yes** (closest to aptkit's actual shape).
+3. [03-agentic-coding-system.md](03-agentic-coding-system.md) — plan-execute + verifier + scoped writes. Applies: **no** (aptkit's agents are read-only analytics/retrieval).

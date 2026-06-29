@@ -1,186 +1,241 @@
 # 09 — Chain-of-thought (CoT)
 
-**Industry name:** chain-of-thought / step-by-step reasoning — *Industry standard*
+**Subtitle:** chain-of-thought — step-by-step reasoning, and where to put it
+(Industry standard)
 
 ## Zoom out, then zoom in
 
-"Let's think step by step" was the magic phrase of 2023. In 2026 it's more
-nuanced: frontier models reason internally now, so explicitly asking for CoT
-helps cheaper models (like the Gemma this repo defaults to) more than it helps
-the big ones. The trap I've hit: asking for reasoning on a *simple* task wastes
-tokens and, worse, asking for free-form reasoning when you also need structured
-output pollutes your JSON. **The discipline: prompt for reasoning where the task
-is genuinely multi-step, and when you need both reasoning and a structured
-answer, put the reasoning in a field of the structured output — never in
-free-form prose around it.**
+Ask a model to reason step by step before answering and it solves multi-step
+problems better. But reasoning is prose, and prose pollutes a structured
+output. aptkit's move is the modern one: when you want both reasoning *and* a
+machine-readable answer, the reasoning goes in a *field* of the structured
+output — a `reasoning` key — not in free-form text that the parser then has
+to fight.
 
 ```
-  Zoom out — reasoning in the agent prompts
+  Zoom out — reasoning captured as a structured field
 
-  ┌─ Authoring ───────────────────────────────────────────────┐
-  │  diagnostic.ts: "Generate 2-3 hypotheses BEFORE the first  │ ← we are here
-  │     tool call" + "Recommended approach: 1. ... 2. ..."     │
-  │  rubric-judge: reasoning field IN the structured output    │
-  └───────────────────────────┬────────────────────────────────┘
-  ┌─ Runtime ─────────────────▼────────────────────────────────┐
-  │  agent loop: reasoning happens across turns (think→tool→...)│
-  └──────────────────────────────────────────────────────────────┘
+  ┌─ Capability ────────────────────────────────────────────────┐
+  │  diagnostic agent → Diagnosis with confidence inference       │ ← we are here
+  │  rubric judge     → RubricJudgment { ..., reasoning? }        │
+  └───────────────────────────┬──────────────────────────────────┘
+                              │ generateStructured
+  ┌─ Validate ────────────────▼───────────────────────────────────┐
+  │  reasoning is a STRING FIELD in the schema, validated alongside │
+  │  the answer — not free prose competing with the JSON           │
+  └────────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: the diagnostic agent is the repo's clearest CoT — its prompt
-*sequences* the reasoning ("generate hypotheses, then query to falsify each").
-The rubric judge shows the structured-CoT move: a `reasoning` field inside the
-validated JSON, not loose prose.
+Zooming in: chain-of-thought is the prompt pattern "think before you answer."
+It helps on multi-step problems and wastes tokens on simple lookups. The
+modern caveat: frontier models reason internally now, so asking explicitly
+matters less for them and more for cheaper local models like Gemma. And the
+key engineering move: keep the reasoning *inside* the structured contract.
 
-## The structure pass
+## Structure pass
 
-**Layers:** the prompt (asks for or forbids reasoning) → the model (emits
-reasoning, internally or visibly) → the consumer (must not choke on the
-reasoning).
+**Layers.** Prompt (asks for reasoning) → model (produces it) → validator
+(captures it as a typed field).
 
-**Axis — is reasoning free-form prose or a structured field?** This is the axis
-that decides whether CoT and structured output can coexist:
+**Axis — where does the reasoning text end up?** Trace it:
 
 ```
-  Axis: "where does the reasoning go?"
+  Axis: "where does the model's reasoning live in the output?"
 
-  ┌─ Free-form CoT prose ──┐   seam    ┌─ Structured reasoning field ─┐
-  │ "Let's think... <prose>│ ══╪══════► │ {"reasoning":"...",          │
-  │  then {json}"          │ flips     │  "verdict":"pass", ...}      │
-  │ → POLLUTES the parser  │           │ → parser-safe, still reasons │
-  └────────────────────────┘           └───────────────────────────────┘
+  naive CoT       → free prose BEFORE the JSON → parser must skip it  ✗
+  structured CoT  → a "reasoning" field IN the JSON → validated       ✓
+  no CoT (lookup) → no reasoning at all → cheapest                    ✓
 ```
 
-**Seam:** the boundary between reasoning and answer. If reasoning is free-form
-prose wrapped around a JSON object, `parseAgentJson` has to carve the JSON out of
-the prose (it can, via substring scan — `json-output.ts:17` — but it's fragile).
-If reasoning is a *field*, the whole output is one clean object. **What breaks at
-the seam:** "think step by step, then return JSON" produces prose-then-JSON that
-fights your structured-output contract.
+**Seam.** The boundary between *reasoning as prose* and *reasoning as a
+field* is the load-bearing one. On the prose side, reasoning competes with
+the structured answer and forces the parser to skip a prefix (the
+output-mode mismatch from concept 7). On the field side, reasoning is just
+another validated key. Crossing that seam is what makes CoT compatible with
+structured output.
 
 ## How it works
 
-### Move 1 — the mental model
+You know how you'd return `{ result, debugInfo }` from a function instead of
+`console.log`-ing the debug info into the same stream as the result?
+Structured chain-of-thought is that: the reasoning gets its own field
+instead of being smeared into the answer text. Let's walk it.
 
-You already do this in code reviews: you don't want just the answer, you want the
-reasoning that justifies it — but you want it in a structured place (the PR
-description), not scrawled across the diff. CoT is asking the model to show its
-work; structured CoT is giving the work a designated field so it doesn't bleed
-into the answer.
+### Step 1 — the reasoning field in the schema
 
-```
-  Pattern — reasoning placement
+aptkit's judgment type carries an optional `reasoning` field right alongside
+the verdict:
 
-  TASK simple?  ──► skip CoT (wastes tokens)
-  TASK multi-step + prose output? ──► "think step by step" inline
-  TASK multi-step + structured output? ──► reasoning as a FIELD:
-       { "reasoning": "...", "answer": ... }   ← one object, parser-safe
-```
-
-### Move 2 — walking the two reasoning styles
-
-**Sequenced CoT (the diagnostic agent).** `diagnostic.ts:17` lays out a
-"Recommended approach": *"1. Generate 2-3 hypotheses before the first tool call.
-2. Query to falsify each hypothesis. 3. … 4. Conclude with the hypothesis that
-best fits the evidence."* This is CoT as an explicit procedure — the prompt
-doesn't just say "reason," it scripts the reasoning steps. **Why here:** root-cause
-diagnosis *is* multi-step (hypothesize → test → conclude), so the reasoning
-earns its tokens. **What breaks without it:** the model jumps to a conclusion and
-never falsifies competing hypotheses — the single-hypothesis trap.
-
-**Cross-turn CoT (the agent loop).** In `runAgentLoop`, reasoning is distributed
-across turns: the model emits a thought, calls a tool, sees the result, reasons
-again (`run-agent-loop.ts:98` loop). Each assistant turn's text is the visible
-reasoning, traced as a `step` event (`:128`). The loop *is* a chain-of-thought
-spread over tool calls — the ReAct pattern (see `../study-agent-architecture/`).
-
-**Structured reasoning (the rubric judge).** The judgment shape includes a
-`reasoning` field and a per-dimension `reason` (`rubric-judge.ts:46`,
-`RubricJudgment`). The reasoning lives *inside* the validated JSON:
-
-```
-  Inline annotation — rubric-judge.ts:135 output shape
-
-  const outputShape = {
-    dimensions: { <dim>: { score: 0, reason: '' } },  ← per-dimension reasoning
-    verdict: '...',
-    fix: '',
-    reasoning: '',                                     ← overall reasoning, a FIELD
-  };
-  // → the model reasons AND returns clean JSON; parser never sees loose prose
+```ts
+// packages/evals/src/rubric-judge.ts:46
+export type RubricJudgment = {
+  dimensions: Record<string, RubricDimensionScore>;  // each: { score, reason }
+  verdict: string;
+  fix: string;
+  reasoning?: string;        // ← CoT captured as a field, not prose
+};
 ```
 
-This is the move the spec calls out: want both reasoning and a structured answer?
-The reasoning goes in a field, not in free prose. The validator (`:206`) even
-checks `reasoning` is a string when present.
+And the per-dimension `reason` field (`rubric-judge.ts:41`) is reasoning at a
+finer grain — the model justifies each score in its own slot. The validator
+checks `reasoning` is a string when present (`rubric-judge.ts:206`). So the
+reasoning is part of the validated contract, not a free-text prefix the
+parser has to navigate around.
 
-**When CoT hurts.** The intent classifier (`intent.ts:19`) deliberately forbids
-reasoning: *"Reply with ONLY the one word"* with `maxTokens: 16`. Asking a
-one-word classifier to reason would waste tokens and risk it emitting the
-reasoning instead of the label (an output-mode mismatch, concept 07). Simple
-lookups and structured classifiers should *suppress* CoT.
+### Step 2 — the prompt elicits reasoning into the field
 
-### Move 3 — the principle
+The judge's output shape, built in the system prompt, includes the
+`reasoning` key explicitly so the model knows where to put its thinking:
 
-**Reasoning is a token spend you make only when the task is multi-step, and you
-give it a structured home when you also need a parseable answer.** The modern
-caveat matters: on frontier models internal reasoning means explicit CoT buys
-less than it used to, but on the cheaper local models this repo targets (Gemma)
-it still pays. The durable rule is placement — free-form CoT and structured
-output don't mix, so route the reasoning into a field.
+```ts
+// packages/evals/src/rubric-judge.ts:135
+const outputShape = {
+  dimensions: dimensionShape,   // { dimId: { score, reason } }
+  verdict: ...,
+  fix: '',
+  reasoning: '',                // ← the model fills this with its CoT
+};
+// :158  'Output JSON only. ... Use exactly this shape:' + JSON.stringify(outputShape)
+```
+
+```
+  Pattern — CoT routed into a field
+
+  prompt: "Use exactly this shape: { dimensions:{...,reason}, verdict,
+                                     fix, reasoning }"
+            │
+            ▼
+  model thinks → writes reasoning INTO the "reasoning" key
+            │
+            ▼
+  validator: reasoning is a string? ✓   verdict in allowlist? ✓
+            │
+            ▼
+  one parse, no prose-prefix to skip — CoT + structure coexist
+```
+
+The per-dimension `reason` is the CoT made *useful*: not just "I thought
+about it" but a justification attached to each score, which is what makes the
+judgment auditable.
+
+### Step 3 — when CoT helps vs hurts, in this repo
+
+```
+  Comparison — CoT cost/benefit by capability
+
+  intent classifier (intent.ts) → SIMPLE LOOKUP
+    one of three words, maxTokens:16 → CoT would WASTE tokens, skip it  ✗
+  diagnostic agent → MULTI-STEP (hypothesis-tested Diagnosis)
+    benefits from step-by-step reasoning → CoT helps                    ✓
+  rubric judge → MULTI-STEP scoring
+    reasoning field justifies each score → CoT helps, captured in field ✓
+```
+
+The intent classifier is the clean negative example: it has a 16-token
+budget and picks one of three words. Asking it to reason step by step would
+blow the budget and add nothing — a lookup doesn't need a chain of thought.
+The diagnostic and judge tasks are genuinely multi-step, so reasoning earns
+its tokens there.
+
+### Step 4 — the modern caveat: internal reasoning
+
+Frontier models now do chain-of-thought internally — you don't always have
+to ask. But aptkit's headline provider is Gemma, a local model
+(`gemma-provider.ts:47`, `gemma2:9b`), which benefits more from explicit
+reasoning than a frontier model does. So the calculus here leans toward
+keeping explicit reasoning fields: the cheaper the model, the more an
+explicit "reason about each dimension" instruction buys you. This is the
+provider seam (from the overview) showing up again — the same prompt
+technique pays off differently depending on the model under it.
+
+### The principle
+
+**Chain-of-thought trades tokens for accuracy on multi-step tasks, and the
+engineering move is to capture the reasoning in a structured field so it
+coexists with the machine-readable answer instead of fighting it.** Skip it
+on lookups; use it on multi-step work; and never let the reasoning escape
+into free prose that the parser then has to skip — give it a `reasoning` key.
+The cheaper your model, the more explicit CoT earns its place.
 
 ## Primary diagram
 
+CoT routed into a field, contrasted with the prose-prefix anti-pattern.
+
 ```
-  Chain-of-thought — placement decision across the repo
+  Chain-of-thought in aptkit — field, not prefix
 
-  intent classifier      → NO CoT  ("one word only", maxTokens:16)
-                            simple task, reasoning would waste/pollute
+  ANTI-PATTERN (prose prefix):
+    "Let me think... [paragraph] ```json {answer} ```"
+     └─ parser must skip prose, output-mode-mismatch risk (concept 7)
 
-  diagnostic agent        → SEQUENCED CoT in the prompt
-                            "1. hypothesize 2. falsify 3. locate 4. conclude"
-
-  agent loop (any)        → CROSS-TURN CoT (think → tool → think), ReAct
-                            each assistant turn = a reasoning step (trace)
-
-  rubric judge            → STRUCTURED CoT: reasoning in a JSON FIELD
-                            {dimensions:{reason}, reasoning} — parser-safe
+  aptkit (reasoning as a field):
+  ┌─ prompt ────────────────────────────────────────────────────┐
+  │  "Use exactly this shape: { dimensions:{score,reason},        │
+  │     verdict, fix, reasoning }"                                │
+  └────────────────────────────┬──────────────────────────────────┘
+                              │ model fills reasoning + reason keys
+  ┌─ validated RubricJudgment ▼───────────────────────────────────┐
+  │  { dimensions: { quality: { score:4, reason:"..." } },        │
+  │    verdict:"pass", fix:"...", reasoning:"..." }               │
+  │  reasoning + answer in ONE validated object                   │
+  └────────────────────────────────────────────────────────────────┘
+   skip CoT entirely for lookups (intent classifier, mt:16)
 ```
 
 ## Elaborate
 
-The CoT result (Wei et al., 2022) showed step-by-step prompting unlocks
-multi-step reasoning in large models; the 2024–2025 shift is that
-reasoning-tuned models (the o-series, Claude's extended thinking) do this
-internally, so the *explicit* "think step by step" instruction is increasingly
-redundant on frontier models but still load-bearing on small/local ones. The
-structured-reasoning-field pattern is the production reconciliation of CoT with
-tool calling and JSON mode — Anthropic's guidance is exactly this: use a
-`<thinking>` region or a dedicated field so reasoning doesn't contaminate the
-answer. The agent loop here is the ReAct variant of CoT (reason+act
-interleaved), covered at depth in `../study-agent-architecture/`.
+The chain-of-thought line of work (Wei et al., "chain-of-thought prompting")
+showed that eliciting intermediate reasoning improves multi-step accuracy.
+The follow-on insight that matters for production is structural: free-form
+reasoning conflicts with structured output, so you route it into a field. The
+OpenAI and Anthropic guidance both converge on this — put scratch-work in a
+designated place, return the answer in the schema.
+
+The modern wrinkle is reasoning models that think internally before
+answering. For those, an explicit "think step by step" is often redundant.
+But a toolkit built around a *local* model can't assume that capability, so
+aptkit's explicit `reasoning`/`reason` fields are the right hedge — they help
+the weak model and don't hurt the strong one. This connects to evals (concept
+5): the per-dimension `reason` is what makes a judge's score auditable and
+its failures diagnosable.
 
 ## Interview defense
 
-**Q: You need the model to reason AND return JSON — how?** Put the reasoning in a
-field of the structured output (`{"reasoning": "...", "answer": ...}`), never as
-free-form prose around the JSON. Free prose + JSON fights your parser; a field
-keeps one clean object that still carries the reasoning.
+**Q: You want both reasoning and a structured answer. How do you prompt for
+it?**
+
+Put the reasoning in a field of the schema — a `reasoning` key, or a `reason`
+per sub-decision — not in free prose before the JSON. Free-form reasoning
+collides with the structured output: the parser has to skip a prose prefix,
+which is exactly the output-mode mismatch failure. A reasoning *field* is
+just another validated string, and it coexists with the answer in one parse.
 
 ```
-  ✗ "think step by step\n\n{...}"   → parser carves JSON out of prose (fragile)
-  ✓ {"reasoning":"...", "verdict":"..."}  → one object, reasons + parses
+  reasoning as prose prefix → parser skips it → fragile
+  reasoning as a schema field → validated alongside the answer → clean
 ```
-*Anchor: `rubric-judge.ts:135` (reasoning field) vs `intent.ts:19` (no CoT).*
 
-**Q: When does CoT hurt?** Simple lookups and structured classifiers — it wastes
-tokens and risks the model emitting reasoning where you wanted a bare label
-(output-mode mismatch). The intent classifier forbids it on purpose. On frontier
-models explicit CoT also buys less now that reasoning is internal.
+Anchor: "aptkit's `RubricJudgment` has a `reasoning` field and a per-dimension
+`reason`; the prompt hands the model the exact output shape including those
+keys (`rubric-judge.ts:135`)."
+
+**Q: When do you NOT use chain-of-thought?**
+
+On simple lookups and tight classifiers, where it wastes tokens for no
+accuracy gain. aptkit's intent classifier picks one of three words on a
+16-token budget — asking it to reason would blow the budget and add nothing.
+The modern caveat too: frontier models reason internally, so explicit CoT
+matters less for them and more for cheap local models like Gemma.
+
+Anchor: "Intent classifier, `maxTokens:16` — a lookup, no CoT. Diagnostic and
+judge are multi-step, so reasoning earns its tokens there."
 
 ## See also
 
-- `02-structured-outputs.md` — the structured output the reasoning field lives in.
-- `07-output-mode-mismatch.md` — free-form CoT + JSON is a mode collision.
-- `04-token-budgeting.md` — CoT is a deliberate token spend.
-- `../study-agent-architecture/` — the agent loop as ReAct-style CoT.
+- [02-structured-outputs.md](02-structured-outputs.md) — the structured
+  contract the reasoning field lives in
+- [07-output-mode-mismatch.md](07-output-mode-mismatch.md) — what happens
+  when reasoning escapes into prose
+- [04-token-budgeting.md](04-token-budgeting.md) — CoT's token cost
+- [10-self-critique.md](10-self-critique.md) — reasoning as the input to a
+  self-review step

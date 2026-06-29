@@ -1,80 +1,129 @@
-# AI Engineering — aptkit, in one picture
+# AI Engineering — aptkit, in one map
 
-aptkit is an **LLM application engineering** codebase. Not classical ML, not
-prompt meta-tooling — a TypeScript monorepo that packages the reusable parts of
-an agent system behind swappable contracts, with a local-first default (Gemma
-on Ollama, zero cloud) and an eval/replay backbone that is the strongest single
-thing in the repo.
+This guide studies one codebase: **aptkit** (`/Users/rein/Public/aptkit`),
+a TypeScript monorepo that packages reusable AI-agent capabilities as
+`@rlynjb/aptkit-core`, plus its companion runtime **buffr**
+(`/Users/rein/Public/buffr`) — the laptop body that supplies the durable
+vector store (`PgVectorStore`).
 
-Here is the whole AI system in one frame. Every concept file in this guide
-zooms into one box.
-
-```
-  aptkit AI system — the whole thing, top to bottom
-
-  ┌─ Capability layer (the agents) ───────────────────────────────────┐
-  │  rag-query · query · recommendation · anomaly-monitoring ·         │
-  │  diagnostic-investigation · rubric-improvement                     │
-  │  each = prompt package + tool policy + agent-loop config + parser  │
-  └───────────────────────────┬───────────────────────────────────────┘
-                              │ runAgentLoop (bounded turns, forced synthesis)
-  ┌─ Runtime layer (provider-neutral core) ─▼─────────────────────────┐
-  │  ModelProvider.complete()  ·  ToolRegistry  ·  CapabilityEvent     │
-  │  parseAgentJson  ·  generateStructured  ·  usage ledger            │
-  └───────────────┬───────────────────────────────┬───────────────────┘
-                  │ tools                          │ model
-  ┌─ Retrieval ───▼──────────────┐   ┌─ Providers ─▼────────────────────┐
-  │ EmbeddingProvider+VectorStore│   │ gemma (local, emulated tools)     │
-  │ chunk→embed→upsert / search  │   │ anthropic · openai · fallback ·   │
-  │ search_knowledge_base tool   │   │ context-window guard              │
-  │ + episodic memory (reuses    │   └───────────────────────────────────┘
-  │   the same two contracts)    │
-  └──────────────┬───────────────┘
-                 │ implements VectorStore
-  ┌─ Storage (in aptkit: in-memory · in buffr: Postgres) ─▼───────────┐
-  │ InMemoryVectorStore (cosine scan)   │  buffr PgVectorStore         │
-  │                                     │  (pgvector + HNSW, agents.*)  │
-  └──────────────────────────────────────────────────────────────────┘
-  ┌─ Eval / observability backbone (cuts across all of it) ───────────┐
-  │ precision@k · rubric-judge (Claude judges Gemma) · structural-diff │
-  │ detection-scorer · replay-runner · promoted-fixture golden master  │
-  └────────────────────────────────────────────────────────────────────┘
-```
+Everything below is grounded in real files. Where aptkit doesn't do
+something, this guide says `not yet exercised` instead of inventing it.
 
 ## The shape of this codebase
 
-Of the three AI shapes the spec recognizes — LLM application engineering,
-prompt meta-tooling, classical ML — aptkit is squarely the first. It builds a
-bounded agent loop, provider adapters, a from-scratch RAG pipeline, episodic
-memory over the same retrieval contracts, and an eval harness. There is **no
-training pipeline, no feature engineering, no on-device classifier**. Section 08
-(Machine Learning) is therefore taught as new ground, not as a tour of code that
-exists — and the ML system-design templates in Section 09 are honest about that.
+Of the three AI-work shapes the spec recognizes — LLM application
+engineering (loopd-shaped), prompt engineering as meta-tooling
+(aipe-shaped), classical supervised ML (contrl-mo-shaped) — aptkit is
+overwhelmingly **LLM application engineering**. It builds the substrate
+under an agent product: a provider-neutral model interface, a from-scratch
+RAG pipeline, a bounded agent loop, episodic memory over the retrieval
+contracts, and a distinctive eval/replay harness. The classical-ML
+section (08, 09) is almost entirely new ground; the one genuine bridge is
+the ranked-retrieval scorer (`scorePrecisionAtK`, `packages/evals/src/precision-at-k.ts`).
 
-## What's distinctive here (read these first)
+```
+  aptkit on the three-shapes map
 
-1. **The retrieval-quality bug + fix + regression test.** A weak local model
-   passing a hallucinated `filter` argument used to wipe every search result.
-   The fix (`matchesFilter` in `search-knowledge-base-tool.ts:101`) ignores
-   filter keys absent from a chunk's metadata. See `03-retrieval-and-rag/04` and
-   `03/11`.
+  ┌─ LLM application engineering (loopd-shaped) ──── PRIMARY ─┐
+  │  provider-neutral ModelProvider.complete()               │
+  │  from-scratch RAG (EmbeddingProvider + VectorStore)      │
+  │  bounded agent loop (runAgentLoop, maxTurns)             │
+  │  episodic memory over the retrieval contracts           │
+  │  precision@k / rubric-judge / replay eval harness        │
+  └──────────────────────────────────────────────────────────┘
+  ┌─ prompt engineering meta-tooling (aipe-shaped) ── adjacent ┐
+  │  PromptPackage + renderPromptTemplate + injectProfile      │
+  │  (see the sibling guide study-prompt-engineering)          │
+  └────────────────────────────────────────────────────────────┘
+  ┌─ classical supervised ML (contrl-mo-shaped) ─ NOT EXERCISED ┐
+  │  one bridge only: precision@k / recall@k scorer            │
+  │  no training, no feature engineering, no on-device model   │
+  └──────────────────────────────────────────────────────────────┘
+```
 
-2. **Emulated tool-calling for a model with none.** Gemma has no native tool
-   API, so the provider renders tools into the system prompt and parses a JSON
-   tool call back out, with a bounded retry nudge and a graceful text fallback
-   (`gemma-provider.ts`). See `04-agents-and-tool-use/02`.
+## The whole system in one diagram
 
-3. **One contract, two consumers.** `EmbeddingProvider` + `VectorStore` power
-   both RAG and episodic memory with zero new infrastructure — the strongest
-   evidence the boundary was drawn in the right place. See `04/05` and `03/11`.
+This is the picture to hold. Every concept file zooms into one box.
 
-## How to read this guide
+```
+  aptkit — the layers, end to end
 
-Start with `01-llm-foundations` (foundations move fast — you already have the
-shapes from AdvntrCue). Then `03-retrieval-and-rag` and `04-agents-and-tool-use`
-are the heart of this repo. `05-evals-and-observability` is the part most
-candidates can't defend — spend time there. `06-production-serving` and the
-templates in `07`/`09` are interview-reframe layers. `08-machine-learning` is
-study-only ground.
+  ┌─ App layer (apps/studio, host apps, buffr CLI) ──────────────┐
+  │  React/Vite Studio · buffr laptop runtime · your own host    │
+  └───────────────────────────────┬───────────────────────────────┘
+                                   │ calls capabilities
+  ┌─ Capability layer (packages/agents/*) ───▼───────────────────┐
+  │  rag-query · recommendation · anomaly-monitoring ·           │
+  │  diagnostic-investigation · query · rubric-improvement       │
+  │  (each = prompt package + tool policy + loop config + validator)
+  └───────────────────────────────┬───────────────────────────────┘
+                                   │ runAgentLoop()
+  ┌─ Runtime layer (packages/runtime) ───────▼───────────────────┐
+  │  bounded agent loop · ModelProvider contract · JSON extract  │
+  │  · structured-generation retry · usage/cost ledger · NDJSON  │
+  └──────────┬────────────────────────────────────┬──────────────┘
+             │ ModelProvider.complete()            │ tools / retrieval
+  ┌─ Provider layer (packages/providers/*) ▼──┐  ┌─▼ Retrieval layer ──┐
+  │  anthropic (claude-sonnet-4-6) · openai   │  │ (packages/retrieval)│
+  │  (gpt-4.1) · gemma (Ollama, emulated tool │  │ EmbeddingProvider + │
+  │  calling) · fallback chain · context guard│  │ VectorStore contracts│
+  └────────────────────────────────────────────┘  │ pipeline · chunker  │
+                                                   │ search_knowledge_base│
+  ┌─ Storage layer ─────────────────────────────┐  │ + memory (episodic) │
+  │  InMemoryVectorStore (cosine, aptkit)        │◄─┴─────────────────────┘
+  │  PgVectorStore (pgvector + HNSW, buffr)      │
+  └───────────────────────────────────────────────┘
+```
 
-See `README.md` for the file-by-file index and reading order.
+## Reading order
+
+The sub-sections follow the phases of building an LLM system: foundations
+first, then context, retrieval, agents, evals, serving, and finally the
+interview-reframe templates and the (mostly aspirational) ML track.
+
+1. `01-llm-foundations/` — what the model is, how aptkit talks to it,
+   the provider abstraction, the cost ledger, the heuristic-before-LLM
+   coverage gate, the user-override lock idea.
+2. `02-context-and-prompts/` — the context window guard, lost-in-the-middle,
+   prompt chaining across capabilities.
+3. `03-retrieval-and-rag/` — the from-scratch RAG pipeline, the contracts,
+   embeddings, chunking, the in-memory and pgvector stores, the signature
+   hallucinated-filter bug and its fix, and what RAG is here.
+4. `04-agents-and-tool-use/` — agents vs chains, emulated tool calling,
+   the ReAct-style loop, tool routing/policy, episodic agent memory,
+   error recovery in the bounded loop.
+5. `05-evals-and-observability/` — eval set types, the eval-method ladder,
+   LLM-as-judge bias (Claude judging Gemma), trace/replay observability.
+6. `06-production-serving/` — caching, cost optimization, prompt injection,
+   rate limiting/backpressure, retry/circuit breaker (most `not yet exercised`).
+7. `07-system-design-templates/` — search ranking, tech-support chatbot,
+   reframed as interview prompts this codebase exemplifies (or could).
+8. `08-machine-learning/` — classical ML as new ground; one bridge
+   (precision@k), the rest curriculum-only.
+9. `09-ml-system-design-templates/` — recommender, anomaly detection,
+   object detection, reframed for interviews.
+
+Then the two root files:
+
+- `ai-features-in-this-codebase.md` — the actual AI features aptkit ships.
+- `ml-features-in-this-codebase.md` — the honest ML answer (one bridge,
+  no trained models).
+
+## Cross-links to sibling guides
+
+- **study-prompt-engineering** — the prompt-as-code layer (PromptPackage,
+  renderPromptTemplate, injectProfile) and prompt-injection defenses are
+  taught in depth there.
+- **study-agent-architecture** — the agent loop, multi-agent orchestration,
+  agentic retrieval reasoning patterns.
+- **study-dsa-foundations** — cosine similarity, ranked retrieval, the
+  heap/sort math under precision@k.
+- **study-database-systems** — pgvector storage layout, HNSW indexing,
+  the durable store beneath buffr.
+- **study-testing** — the replay/fixture golden-master harness, the
+  eval seam, deterministic provider fixtures.
+
+> Note on curriculum IDs: no `aieng-curriculum.md` / `curriculum.md` is
+> present in `.aipe/project/`. Project-exercise blocks therefore name the
+> curriculum *phase* (from this spec) but do not cite invented `Bx.y`
+> Build-item IDs. Files to touch are always real aptkit/buffr paths.

@@ -1,214 +1,174 @@
-# Hybrid retrieval — Reciprocal Rank Fusion
+# Hybrid retrieval
+> Reciprocal Rank Fusion · Industry standard
 
-**Subtitle:** Hybrid retrieval · merging dense + sparse rankings with RRF · *Industry standard*
+You've got two rankers that fail on opposite query types (file 05): dense catches paraphrase, sparse catches exact tokens. Hybrid retrieval runs both and merges their ranked lists into one. The clean way to merge isn't to average their scores — those scores live on incompatible scales (cosine is [-1,1], BM25 is unbounded) — it's **Reciprocal Rank Fusion**: throw away the scores, keep only each item's *rank position*, and combine. RRF is a few lines, has one tunable constant, and consistently beats either ranker alone. aptkit has neither lane fused today — this is `not yet exercised`, and building it is the exercise.
 
 ## Zoom out, then zoom in
 
-Hybrid retrieval is what you build *after* you have both a dense path and a sparse
-path and need one ranked list out of two. It sits above both retrievers, as a pure
-merge step. aptkit has the dense path and the merge slot, but no sparse path and no
-merger yet — so this whole concept is `not yet exercised`, taught as the pattern and
-its insertion point.
+Hybrid retrieval is a fusion layer that would sit *above* the two retriever lanes and *below* the search tool.
 
 ```
-  Zoom out — fusion sits above two retrievers
-
-  ┌─ search_knowledge_base tool ────────────────────────────────┐
-  │  ★ FUSE two ranked lists into one ★   ← the RRF slot         │ ← we are here
-  └──────────────┬───────────────────────────┬──────────────────┘
-                 │ dense (exists)             │ sparse (not built)
-  ┌─ pipeline.query ▼─────────┐   ┌─ bm25Index.search ▼─────────┐
-  │ cosine over nomic, top-k  │   │ NOT YET EXERCISED           │
-  └───────────────────────────┘   └─────────────────────────────┘
+where RRF would sit (DOES NOT EXIST YET)
+┌──────────────────────────────────────────────────────────┐
+│  search_knowledge_base                                      │
+└───────────────┬────────────────────────────────────────────┘
+                ▼
+┌──────────────────────────────────────────────────────────┐
+│  ★ RRF fusion ★   merge two ranked lists by rank position   │  ← the gap
+└───────┬───────────────────────────────────┬────────────────┘
+        ▼                                     ▼
+┌────────────────────┐              ┌────────────────────────┐
+│ DENSE (cosine)      │              │ SPARSE (BM25)           │
+│ exists ✓            │              │ not yet exercised (05)  │
+└────────────────────┘              └────────────────────────┘
 ```
 
-Now zoom in. You have merged two sorted lists before — but you couldn't just
-concatenate their scores, because the two lists score on different scales. A cosine
-similarity of 0.82 and a BM25 score of 14.3 are not comparable numbers. RRF solves
-this by throwing away the scores entirely and fusing on *rank position* — which is
-the move worth understanding even before you build it.
+Two gaps stack here: there's no sparse lane (file 05) and no fusion. But fusion is the *interesting* gap — it's the small, elegant algorithm that makes hybrid worth doing. It depends only on each lane returning a ranked `VectorHit[]`, which both lanes already do (or would). The fusion layer never looks at raw scores, so it doesn't care that cosine and BM25 are unit-incompatible — that scale-blindness is the whole reason RRF wins.
 
 ## Structure pass
 
-**Layers.** Fusion (RRF) → two rankings (dense list, sparse list) → two retrievers
-(cosine — exists; BM25 — `not yet exercised`).
+Pick the **trust** axis: how much does fusion trust each ranker's *scores* vs its *ordering*?
 
-**Axis — control.** Trace who decides the final order. The retrievers each propose a
-ranked list; the fuser decides the merged order. Control over "what's #1" moves from
-*either retriever* up to *the fuser*. RRF's design choice is that control depends
-only on each item's *rank* in each list, never on the raw scores — so no retriever's
-score scale can dominate.
+```
+trust across fusion strategies
+  SCORE FUSION                       RANK FUSION (RRF)
+  ┌──────────────────────┐          ┌──────────────────────────┐
+  │ trusts raw scores      │          │ trusts ONLY the ordering  │
+  │ cosine [-1,1] vs       │          │ rank 1, rank 2, rank 3... │
+  │ BM25 [0,∞) → must      │          │ no normalization needed   │
+  │ normalize (fragile)    │          │ scale-immune              │
+  └──────────────────────┘          └──────────────────────────┘
+         ▲ seam: RRF refuses to trust scores it can't compare ▲
+```
 
-**Seam.** The would-be seam is inside `search-knowledge-base-tool.ts`: today the
-handler calls `pipeline.query` once (`search-knowledge-base-tool.ts:89`). The fusion
-step slots right there — call both retrievers, fuse, return. Nothing in the
-pipeline or agent changes; the tool grows a merge.
+The seam is the score scale. Score fusion needs you to normalize cosine and BM25 onto a common scale — and that normalization is brittle, corpus-dependent, and a constant source of "why did this regress." RRF sidesteps it entirely by trusting only rank order. A rank of 1 means the same thing from both lanes ("this ranker's top pick") regardless of the underlying number. That's why RRF is the default fusion method: it's robust precisely because it trusts less.
 
 ## How it works
 
-### Move 1 — the mental model
-
-You know that merging two sorted lists by their values requires the values to be on
-one scale. When they aren't — two judges scoring on different rubrics — you don't
-average their scores; you average their *ranks*. RRF is exactly that: convert each
-list to "you were #1, #2, #3…" and score an item by how high it ranks across lists.
-A chunk that both retrievers rank near the top wins; a chunk only one finds still
-scores, just lower.
+**Move 1 — the RRF formula.** Each item's fused score is the sum, over every ranked list it appears in, of `1 / (k + rank)`:
 
 ```
-  RRF — fuse on rank position, not on score
-
-  dense ranks:  [A(#1), C(#2), B(#3)]      sparse ranks: [B(#1), A(#2), D(#3)]
-       │                                         │
-       └──────────► score(item) = Σ 1/(k + rank_in_each_list) ◄──────────┘
-   A: 1/(60+1) + 1/(60+2)   B: 1/(60+3) + 1/(60+1)   ─► sort by summed score
+RRF score for one item
+   RRF(item) = Σ over lists L  of   1 / (k + rank_L(item))
+                                          │        │
+                                          │        └─ item's position in list L (1-based)
+                                          └────────── constant, conventionally 60
+   appears high in BOTH lists → two big terms → big fused score
+   appears in only one list, low → one small term → small fused score
 ```
 
-### Move 2 — the RRF formula and where it slots
+Why `1/(k+rank)`? It's a reciprocal: rank 1 contributes a lot, rank 2 less, rank 100 almost nothing — so being near the top matters far more than being present at all. The constant `k=60` (the value from the original RRF paper, and everyone's default) flattens the curve a little so the very top ranks don't completely dominate — without it, a rank-1 item (`1/1`) would be worth 2x a rank-2 item (`1/2`), which over-rewards the top. With `k=60`, rank 1 is `1/61` and rank 2 is `1/62` — close, so agreement across lists drives the result more than any single list's #1.
 
-**The formula: sum of reciprocal ranks.** RRF assigns each item a score by summing
-`1 / (k + rank)` over every list it appears in. `k` is a constant — conventionally
-60 — that dampens the gap between top ranks so a single retriever's #1 cannot
-steamroll the fusion. No score normalization is needed because scores never enter
-the formula; only positions do.
+**Move 2 — the fusion step.** `not yet exercised`. The logic in pseudocode:
 
 ```
-  RRF score (PSEUDOCODE — not yet exercised)
-
-  score(item) = Σ over lists  1 / (k + rank_in_list)      k = 60
-   rank is 1-based; absent-from-a-list contributes nothing
-   no normalization: cosine 0.82 vs BM25 14.3 never compared directly
+fuse two ranked lists with RRF (pseudocode — DOES NOT EXIST in aptkit)
+function rrfFuse(denseHits, sparseHits, k = 60, topK = 5):
+    scores = {}                                  # id → fused score
+    for list in [denseHits, sparseHits]:
+        for rank, hit in enumerate(list, start=1):
+            scores[hit.id] += 1 / (k + rank)     # ← rank position only; ignore hit.score
+    ranked = sort scores by value DESC
+    return ranked[:topK] as VectorHit[]          # same return shape as either lane
 ```
 
-**Where it slots in aptkit.** The tool handler today is single-path
-(`search-knowledge-base-tool.ts:89`):
+```
+worked example (k=60, topK=3)
+  DENSE ranks:   [A, B, C, D]        SPARSE ranks:  [C, A, E]
+  A: 1/(60+1) + 1/(60+2) = .0164 + .0161 = .0325   ← high in both → wins
+  C: 1/(60+3) + 1/(60+1) = .0159 + .0164 = .0323   ← also high in both
+  B: 1/(60+2)            =          .0161           ← dense only
+  E:            1/(60+3) =          .0159           ← sparse only
+  fused top-3: [A, C, B]   ← A and C surface because BOTH lanes agree on them
+```
+
+The magic is in A and C: neither lane ranked both at the top, but RRF rewards *cross-lane agreement*, so the items both rankers liked rise above the items only one liked. That's the consensus signal you can't get from either list alone.
+
+**Where it plugs in.** The fused output must keep the `VectorHit` shape so the search tool downstream is untouched:
 
 ```ts
-let hits = await pipeline.query(query, fetchK);   // dense only, today
+// the contract RRF must satisfy — packages/retrieval/src/contracts.ts:15-19
+export type VectorHit = {
+  id: string;
+  score: number;     // ← put the RRF score here so callers stay generic
+  meta: Record<string, unknown>;
+};
+// fusion returns VectorHit[] — search_knowledge_base (file 11) never knows it fused
 ```
 
-The hybrid version wraps this. It is the *only* line that changes — the agent, the
-pipeline contracts, and the citation logic are all downstream of the fused list:
+The fused list reuses `VectorHit` so `createSearchKnowledgeBaseTool` (`search-knowledge-base-tool.ts:89`) calls `pipeline.query` and gets the same shape back whether it's pure dense or fused — the over-fetch and filter logic above it doesn't change.
 
-```
-  Hybrid handler (PSEUDOCODE — not yet exercised)
-
-  dense  = await pipeline.query(query, fetchK)      # exists (line 89)
-  sparse = await bm25Index.search(query, fetchK)    # not built (see 05-dense-vs-sparse)
-  fused  = reciprocalRankFusion([dense, sparse], k=60)
-  hits   = fused.slice(0, topK)                     # then existing toResult/citation path
-```
-
-**Why RRF over weighted score-blend.** A weighted blend
-(`0.7*cosine + 0.3*bm25`) forces you to normalize two incomparable scales and tune a
-weight per corpus. RRF needs neither — it is parameter-light (just `k`), robust, and
-the reason it is the standard hybrid-fusion default. That robustness is exactly what
-you want for a step that has to work across query types without per-query tuning.
-
-```
-  Two fusion strategies
-
-  weighted blend: normalize scales + tune weights per corpus  ── fragile
-  RRF:            rank-only, single k=60, no normalization     ── robust ✓
-```
-
-### Move 2.5 — current state vs future state
-
-```
-  Phase A (aptkit, now)             Phase B (hybrid — not yet exercised)
-  ┌────────────────────────┐        ┌──────────────────────────────────┐
-  │ tool calls pipeline.query│      │ tool calls dense + sparse, fuses  │
-  │ one ranked list (cosine) │ add  │ RRF(k=60) merges by rank          │
-  │ search-…-tool.ts:89      │ RRF  │ same line is the only change      │
-  └────────────────────────┘        └──────────────────────────────────┘
-   the fusion slot exists; the second retriever and the fuser do not
-```
-
-### Move 3 — the principle
-
-When you merge rankings from systems that score on different scales, fuse on
-*position*, not on *value* — that's what makes RRF the default. Don't normalize two
-incomparable score scales and don't tune a blend weight per corpus; sum reciprocal
-ranks with `k=60` and let robustness beat precision-tuning. Build it only once a
-sparse path exists — fusing one list with itself is a no-op — which is why aptkit's
-RRF is a documented next step, not a feature.
+**Move 3 — the principle.** Fuse rankings, not scores. The instant you're combining two rankers that score on different scales, normalization is a trap — it's fragile and corpus-specific. RRF's discipline is to discard the scores and trust only positions, which makes it scale-immune and nearly tuning-free (one constant, and 60 works). The payoff isn't just "best of both"; it's the *agreement* signal — items both lanes rank highly get promoted, and that consensus is more reliable than either lane's top pick.
 
 ## Primary diagram
 
 ```
-  Hybrid retrieval with RRF (the target shape)
-
-  query
-    ├──► pipeline.query (cosine) ───► [A,C,B]   (dense ranks)   ── exists
-    └──► bm25Index.search ──────────► [B,A,D]   (sparse ranks)  ── not yet exercised
-                                         │
-                  RRF: score = Σ 1/(60 + rank), per item across both lists
-                                         ▼
-                              fused ranked list ─► slice topK
-                                         │
-                       existing toResult/citation path (unchanged)
+hybrid retrieval with RRF (the buildable target)
+   query
+     ├──────────────► DENSE lane  ──► [A, B, C, D]  (by cosine)
+     └──────────────► SPARSE lane ──► [C, A, E]     (by BM25)
+                              │            │
+                              ▼            ▼
+                  ┌────────────────────────────────┐
+                  │ RRF: Σ 1/(60 + rank)            │
+                  │ rank position only, scores tossed│
+                  └───────────────┬────────────────┘
+                                  ▼
+                     fused [A, C, B] as VectorHit[]
+                                  │
+                                  ▼  cross-lane agreement → A, C promoted
+                        search_knowledge_base (unchanged)
 ```
+
+Two ranked lists in, one fused list out, scores discarded, agreement rewarded.
 
 ## Elaborate
 
-Hybrid retrieval is the canonical answer to "dense alone misses exact tokens"
-(`05-dense-vs-sparse.md`): keep dense for semantics, add sparse for literals, fuse
-so a chunk strong in either surfaces. The reason RRF specifically dominates is
-operational — it has one knob (`k`), needs no score calibration, and degrades
-gracefully when one retriever returns garbage. At aptkit's scale this is premature
-until the corpus carries identifiers or code; the value of documenting it now is
-knowing the *exact line* (`search-knowledge-base-tool.ts:89`) where it lands.
-Read `05-dense-vs-sparse.md` for the sparse path RRF needs and `07-reranking.md` for
-the complementary "re-score the fused candidates" stage.
+RRF comes from Cormack, Clarke & Büttcher (2009), who showed this trivially simple method beats more complex learned fusion — a recurring lesson in IR. It's now the built-in fusion in Elasticsearch, OpenSearch, and Weaviate's hybrid search. Adjacent: **weighted RRF** (multiply each lane's contribution by a trust weight when you know one lane is better for your corpus), **convex score combination** (`α·dense + (1-α)·sparse` after normalization — the fragile alternative RRF avoids), and the fact that RRF generalizes to *any* number of rankers (add a reranker's list, a recency list, etc.). Read next: `05-dense-vs-sparse.md` (the two lanes you're fusing) and `07-reranking.md` (the precision stage after fusion).
 
 ## Project exercises
 
-### Implement reciprocal rank fusion over dense + a stub sparse list
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a pure `reciprocalRankFusion(lists, k = 60)` that takes ranked
-  id lists and returns one fused ranked list, wired into the search tool to fuse the
-  existing dense results with a second list (a BM25 path, or a stub for the test).
-- **Why it earns its place:** RRF is the single most-asked hybrid-retrieval
-  mechanism; a tested implementation that fuses on rank (not score) proves you
-  understand why score-blending is fragile.
-- **Files to touch:** a new `packages/retrieval/src/reciprocal-rank-fusion.ts`,
-  `packages/retrieval/src/search-knowledge-base-tool.ts` (call it around line 89), a
-  new test in `packages/retrieval/test/`.
-- **Done when:** a unit test shows an item ranked #2 in both lists outscores an item
-  ranked #1 in only one, with `k = 60`.
-- **Estimated effort:** `1–4hr`
+### Combine the dense store and a sparse retriever with RRF
+
+- **Exercise ID:** `EX-RAG-06a`
+- **What to build:** An `rrfFuse(lists, k=60, topK)` and a `HybridRetriever` that calls the dense store + the sparse retriever (from `EX-RAG-05a`) in parallel and fuses their ranked lists into one `VectorHit[]`.
+- **Why it earns its place:** This is the payoff of building the sparse lane — and the thing that makes aptkit's retrieval beat dense-only on a mixed query set. The fusion is tiny but the win is real and measurable. Case B; depends on `EX-RAG-05a`. Phase 2B.
+- **Files to touch:** new `packages/retrieval/src/rrf.ts` and `packages/retrieval/src/hybrid-retriever.ts`; consumes the dense `VectorStore` (`packages/retrieval/src/in-memory-vector-store.ts`) and the future sparse retriever; returns `VectorHit` (`packages/retrieval/src/contracts.ts:15-19`).
+- **Done when:** on the `EX-RAG-05b` fixture, the hybrid retriever beats both dense-only and sparse-only on top-5 hit rate, and a test pins the RRF math on a hand-computed example.
+- **Estimated effort:** `1–2 days`
+
+### Unit-test the RRF math against a hand-computed example
+
+- **Exercise ID:** `EX-RAG-06b`
+- **What to build:** A pure-function test of `rrfFuse` using the worked example above (DENSE `[A,B,C,D]`, SPARSE `[C,A,E]`, k=60) asserting the exact fused order and that cross-lane agreement promotes A and C.
+- **Why it earns its place:** RRF's whole value is the agreement-promotion behavior — pin it so a refactor that "simplifies" the formula can't silently turn it into score-averaging.
+- **Files to touch:** test alongside `packages/retrieval/src/rrf.ts`.
+- **Done when:** the test asserts `[A, C, B]` and fails if `k` or the reciprocal is changed.
+- **Estimated effort:** `<1hr`
 
 ## Interview defense
 
-**Q: "How do you combine dense and sparse results?"**
-Reciprocal Rank Fusion. Each retriever returns a ranked list; I score every item by
-summing `1/(k + rank)` over the lists it appears in, with `k = 60`, then sort by that
-sum. It fuses on rank *position*, so I never have to normalize cosine scores against
-BM25 scores — which are on incomparable scales. In aptkit it slots into the search
-tool around `search-knowledge-base-tool.ts:89`; today only the dense list exists, so
-it's `not yet exercised`.
+**Q: Why fuse ranks instead of just averaging the cosine and BM25 scores?**
 
 ```
-  score = Σ 1/(60 + rank)  ── rank-based, no normalization, one knob
+cosine ∈ [-1,1]   BM25 ∈ [0,∞)   ← incompatible scales
+average → BM25 dominates by magnitude, normalization is corpus-fragile
+RRF → 1/(k+rank): rank 1 means "top pick" identically in both lanes
 ```
-Anchor: *fuse on rank, not on score — that's why RRF needs no calibration.*
 
-**Q: "Why not just average the two scores?"**
-Because cosine similarity (≈0–1) and BM25 (unbounded, corpus-dependent) live on
-different scales — averaging them lets whichever scores bigger dominate, and you'd
-have to normalize and tune a weight per corpus. RRF sidesteps all of that by using
-only rank position, which is why it's the robust default.
+Anchor: score averaging requires normalizing incompatible scales, which is brittle; RRF trusts only rank position, which is scale-immune.
+
+**Q: What does the constant k=60 actually do?**
 
 ```
-  blend 0.82 (cosine) vs 14.3 (BM25) ─► incomparable, needs tuning
-  RRF on ranks #1/#2/#3 ─► comparable by construction
+k small (k=0): rank1=1/1, rank2=1/2 → top rank dominates 2:1
+k=60:          rank1=1/61, rank2=1/62 → near-equal → AGREEMENT decides
 ```
-Anchor: *scores from different retrievers aren't comparable; ranks are.*
+
+Anchor: `k` flattens the reciprocal curve so cross-lane agreement, not a single list's #1, drives the fused order — 60 is the paper's default and it works.
 
 ## See also
 
-- `05-dense-vs-sparse.md` — the two retrievers RRF fuses
-- `07-reranking.md` — re-scoring the fused candidates with a cross-encoder
-- `04-vector-databases.md` — the dense retriever that exists today
-- `11-rag.md` — the search tool and pipeline RRF plugs into
-- `05-evals-and-observability/01-eval-set-types.md` — proving fusion beats dense alone
+- [05-dense-vs-sparse.md](05-dense-vs-sparse.md) — the two lanes fusion combines
+- [07-reranking.md](07-reranking.md) — adding a precision stage after fusion
+- [11-rag.md](11-rag.md) — where the fused list feeds the agent

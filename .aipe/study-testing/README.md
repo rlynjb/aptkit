@@ -1,84 +1,80 @@
 # Study — Testing & Correctness (aptkit)
 
-How do you *know* this code works — and will keep working after the next
-change? A good suite tells you what a change broke before your users do. A
-suite that doesn't is decoration. This guide audits aptkit's tests against
-that bar.
+**The question this guide answers: how do you KNOW the code works — and will
+keep working after the next change?** A good suite tells you what a change
+broke before your users do. A suite that doesn't is decoration. This guide
+audits aptkit's suite against that bar.
 
-The headline: aptkit's tests are unusually good for a one-person repo. Zero
-test dependencies (`node --test`, the built-in runner), TDD throughout, and a
-**single load-bearing design move** that makes everything testable — every
-expensive seam (the model, the embedder, the vector store, the transport) is
-an *injected contract*, so a fake slots in where production wires a real one.
-The same `ModelProvider` boundary that buys provider-swap and fallback is what
-lets a recorded Gemma reply replace a live `:11434` call in a unit test.
+## The through-line
 
-## The seam that organizes this whole guide: determinism
+aptkit is an AI-agent toolkit. The hard part of testing it is that the core is
+non-deterministic — a model decides what to say, which tool to call, whether to
+emit valid JSON. You can't assert `equals` against a coin flip. aptkit's answer,
+repeated in every package, is one move:
+
+> **Put the model behind a port (`ModelProvider`), inject a fake at the port,
+> and the whole assembly above it becomes deterministic.**
+
+Everything testable in this repo traces back to that one inversion. The agents
+don't call a vendor SDK; they call `ModelProvider.complete()`. Tests feed that
+port recorded responses (`FixtureModelProvider`) and assert exact outputs. Same
+shape one layer down (the Gemma provider's injected `chat` transport) and one
+layer over (the `EmbeddingProvider`/`VectorStore` retrieval contracts).
+
+## The seam that splits this guide from study-ai-engineering
 
 ```
-  The fault line — which half is a finding here vs in study-ai-engineering
+  Determinism — the line between a test and an eval
 
-  ┌─ TESTING (here) ─────────────────────────────┐
-  │  assertion = "equals the expected value"      │
-  │  given known input → assert known output      │
-  │  unit · integration · contract · regression   │
-  └───────────────────────────────────────────────┘
-                      │  they MEET when you test an AI feature:
-                      │  a deterministic harness wrapping a
-                      ▼  probabilistic core
-  ┌─ EVALUATION (study-ai-engineering) ──────────┐
-  │  assertion = "good enough / didn't regress"   │
-  │  non-deterministic model output, scored        │
-  │  precision@k · LLM-as-judge · rubric scoring   │
-  └───────────────────────────────────────────────┘
+  ┌─ TEST (here, study-testing) ─────────────────────────────┐
+  │  assertion = "equals the expected value"                 │
+  │  prompt assembly · tool dispatch · output parsing ·      │
+  │  fixture replay · scorer math · contract behavior        │
+  └────────────────────────────┬─────────────────────────────┘
+                               │  same module, different half
+  ┌─ EVAL (study-ai-engineering) ────────────────────────────▼┐
+  │  assertion = "is the model output good / did it regress?" │
+  │  rubric-judge scoring · promoted-fixture golden masters   │
+  └────────────────────────────────────────────────────────────┘
 ```
 
-aptkit is interesting precisely because it sits on this fault line. The
-`scorePrecisionAtK` / `RubricJudge` machinery is an *evaluation* tool — but
-its own tests (`packages/evals/test/*`) are pure *testing*: known ranking,
-known relevant set, precision computed by hand, `assert.equal(score, 2/3)`.
-The eval logic is deterministic and unit-tested here; the model output it
-scores is probabilistic and belongs to study-ai-engineering. Every finding
-below states which half it's on.
-
-## What's in this folder
-
-- `audit.md` — Pass 1. The 7-lens audit. Walks coverage, levels, design
-  pressure, determinism, error paths, AI-feature testing, and a red-flag
-  capstone. Start here for the verdict.
-- `01-injectable-transport-seam.md` — the kernel pattern. Every provider takes
-  its I/O as a constructor arg (`chat`, `embed`, an array of providers), so
-  tests feed recorded bytes with no network. This is why the suite has zero
-  network dependencies.
-- `02-fixture-replay-golden-master.md` — `FixtureModelProvider` replays
-  recorded `ModelResponse[]` deterministically; promoted fixtures are
-  timestamped correctness baselines. Regression-tests agent trajectories
-  across model/prompt changes.
-- `03-regression-test-from-a-real-bug.md` — the `{textContains}` hallucinated
-  filter bug → a test asserting a hallucinated filter key returns non-empty.
-  A real bug pinned by a named test.
-- `04-deterministic-eval-scorers.md` — the testing half of the eval seam:
-  precision@k, detection-scorer, structural-diff scored against hand-computed
-  expected values. Where testing meets evaluation.
-- `05-db-integration-serialized.md` — buffr's `PgVectorStore` tests run against
-  real Postgres with `--test-concurrency=1` and a `skip` guard when
-  `DATABASE_URL` is unset. The one true integration layer in the system.
+If the assertion is "equals," it's here. If it's "good enough / didn't
+regress," it's study-ai-engineering. They MEET constantly in aptkit — a
+deterministic harness wrapping a probabilistic core. Each pattern file states
+which half it's on.
 
 ## Reading order
 
-1. `audit.md` — the map and the verdict.
-2. `01` and `02` — the two patterns that make everything else testable.
-3. `03`, `04`, `05` — the specific techniques worth naming.
+1. **`00-overview.md`** — one-page orientation: the suite at a glance, the
+   numbers, the one move that makes it all testable.
+2. **`audit.md`** — the 7-lens audit (Pass 1). The risk map, the pyramid, the
+   error-path coverage, the AI-feature seam, and the consolidated red-flag
+   checklist with the three ranked fixes. Read this for the verdict.
+3. **The pattern files (Pass 2)** — the testing techniques aptkit actually
+   exercises deliberately, each worth recognizing by name:
+   - **`01-injected-model-port.md`** — the dependency-injection seam: a fake at
+     the `ModelProvider` port replays recorded responses; the whole agent above
+     it runs unchanged and deterministic.
+   - **`02-injected-transport.md`** — the seam one level deeper: the Gemma
+     provider's own decode/retry tested with recorded Ollama replies, no
+     `:11434`.
+   - **`03-promoted-fixture-golden-master.md`** — recorded `ModelResponse[]`
+     promoted to a timestamped baseline, replayed to catch regression on a
+     non-deterministic core.
+   - **`04-deterministic-fake-embedder.md`** — keyword-presence embedders that
+     make cosine ranking exact, so retrieval/memory tests can't flake.
+   - **`05-bug-to-regression-test.md`** — the hallucinated-filter bug turned
+     into a permanent guard (`search-knowledge-base-tool.test.ts`).
 
-## Cross-links to other guides
+## Cross-links
 
-- **study-ai-engineering** — the *evaluation* half. The rubric-judge as
-  LLM-as-judge, the eval-set design, precision@k as a retrieval metric (not
-  as a unit-test assertion). This guide tests the scorers; that guide uses
-  them to grade models.
-- **study-software-design** — "hard to test" is a design smell there, not
-  re-audited here. aptkit's testability is downstream of its deep-module /
-  injected-contract design; lens 3 below cross-links rather than duplicates.
-- **study-debugging-observability** — the `CapabilityEvent` trace that tests
-  assert on (`events.map(e => e.type)`) is the same trace that powers Studio
-  replay and NDJSON observability. Tests and observability share one stream.
+- **study-ai-engineering** — the eval half of the determinism seam: rubric-judge
+  scoring, precision@k as a retrieval *metric* (vs the scorer's *math*, tested
+  here), regression evaluation of model output.
+- **study-software-design** — "hard to test" as a design smell. aptkit shows the
+  inverse: the suite is easy because the seams (dependency inversion on every
+  external boundary) were drawn right. The deep-modules / dependency-inversion
+  findings live there.
+- **study-debugging-observability** — the trace-event stream (`CapabilityEvent`,
+  NDJSON) that the agent tests assert against is also the production evidence
+  channel.

@@ -1,121 +1,115 @@
 # Reflexion / Self-Critique Loop
 
-**Industry standard.** "Reflexion," "self-critique," "self-refine," "critic loop." Type label: reasoning pattern (a loop layered on a base pattern). **In this codebase: partially — the rubric-improvement agent is a self-*judging* loop, but no agent critiques and revises its own answer before returning it.** The recovery turn salvages bad output; it doesn't critique good output.
+**Industry term:** reflexion / self-critique (the agent evaluates its own output and retries). *Industry standard.*
 
 ## Zoom out, then zoom in
 
-Reflexion is: the agent produces a draft, evaluates its own output, and retries if it's flawed. aptkit's closest instance is the rubric-improvement agent — but it judges a *subject* against a rubric, it doesn't loop on its own answer. Worth seeing the distinction clearly, because it's an easy interview trap.
+A loop where the agent grades its own draft and revises. aptkit has one thing in this family — `rubric-improvement` — but it's pointed at an *external* subject, not the agent's own output. That distinction is the whole lesson here.
 
 ```
-  Zoom out — the reflexion-shaped code in aptkit
+  Zoom out — the closest aptkit gets
 
-  ┌─ Pattern family (SECTION A) ────────────────────────────┐
-  │  ReAct → plan-execute → ★ reflexion ★ → ToT              │ ← partial here
-  │  closest instance: rubric-improvement (judges a subject) │
-  └───────────────────────────┬──────────────────────────────┘
-                              │ and the runtime's
-  ┌─ Loop layer ──────────────▼──────────────────────────────┐
-  │  runRecoveryTurn (run-agent-loop.ts:204) — salvage, not   │
-  │  self-critique                                            │
-  └────────────────────────────────────────────────────────────┘
+  ┌─ Capability layer ──────────────────────────────────────────┐
+  │  rubric-improvement: an agentic IMPROVEMENT loop over a       │ ← we are here
+  │  scored subject — reflexion-shaped, but aimed outward         │
+  └───────────────────────────────┬──────────────────────────────┘
+                                   │ runAgentLoop (maxTurns 6, maxToolCalls 3)
+  ┌─ Runtime layer ─────────────────▼───────────────────────────┐
+  │  the agent loop skeleton                                      │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-## Structure pass
+Zoom in: textbook reflexion has the agent critique *its own answer*. aptkit's `rubric-improvement` (`packages/agents/rubric-improvement/src/rubric-improvement-agent.ts`) scores a *subject* against a rubric, finds the weakest dimension, and proposes a next action. It's a critique loop, but the thing being critiqued is external. aptkit has no loop where an agent re-critiques and revises its *own* output.
 
-**Axis: what is being evaluated?** True reflexion evaluates *the agent's own answer* and loops to improve it. Trace that across aptkit's two candidates and both fall short of the canonical pattern in instructive ways:
-- `rubric-improvement` evaluates an *external subject*, not its own output — it's an LLM-as-judge with a next-action, not a self-critique loop.
-- `runRecoveryTurn` re-runs when parsing *failed*, not when the answer was *judged weak* — it's error recovery, not reflection.
+## The structure pass
 
-The seam: reflexion loops on *quality*; aptkit's recovery loops on *parse-validity*. Different triggers, different patterns.
+**Layers.** A base pattern (ReAct produces a draft) and a critic layer on top (grade, then revise-or-return).
+
+**Axis: failure containment — what kind of error does self-critique catch?** It catches format and obvious errors well; it catches subtle reasoning errors poorly, because the critic shares the producer's blind spots.
+
+**The seam.** The critic step. It either approves (return) or rejects (revise and loop). The cap on retries is load-bearing — without it, a stubborn critic loops forever.
 
 ## How it works
 
+**Use case in aptkit:** `rubric-improvement`. It's the only agent with a "judge then act" shape. The mechanics below cover both the textbook reflexion loop and how aptkit's external-subject version differs.
+
 ### Move 1 — the mental model
 
-Reflexion sits on top of a base pattern (usually ReAct): the base produces a draft, a critic step asks "is this correct/complete?", and on "flawed" it revises and loops — with a cap, because a model critiquing itself can loop forever.
+It's a code reviewer pass on your own PR before you request review — except the reviewer is the same model that wrote the code. Useful for catching typos and obvious bugs; weak at catching the design flaw you couldn't see when you wrote it.
 
 ```
-  Reflexion — a critic loop on top of a base pattern
-
-  ┌─ base (ReAct) produces a draft answer ──────────┐
-  └────────────────────┬─────────────────────────────┘
+  ┌──────────────────────────────────────────────┐
+  │  base pattern (ReAct) produces a draft answer  │
+  └────────────────────┬───────────────────────────┘
                        ▼
-  ┌─ critic: "correct? complete?" ──────────────────┐
-  └─────────┬───────────────────────┬─────────────────┘
-            ▼ good                  ▼ flawed
-        return                  revise + loop (cap the retries)
+  ┌──────────────────────────────────────────────┐
+  │  Critic step: "is this correct / complete?"    │
+  └────────────────────┬───────────────────────────┘
+              ┌─────────┴─────────┐
+              ▼ good              ▼ flawed
+          return            revise + loop
+                            (cap the retries)
 ```
 
-### Move 2 — what aptkit actually has, and what it doesn't
+### Move 2 — the walkthrough
 
-**The rubric-improvement agent — a judge, not a self-critic.** It scores a subject against a rubric, finds the weakest dimension, and emits one next action. This is reflexion-*shaped* (score → identify weakness → act) but the subject is external.
+**aptkit's external-subject critique.** `rubric-improvement` scores a subject against a `RubricDefinition`, then emits a judgment plus a next action:
 
-```typescript
-// packages/agents/rubric-improvement/src/rubric-improvement-agent.ts:97-105
-'Your job is to score the subject, identify the weakest dimension, and produce one focused next action.',
-// ...output shape: { judgment, weakestDimension, nextAction, nextDrill }
+```ts
+// rubric-improvement-agent.ts:66 — the improvement loop
+const { parsed } = await runAgentLoop({
+  capabilityId: RUBRIC_IMPROVEMENT_CAPABILITY_ID,
+  system,                          // "score the subject, find the weakest dimension"
+  userPrompt: buildRubricImprovementUserPrompt(input),
+  maxTurns: 6, maxToolCalls: 3,
+  parseResult: (text) => parseImprovementResult(text, validate),
+  recoveryPrompt: (completedToolCalls) => [ /* re-emit valid JSON */ ],
+});
 ```
 
-It runs the standard loop (`maxTurns: 6, maxToolCalls: 3`, line 76-77) with tools to fetch judgment history and generate the next scenario. It's an **agentic improvement loop** over a learner's attempts — genuinely useful — but it doesn't critique and revise *its own* judgment. There's no "is my judgment wrong? re-judge" step.
+The critique is of the *subject*, not the agent's prior answer. There's no "the agent revises its own output and re-grades" cycle — it grades once and recommends. That's a single-pass judge, not iterative reflexion.
 
-**The recovery turn — salvage, not critique.** When `parseResult` returns null, the loop runs one recovery turn:
+**The recovery turn is NOT reflexion.** `runAgentLoop`'s recovery path (`run-agent-loop.ts:204`) re-runs the model when the output doesn't *parse*. That's a format-validity retry, not a quality self-critique — it doesn't ask "is this answer good," it asks "is this valid JSON." Don't conflate the two in an interview.
 
-```typescript
-// packages/runtime/src/run-agent-loop.ts:192-198
-parsed = options.parseResult(finalText);
-if (parsed === null && options.recoveryPrompt) {
-  const recoveryText = await runRecoveryTurn(options, options.recoveryPrompt(toolCalls));
-  parsed = recoveryText === null ? null : options.parseResult(recoveryText);
-}
-```
-
-This fires on a *parse failure* (model returned prose, not JSON), reusing the evidence already gathered (`recommendation-agent.ts:103` builds the recovery prompt from completed tool calls). It's a one-shot retry for format, not a quality critique — and it caps at exactly one attempt, so no loop.
-
-**What aptkit lacks: a self-critique-over-answer loop.** No agent does "draft the answer → ask a critic if it's grounded/complete → revise if not." The rag-query agent could: after grounding, a critic step could ask "is every claim cited?" and re-search on "no." aptkit doesn't — it trusts the first grounded answer.
-
-**The hard limit that makes aptkit's restraint reasonable.** A model critiquing its own output shares the blind spots that produced it. Self-critique catches format and obvious-error failures well; subtle-reasoning failures poorly. The cost is 2-5x tokens for one reliability step. aptkit gets the format-failure coverage cheaply via the recovery turn (one shot, only on parse failure) without paying the full reflexion tax on every run.
+**The hard limit if aptkit added true reflexion.** A model critiquing its own output shares the blind spots that produced it. Self-critique catches format and obvious errors; it catches subtle-reasoning failures poorly. And it costs 2-5x tokens for one extra reliability step. For a weak local model like Gemma, the critic is as likely to approve a wrong answer as catch it — which is partly why aptkit leans on *structural* validators (`validate.ts`) instead of model self-critique.
 
 ### Move 3 — the principle
 
-Reflexion buys reliability at a token multiplier, and only on the failure classes a model can see in itself. aptkit spends that budget surgically: a single recovery turn gated on parse-failure, not a critique loop on every answer. If subtle-reasoning errors became the dominant failure, the move is a critic from a *different* model family — not the same model grading itself.
+Self-critique is a reliability step you pay 2-5x tokens for, and it only helps where the model can actually see its own error. aptkit's choice — structural validators plus a parse-recovery turn, not model self-critique — is the right call for a weak local model whose self-critique would be unreliable.
 
 ## Primary diagram
 
 ```
-  aptkit's two reflexion-adjacent loops vs true reflexion
+  Reflexion (textbook) vs aptkit's rubric-improvement
 
-  rubric-improvement (judges EXTERNAL subject):
-    subject → score against rubric → weakestDimension → nextAction
-    (no loop back over its own judgment)
+  textbook reflexion:   draft ─► self-critique ─► revise ─► re-grade ─┐
+                          ▲                                           │
+                          └────────── loop (capped) ──────────────────┘
 
-  runRecoveryTurn (salvages on PARSE failure):
-    finalText → parse → null? → ONE recovery turn → parse again
-    (one shot, triggered by format not quality)
-
-  TRUE reflexion (NOT in aptkit):
-    draft → critic("grounded? complete?") → flawed? → revise → loop (capped)
+  aptkit rubric-improvement:  subject ─► grade once ─► next action
+                              (external subject, single pass; the
+                               recovery turn is parse-validity, not critique)
 ```
 
 ## Elaborate
 
-Reflexion formalized "let the model check its own work and try again." The catch the field learned: self-critique has a ceiling set by the model's own blind spots, which is why high-stakes systems use a *different* model as critic (the self-preference bias from LLM-as-judge). aptkit's rubric-improvement agent is the seed of a real reflexion system — it already has the judge and the rubric; wiring it to critique an agent's *answer* (not a learner's subject) would be the step to actual reflexion.
+Reflexion (Shinn et al., 2023) added a verbal self-reflection step that let an agent learn from failed attempts within a task. It works best when failures are *checkable* — a test fails, a format is wrong — and worst when the failure is a subtle reasoning error the same model can't detect. For high-stakes outputs, the production fix is a *different* model family as the critic (covered in `03-multi-agent-orchestration/05-debate-verifier-critic.md`), which breaks the shared-blind-spot problem.
 
 ## Interview defense
 
-**Q: Do your agents self-critique?**
-Not over their own answers. The rubric-improvement agent is a judge — it scores an external subject against a rubric and emits a next action — but it doesn't loop on its own judgment. And the runtime has a recovery turn that re-prompts on a *parse* failure, but that's salvage, not quality critique. I deliberately don't run a critique loop on every answer because a model grading itself shares its own blind spots and costs 2-5x tokens.
+**Q: Does aptkit do self-critique?**
+
+Not on the agent's own output. `rubric-improvement` is a critique loop, but it grades an external subject, not its own answer. And the loop's recovery turn is a parse-validity retry, not a quality self-critique. For a weak local model, structural validators plus a parse-recovery turn beat unreliable model self-critique.
 
 ```
-  recovery turn: parse-fail → ONE retry (format)   ≠   reflexion: quality → loop
+  rubric-improvement: grade SUBJECT (external)  ≠  reflexion on SELF
+  recovery turn: "is this valid JSON?"          ≠  "is this answer good?"
 ```
-*Anchor: name the difference — aptkit loops on parse-validity, not on judged quality.*
 
-**Q: If you needed real self-critique, how?**
-A critic step from a *different* model family, gated on stakes — not the same model grading itself. My swappable provider layer makes that one config change. And I'd cap the rounds, because a self-critic with no cap loops forever.
+*Anchor: name the shared-blind-spot limit — a model critiquing itself shares the errors that produced the output.*
 
 ## See also
 
-- `02-agent-loop-skeleton.md` — `runRecoveryTurn` in the kernel
-- `04-agent-evaluation.md` (SECTION D) — the rubric-judge eval, the judge mechanics
-- `03-multi-agent-orchestration/05-debate-verifier-critic.md` — the multi-agent version of critique
-- `study-prompt-engineering/` — the prompt-level self-critique mechanics (cross-ref)
+- [03-react.md](03-react.md) — the base pattern reflexion sits on.
+- [../03-multi-agent-orchestration/05-debate-verifier-critic.md](../03-multi-agent-orchestration/05-debate-verifier-critic.md) — the multi-agent fix for shared blind spots.
+- Prompt-level self-critique mechanics: `.aipe/study-prompt-engineering/`.

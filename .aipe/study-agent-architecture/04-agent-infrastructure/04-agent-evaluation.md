@@ -1,37 +1,41 @@
 # Agent Evaluation
 
-**Industry standard.** "Agent eval," "trajectory eval," "replay testing." Type label: infrastructure. **In this codebase: yes — the replay-centric eval pipeline is aptkit's testing/observability backbone.** Live run → artifact → eval → promote to fixture → deterministic replay.
+**Industry term:** agent evaluation (trajectory eval, not just output eval). *Industry standard.*
 
 ## Zoom out, then zoom in
 
-Evaluating an agent is harder than evaluating one LLM call, because the unit of evaluation is the *trajectory* — the whole sequence of tool calls and turns — not just the final output. aptkit's answer is a replay pipeline: capture a run as an artifact (including the trace), score it, and promote good runs to fixtures that replay deterministically forever.
+Evaluating an agent is harder than evaluating one LLM call, because the unit of evaluation is the *trajectory* — what tools were called, in what order, did it recover — not just the final output. aptkit's replay-centric backbone captures exactly this.
 
 ```
-  Zoom out — aptkit's replay-centric eval pipeline
+  Zoom out — eval over the trace, not just the answer
 
-  ┌─ Live run ──────────────────────────────────────────────┐
-  │  agent loop emits CapabilityEvent trace + output         │
-  └───────────────────────────┬──────────────────────────────┘
-                              ▼ saved as
-  ┌─ Replay artifact (artifacts/replays/*.json) ─────────────┐
-  │  output + trace + eval + modelTurns                      │ ← we are here
-  └───────────────────────────┬──────────────────────────────┘
-        ┌──────────────────────┴──────────────────┐
-        ▼ score                                    ▼ promote
-  evals (structural-diff,                    fixtures/promoted/*.json
-   detection-scorer, rubric-judge,           → FixtureModelProvider
-   precision@k)                                replays deterministically
+  ┌─ Eval layer (@aptkit/evals) ────────────────────────────────┐
+  │  replay-runner → structural-diff / detection-scorer /        │ ← we are here
+  │  rubric-judge / precision-at-k, over the trace + output      │
+  └───────────────────────────────┬──────────────────────────────┘
+                                   │ reads replay artifacts (output + trace + modelTurns)
+  ┌─ Artifacts ─────────────────────▼───────────────────────────┐
+  │  live run → artifact → eval → promote to fixture → replay     │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-## Structure pass
+Zoom in: aptkit's loop emits a `CapabilityEvent` trace (`step`, `tool_call_start/end`, `model_usage`), and a run is saved as a replay artifact carrying the output, the trace, and `modelTurns`. The evals package scores both the output and the trajectory. That replay loop — live run → artifact → eval → promote to fixture → deterministic replay — is the testing and observability backbone.
 
-**Axis: what's the unit of evaluation?** One LLM call → score the output. An agent → score the *trajectory*: was the right tool called, in the right order, did it recover from errors, how many steps/$/ms, was the final output good. Trace it across aptkit's artifact: it captures `output`, `trace` (the tool-call sequence), `eval` (the score), and `modelTurns` (the trajectory length) — every dimension a trajectory eval needs. The seam: live evaluation (non-deterministic, against a real model) vs replay evaluation (deterministic, against recorded responses).
+## The structure pass
+
+**Layers.** Output eval (was the answer good?) over trajectory eval (was the *path* good?).
+
+**Axis: guarantees — what's actually being asserted?** Output eval asserts answer quality; trajectory eval asserts tool-call correctness, ordering, and recovery.
+
+**The seam.** The replay artifact. It freezes a run (output + trace + model turns) so eval is deterministic and repeatable — the boundary between a live nondeterministic run and a reproducible test.
 
 ## How it works
 
-### Move 1 — the mental model
+**Use case in aptkit:** regression-proofing the agents. A run is recorded, scored, and (when correct) promoted to a fixture that replays deterministically — so a prompt change that breaks tool-call behavior is caught.
 
-LLM eval scores one input→output. Agent eval scores a trajectory — the path, not just the destination. aptkit captures the whole path in an artifact and scores that.
+### Move 1 — what expands
+
+A single LLM call evals input → output → score. An agent evals the whole trajectory.
 
 ```
   LLM eval (one call):       Agent eval (a trajectory):
@@ -44,77 +48,67 @@ LLM eval scores one input→output. Agent eval scores a trajectory — the path,
                              └──────────────────────────┘
 ```
 
-### Move 2 — the pipeline, scorer by scorer
+### Move 2 — the walkthrough
 
-**Capture: the replay artifact holds the trajectory.** A run produces an artifact (`artifacts/replays/*.json`) with the output, the `trace` (the `CapabilityEvent` stream — every `tool_call_start/end`, `model_usage`), the `eval`, and `modelTurns`. The trace IS the trajectory; capturing it is what makes trajectory eval possible offline.
+**The replay artifact captures the trajectory, not just the output.** An artifact carries `capabilityId`, the per-capability output, the `trace` (the `CapabilityEvent` stream), and `modelTurns`. So eval can ask trajectory questions — which tools were called, did a tool error, how many turns — not just "was the answer right."
 
-**Score: aptkit has four scorer shapes** (`packages/evals`):
-- **`structural-diff`** — rule-based shape assertion: does the output match the expected structure? Catches schema regressions deterministically.
-- **`detection-scorer`** — for the anomaly agent: did it detect the right anomalies?
-- **`rubric-judge`** — LLM-as-judge against a rubric, for quality dimensions a rule can't capture. (This is aptkit's offline critic — see the verifier-critic file.)
-- **`precision-at-k` / `recall-at-k`** — `scorePrecisionAtK` / `scoreRecallAtK`: ranked-retrieval scorers for the rag-query agent. These score *retrieval quality* — did the right chunks rank in the top k — which is the trajectory metric that matters for agentic RAG.
+**The scorers, matched to what's being evaluated.** aptkit's evals package (`@aptkit/evals`) holds several:
+- `structural-diff` — rule-based diff of the output shape against an expected artifact.
+- `detection-scorer` — for the anomaly agent, did it detect the right anomalies.
+- `rubric-judge` — an LLM-as-judge over a rubric (the eval-time critic, with the self-preference-bias caveat from [../03-multi-agent-orchestration/05-debate-verifier-critic.md](../03-multi-agent-orchestration/05-debate-verifier-critic.md)).
+- `precision-at-k` / `recall-at-k` (`scorePrecisionAtK` / `scoreRecallAtK`) — ranked-retrieval scorers for the RAG agent.
 
-**Promote: good runs become deterministic fixtures.** A promoted artifact (`fixtures/promoted/*.json`) is a recorded `ModelResponse[]` that the `FixtureModelProvider` replays exactly. So a run that was correct once becomes a regression test forever — re-run it, get the identical trajectory, assert it still passes. The promoted fixtures are *correctness baselines* (editing them changes test meaning).
+The retrieval scorers are the trajectory-eval angle for agentic RAG: they grade *what was retrieved*, the load-bearing step before the answer.
 
-```
-  the replay loop — live → artifact → eval → promote → deterministic replay
+**Promote-to-fixture is how trajectory eval becomes a deterministic test.** A correct live run is promoted to a fixture (`fixtures/promoted/*.json`), and a `FixtureModelProvider` replays the recorded `ModelResponse[]` deterministically. So the *exact* trajectory — same tool calls, same order — replays without a live model. That's how aptkit catches "this prompt change made the agent stop calling the search tool": the replayed trajectory diverges from the promoted baseline.
 
-  live model ──► run ──► artifact ──► eval scores it ──► promote ──┐
-                                                                   │
-  FixtureModelProvider ◄──── replays recorded ModelResponse[] ◄────┘
-  (deterministic: same trajectory every time, no model call)
-```
+**The honest gap.** aptkit doesn't compute the full trajectory-efficiency metric suite (steps-to-completion trends, recovery-rate over a set) as a dashboard — the building blocks (trace, `model_usage` for cost, tool-call records) are all captured, but they're scored per-artifact, not aggregated into trajectory-efficiency KPIs across runs. And `rubric-improvement` has no `replay:promoted` script wired into the root pipeline (the others do). `not yet exercised` as a cross-run efficiency dashboard.
 
-**Why this is the right backbone for agent eval.** The hardest part of agent eval is non-determinism — you can't regression-test a thing that gives a different trajectory each run. The replay pipeline freezes the trajectory: a promoted fixture is a *golden trajectory*. The evaluator paradox (using an LLM to grade an LLM's trajectory, via rubric-judge) is real, and aptkit's controls are exactly the recommended ones: frozen golden trajectories (the promoted fixtures), iteration caps (`maxToolCalls`), and the rule-based scorers (`structural-diff`, `precision@k`) that don't need a judge at all.
-
-**The honest gap.** The rubric-improvement agent has no `replay:promoted` script wired into the root pipeline (the project context notes this) — the other agents do. So its eval coverage is thinner than the rest.
+**The evaluator paradox.** Using an LLM (`rubric-judge`) to grade an LLM's trajectory is real; the controls are frozen golden trajectories (the promoted fixtures), iteration caps (the loop's budget), and human spot-checks (the Studio replay UI). aptkit leans hardest on the *frozen-trajectory* control — deterministic replay against a promoted baseline — which doesn't depend on a judge model at all.
 
 ### Move 3 — the principle
 
-The unit of agent evaluation is the trajectory, and the metrics that matter are task success, tool-call accuracy, trajectory efficiency (steps and cost), and recovery rate. aptkit captures all of them in the artifact and freezes correct trajectories as fixtures — turning non-deterministic agent runs into deterministic regression tests. The rule-based scorers (precision@k, structural-diff) sidestep the evaluator paradox entirely; rubric-judge is used only where a rule can't capture quality.
+The unit of agent evaluation is the trajectory, not the output — and the way to make a nondeterministic trajectory testable is to freeze it. aptkit's promote-to-fixture loop is exactly that: a correct run becomes a deterministic replay baseline, so a regression in tool-call behavior is caught without a live model. The metrics that matter — task success, tool-call accuracy, trajectory efficiency, recovery rate — are all derivable from the trace aptkit already captures.
 
 ## Primary diagram
 
 ```
-  aptkit's agent eval — full frame
+  aptkit's replay-centric eval — the trajectory is the unit
 
-  ┌─ Live run (real model) ─────────────────────────────────┐
-  │  runAgentLoop → output + trace(tool calls) + modelTurns  │
-  └───────────────────────────┬──────────────────────────────┘
-                              ▼ artifacts/replays/*.json
-  ┌─ Score (packages/evals) ──────────────────────────────────┐
-  │  structural-diff (shape) · detection-scorer (anomalies) ·  │
-  │  rubric-judge (LLM quality) · precision@k / recall@k       │
-  │  (the trajectory: right tools? right order? good output?)  │
-  └───────────────────────────┬──────────────────────────────┘
-                              ▼ promote good runs
-  ┌─ Deterministic replay ────────────────────────────────────┐
-  │  FixtureModelProvider replays recorded ModelResponse[]      │
-  │  → golden trajectory, regression test forever              │
-  └─────────────────────────────────────────────────────────────┘
+  live run ─► artifact { output, trace (CapabilityEvent), modelTurns }
+                 │
+                 ▼  scorers (@aptkit/evals)
+        structural-diff · detection-scorer · rubric-judge · precision-at-k
+                 │ passes?
+                 ▼
+        promote to fixture (frozen golden trajectory)
+                 │
+                 ▼
+        FixtureModelProvider replays the EXACT trajectory deterministically
+        → a prompt change that alters tool calls diverges from the baseline = caught
+  (cross-run efficiency dashboard: not yet exercised)
 ```
 
 ## Elaborate
 
-Agent eval is where most teams underinvest, because eval of a non-deterministic multi-step process feels impossible. aptkit's replay-centric approach is the production answer: capture the trajectory, score it with a mix of rule-based and judge-based scorers, and freeze correct trajectories as deterministic fixtures. The precision@k scorers are the standout — they evaluate the *retrieval* leg of the trajectory specifically, which is the part that determines whether an agentic-RAG answer is grounded. This is the testing backbone the whole repo hangs off; it's also the observation half of graph orchestration (the trace) discussed in SECTION C.
+Agent eval is where most teams under-invest, because output eval feels sufficient until a prompt tweak silently changes *how* the agent gets the answer — wrong tool, extra turns, a recovery that used to fire and now doesn't. Trajectory eval catches that, and the cheapest robust form is a frozen golden trajectory you replay deterministically. aptkit's promote-to-fixture loop is a clean instance: it turns a verified run into a regression test that asserts the whole path, not just the endpoint. The LLM-as-judge scorer (`rubric-judge`) is there for the cases a rule can't grade, with the frozen fixtures as the bias-free backstop.
 
 ## Interview defense
 
-**Q: How do you evaluate an agent?**
-The unit is the trajectory, not the output — so I capture the whole run as an artifact: output, the tool-call trace, and the turn count. Then I score it with four scorer shapes — `structural-diff` for output shape, `detection-scorer` for the anomaly agent, `rubric-judge` for quality a rule can't capture, and `precision@k`/`recall@k` for the rag-query agent's retrieval leg. Correct runs get promoted to fixtures that replay deterministically, so a non-deterministic agent becomes a deterministic regression test.
+**Q: How do you evaluate an agent, not just a model call?**
+
+Over the trajectory. aptkit records each run as a replay artifact carrying the output *and* the trace — which tools fired, in what order, with what cost. The scorers grade both (structural-diff, detection, rubric-judge, precision@k). The key move is promote-to-fixture: a verified run becomes a frozen golden trajectory that replays deterministically, so a prompt change that alters tool-call behavior diverges from the baseline and gets caught — no live model needed.
 
 ```
-  live run → artifact(output+trace) → score → promote → deterministic replay
+  output eval:     was the answer right?
+  trajectory eval: right tools, right order, recovered? (the agent unit)
+  frozen fixture:  deterministic replay = the bias-free regression test
 ```
-*Anchor: freeze correct trajectories as golden fixtures — that's how you regression-test a non-deterministic agent.*
 
-**Q: How do you avoid the evaluator paradox (LLM grading an LLM)?**
-Mostly by not needing a judge: `precision@k` and `structural-diff` are rule-based, no LLM. I use `rubric-judge` only for quality dimensions a rule can't capture, and I control its bias with frozen golden trajectories and iteration caps. The promoted fixtures are the golden set.
+*Anchor: freeze the trajectory; a promoted fixture asserts the whole path, not just the endpoint.*
 
 ## See also
 
-- `02-agent-loop-skeleton.md` — the trace the artifact captures
-- `03-multi-agent-orchestration/05-debate-verifier-critic.md` — rubric-judge as the offline critic
-- `02-agentic-retrieval/01-agentic-rag.md` — precision@k scores this agent's retrieval
-- `study-ai-engineering/` — output-quality eval and LLM-as-judge bias (cross-ref)
-- `study-testing/` — the replay pipeline as the testing backbone (cross-ref)
+- [../03-multi-agent-orchestration/05-debate-verifier-critic.md](../03-multi-agent-orchestration/05-debate-verifier-critic.md) — rubric-judge as the eval-time critic.
+- [../02-agentic-retrieval/02-self-corrective-rag.md](../02-agentic-retrieval/02-self-corrective-rag.md) — precision@k as offline retrieval grading.
+- LLM-as-judge bias and output-quality eval: `.aipe/study-ai-engineering/05-evaluation/`.

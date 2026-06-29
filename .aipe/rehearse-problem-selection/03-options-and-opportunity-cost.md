@@ -1,143 +1,103 @@
 # Options and Opportunity Cost
 
-*Brief-answer 6: every option considered, including `do nothing`, each with
-its named opportunity cost. The fork the whole brief turns on.*
+Answer 6: the fork. Three real options — **build**, **adopt**, **do nothing** — each with its opportunity cost named without flinching. Coach posture: a review room doesn't punish you for the path you took; it punishes you for not being able to name what the *other* paths would have bought. The chosen option is only defensible once the rejected ones are stated at full strength.
 
-Three options were on the table. The spec requires `do nothing` to be a
-real one — it is, and it's the cheapest to start and the most expensive to
-live with.
+## The fork, at a glance
 
 ```
-  The three options, side by side
+  THREE OPTIONS — what each buys, what each costs
 
-                  DO NOTHING        ADOPT framework        BUILD substrate ★
-                  ──────────        ────────────────        ─────────────────
-  what            keep re-wiring    npm install             write the contracts
-                  per app + weld    LangChain /             from scratch:
-                  to one vendor     LlamaIndex (or a        ModelProvider +
-                                    turnkey hosted agent)   Embedding/VectorStore
-
-  day-1 cost      ~0                low (install + glue)    high (design + build)
-
-  ongoing cost    pain compounds    framework owns your     you own maintenance +
-                  every new app     control flow + API;     the semver contract
-                                    upgrades break you      (@rlynjb/...0.4.x)
-
-  control         vendor-welded     framework-welded        yours
-
-  local-first?    only if you       depends on framework    yes — Gemma via
-                  hand-build it     support; often           Ollama is the
-                  again             cloud-first             default
-
-  portfolio       another glued     "I can use a tool"      "I built the
-  signal          demo app          signal                  substrate" signal
-
-  what you LEARN  nothing new       the framework's API      RAG/agent/eval
-                                                            internals
-```
-
-★ = chosen.
-
----
-
-## Option A — Do nothing
-
-Keep building each app the way AdvntrCue was built: bespoke RAG, welded to
-whatever vendor that app picked.
-
-**Opportunity cost (named):** the pain *compounds*. Every new app pays the
-full plumbing cost again, and every welded app makes the eventual un-weld
-more expensive. You also forfeit the portfolio signal entirely — a fifth
-vendor-glued app says nothing new about a frontend→AI pivot.
-
-```
-  Do-nothing opportunity cost — the line that goes the wrong way
-
-  cost
-   │                                          ╱ keep re-wiring
-   │                                      ╱
-   │                                  ╱
-   │                              ╱
-   │        substrate ──────────────────────  (build once, reuse)
-   │      ╱
-   └────────────────────────────────────────────► apps shipped
-        app1     app2      app3      app4
-```
-
-This is a real option, not a strawman. With exactly one consumer today
-(buffr), the do-nothing math is genuinely close — see the skeptical-reviewer
-file. It loses on the compounding curve and on the portfolio, not on day-1
-cost.
-
----
-
-## Option B — Adopt a framework (LangChain / LlamaIndex / turnkey hosted)
-
-`npm install` a mature agent/RAG framework and glue your apps to it.
-
-**Opportunity cost (named):** you trade **control and learning** for speed.
-The framework owns your control flow and its API surface; its upgrades can
-break you on its schedule, not yours. Many are cloud-first, which fights
-the local-first goal. And for the pivot, "I can wire LangChain" is a weaker
-signal than "I built the retrieval loop and the eval harness." You'd also
-still be welded — just to the framework instead of the cloud vendor.
-
-What adopting would have *bought* you and you gave up: turnkey RAG on day
-one, batteries-included tool-calling, a maintained codebase you don't own.
-That's a real cost of choosing build — name it, don't hide it.
-
----
-
-## Option C — Build the substrate (aptkit) ★ CHOSEN
-
-Write the provider-neutral contracts from scratch and ship them as one
-bundle.
-
-```
-  Why build won — the four reasons, ranked by weight
-
-  ┌─ 1. CONTROL (heaviest) ──────────────────────────────────┐
-  │ provider-neutral via ModelProvider.complete() — never a   │
-  │ vendor SDK directly. Swappable adapters: cloud, local     │
-  │ Gemma, fallback chain. The pain was welding; this is the  │
-  │ direct un-weld.                                           │
+  ┌─ A: BUILD the substrate (aptkit) ── CHOSEN ──────────────┐
+  │  buy:  learning depth · local-first · provider-neutral ·  │
+  │        portfolio artifact · full control of the seams     │
+  │  cost: weeks of plumbing a framework gives for free;      │
+  │        you maintain it; no community/ecosystem behind it   │
   └────────────────────────────────────────────────────────────┘
-  ┌─ 2. PORTFOLIO ───────────────────────────────────────────┐
-  │ the substrate IS the pivot artifact: from-scratch RAG +   │
-  │ eval harness + contracts > another glued demo app.       │
+  ┌─ B: ADOPT a framework (LangChain / LlamaIndex / hosted) ─┐
+  │  buy:  RAG + agent loop + tool-calling on day one;        │
+  │        ecosystem, integrations, someone else's bugfixes   │
+  │  cost: vendor/framework lock-in returns; shallow learning; │
+  │        a weaker pivot-portfolio signal; abstraction you    │
+  │        don't control sitting on your hot path              │
   └────────────────────────────────────────────────────────────┘
-  ┌─ 3. LEARNING ────────────────────────────────────────────┐
-  │ you learn the internals you'd never see behind a          │
-  │ framework: chunking, ANN search, agent loop budgets,      │
-  │ precision@k. me.md: fundamentals become real by building. │
-  └────────────────────────────────────────────────────────────┘
-  ┌─ 4. LOCAL-FIRST ─────────────────────────────────────────┐
-  │ Gemma-via-Ollama default, no key/no TLS. A framework      │
-  │ default would re-introduce the cloud weld.               │
+  ┌─ C: DO NOTHING (keep re-wiring per app) ─────────────────┐
+  │  buy:  zero substrate cost now; ship the next app fast    │
+  │        on familiar bespoke plumbing                       │
+  │  cost: the re-wiring tax compounds per app; lock-in        │
+  │        per app; NO portfolio artifact for the pivot;       │
+  │        the pain you already named never gets solved        │
   └────────────────────────────────────────────────────────────┘
 ```
 
-**Opportunity cost of building (named, owned):** the **build-and-maintain
-time** that adopting would have spent for you, plus the **turnkey RAG**
-LangChain/LlamaIndex hand you on day one. You now also own a published
-semver contract (`@rlynjb/aptkit-core@0.4.x`) forever — buffr pins `^0.4.1`
-and its `PgVectorStore implements VectorStore` breaks if you change the
-contract shape. That maintenance burden is the price of control.
+## Option A — build the substrate (chosen)
 
-┃ The decision in one line: **for personal-tooling + portfolio, control and
-┃ learning are worth more than the time adopting would save** — because the
-┃ artifact's value IS the depth that building creates, and the user count
-┃ (one) is too low for framework-scale convenience to pay off.
+**What it is:** build aptkit — a provider-neutral TS monorepo, one published bundle `@rlynjb/aptkit-core@0.4.1` over 16 packages, with `ModelProvider.complete()` + `EmbeddingProvider`/`VectorStore` as the load-bearing contracts, RAG from scratch, evals (precision@k / recall@k + rubric-judge), and local Gemma via Ollama.
 
----
+**What it buys:**
+- **Learning depth.** RAG, the agent loop, tool-calling emulation, and the eval harness are built from scratch — which is exactly how fundamentals become real for this reader (`me.md`: "you don't trust the fundamentals until you've built with them"). A framework would have *hidden* the very mechanisms the pivot needs to demonstrate understanding of.
+- **Local-first + provider-neutral control.** The default runs Gemma on Ollama with no cloud call; cloud SDKs are swappable adapters behind one contract (`context.md` stack + seams). Rein owns the seam, not a framework.
+- **A portfolio artifact.** A from-scratch, evaluated, *consumed-by-a-second-repo* substrate is a sharper proof of AI-engineering depth than a LangChain wiring demo. The portfolio is the explicit purpose of the pivot (`me.md`).
 
-## The honest counter-case
+**The opportunity cost (named, not softened):**
+> ┃ Weeks of substrate work — provider adapters, a RAG pipeline, an eval
+> ┃ harness, a publish/bundle flow — that LangChain or LlamaIndex would have
+> ┃ handed over on day one. Rein now maintains all of it. There is no
+> ┃ ecosystem, no community bugfixes, no integrations she didn't write.
 
-This brief does not pretend build is obviously right. With **one consumer**,
-a skeptic's strongest line is: *"adopt LangChain, ship buffr in a weekend,
-keep the time."* That line holds on pure delivery economics. Build wins
-**only** on the two axes that actually matter here — portfolio depth and
-control/learning — neither of which a framework gives you. If the goal were
-"ship buffr fastest," adopt wins. The goal is the pivot artifact, so build
-wins. Stating which goal flips the answer is the honest version of this
-choice — full pressure-test in `05`.
+This cost was paid **deliberately** — the learning, control, and portfolio value were judged worth more than the time, *for a personal-tooling + portfolio problem with no delivery deadline driven by users.* For a problem *with* external users and a ship date, the calculus would flip toward Option B. That honesty is the defense.
+
+## Option B — adopt an off-the-shelf framework
+
+**What it is:** build the apps on LangChain / LlamaIndex (or a turnkey hosted agent) and skip the substrate entirely.
+
+**What it buys:** RAG, the agent loop, tool-calling, retrievers, and vector-store integrations on day one. An ecosystem. Someone else maintaining the plumbing.
+
+**Why it was rejected (each reason a reviewer can test):**
+- **Lock-in returns through the front door.** The original pain was welding to one vendor (AdvntrCue → GPT-4). Adopting a heavy framework trades a *vendor* weld for a *framework* weld — the abstraction you don't control now sits on your hot path. **INFERENCE:** that the framework weld is as costly as the vendor weld; a reviewer could argue a framework's provider abstraction is *better* than hand-rolling. The honest counter is that the goal was to *understand and own* the abstraction, not to consume one.
+- **Shallow learning.** A framework does the interesting parts for you — the emulated tool-calling for a model with none, the dimension-mismatch one-way door, the precision@k harness. Adopting means never building them, which for a pivot portfolio is the wrong trade.
+- **Weaker pivot signal.** "I wired up LangChain" reads differently in an AI-engineering interview than "I built a provider-neutral agent substrate from scratch, evaluated it, and shipped it to a second app." **EVIDENCE** for the framing: the portfolio-as-pivot-case is the spine of `me.md`.
+
+**The opportunity cost of Option B:** the learning depth, the control, and the portfolio differentiation — exactly what Option A buys. Naming this is what makes the rejection defensible: B wasn't dismissed, it was *out-valued* for this specific problem.
+
+## Option C — do nothing (the real baseline)
+
+**What it is:** don't centralize anything. Keep building each app's RAG/agent plumbing bespoke, the way AdvntrCue was built. This is the genuine null option, and a review room expects it on the table.
+
+**What it buys:** zero substrate cost today. The next app ships fast on familiar, hand-rolled plumbing Rein already knows how to write.
+
+**The opportunity cost (why do-nothing loses):**
+> ┃ The re-wiring tax compounds — paid again per app, forever. Each app stays
+> ┃ vendor-welded and can't move models. And critically: there is NO portfolio
+> ┃ artifact for the pivot. The problem Rein actually has — proving
+> ┃ AI-engineering depth to land the next role — goes unsolved. Do-nothing is
+> ┃ cheapest now and most expensive against the goal that matters.
+
+**INFERENCE:** "the tax compounds per app" is the same forward-looking claim flagged in `01` — at decision time there was one data point (AdvntrCue), not a measured trend. The reviewer-proof version: do-nothing fails *not* primarily on compounding plumbing cost (which is small in a small portfolio) but on the **portfolio/learning axis**, which is the dominant term in this problem.
+
+## The decision, in one frame
+
+```
+  WHY A BEAT B AND C — scored on the axes that dominate THIS problem
+
+  axis              A: build   B: adopt   C: do nothing
+  ────────────────  ────────   ────────   ─────────────
+  learning depth      HIGH       low         none
+  portfolio signal    HIGH       med         none
+  local-first ctrl    HIGH       med*        per-app
+  time-to-first-app   low        HIGH        HIGH
+  maintenance burden  HIGH       low         med
+
+  * framework-dependent; not all give local-first cleanly
+
+  dominant axes for a personal-tooling + PORTFOLIO problem
+  with NO user deadline → learning depth + portfolio signal.
+  A wins those outright; it pays for them in time + maintenance.
+```
+
+▸ The call holds because the **dominant axes are learning and portfolio**, not time-to-ship — and on a different problem (users, deadline) the same scoring would pick B. Stating that the decision is *contingent on the problem's shape*, not universal, is the staff-level move.
+
+## See also
+
+- `01-problem-brief.md` — the pain that frames the fork
+- `02-scope-cuts-and-non-goals.md` — the smallest slice the chosen option shipped
+- `05-skeptical-reviewer-questions.md` — "why not just use LangChain?" defended in full

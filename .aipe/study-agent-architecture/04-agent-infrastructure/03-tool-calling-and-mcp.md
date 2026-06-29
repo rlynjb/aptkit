@@ -1,146 +1,127 @@
 # Tool Calling and MCP
 
-**Industry standard.** "Tool calling," "function calling," "MCP (Model Context Protocol)." Type label: infrastructure (the substrate under every pattern). **In this codebase: yes — `ToolRegistry` + `ToolPolicy` is aptkit's tool layer; the Gemma provider *emulates* tool-calling for a model that has none. No MCP server; direct tool definitions.**
+**Industry term:** tool calling (function calling) + MCP (Model Context Protocol). *Industry standard.*
 
 ## Zoom out, then zoom in
 
-Tool calling is the connective tissue under every pattern in this guide — ReAct, agentic RAG, and every multi-agent topology run on it. aptkit's tool layer has two notable pieces: a provider-neutral `ToolRegistry` with least-privilege policy filtering, and a striking one — the Gemma provider *fakes* tool-calling because Gemma has no native tool support.
+The connective tissue under every pattern — ReAct, agentic RAG, every topology runs on tool calling. aptkit's twist is that its default model, Gemma, has *no native tool calling*, so the provider fakes it. That emulation is the file's load-bearing detail.
 
 ```
-  Zoom out — tool calling is the substrate
+  Zoom out — tool calling is the substrate; gemma emulates it
 
-  ┌─ every pattern runs on tool calls ──────────────────────┐
-  │  ReAct · agentic RAG · supervisor-worker · ...           │
-  └───────────────────────────┬──────────────────────────────┘
-                              ▼
-  ┌─ Tool layer ──────────────────────────────────────────────┐
-  │  ToolRegistry (define+execute) · filterToolsForPolicy      │ ← we are here
-  │  (least-privilege allowlist)                               │
-  └───────────────────────────┬──────────────────────────────┘
-                              ▼
-  ┌─ Provider layer ──────────────────────────────────────────┐
-  │  Anthropic (native tools) · ★ Gemma (EMULATED tools) ★     │
-  └─────────────────────────────────────────────────────────────┘
+  ┌─ Runtime layer ─────────────────────────────────────────────┐
+  │  runAgentLoop emits tool_use, runs tools.callTool            │ ← we are here
+  └───────────────────────────────┬──────────────────────────────┘
+          ┌────────────────────────┴───────────┐
+  ┌─ Provider ▼─────────────┐         ┌─ Tools ▼──────────────────┐
+  │ anthropic/openai: native│         │ ToolRegistry + ToolPolicy │
+  │ gemma: EMULATED          │         │ (the tools to call)       │
+  └──────────────────────────┘         └───────────────────────────┘
 ```
 
-## Structure pass
+Zoom in: the loop speaks one tool-calling shape (`tool_use` blocks). Cloud providers map that to native function calling. Gemma can't — so `GemmaModelProvider` (`packages/providers/gemma/src/gemma-provider.ts`) renders the tools into the system text and parses a JSON tool call back out. The loop never knows the difference.
 
-**Axis: who emits a tool call, and how is it represented?** Trace it across providers: Anthropic emits native `tool_use` blocks; Gemma emits *JSON text* that the provider parses into a `tool_use` block. The loop never knows the difference — it always sees `ModelToolUseBlock`. The seam: the `ModelProvider` contract normalizes "native tools" and "emulated tools" into one shape, so `runAgentLoop` is provider-agnostic.
+## The structure pass
+
+**Layers.** The loop's tool contract (`ModelTool`, `tool_use`) over each provider's tool mechanism (native vs emulated).
+
+**Axis: trust — what can the model reach?** The `ToolPolicy` allowlist scopes it; the model can only call tools the registry exposes *and* the policy permits.
+
+**The seam.** The provider boundary. The loop emits provider-neutral tool intent; each adapter translates. Gemma's adapter does the most translation — it fakes the whole protocol.
 
 ## How it works
 
+**Use case in aptkit:** every agent. The clearest is the emulation seam — running an agentic loop on a model that has no tool-calling at all.
+
 ### Move 1 — the mental model
 
-A tool registry is a typed function table the model can call by name; a policy is an allowlist that scopes which functions a given agent can see. You know how a permissions system filters which actions a role can take? `filterToolsForPolicy` is that, for agent tools.
+Native tool calling is a typed API: you hand the model a tool schema, it returns a structured call. Emulation is the same idea over a text channel — render the schema into the prompt, ask for JSON back, parse it. Like calling a REST endpoint that only speaks strings, so you `JSON.stringify` on the way out and `JSON.parse` on the way in.
 
 ```
-  Tool calling — registry + policy + execution
+  Tool calling — native vs emulated
 
-  agent → filterToolsForPolicy(allTools, policy) → schemas the model sees
-  model → emits tool_use(name, args)
-  loop  → registry.callTool(name, args) → result → back to model
+  native (anthropic/openai):  tools=[schema] ──► structured tool_use block
+  emulated (gemma):  schema rendered into SYSTEM text
+                     ──► model returns JSON string
+                     ──► parseToolCall → tool_use block
 ```
 
-### Move 2 — the three pieces
+### Move 2 — the walkthrough
 
-**Piece 1 — the registry (define + execute).** `InMemoryToolRegistry` holds definitions and handlers, and `callTool` executes by name *and records wall-clock duration* for traces.
+**Outbound half: render tools into the system text.** Gemma can't take a `tools` array, so the provider serializes each tool's schema into the prompt and demands a JSON tool call:
 
-```typescript
-// packages/tools/src/tool-registry.ts:50-63
-async callTool(name, args, options?): Promise<ToolCallResult> {
-  options?.signal?.throwIfAborted();
-  const handler = this.handlers.get(name);
-  if (!handler) throw new Error(`tool not found: ${name}`);
-  const start = performance.now();
-  const result = await handler(args, options);
-  return { result, durationMs: Math.round(performance.now() - start) };  // ← duration for traces
-}
+```ts
+// gemma-provider.ts:137 — outbound emulation: tools become system text
+const rendered = request.tools.map((tool) => JSON.stringify(
+  { name: tool.name, description: tool.description ?? '', input_schema: tool.inputSchema }, null, 2)
+).join('\n\n');
+parts.push(['You can call the following tools:', '', rendered, '',
+  'When a tool is needed, respond with ONLY a single JSON object, no prose:',
+  '{"tool": "<tool name>", "arguments": { ...arguments... }}', ...].join('\n'));
 ```
 
-The `durationMs` here is what feeds the `tool_call_end` trace event in the loop — the registry is also the observability boundary.
+**Inbound half: parse messy text back into a tool call.** The model returns a string; `parseToolCall` tolerates the variations a weak model emits (`tool`/`name`/`tool_name`, `arguments`/`input`/`args`):
 
-**Piece 2 — least-privilege policy.** `filterToolsForPolicy` narrows the full catalog to the allowlist for a capability. The rag-query agent sees exactly one tool; the recommendation agent sees 13 read-only ones.
-
-```typescript
-// packages/tools/src/tool-policy.ts:11-22
-export function filterToolsForPolicy(allTools, policy): ModelTool[] {
-  const allowed = new Set(policy.allowedTools);
-  return allTools.filter((tool) => allowed.has(tool.name)).map(...);  // ← only allowed names
-}
+```ts
+// gemma-provider.ts:168 — inbound emulation: messy text → { name, input }
+const name = obj.tool ?? obj.name ?? obj.tool_name;
+const input = obj.arguments ?? obj.input ?? obj.args;
 ```
 
-This is the security story: an agent literally cannot call a tool outside its policy, because the model never sees it in the schema list. rag-query's policy is `[search_knowledge_base]` (one tool); even if a prompt injection tried to make it write data, there's no write tool in its schema to call.
+**The parse-retry: emulation needs a retry the native path doesn't.** A weak model often botches the JSON. So when tools are wanted and the reply *looks* like a failed tool call (contains a `{`), Gemma retries with a corrective nudge:
 
-**Piece 3 — tool-calling under emulation (the striking part).** Gemma has no native tool support, so the provider fakes the whole protocol in two halves:
-
-```typescript
-// OUTBOUND — render tools into the system text, demand JSON (gemma-provider.ts:133-162)
-'When a tool is needed, respond with ONLY a single JSON object, no prose:',
-'{"tool": "<tool name>", "arguments": { ...arguments... }}',
-
-// INBOUND — parse the model's text back into a tool_use block (gemma-provider.ts:77-83)
-const call = parseToolCall(raw);
-if (call) return this.toResponse([{ type: 'tool_use', id: ..., name: call.name, input: call.input }], ...);
+```ts
+// gemma-provider.ts:86 — retry only on a botched tool attempt, not on prose
+if (looksLikeToolAttempt(raw)) continue;   // RETRY_NUDGE appended next attempt
 ```
 
-And it hardens the emulation with a retry: if the model produces botched JSON that *looks* like a tool attempt (contains a `{`), it appends a corrective nudge and retries (`gemma-provider.ts:35, 86`), up to `maxToolCallAttempts`. Plain prose is treated as a real answer, not retried. So a model with zero tool-calling capability gets dragged into the same `tool_use` contract every other provider speaks — and `runAgentLoop` never knows the difference.
+The discipline: only retry a *botched* call (`{` present); plain prose is a real answer, not a failed tool call. Retrying prose would loop on a model that just wanted to answer.
 
-**MCP — named honestly: not used.** aptkit uses *direct tool definitions* (handlers registered into a registry), not an MCP server. MCP standardizes how agents connect to tools/data so a tool defined once is usable across agents without per-agent integration. aptkit's equivalent is the `ToolRegistry` + `ModelTool` shape — a tool defined once is reusable across agents *within the monorepo*, but it's not the MCP protocol. The decision aptkit made: direct definitions (lower overhead, no protocol server) over MCP (cross-process standardization it doesn't need yet).
+**The loop is provider-agnostic by design.** `runAgentLoop` emits `tool_use` and runs `tools.callTool` regardless of provider. Gemma's adapter makes a tool-call-less model *look* like one that has tools. That's the whole point of the `ModelProvider` seam — the loop is written once, against the contract, and the weakest provider is made to fit it.
+
+**MCP — the protocol angle, not in aptkit.** MCP standardizes how agents connect to tools and data, so a tool defined once is usable across agents without per-agent integration. aptkit uses its own `ToolRegistry` + `ToolDefinition`, not MCP. The decision MCP would address — define a tool once, share it across agents and across processes — aptkit handles in-process via the registry. **MCP is not yet exercised.** The tradeoff if adopted: MCP adds a protocol layer and token overhead, but buys cross-process tool sharing aptkit doesn't currently need (everything is one process).
 
 ### Move 3 — the principle
 
-Tool calling is the substrate every pattern runs on, and the `ModelProvider` contract is what lets one loop drive native-tool and emulated-tool providers identically. The least-privilege policy is the control: an agent can't misuse a tool it can't see. The Gemma emulation is the proof that the abstraction holds — even a tool-less model speaks the tool-call contract once you fake the outbound rendering and inbound parsing.
+Tool calling is the substrate every agent pattern runs on, and the `ModelProvider` seam lets the loop be written once against one tool contract while each adapter translates. The hard case — a model with no native tool calling — is where the seam earns its keep: Gemma's emulation (render schema out, parse JSON in, retry botched calls) makes a tool-call-less model usable without the loop changing a line. That's deep-module design: the loop's simplicity is paid for by the adapter's complexity.
 
 ## Primary diagram
 
 ```
-  aptkit's tool layer — full frame, including emulation
+  Tool calling across providers — the loop speaks one shape
 
-  ┌─ Agent ────────────────────────────────────────────────┐
-  │  filterToolsForPolicy(allTools, policy) → scoped schemas │ tool-policy.ts:11
-  └───────────────────────────┬──────────────────────────────┘
-                              ▼
-  ┌─ Provider (normalizes tool calls) ────────────────────────┐
-  │  Anthropic: native tool_use blocks                         │
-  │  Gemma:     render tools→system text → parse JSON→tool_use │ gemma-provider.ts
-  │             retry on botched JSON (looksLikeToolAttempt)   │
-  └───────────────────────────┬──────────────────────────────┘
-                              ▼
-  ┌─ Registry ────────────────────────────────────────────────┐
-  │  callTool(name, args) → { result, durationMs }             │ tool-registry.ts:50
-  │  (durationMs feeds the tool_call_end trace)                │
-  └─────────────────────────────────────────────────────────────┘
-  (no MCP server — direct tool definitions)
+  runAgentLoop ──tool_use / callTool──┐ (provider-neutral)
+                                      │
+        ┌─────────────────────────────┼─────────────────────────────┐
+        ▼                             ▼                             ▼
+  anthropic (native)          openai (native)            gemma (EMULATED)
+  tools=[schema]              tools=[schema]              schema→system text
+  → structured call           → structured call           → JSON string
+                                                           → parseToolCall
+                                                           → retry if botched
+  ToolPolicy allowlist scopes WHAT each agent may call (trust boundary)
+  MCP: not yet exercised (registry is in-process, not a cross-process protocol)
 ```
 
 ## Elaborate
 
-Tool calling went from a provider-specific feature to the universal agent substrate, and MCP emerged to standardize tool/data connections across agents and processes. aptkit deliberately stopped short of MCP — its `ToolRegistry` gives intra-monorepo reuse without a protocol server, which is the right scope for a toolkit. The genuinely interesting engineering is the Gemma emulation: it shows the tool-call contract is an *abstraction*, not a model capability — you can synthesize it for a model that lacks it, as long as you own both halves (outbound rendering, inbound parsing) and harden the parse with a retry.
+Tool calling is the mechanism that turned LLMs from text generators into agents — the model emits structured intent, your code runs it. Native function calling (Anthropic, OpenAI) makes this a typed API; weaker or older models need emulation over text, which is exactly what aptkit's Gemma provider does. The emulation's two hard parts — robust parsing of messy output and a retry that distinguishes a botched call from a real prose answer — are the production scar tissue of running agents on a local model. MCP is the next layer up: a protocol so tools defined once work across agents and processes; aptkit's in-process registry covers the single-process case without it.
 
 ## Interview defense
 
-**Q: How do your agents call tools, and how do you keep them in scope?**
-A `ToolRegistry` holds definitions and handlers; `callTool` executes by name and records duration for traces. Least-privilege is enforced by `filterToolsForPolicy` — each agent's policy is an allowlist, so the model never *sees* a tool outside its scope. rag-query's policy is one tool; even a prompt injection can't make it write data, because there's no write tool in its schema.
+**Q: Your default model has no tool calling. How does it run an agent loop?**
+
+The Gemma provider emulates it. Outbound, it renders each tool's schema into the system text and demands a JSON tool call. Inbound, it parses the messy reply into a `tool_use` block, tolerating key variations. And it retries — but *only* when the reply looks like a botched tool call (has a `{`), not when it's plain prose, so it doesn't loop on a model that just wanted to answer. The loop never knows the difference.
 
 ```
-  filterToolsForPolicy → model sees only allowed tools (can't misuse the unseen)
+  schema → system text → model JSON → parse → tool_use   (emulation)
+  retry only botched calls ({), not prose  (the key discipline)
 ```
-*Anchor: the policy is the security boundary — scoping the schema, not just checking at call time.*
 
-**Q: Your local model has no tool-calling — how does that work?**
-The Gemma provider emulates it. Outbound, it renders the tool schemas into the system text and demands a JSON object. Inbound, it parses that JSON back into a `tool_use` block, with a retry that nudges the model when the JSON is botched. The loop never knows the difference — it always sees a normalized `tool_use`. That's the proof the tool-call contract is an abstraction, not a model feature.
-
-```
-  render tools→text (out) · parse JSON→tool_use (in) · retry on botched JSON
-```
-*Anchor: own both halves of the protocol and a tool-less model speaks tools.*
-
-**Q: Do you use MCP?**
-No — direct tool definitions. MCP standardizes cross-process tool connections; my `ToolRegistry` gives intra-monorepo reuse without a protocol server. Lower overhead, and I don't need cross-process standardization yet.
+*Anchor: the ModelProvider seam lets the loop be written once; emulation makes the weakest model fit the contract.*
 
 ## See also
 
-- `02-agent-loop-skeleton.md` — the loop that drives tool calls
-- `02-agentic-retrieval/01-agentic-rag.md` — search_knowledge_base as a tool
-- `05-guardrails-and-control.md` — the policy as part of the control envelope
-- `study-ai-engineering/04-agents-and-tool-use/` — tool-calling mechanics (cross-ref)
+- [../01-reasoning-patterns/02-agent-loop-skeleton.md](../01-reasoning-patterns/02-agent-loop-skeleton.md) — the loop that consumes tool calls.
+- [05-guardrails-and-control.md](05-guardrails-and-control.md) — the ToolPolicy allowlist as a trust boundary.
+- Tool-calling / function-calling mechanics: `.aipe/study-ai-engineering/04-agents-and-tool-use/`.

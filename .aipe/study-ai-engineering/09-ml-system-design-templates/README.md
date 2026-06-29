@@ -1,27 +1,17 @@
-# 09 — ML system-design templates
+# 09 — ML system design templates (interview reframes)
 
-> Anchor: LLM application engineering. · Curriculum: Phase 3 (no curriculum file
-> in this repo; exercises cite real aptkit/buffr paths instead).
+> Anchor: codebases reframed as interview templates. Curriculum: Phase 5.
 
-Interview reframes for the classical-ML design loop. These are the canonical
-"design a recommender," "design anomaly detection," "design object detection"
-prompts — the ones that expect candidate generation, ranking models, feature
-pipelines, and trained classifiers. Same code, different framing.
+Mirror of `07-system-design-templates/` for the ML side. Fixed nine-bullet
+shape, generated for every guide regardless of current applicability. For
+aptkit the mappings are honest: the recommender and anomaly templates map
+`partially` onto the analytics agents (which detect anomalies and propose
+recommendations with an LLM, not a trained model); object detection does
+not apply to aptkit at all (the reader's contrl project is the anchor for
+CV instead).
 
-The shape matches `07-system-design-templates/`: prompt, standard architecture,
-data model, components, scale concerns, eval framing, failure modes, then the
-honest verdict and the refactor that would close the gap.
+## Files
 
-Be honest in the room: aptkit is an LLM-application toolkit, not a classical-ML
-system. There is no trained model, no candidate generator, no interaction log, no
-feature store. The "recommendation agent" is an LLM, not a fitted recommender.
-The "anomaly-monitoring agent" scores prose against categories, not metrics
-against baselines. So two of these three verdicts run `no` or weak `partially`,
-and that is the correct answer — the value is walking the canonical architecture
-and naming the exact seam where aptkit would have to grow a model.
-
-## Files (self-contained per template)
-
-1. `01-recommender-system.md` — candidate gen + ranking model; why aptkit's recommendation agent is an LLM, not a recommender
-2. `02-anomaly-detection.md` — statistical scorers + drift; the anomaly-monitoring agent scores prose, not metrics
-3. `03-object-detection-cv.md` — the canonical CV pipeline; aptkit has no vision, walked as out-of-shape
+- `01-recommender-system.md` — "Design a recommender." Applies `partially` (the recommendation agent is LLM-driven, not a learned ranker).
+- `02-anomaly-detection.md` — "Design anomaly detection." Applies `partially` (the anomaly-monitoring agent is LLM-driven over fixed categories).
+- `03-object-detection-cv.md` — "Design real-time on-device CV." Applies `no` (anchor: contrl, not aptkit).

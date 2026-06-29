@@ -1,326 +1,217 @@
-# Training-run logging
+# Training-Run Logging
 
-**Subtitle:** every run logs enough to reproduce and compare it · *Industry standard*
+> experiment/training-run logging · reproducibility infrastructure
+
+Let me be blunt before we start: **aptkit trains no model.** There is no `model.fit()` anywhere in `packages/`. So everything in this file is new ground — concepts you'll build into buffr as exercises, not features I'm pointing at in shipped code. Your one real ML project is contrl (the MediaPipe pose-landmark rep counter on-device). Keep that in your head as the anchor: imagine you'd trained a small classifier on top of those landmarks and shipped three versions of it. The question this file answers is the one that wrecks ML teams: **"Which run produced the model that's in prod right now, and can I rebuild it byte-for-byte?"** If you can't answer that, you don't have an ML system, you have a science experiment that escaped the lab.
 
 ## Zoom out, then zoom in
 
-aptkit trains no models, so the layers below are the *generic* supervised
-pipeline. The point of this file is the band drawn *across* it: the
-logging/tracking layer that records one row per run so you can answer "what
-changed?" later. It is not a stage — it is a cross-cutting concern that taps
-every stage and emits one durable record.
+Training-run logging is not a *stage* in the pipeline. It's a cross-cutting recorder that taps every stage and writes a permanent receipt for each run. Here's the generic supervised-ML pipeline with the recorder marked.
 
 ```
-  Zoom out — the pipeline with the tracking band across it
-
-  ┌─ Data layer ───────────────────────────────────────────────┐
-  │  labeled rows @ DATA VERSION (snapshot id / hash)           │──┐
-  └────────────────────────────┬───────────────────────────────┘  │
-                               │ featurize                         │
-  ┌─ Feature layer ────────────▼───────────────────────────────┐  │
-  │  numeric X @ FEATURE VERSION (feature code / config sha)    │──┤
-  └────────────────────────────┬───────────────────────────────┘  │
-                               │ fit (HYPERPARAMS, CODE git sha)   │
-  ┌─ Model layer ──────────────▼───────────────────────────────┐  │
-  │  fitted f(X) → ŷ                                            │──┤
-  └────────────────────────────┬───────────────────────────────┘  │
-                               │ evaluate                          │
-  ┌─ Metrics layer ────────────▼───────────────────────────────┐  │
-  │  precision@k / recall@k on held-out test                    │──┤
-  └─────────────────────────────────────────────────────────────┘  │
-                                                                    ▼
-  ★ ════ TRACKING BAND ═══════════════════════════════════════════ ★
-  │  one RUN RECORD: {run_id, ts, data_ver, feature_ver,            │
-  │  hyperparams, code_sha, metrics} — spans data → model → metrics │
-  ════════════════════════════════════════════════════════════════
+Where training-run logging lives
+┌──────────────────────────────────────────────────────────────────────┐
+│  DATA ──→ FEATURES ──→ TRAIN/VAL/TEST ──→ MODEL ──→ DEPLOY            │
+│   │          │              │              │          │               │
+│   │ data     │ feature      │ hyperparams  │ metrics  │ prod model id  │
+│   │ version  │ set version  │ + seed       │ + confmat│                │
+│   ▼          ▼              ▼              ▼          ▼               │
+│  ┌──────────────────────────────────────────────────────────────┐    │
+│  │  ★ TRAINING-RUN LOGGER  (one row per run)                     │    │
+│  │     taps EVERY stage; writes an immutable receipt             │    │
+│  └──────────────────────────────────────────────────────────────┘    │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-Now zoom in. Without that record, "the model got worse this week" is
-undebuggable — you cannot tell whether the data snapshot moved, the feature code
-changed, a hyperparameter was nudged, or someone shipped a different commit. The
-discipline is simple and unglamorous: *every run logs its inputs and its
-outputs, keyed by a run id and a timestamp.* You already practice this in
-aptkit — on eval runs, not training runs.
+The recorder reads from each stage as the run executes and emits exactly one durable record per run. It sits *beside* the pipeline, not inside it — which is why a missing logger is invisible until the day you need it and it isn't there. Tools that do this for a living are MLflow and Weights & Biases; you're going to build a tiny version of the same idea.
 
 ## Structure pass
 
-**Layers.** Data → feature → model → metrics, and a tracking band laid across
-all four. Each pipeline layer contributes one *version* field to the record; the
-metrics layer contributes the *result* fields. The record is the only artifact
-that sees all layers at once.
+One axis: **what must be captured to make a run reproducible AND comparable.** Reproducible = I can rebuild this exact model. Comparable = I can rank this run against the other forty. Both demands hit the same record, and they imply different fields. The seams fall along *who owns each fact*:
 
-**Axis — what must I log to reproduce this run?** Five inputs and one output.
-Inputs: which data (data version), which feature code (feature version), which
-knobs (hyperparameters), which code (git sha), and *when* (timestamp + run id).
-Output: the metrics. If any input is missing from the record, a regression
-becomes a guessing game — you can re-run but you cannot diff.
+- **Inputs the run consumed** — data version, feature-set version, hyperparameters, random seed. Owned upstream; the logger snapshots them.
+- **Code that ran** — git commit SHA of the training code. Owned by version control; the logger reads `git rev-parse`.
+- **Outputs the run produced** — train/val/test metrics, the confusion matrix (see `08-confusion-matrices.md`), the model artifact pointer. Owned by the run itself.
 
-**Seam.** The load-bearing boundary is **the run record schema** — the fixed set
-of fields every run must populate before it is allowed to count. Above the seam:
-humans comparing runs in a table. Below it: training code writing one JSON/row.
-The axis "can two runs be compared?" flips exactly here — a run with a record is
-comparable; a run without one is folklore.
+The seam that people skip is the middle one. They log hyperparameters and metrics, forget the commit SHA, and six months later cannot rebuild the model because the training code changed underneath them.
 
 ## How it works
 
-### Move 1 — the mental model
+### Move 1 — Mental model
 
-You already own this discipline. Every aptkit replay run writes a structured
-artifact to `artifacts/replays/*.json`, and it records *exactly the fields a
-training-run log records* — just for an eval run instead of a fit. Open
-`2026-06-18T19-29-11-225Z-revenue-by-state-query-fixture-studio.json`: it logs
-`provider:{id,model}` (which model produced this), `fixture:{path}` (which
-dataset fed it), `createdAt` (when), `durationMs` (how long), and the output
-(`answer`). That is a run record. The "training" is the only missing word.
+A training run is a pure-ish function. Same inputs + same code + same seed → same model. The logger's job is to record the full left-hand side of that equation so the right-hand side is reproducible.
 
 ```
-  Pattern — every run emits one durable record
-
-  ┌──────────────┐  reads inputs   ┌─────────────────────────────┐
-  │  a run       │ ──────────────► │  RUN RECORD (one JSON/row)  │
-  │  (fit OR     │  writes output  │  inputs: which data, code,  │
-  │   replay)    │ ──────────────► │  knobs, when               │
-  └──────────────┘                 │  output: the metrics       │
-                                   └─────────────────────────────┘
-        many runs ──► many records ──► one comparison table
+The reproducibility equation
+┌─────────────────────────────────────────────────────────────┐
+│   f( data_version,                                            │
+│      feature_set_version,    ─── INPUTS (snapshot these)      │
+│      hyperparameters,                                         │
+│      seed ) @ code_commit    ─── CODE (snapshot this)         │
+│            │                                                  │
+│            ▼                                                  │
+│        MODEL  +  {train/val/test metrics, confusion matrix}   │
+│            │            └── OUTPUTS (snapshot these too)       │
+│            ▼                                                  │
+│     ONE LOG ROW = the whole equation, frozen                  │
+└───────────────────────────────────────────────────────────────┘
 ```
 
-You don't compare runs by re-running them. You compare the *records* they left
-behind. The record outlives the process.
+If any term on the left is missing from the row, the equation is unsolvable — you cannot reproduce the model.
 
-### Move 2 — the five inputs and one output, one field at a time
+### Move 2 — Step by step
 
-A reproducible run record pins five inputs and records one output. Each maps
-onto a field aptkit's replay artifact already writes.
+**Part A: Snapshot the inputs at run start**
 
-**Data version — which snapshot fed the run.** Not "the dataset" — *which
-version* of it. A path, a content hash, or a snapshot id. Change the rows and
-the record must change.
+Before a single gradient step, freeze the inputs. Don't capture them at the end — by then someone may have edited the config.
 
 ```
-  data_version: "voucher-dropoff.json@sha:9f3a…"   (snapshot, not "latest")
-        │
-        └─► aptkit replay logs this as:  fixture.path
-            "packages/agents/recommendation/fixtures/voucher-dropoff.json"
+Run start: freeze inputs
+┌──────────────┐   ┌──────────────┐   ┌──────────────┐
+│ data_version │   │ feature_set  │   │ hyperparams  │
+│  "2026-06-   │   │  _version    │   │ {lr, epochs, │
+│   01_v3"     │   │  "fs_v7"     │   │  batch}      │
+└──────┬───────┘   └──────┬───────┘   └──────┬───────┘
+       └──────────────────┼──────────────────┘
+                          ▼
+                  ┌───────────────┐
+                  │  seed = 1337  │  ← fix it, log it
+                  └───────────────┘
 ```
 
-**Feature version — which feature code/config.** The feature function is the
-train/serve seam (file 01). Its version belongs in the record so a feature-code
-change is visible as a different run, not a silent drift.
-
-```
-  feature_version: "featurize.py@git:4c2e…"   (the code that built X)
-        │
-        └─► aptkit replay analogue: fixture.description / capabilityId
-            (which capability + intent shaped the input)
-```
-
-**Hyperparameters — the knobs.** Learning rate, depth, regularization, k.
-Logged as a flat map so two runs diff cleanly.
-
-```
-  hyperparams: { lr: 0.01, max_depth: 6, k: 10 }
-        │
-        └─► aptkit replay analogue: provider.model + (temperature/maxTokens
-            in the ModelRequest) — the run-shaping knobs
+```python
+# not yet exercised in aptkit — no ML training exists in packages/
+def start_run(config) -> RunHandle:
+    return RunHandle(
+        run_id      = uuid4(),
+        started_at  = now(),
+        data_version       = config.data_version,        # input
+        feature_set_version= config.feature_set_version, # input
+        hyperparameters    = config.hyperparameters,     # input
+        seed               = config.seed,                # input
+        code_commit        = git_rev_parse("HEAD"),      # code
+    )
 ```
 
-**Code / model version — which commit produced f.** A git sha pins the training
-code and the model architecture together. Without it, "same data, same
-hyperparams, different result" has no explanation.
+**Part B: Capture the outputs at run end**
+
+When training finishes, attach the results — including the confusion matrix, which is the single richest comparison artifact you get (it tells you *how* the model is wrong, not just how often).
 
 ```
-  code_sha: "git:1a9f…"        model_version: "reranker-v3"
-        │
-        └─► aptkit replay logs this as:  provider: { id, model }
-            { id: "openai", model: "gpt-4.1" }   ← the "which model" field
+Run end: attach outputs
+   MODEL ──→ evaluate on train / val / test
+              │
+              ▼
+   ┌─────────────────────────────────────────┐
+   │ train_metrics : {acc .94, f1 .93}        │
+   │ val_metrics   : {acc .88, f1 .86}        │
+   │ test_metrics  : {acc .87, f1 .85}        │
+   │ confusion_matrix : [[..],[..]]  ◄────────┼── see 08-confusion-matrices.md
+   │ model_uri     : "s3://models/run-id"     │
+   └─────────────────────────────────────────┘
 ```
 
-**Timestamp + run id — when, and a stable key.** The id makes the run
-addressable; the timestamp orders the history.
-
-```
-  run_id: "run-2026-06-18-001"   created_at: "2026-06-18T19:29:11.225Z"
-        │
-        └─► aptkit replay logs this as:  createdAt  (+ the filename is the id)
-```
-
-**Metrics — the one output.** The numbers you compare runs on. In aptkit these
-come from `scorePrecisionAtK` / `scoreRecallAtK`
-(`packages/evals/src/precision-at-k.ts`) — the per-run metric you would log.
-
-```
-  metrics: { precision_at_10: 0.62, recall_at_10: 0.48, duration_ms: 8211 }
-        │
-        └─► aptkit replay logs the result + cost:  eval.ok, durationMs,
-            trace[].inputTokens / outputTokens
+```python
+# not yet exercised in aptkit
+def finish_run(handle, model, splits):
+    write_row({
+        **handle.as_dict(),
+        "train_metrics": evaluate(model, splits.train),
+        "val_metrics":   evaluate(model, splits.val),
+        "test_metrics":  evaluate(model, splits.test),
+        "confusion_matrix": confusion(model, splits.test),  # cross-ref 08
+        "model_uri":     persist(model),
+        "finished_at":   now(),
+    })  # ONE immutable row
 ```
 
-Field-by-field, the replay artifact *is* a run record:
+**The bridge — aptkit already has this instinct.** This is the part to internalize. aptkit does *not* log ML training runs — it trains nothing. But aptkit already logs `CapabilityEvents` and writes **replay artifacts** for every LLM run: enough to replay the run deterministically and compare two runs side by side. That is *exactly the same reproducibility discipline*, just pointed at LLM invocations instead of gradient descent. The mental move — "capture enough per run to reproduce and compare it later" — is identical. Training-run logging is that same instinct applied to ML training. So you're not learning a foreign concept; you're transferring a habit aptkit already enforces for LLM runs onto a domain it doesn't yet touch.
 
-```
-  REPLAY ARTIFACT  (artifacts/replays/*.json)      TRAINING-RUN RECORD
-  ┌─────────────────────────────────┐              ┌──────────────────────┐
-  │ filename + createdAt            │ ───────────► │ run_id + timestamp   │
-  │ provider: { id, model }         │ ───────────► │ model_version /      │
-  │                                 │              │ code_sha             │
-  │ fixture: { path }               │ ───────────► │ data_version         │
-  │ fixture: { description }        │ ───────────► │ feature_version      │
-  │ (ModelRequest temp / maxTokens) │ ───────────► │ hyperparams          │
-  │ eval.ok + durationMs            │ ───────────► │ metrics              │
-  │ trace[].input/outputTokens      │ ───────────► │ cost metrics         │
-  │ answer / recommendations        │ ───────────► │ predictions (output) │
-  └─────────────────────────────────┘              └──────────────────────┘
-```
+### Move 3 — Principle
 
-A training-run record as annotated JSON — same shape, training words:
-
-```jsonc
-{
-  "run_id": "run-2026-06-18-001",          // stable, addressable key
-  "created_at": "2026-06-18T19:29:11.225Z",// orders the history
-  "data_version": "rerank-train.csv@sha:9f3a",  // WHICH rows
-  "feature_version": "featurize.py@git:4c2e",   // WHICH feature code
-  "code_sha": "git:1a9f",                  // WHICH training commit
-  "model_version": "reranker-v3",          // WHICH architecture
-  "hyperparams": { "lr": 0.01, "k": 10 },  // the knobs, flat for diffing
-  "metrics": {                             // the one output you compare on
-    "precision_at_10": 0.62,
-    "recall_at_10": 0.48
-  }
-}
-```
-
-**Move 2.5 — the aptkit reality.** Not yet exercised in aptkit — aptkit runs
-pre-trained LLMs, not trained models. The pattern is taught here as study
-ground. But aptkit *does* log per-run replay artifacts (`artifacts/replays/*.json`)
-that map 1:1 onto a training-run record: `provider.{id,model}` ≈ model version,
-`fixture.path` ≈ data version, `createdAt` ≈ timestamp, `durationMs` + `eval.ok`
-≈ metrics, and the output blocks ≈ predictions. You already own the discipline
-end to end — you apply it to *eval* runs instead of *training* runs.
-
-### Move 3 — the principle
-
-A run you cannot reproduce or compare did not happen — it left no evidence. Log
-the five inputs and the one output, keyed by id and time, *before* you trust the
-result. The record, not the process, is the unit of comparison. aptkit proves
-the habit is already yours: it writes one structured artifact per replay, and a
-training pipeline only adds the word "fit" to the same record.
+**A run you can't reproduce is a run you can't trust, and a run you can't compare is a run you can't improve.** Log the full input equation plus the outputs, immutably, one row per run. The cost is a few fields; the cost of skipping it is the model in prod becoming a black box with no birth certificate.
 
 ## Primary diagram
 
-The whole loop: many runs, each leaving one record, compared in one table.
-
 ```
-  From runs to a comparison table
-
-  run A ─┐                                   ┌─────────────────────────────┐
-  run B ─┤  each writes 1 record  ┌────────► │  COMPARISON TABLE           │
-  run C ─┘  (5 inputs + metrics)  │          │  diff inputs → explain Δ    │
-            │                     │          └─────────────────────────────┘
-            ▼                     │
-  ┌──────────────────────────────┴──┐
-  │ {run_id, ts, data_ver, feat_ver, │   ★ the record is the seam ★
-  │  hyperparams, code_sha, metrics} │   no record → "the model got worse"
-  └──────────────────────────────────┘       is unanswerable
+End-to-end: one run → one immutable receipt
+┌─────────────────────────────────────────────────────────────────────┐
+│                                                                       │
+│  config ──┐                                                           │
+│           ▼                                                           │
+│      start_run() ──► snapshot {data_ver, fs_ver, hparams, seed,       │
+│           │                    code_commit @ git HEAD}                │
+│           ▼                                                           │
+│      [ TRAIN over fixed seed ]                                        │
+│           │                                                           │
+│           ▼                                                           │
+│      finish_run() ──► attach {train/val/test metrics,                 │
+│           │                   confusion_matrix, model_uri}            │
+│           ▼                                                           │
+│   ┌───────────────────────────────────────────────────────────┐     │
+│   │  training_runs table  (buffr / reindb agents schema)        │     │
+│   │  ┌──────┬──────────┬─────────┬────────┬──────┬───────────┐ │     │
+│   │  │run_id│data_ver  │fs_ver   │hparams │seed  │code_commit│ │     │
+│   │  ├──────┼──────────┼─────────┼────────┼──────┼───────────┤ │     │
+│   │  │ ...  │ ...      │ ...     │ {...}  │ 1337 │ a1b2c3    │ │     │
+│   │  └──────┴──────────┴─────────┴────────┴──────┴───────────┘ │     │
+│   │  + train/val/test metrics, confusion_matrix, model_uri      │     │
+│   └───────────────────────────────────────────────────────────┘     │
+│                                                                       │
+│  Query: "which run made the prod model?"  → SELECT ... WHERE model_uri│
+│                                              = <prod pointer>          │
+└───────────────────────────────────────────────────────────────────────┘
 ```
 
-A multi-run comparison table is the payoff — one row per record, inputs on the
-left, the metric on the right, so a metric drop lines up with the input that
-moved:
-
-```
-  run_id   data_ver   feat_ver   code_sha   lr     k    prec@10  recall@10
-  ─────────────────────────────────────────────────────────────────────────
-  001      v9f3a      4c2e       1a9f       0.01   10   0.62     0.48
-  002      v9f3a      4c2e       2b8d       0.01   10   0.66     0.51   ← code↑
-  003      vA1c4      4c2e       2b8d       0.01   10   0.58     0.44   ← data moved
-  004      vA1c4      7e91       2b8d       0.10   10   0.41     0.30   ← feat+lr both
-  ─────────────────────────────────────────────────────────────────────────
-  run 003's drop is the DATA column; run 004 changed two inputs at once —
-  unattributable. One input per run, or the table cannot explain the metric.
-```
+Before the row exists, the prod model is an orphan. After, every prod model has a traceable parent run, and "rebuild it" becomes a `SELECT` plus a `git checkout`.
 
 ## Elaborate
 
-The hard-won lesson behind MLflow / Weights & Biases is that comparison is only
-possible when *exactly one thing changes per run* and that thing is recorded.
-Run 004 above is the cautionary tale: it moved feature version *and* learning
-rate, so its metric drop is unattributable — the record is present but the
-experiment is wasted. The tooling does not enforce discipline; it only stores
-records. The same trap exists in aptkit replays: if you swap the fixture *and*
-the provider in one replay, the artifact still writes, but you can no longer say
-whether the data or the model caused the output to change. The record schema is
-necessary but not sufficient — the *one-variable-per-run* habit is what makes it
-pay. Read `15-drift-detection.md` next: drift is what you detect *between* runs
-once you can compare them.
+A few things that separate a toy logger from a real one:
+
+- **Immutability.** Rows are append-only. If you let runs mutate, you've reintroduced the "config changed underneath me" failure you were trying to kill. No `UPDATE` on a completed run.
+- **The git commit is non-negotiable.** Hyperparameters in the row but stale code on disk means you reproduce a *different* model and conclude the logger lied. Capture `git rev-parse HEAD` and also flag a dirty working tree (`git status --porcelain` non-empty) — a dirty tree means "this run is not reproducible from any commit," and you want that recorded honestly.
+- **Data version is a pointer, not a copy.** You log `"2026-06-01_v3"`, not the dataset. The version string must resolve to immutable data (a snapshot, a content hash) — otherwise the pointer dangles.
+- **Confusion matrix earns its row.** Two runs with identical accuracy can have wildly different confusion matrices. Storing it (cross-ref `08-confusion-matrices.md`) is what lets you compare *failure shape*, which for contrl would be "v2 confuses rep-top with rep-bottom, v3 fixed that but now misses the eccentric phase."
+- **Seed alone isn't full determinism.** GPU nondeterminism, library versions, and data-loader ordering all leak. Logging the seed gets you most of the way; a mature setup also logs library versions. For your buffr exercise, seed + commit + data version is the right scope.
 
 ## Project exercises
 
-### Build a run-comparison table from replay artifacts
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a script that reads every `artifacts/replays/*.json`, pulls
-  `createdAt`, `provider.{id,model}`, `fixture.{id,path}`, `durationMs`,
-  `eval.ok`, and `trace[].inputTokens/outputTokens`, and prints a one-row-per-run
-  comparison table (run id from the filename) sorted by timestamp.
-- **Why it earns its place:** turns the existing replay artifacts into the
-  comparison table this file argues for — proving you can read records you
-  already produce and diff runs without re-running them.
-- **Files to touch:** reads `/Users/rein/Public/aptkit/artifacts/replays/`,
-  new file `/Users/rein/Public/aptkit/packages/evals/src/run-table.ts`.
-- **Done when:** running it prints a fixed-column table where each replay is one
-  row and a provider/fixture difference is visible column-by-column.
-- **Estimated effort:** `1–4hr`
+### EX-ML-14a — buffr training-run log table + row writer
 
-### Write a run record alongside a learned-reranker fit
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** extend a learned-reranker training loop so that after each
-  fit it writes a run record `{run_id, created_at, data_version, feature_version,
-  code_sha, hyperparams, metrics}` to disk, mirroring the replay-artifact shape,
-  with metrics from `scorePrecisionAtK` / `scoreRecallAtK`.
-- **Why it earns its place:** closes the loop from this section — you produce the
-  `(X,y)` dataset (file 01), fit a model (file 04), and now log the run so the
-  next fit is comparable, not folklore.
-- **Files to touch:** new `/Users/rein/Public/buffr/eval/rerank-run-record.ts`,
-  using `/Users/rein/Public/aptkit/packages/evals/src/precision-at-k.ts`.
-- **Done when:** two fits with different hyperparams write two records whose
-  `hyperparams` and `metrics` differ and whose `code_sha`/`data_version` match,
-  and the records load into the table from exercise 1.
-- **Estimated effort:** `1–2 days`
+- **Exercise ID:** `EX-ML-14a` (Phase 2C — establishing the reproducibility substrate before any ML evals exist)
+- **What to build:** A new `training_runs` table in buffr's shared `agents` schema (reindb), plus a small `TrainingRunLogger` with `start_run()` / `finish_run()` that writes exactly one immutable row per run. Columns: `run_id`, `started_at`, `finished_at`, `data_version`, `feature_set_version`, `hyperparameters` (jsonb), `seed`, `code_commit`, `code_dirty` (bool), `train_metrics` (jsonb), `val_metrics` (jsonb), `test_metrics` (jsonb), `confusion_matrix` (jsonb), `model_uri`.
+- **Why it earns its place:** It's the substrate everything else in this sub-section sits on — drift detection and retraining both need to point back at "the run that made the current prod model." Without the table, those features have no parent to reference. It also forces you to practice aptkit's existing replay-artifact instinct in a new domain.
+- **Files to touch:** `Case B (new)` — `/Users/rein/Public/buffr/supabase/migrations/<timestamp>_create_training_runs.sql` (new migration, `agents` schema); `/Users/rein/Public/buffr/src/ml/trainingRunLogger.ts` (new logger).
+- **Done when:** A test inserts a start row, finishes it with metrics + a confusion matrix, and a second `finish_run` on the same `run_id` is rejected (append-only); and `SELECT * FROM agents.training_runs WHERE model_uri = $1` returns the one parent run for a given prod pointer.
+- **Estimated effort:** `1–4hr`
 
 ## Interview defense
 
-**Q: "A model regressed week over week. How do you find what changed?"**
-You don't guess — you diff the run records. Pull last week's record and this
-week's, line up data version, feature version, hyperparams, and code sha, and the
-column that moved is your suspect. If no records exist, you cannot answer at all;
-you can only re-run blind. That is why the record is logged *before* the result
-is trusted.
+**Q: A model is misbehaving in prod. Walk me through how you find what produced it.**
 
 ```
-  run_t-1 ┐
-          ├─► diff inputs ─► the field that changed ─► the cause
-  run_t   ┘    (data? feature? hyperparam? code?)
+Prod model ──model_uri──► SELECT * FROM agents.training_runs
+                          WHERE model_uri = <pointer>
+                                │
+                                ▼
+        run row → {code_commit a1b2c3, data_version v3, seed 1337, hparams}
+                                │
+            git checkout a1b2c3 + load data v3 + seed 1337 → REBUILD
 ```
-*Anchor: aptkit's replay artifacts already log provider, fixture path, and
-timestamp per run — diff two and the change is visible.*
 
-**Q: "What's the minimum a run must log to be reproducible?"**
-Five inputs and one output: data version, feature version, hyperparameters, code
-sha, and a timestamp+run id — plus the metrics. Drop any input and the run
-becomes a result you can observe but not explain. aptkit's replay JSON logs the
-analogue of every one of these per eval run.
+One-line anchor: *the model_uri in prod is a foreign key back to the exact run that birthed it — no row, no answer.*
 
-```
-  reproducible = data_ver + feat_ver + hyperparams + code_sha + (id, ts)
-                 ───────────────── inputs ─────────────────   + metrics(out)
-```
-*Anchor: the replay artifact's `provider` + `fixture.path` + `createdAt` +
-`eval` are the same fields, logged for replays instead of fits.*
+**Q: Why log the confusion matrix when you already log accuracy?**
+
+Accuracy collapses all error into one number; the confusion matrix preserves *which* classes get confused. Two runs at 87% can fail completely differently — and for contrl, "confuses rep-top with rep-bottom" vs "misses the eccentric phase" are different bugs with different fixes. One-line anchor: *accuracy says how often you're wrong; the confusion matrix says how you're wrong* (see `08-confusion-matrices.md`).
+
+**Q: aptkit doesn't train models — why does this matter here?**
+
+Because aptkit already practices the discipline on LLM runs via `CapabilityEvents` and replay artifacts: capture enough per run to reproduce and compare. Training-run logging is the same instinct aimed at ML. The transfer is the point. One-line anchor: *same receipt habit, different run type.*
 
 ## See also
 
-- `15-drift-detection.md` — what you detect once runs are comparable
-- `16-retraining-pipelines.md` — the loop that produces a new run to log
-- `01-supervised-pipeline.md` — the pipeline whose stages each contribute a field
-- `05-evals-and-observability/` — how aptkit records and grades runs today
+- [`08-confusion-matrices.md`](./08-confusion-matrices.md) — what the per-run confusion matrix captures
+- [`15-drift-detection.md`](./15-drift-detection.md) — detecting when the logged prod model starts degrading
+- [`16-retraining-pipelines.md`](./16-retraining-pipelines.md) — what each retrain run logs back here

@@ -1,291 +1,184 @@
 # Chapter 2 — The Architecture
 
-After the pitch, someone hands you a marker and says "walk me through the
-system." This chapter is about drawing aptkit from scratch, at a whiteboard,
-in ninety seconds, with confidence — and knowing exactly where they'll
-interrupt and what to say when they do.
+After the pitch lands, the interviewer almost always says "walk me through the architecture." This is the whiteboard moment. You'll stand up, pick up a marker, and have ninety seconds to draw a system that someone who has never seen the code can follow. This chapter teaches you to draw aptkit from memory, top to bottom, and to know in advance where they'll interrupt.
 
-The trick is that you don't draw everything. You draw the *layers* and the
-*two contracts*, because those are the load-bearing joints. If you can draw
-the bands top to bottom and name what flows between them, you can answer
-almost any architecture follow-up by pointing at the picture instead of
-reaching for it in your head.
+You think visually first — this is your strongest interview moment, not your weakest. Lead with the picture. Draw the layers, then trace one request down through them. Never start with a file.
 
-## The chapter-opening diagram — the whiteboard you redraw
+## The chapter-opening diagram — the system you draw
 
-This is the diagram you reproduce live. Practice drawing it until you can do
-it in under ninety seconds: six bands, two contracts marked with stars, the
-deployment seam at the bottom.
+This is the diagram you reproduce at the whiteboard. Memorize the five bands and the two seams; the boxes inside are detail you fill as you talk.
 
 ```
-THE APTKIT REQUEST FLOW — draw these bands, mark the two contracts
+  APTKIT ARCHITECTURE — five layers, two load-bearing seams
 
-  ┌─ UI LAYER · apps/studio (React 18 + Vite) ──────────────────────┐
-  │  RagQueryWorkspace · AgentReplayShell · DocPage                 │
-  │  static GitHub Pages — no backend server                        │
-  └────────────────────────────────┬─────────────────────────────────┘
-                                   │  invokes a capability
-  ┌─ AGENT LAYER · packages/agents/* (6) ──▼───────────────────────────┐
-  │  rag-query-agent.ts: injectProfile → registry → runAgentLoop      │
-  │  capability = prompt pkg + tool policy + loop config + validator  │
-  └────────────────────────────────┬─────────────────────────────────┘
-                                   │  runAgentLoop(...)
-  ┌─ RUNTIME · packages/runtime/run-agent-loop.ts ──▼──────────────────┐
-  │  for turn < maxTurns:                                              │
-  │    model.complete({system, messages, tools})  ★ CONTRACT 1 ★      │
-  │    if tool_use → callTool → push result → loop                    │
-  │    if last turn → drop tools, append synthesisInstruction         │
-  │  emits CapabilityEvent trace (step/tool_call/usage/error)         │
-  └──────────────┬─────────────────────────────────┬──────────────────┘
-       complete() │                                 │ search_knowledge_base
-  ┌─ PROVIDERS ───▼──────────────┐    ┌─ RETRIEVAL ──▼────────────────────┐
-  │  gemma (LOCAL DEFAULT,       │    │  pipeline: embed → store.search   │
-  │   emulated tool-calling,     │    │  ★ CONTRACT 2 ★                   │
-  │   :11434, no key)            │    │  VectorStore + EmbeddingProvider  │
-  │  anthropic · openai          │    │  InMemoryVectorStore (cosine)     │
-  │  fallback chain · local guard│    │  nomic-embed-text, 768-dim        │
-  └──────────────────────────────┘    └───────────────┬───────────────────┘
-                                                      │ same VectorStore contract
-  ┌─ DEPLOYMENT SEAM ─────────────────────────────────▼────────────────────┐
-  │  buffr (separate repo): PgVectorStore implements VectorStore over       │
-  │  Supabase pgvector + HNSW; agents schema; SupabaseTraceSink persists    │
-  │  the CapabilityEvent trace to agents.messages. one-line store swap.     │
-  └───────────────────────────────────────────────────────────────────────┘
+  ┌─ STUDIO (apps/studio, React 18 + Vite) ──────────────────────────┐
+  │  hash-routed UI · AgentReplayShell replays traces ·              │
+  │  RagQueryWorkspace = deterministic in-browser RAG, precision@1   │
+  └───────────────────────────────┬──────────────────────────────────┘
+                                  │  invoke a capability
+  ┌─ AGENTS (6 capabilities) ─────▼──────────────────────────────────┐
+  │  recommendation · anomaly-monitoring · diagnostic-investigation  │
+  │  query · rubric-improvement · rag-query (capstone)               │
+  │  each = prompt package + tool policy + loop config + validator   │
+  └───────────────────────────────┬──────────────────────────────────┘
+                                  │  runAgentLoop(provider, tools, …)
+  ┌─ RUNTIME (packages/runtime) ──▼──────────────────────────────────┐
+  │  bounded loop · CapabilityEvent trace · forced synthesis turn    │
+  │  ════ SEAM 1: ModelProvider.complete() ══════════════════════    │
+  └──────────┬───────────────────────────────────┬────────────────────┘
+             │ complete(request)                 │ search_knowledge_base
+  ┌─ PROVIDERS ▼─────────────────┐   ┌─ RETRIEVAL ▼─────────────────────┐
+  │  gemma (local default,       │   │  ═ SEAM 2: EmbeddingProvider +   │
+  │   emulated tool-calling) ★   │   │    VectorStore ═══════════════   │
+  │  local guard · fallback      │   │  InMemoryVectorStore (cosine)    │
+  │  anthropic · openai (cloud)  │   │  OllamaEmbeddingProvider, 768    │
+  └──────────────────────────────┘   └───────────────┬──────────────────┘
+                                                     │ same VectorStore
+  ┌─ buffr (separate repo, consumes the npm bundle) ──▼────────────────┐
+  │  PgVectorStore implements VectorStore over Supabase pgvector+HNSW  │
+  │  agents schema in reindb · app_id tenancy · SupabaseTraceSink     │
+  └────────────────────────────────────────────────────────────────────┘
 ```
 
-That's the system. Six bands, data flowing down through `complete()` and
-`search_knowledge_base`, and the deployment seam where buffr slots in. Now
-let's walk the request end to end.
+Notice what carries the weight: the two seam lines (`══`). Everything above seam 1 is a client of the model port; everything in the providers band is an adapter for it. Same story for seam 2 and retrieval. If you can draw the bands and mark the two seams, the rest is narration.
 
-### Question 1 — "Walk me through what happens on a request"
+## Question 1 — walk me through the system
 
 ```
-┌─────────────────────────────────────────────────────┐
-│ THEY ASK                                            │
-│   "Walk me through the architecture. What happens   │
-│    when a user asks a question?"                    │
-│                                                     │
-│ WHAT THEY'RE TESTING                                │
-│   Can you trace one request end to end without      │
-│   getting lost? Do you know where the boundaries    │
-│   are? Can you stay at the right altitude — not     │
-│   too vague, not lost in a single function?         │
-└─────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│ THEY ASK                                                  │
+│   "Walk me through the architecture."                     │
+│                                                           │
+│ WHAT THEY'RE TESTING                                      │
+│   Do you have a layered mental model or a pile of files?  │
+│   Can you trace one request end-to-end without losing     │
+│   the thread? Do you know which boundaries are            │
+│   load-bearing and which are incidental? A candidate who  │
+│   draws a clean five-band diagram and traces one flow     │
+│   through it is signalling they actually designed this.   │
+└─────────────────────────────────────────────────────────┘
 ```
 
-Here's the walk. I trace one question through the RAG agent, top to bottom,
-naming the contract every time I cross a boundary:
+The strong answer is a guided tour down the diagram, following one request. Say this while you draw:
 
-> "A question comes into the rag-query agent. First it builds the system
-> prompt — `injectProfile` in `packages/agents/rag-query/rag-query-agent.ts`
-> folds a profile into the template. Then it hands off to `runAgentLoop` in
-> the runtime.
+> "I'll trace a RAG query, because it touches every layer. Start at the top — Studio, the React preview UI, or in production a buffr session. It invokes a capability, the rag-query agent.
 >
-> The loop is bounded — it runs up to `maxTurns`, default eight. Each turn it
-> calls `model.complete()`. That's my first contract, `ModelProvider` — the
-> runtime never names a vendor, it just calls `complete()`. By default that's
-> the local Gemma provider talking to Ollama on port 11434.
+> That agent is a thin composition: a prompt package, a tool policy that allowlists one tool, and a call to `runAgentLoop`. The loop is the runtime. It's bounded — maxTurns is 6 for this agent — and on the last turn it forces a synthesis instruction so the model has to answer from what it found instead of asking for another search.
 >
-> If the model decides it needs to search, it emits a `search_knowledge_base`
-> tool call. The loop runs the tool, which hits the retrieval pipeline:
-> embed the query with nomic at 768 dimensions, search the `VectorStore` —
-> that's my second contract — get back ranked hits with citations, feed them
-> to the model as a tool result. The model loops again with the evidence.
+> The loop talks to the model through one contract — `ModelProvider.complete()`. That's the first seam. The default adapter behind it is Gemma over Ollama, running locally. Gemma has no native tool-calling, so the provider emulates it: it renders the tools into the system prompt as JSON, demands a single JSON object back, parses it, and retries once with a corrective nudge if the JSON is malformed.
 >
-> Here's the part I'm proud of: on the *last* turn, the loop drops the tools
-> entirely and appends a synthesis instruction telling the model it has no
-> more tool calls — so it's forced to answer with what it has instead of
-> spinning forever asking to search again. That's the `forceFinal` branch in
-> `run-agent-loop.ts`.
+> When the model decides to search, the loop runs the `search_knowledge_base` tool. That crosses the second seam — `EmbeddingProvider` and `VectorStore`. In aptkit the store is in-memory, a cosine scan over an array. In buffr the exact same contract is implemented by `PgVectorStore` over Postgres pgvector with an HNSW index. The agent code doesn't change — buffr swaps the store at wiring time.
 >
-> The whole way through, the loop emits a `CapabilityEvent` trace. In aptkit
-> that streams as NDJSON for Studio to replay. In buffr, a `SupabaseTraceSink`
-> persists it to the `agents.messages` table. Same trace, two sinks."
+> The loop emits a `CapabilityEvent` trace the whole way — step, tool_call_start, tool_call_end, model_usage. Studio replays it; buffr persists it to the `agents.messages` table through a trace sink."
 
-That walk crosses every boundary and names the contract at each one. The
-interviewer can interrupt anywhere and I'm already standing at the box.
+That's the whole system in one request. You never listed packages — you followed data down through five bands and named the two seams as you crossed them.
 
 ```
-┃ The whole system hangs off two contracts:
-┃ complete() for models, VectorStore for retrieval.
-┃ Name them every time you cross the boundary.
+  ▸ Don't describe the layers. Trace one request through
+    them. The flow IS the architecture; the file list isn't.
 ```
 
-### Question 2 — "Why is the agent loop bounded? Why the forced synthesis?"
+## Where they'll interrupt — the follow-up tree
+
+Interviewers interrupt the architecture walk. Knowing where lets you welcome it instead of losing your place.
 
 ```
-┌─────────────────────────────────────────────────────┐
-│ THEY ASK                                            │
-│   "Why cap the loop at maxTurns? What's the         │
-│    forced-synthesis turn for?"                      │
-│                                                     │
-│ WHAT THEY'RE TESTING                                │
-│   Do you understand the failure mode of an agent    │
-│   loop — that a weak model will loop forever asking │
-│   for one more tool call and never answer? Did you  │
-│   design for that or get lucky?                     │
-└─────────────────────────────────────────────────────┘
+  You're tracing the RAG query and cross seam 1 (the model port).
+        │
+        ├─► IF THEY ASK "why a port and not just call Anthropic?"
+        │     "So the loop never names a vendor. The same loop runs
+        │      against Gemma locally, the fallback chain, or a cloud
+        │      SDK — they're all adapters for one contract. Memory
+        │      later proved this: it's a second consumer of the
+        │      retrieval ports with zero new infrastructure."
+        │
+        ├─► IF THEY ASK "how does Gemma do tool calls without support?"
+        │     "It doesn't — I emulate it. Tools go into the system
+        │      prompt as JSON, the model returns one JSON object, I
+        │      parse it into a tool_use block, retry once on bad JSON.
+        │      packages/providers/gemma/src/gemma-provider.ts."
+        │
+        └─► IF THEY ASK "what stops the loop running forever?"
+              "A hard turn budget — the for-loop caps at maxTurns, and
+               the last turn forces a synthesis instruction so the model
+               answers instead of asking for another tool call. Bounded
+               by construction, not by hoping the model stops."
 ```
 
-> "An agent loop's failure mode is non-termination — the model keeps deciding
-> it needs one more search and never synthesizes an answer. A local Gemma is
-> especially prone to this. So the loop is bounded two ways: a hard
-> `maxTurns` ceiling and an optional `maxToolCalls` budget.
->
-> But just stopping isn't enough — if you cut the model off mid-loop you get
-> a tool call as the final output, not an answer. So on the last turn the
-> loop flips a `forceFinal` flag: it passes `tools: undefined` so the model
-> *can't* call a tool, and it appends a synthesis instruction —
-> `buildSynthesisInstruction` literally says 'You have NO more tool calls
-> available... Do not say you need more queries.' That forces a real answer
-> out of whatever evidence it gathered. The empty-frontier termination of an
-> agent loop, if you like — it's the part people forget to build."
+The forced synthesis turn is the part interviewers don't expect you to have. Naming it — "the last turn forces a synthesis instruction so the model can't just keep asking for more searches" — signals you built the loop, not read about one.
 
-That last line — naming the part people forget — is the senior signal. Lots
-of people build an agent loop. Fewer remember that *the loop needs a forced
-exit that still produces an answer*, not just a stop.
-
-### Strong vs weak — the architecture walk
+## Question 2 — what's the relationship between aptkit and buffr
 
 ```
-┌──────────────────────────────┬──────────────────────────────┐
-│ WEAK WALK                    │ STRONG WALK                  │
-├──────────────────────────────┼──────────────────────────────┤
-│ "So there's a frontend, and  │ "A question hits the agent,  │
-│  it talks to the agents, and │  which calls runAgentLoop.   │
-│  the agents use the LLM, and │  Each turn calls complete()  │
-│  there's a vector database   │  — that's the ModelProvider  │
-│  for the RAG, and it all     │  contract, vendor-neutral.   │
-│  kind of connects through    │  If it searches, it crosses  │
-│  the runtime."               │  the VectorStore contract.   │
-│                              │  Last turn forces synthesis."│
-├──────────────────────────────┼──────────────────────────────┤
-│ Why it's weak:               │ Why it works:                │
-│ "kind of connects" is the    │ Names the boundary and the   │
-│ tell. No named boundaries,   │ contract at every hop. The   │
-│ no contracts, no direction.  │ interviewer can interrupt at │
-│ The interviewer can't probe  │ any box and you're standing  │
-│ because there's nothing      │ at it. Direction of flow is  │
-│ specific to grab.            │ explicit.                    │
-└──────────────────────────────┴──────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│ THEY ASK                                                  │
+│   "Why is there a second repo? Why not one codebase?"     │
+│                                                           │
+│ WHAT THEY'RE TESTING                                      │
+│   Do you understand the difference between a library and  │
+│   a deployment? Can you defend a boundary that costs you  │
+│   something (two repos, a publish step) on the grounds    │
+│   of what it buys (the core stays deployment-agnostic)?   │
+└─────────────────────────────────────────────────────────┘
 ```
 
-The weak walk uses the word "connects" three times. That word is where
-architecture answers go to die — it means "I know these things are related
-but I can't name the relationship." Name the relationship: it's a contract, a
-call, a tool result. Direction and boundary, every hop.
+> "AptKit is the library — it's deployment-agnostic on purpose. It ships an in-memory vector store and a local model so it runs with zero infrastructure, but it makes no decision about where data lives. Buffr is one deployment: a laptop runtime that consumes the published bundle, `@rlynjb/aptkit-core`, and fills the durable slot. It implements `PgVectorStore` against the same `VectorStore` contract, brings the `agents` schema in a shared Postgres, and persists traces. The swap is one line — buffr injects its store where aptkit would use the in-memory one. The cost is a publish step and a version contract between the repos. What it buys is that aptkit's core never imports app-specific product logic, which is the entire reason the monorepo exists."
 
-### Where they'll interrupt — the follow-up tree
+## When you don't know — the internals of the index
 
 ```
-You finish the request walk.
-      │
-      ├─► IF THEY ASK "where does state live?"
-      │     Conversation memory (packages/memory) and the
-      │     vector corpus live in the VectorStore. In aptkit
-      │     that's in-memory; in buffr it's Postgres. The
-      │     runtime itself is stateless per loop. → Ch04.
-      │
-      ├─► IF THEY ASK "what if the model returns garbage?"
-      │     parseAgentJson tolerates messy output; the gemma
-      │     provider has parse-retry; structured generation
-      │     retries on validation failure. → Ch05.
-      │
-      ├─► IF THEY ASK "why is memory not wired into an agent?"
-      │     Honest: packages/memory reuses the retrieval
-      │     contracts but no aptkit agent consumes it yet —
-      │     buffr's chat runtime is the only consumer. It's
-      │     built, not wired. → Ch06.
-      │
-      └─► IF THEY ASK "draw the deployment"
-            buffr consumes the published bundle, implements
-            VectorStore as PgVectorStore over Supabase
-            pgvector+HNSW, adds SupabaseTraceSink. → Ch03.
-```
-
-The third branch is the honest one. If you claim memory is "integrated" and
-they open the agents folder, you're caught. "It's built and reuses the
-retrieval contracts, but only buffr's chat runtime consumes it — no aptkit
-agent wires it yet" is precise and costs you nothing.
-
-```
-╔════════════════════════════════════════════════════════╗
-║ WHEN YOU DON'T KNOW                                     ║
-║                                                         ║
-║   They ask about HNSW internals: "How does the HNSW     ║
-║   index actually find nearest neighbors? What's the     ║
-║   graph construction cost?"                             ║
-║                                                         ║
-║   You used HNSW in buffr's Postgres index. You did      ║
-║   NOT tune it or study its internals — you took the     ║
-║   pgvector default and the numbers held.                ║
-║                                                         ║
-║   Say:                                                  ║
-║   "I haven't gone deep on HNSW's graph construction or  ║
-║    the layer-probability math. I used it as the         ║
-║    pgvector default in buffr because it's the standard  ║
-║    ANN index for cosine similarity, and at my corpus    ║
-║    size the recall and latency were fine — my own       ║
-║    in-memory store does a brute-force cosine scan and   ║
-║    even THAT was acceptable. If you want to dig into     ║
-║    HNSW's internals, walk me through where you'd start." ║
-║                                                         ║
-║   What this signals: you know what HNSW is FOR and why  ║
-║   you reached for it, you're honest that you took the   ║
-║   default, and you anchor it to a real tradeoff (brute  ║
-║   force was fine at your scale). All senior signals.    ║
-║                                                         ║
-║   Do NOT say:                                           ║
-║   "It builds a graph of nodes and navigates to close    ║
-║    ones, it's hierarchical so it's fast..." — vague     ║
-║   gesturing at internals you don't own is worse than    ║
-║   the honest deferral.                                  ║
-╚════════════════════════════════════════════════════════╝
-```
-
-```
-        ▸ "Connects" is where architecture answers die.
-          Name the relationship: a contract, a call, a
-          tool result.
+╔═══════════════════════════════════════════════════════════╗
+║ WHEN YOU DON'T KNOW                                        ║
+║                                                           ║
+║   You mention buffr's HNSW index and they ask: "Walk me   ║
+║   through how HNSW actually works internally — the layer  ║
+║   construction, the search descent."                      ║
+║                                                           ║
+║   You picked HNSW on pgvector's defaults. You understand  ║
+║   it's an approximate-nearest-neighbor graph and why you  ║
+║   need it (the in-memory scan is linear), but you haven't ║
+║   tuned its internals or studied the multi-layer skip-    ║
+║   list construction.                                      ║
+║                                                           ║
+║   Say:                                                    ║
+║   "I haven't gone deep into HNSW's internal layer         ║
+║    construction — I picked it on pgvector's defaults      ║
+║    because I knew I needed approximate nearest-neighbor    ║
+║    once the corpus outgrew a linear scan, and the recall  ║
+║    held up on my corpus. What I do understand is the      ║
+║    tradeoff it's making: it trades exact results for      ║
+║    sublinear search. If you want to go into the layer     ║
+║    graph, I'd be learning it with you — where would you   ║
+║    start?"                                                ║
+║                                                           ║
+║   What this signals: you know what the structure BUYS     ║
+║   (sublinear ANN) and why you reached for it, you're      ║
+║   honest about the depth limit, and you invite the        ║
+║   interviewer to teach. All three read as senior.         ║
+║                                                           ║
+║   Do NOT say:                                             ║
+║   "It's a graph that connects nearby vectors and you      ║
+║    sort of hop around to find close ones."                ║
+║   Vague hand-waving in territory you don't own is the     ║
+║   surest way to fail. Name the limit instead.            ║
+╚═══════════════════════════════════════════════════════════╝
 ```
 
 ## What you'd change
 
-If I were redrawing this architecture today, I'd make the trace sink a
-first-class seam from the start. Right now the trace is a `CapabilityEvent`
-union emitted by the loop, and aptkit streams it as NDJSON while buffr
-persists it with `SupabaseTraceSink`. That works, but the sink boundary grew
-organically — buffr added persistence after the fact. I'd define a
-`TraceSink` contract in the runtime next to `ModelProvider` and `VectorStore`
-so observability is one of the named seams, not an afterthought. It's the
-same move I already made for models and retrieval; the trace deserved it too.
+If you were drawing this fresh, you'd make the trace seam explicit in the architecture from day one. Right now the `CapabilityEvent` trace is emitted by the loop and consumed two ways — Studio replays it, buffr persists it through `SupabaseTraceSink` — but there's no formal "trace sink" port in aptkit's core the way there's a model port and a vector port. Buffr defines `CapabilityTraceSink` on its side. Lifting that into a third contract in the core would make the observability seam a first-class part of the diagram instead of an implicit one. It works as-is, but a third named seam would be more honest about what's actually swappable.
 
-## One-page summary — Chapter 2
+## One-page summary
 
-```
-CORE CLAIM
-  Draw six bands top to bottom, mark the TWO contracts
-  (complete(), VectorStore), name the boundary at every hop.
-  Never say "connects."
+**Core claim:** Trace one request down five bands (Studio → agents → runtime → providers + retrieval → buffr) and mark the two seams (model port, retrieval ports) as you cross them. The flow is the architecture.
 
-QUESTIONS COVERED
-  Q: Walk me through a request.
-     A: question → injectProfile → runAgentLoop → complete()
-        [contract 1] → maybe search_knowledge_base [contract 2]
-        → loop → last turn forces synthesis → CapabilityEvent trace.
-  Q: Why bounded + forced synthesis?
-     A: Non-termination is the loop's failure mode. maxTurns caps
-        it; forceFinal drops tools + appends synthesisInstruction
-        so it answers instead of looping. The forgotten part.
-  Q: Where does state live? / model returns garbage? / memory?
-     A: VectorStore (in-mem vs Postgres); parse-retry +
-        structured-gen retry; memory built but only buffr wires it.
+**Questions covered:**
+- *"Walk me through the architecture."* → Trace a RAG query top to bottom; name the two seams; name the forced synthesis turn and the bounded loop.
+- *"Why two repos?"* → Library (deployment-agnostic) vs deployment (buffr fills the durable slot via the same VectorStore contract); cost is a publish step, buy is a core that never imports product logic.
+- *"How does HNSW work internally?"* → Name what it buys (sublinear ANN), own the depth limit, invite the interviewer in.
 
-PULL QUOTES
-  ▸ The whole system hangs off two contracts.
-  ▸ "Connects" is where architecture answers die.
+**Pull quotes:**
+- Don't describe the layers. Trace one request through them. The flow is the architecture.
+- The forced synthesis turn is the part they don't expect you to have. Name it.
 
-WHAT YOU'D CHANGE
-  Promote the trace sink to a named TraceSink contract beside
-  ModelProvider and VectorStore — observability as a real seam.
-```
+**What you'd change:** Lift the trace sink into a third named contract in aptkit's core so the observability seam is first-class, not implicit.

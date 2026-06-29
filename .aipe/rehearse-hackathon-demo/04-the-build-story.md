@@ -1,175 +1,176 @@
-# Chapter 04 — The Build Story   (8:00–8:45, 45 sec)
+# Chapter 4 — The Build Story   (8:00–8:45, 45 seconds)
 
 ## Opening hook
 
-Forty-five seconds. This is the chapter that separates a working build from a
-pitch deck — proof that what they just saw is real code, not a Figma mockup
-wired to a happy path. You don't list features here; you name what shipped, the
-one hard part you cracked, and the rough edge you own on purpose. Judges in
-2026 assume heavy AI assistance and they assume rough edges. The confidence
-comes from naming both before they ask.
+Forty-five seconds. This is the chapter that separates a working build
+from a pitch deck. The room has seen the demo and one diagram; now you
+prove it's real with two things and nothing more: **what actually
+shipped**, and **the one hard part you cracked**. No feature tour. No
+roadmap. Two beats, fast, then out.
 
-The hard part is genuinely good, so lead with it: you taught a local model that
-*can't* call tools to drive a tool-using agent loop — and you found and killed
-a retrieval bug that a weak model's behavior caused. That's a real war story,
-and it has a regression test behind it.
+The mistake here is listing everything. You don't have time and the
+room doesn't care about the count — they care that there's a genuine
+obstacle behind the polish. So lead with the scale in one line, then
+spend most of the budget on the hard part, because the hard part is
+the proof.
 
 ## The time-budget bar
 
-```
-  ┌──────────────────────────────────────────────────────────┐
-  │ ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░▓▓▓░░░░░░░░░░░░░░░░░░ │
-  │ 1:00 ──────────────────── 8:00 ─ 8:45 ─────────────────── 10:00 │
-  │     THE BUILD STORY — you own 8:00 to 8:45 (45 sec)        │
-  └──────────────────────────────────────────────────────────┘
-```
-
-In 45 seconds: name what shipped (one breath), tell the hard part (the spine),
-own the rough edge (one sentence).
-
-## The chapter-opening diagram — what actually shipped
-
-This is the proof-of-real, at a glance: 16 packages bundled and published to
-npm, six agents, Studio, evals — and buffr graduating to a live Postgres.
+You own forty-five seconds. One line on what shipped, then the hard
+part. That's it.
 
 ```
-  WHAT SHIPPED — real code, in the repo, on npm
+  ┌──────────────────────────────────────────────────────┐
+  │ ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░▓▓░░░░░░░░░░░ │
+  │ 8:00 ─ 8:45 ─────────────────────────────────── 10:00  │
+  │     BUILD STORY — you own 8:00 to 8:45 (45 sec)       │
+  └──────────────────────────────────────────────────────┘
+```
 
-  ┌─ @rlynjb/aptkit-core (published to npm) ─────────────────────┐
-  │  16 internal packages inlined into one tarball                │
-  │  runtime · tools · context · retrieval · memory · prompts ·   │
-  │  evals · workflows · 6 agents · 5 providers · core            │
+## The diagram — what shipped, and where the hard part lived
+
+The shape of the build: a bundle published to npm, the agents and
+Studio on top, and one red box marking where the genuine bug lived.
+
+```
+  WHAT SHIPPED — and the hard part (red box)
+
+  ┌─ published ──────────────────────────────────────────────────┐
+  │ @rlynjb/aptkit-core  →  npm, 16 packages bundled into one tar │
   └───────────────────────────────────────────────────────────────┘
-            │ consumed from npm by
-            ▼
-  ┌─ buffr (companion repo) ──────────────────────────────────────┐
-  │  graduates the demo's in-memory store to a LIVE Supabase       │
-  │  pgvector PgVectorStore — same VectorStore contract            │
+         │ consumed by
+         ▼
+  ┌─ agents (6, same shape) ─┐   ┌─ Studio ──────────┐  ┌─ evals ──┐
+  │ query · recommendation · │   │ React+Vite, hash- │  │ precision│
+  │ monitoring · diagnostic ·│   │ routed, static    │  │ @k /     │
+  │ rubric · rag-query       │   │ GitHub Pages demo │  │ recall@k │
+  └────────────┬─────────────┘   └───────────────────┘  └──────────┘
+               │ the rag-query agent runs against a local model…
+               ▼
+  ┌─ THE HARD PART ───────────────────────────────────────────────┐
+  │ teaching a tool-LESS local model (Gemma) to call tools —       │
+  │ and the bug it caused: a hallucinated filter wiping retrieval  │
+  │ → fixed in search_knowledge_base + a regression test           │
   └───────────────────────────────────────────────────────────────┘
 
-  + apps/studio: React/Vite, reincodes-themed, hash-routed,
-    deployed to GitHub Pages (fixture-only static build)
-
-  THE HARD PART ─────────────────────────────────────────────────
-    teaching a tool-less local model (Gemma) to call tools
-    → and the retrieval-miss bug that a weak model's hallucinated
-      filter caused → caught, fixed, regression-tested
+  (buffr, the companion repo, graduates the same toolkit to a live
+   Supabase pgvector store — future, see the close)
 ```
 
-The picture's job: this is a published npm package and a companion runtime,
-not a weekend toy. Point at "16 packages" and "buffr → live pgvector" so the
-room sees the toolkit graduated past the demo.
+## Beat 1 — what shipped (8:00–8:15)
 
-## The body — three beats in 45 seconds
-
-### Beat 1 — what shipped (one breath, ~10 sec)
+One line, said fast.
 
 ```
-  ┃ "This is 16 packages bundled into one npm release — the agent
-  ┃  loop, the providers, the RAG pipeline, the evals — six agents
-  ┃  on top, a Studio to preview them, and a companion runtime,
-  ┃  buffr, that swaps today's in-memory store for live Supabase
-  ┃  pgvector. Same contract, real database."
+┃ "What's real: a sixteen-package toolkit published to npm as one
+┃  bundle, six agents built on the same loop, Studio with a static
+┃  demo, and an eval suite that scores retrieval. All of it ships."
 ```
 
-### Beat 2 — the hard part (the spine, ~25 sec)
+## Beat 2 — the hard part (8:15–8:45)
 
-This is the story. Tell it as a problem you hit and solved, not a feature.
-
-```
-  ┃ "The hard part: Gemma running locally can't call tools — it has
-  ┃  no native tool API. So I taught the provider to fake the
-  ┃  protocol: render the tools into the prompt, parse a JSON tool
-  ┃  call back out, retry when it botches the JSON."
-  ┃
-  ┃ "And that flushed out a real bug. A weak model would sometimes
-  ┃  hallucinate a metadata filter on the search — a key that
-  ┃  doesn't exist on any chunk — and that filter would silently
-  ┃  wipe every result. Retrieval would just return nothing.
-  ┃  The fix: a filter key that's absent from a chunk's metadata is
-  ┃  ignored instead of excluding it. It's a five-line change with a
-  ┃  regression test that locks it in."
-```
-
-That bug and fix are real: `packages/retrieval/src/search-knowledge-base-tool.ts`
-(`matchesFilter` — "Keys absent from a chunk's meta are ignored, so a weak
-model's hallucinated filter can't silently wipe every result"), with the
-regression test named in plain English in
-`packages/retrieval/test/search-knowledge-base-tool.test.ts`: *"ignores filter
-keys absent from chunk metadata (a hallucinated filter does not wipe results)."*
-There's a companion `minTopK` floor test too ("a weak model cannot starve
-retrieval"). When you say "regression test," you can point at the exact test
-name. That's the difference between a claim and proof.
-
-### Beat 3 — own the rough edge (one sentence, ~10 sec)
-
-Name it before a judge does. Confidence, not apology.
+This is where the budget goes. The genuine obstacle, the bug it
+caused, and the fix — in the voice of someone who hit it and shipped
+through it.
 
 ```
-  ┃ "The in-browser demo uses a deterministic stub embedder by
-  ┃  design — so it can't break on stage and the score is
-  ┃  reproducible. The real embedder is nomic-embed-text on Ollama;
-  ┃  same contract, I just swap it in for the live run."
+┃ "The hard part: I wanted the agent to run on a local model —
+┃  Gemma through Ollama — but Gemma has no tool-calling at all. So
+┃  I taught it: render the tools into the prompt, demand JSON, parse
+┃  it back, retry if it's malformed."
 ```
 
-### The strong-vs-weak build-story move
+```
+┃ "And that broke retrieval in a way I didn't expect. The weak
+┃  model would hallucinate a filter argument — a key that didn't
+┃  exist — and the naive filter wiped every result to zero. So a
+┃  question that should've been answered came back empty. I fixed
+┃  it: a filter key now only excludes a chunk that HAS that key with
+┃  a different value — a hallucinated key is ignored. Plus a top-k
+┃  floor so the model can't starve a multi-part question, and a
+┃  regression test so it stays fixed."
+```
+
+That's the build story. It's true and it's verifiable: the emulation
+lives in `gemma-provider.ts`; the hallucinated-filter fix is
+`matchesFilter` in
+`packages/retrieval/src/search-knowledge-base-tool.ts` (a filter key
+only excludes hits that *have* that key with a different value); the
+`minTopK` floor is in the same file; the regression test is
+`packages/retrieval/test/search-knowledge-base-tool.test.ts`.
+
+## Own the rough edge
+
+Say this plainly — it reads as confidence, and a judge who spots it
+unprompted respects you more for naming it first:
+
+```
+┃ "The honest rough edge: the in-browser demo uses a deterministic
+┃  stub embedder by design, so it can't flake on stage. The real
+┃  embeddings run through local Ollama — which you saw in the CLI."
+```
+
+## Strong vs weak — the build story
 
 ```
   WEAK build story                   STRONG build story
-  ─────────────────────────────      ─────────────────────────────────────
-  "It's a really robust, scalable    "16 packages, published to npm. The
-  toolkit with a lot of features —    hard part was teaching a tool-less
-  we built agents, providers, RAG,    model to call tools — and the
-  evals, memory, workflows..."        retrieval bug that uncovered, fixed,
-  (a feature list; nothing proves     regression-tested." (a war story with
-  it's real or hard)                  a named test behind it)
+  ─────────────────────────────      ──────────────────────────────
+  "We built sixteen packages, an     "Sixteen packages on npm, six
+  agent loop, five providers, a       agents, a static demo — all
+  Studio, an eval suite, content      ships. The hard part: a local
+  workflows, memory, prompts,         model with no tool-calling, the
+  policies…" (a feature inventory)    retrieval bug it caused, the fix
+                                       and the regression test."
+
+  room hears a list, believes        room hears a real obstacle
+  none of it specifically            cracked, believes the whole thing
 ```
 
-A feature list proves nothing. One hard problem, named precisely, with a test
-you can point at, proves you built it.
+## IF IT BREAKS
 
-## The IF-IT-BREAKS box
+No live beat here — it's spoken over the diagram slide. The only risk
+is overrunning.
 
 ```
 ╔══════════════════════════════════════════════════════════════════╗
-║ IF IT BREAKS                                                       ║
-║ No live screen here — this is spoken over the "what shipped"       ║
-║ slide. If the slide won't show → say the three beats from memory.  ║
-║ If a judge interrupts to verify, offer the file path out loud:     ║
-║ "the regression test is in retrieval's search-knowledge-base-tool  ║
-║ test — I can open it." Don't break stride to open it mid-clock.    ║
+║ IF IT BREAKS (running long)                                        ║
+║ You're past 8:45 → drop beat 1 entirely (the "what shipped" line)  ║
+║ and keep only the hard part. The hard part is the proof; the       ║
+║ inventory is skippable. Get to the close by 8:50 at the latest.    ║
 ╚══════════════════════════════════════════════════════════════════╝
 ```
 
-## The "tighten it" treatment
+## Tighten it
 
-This chapter is already 45 seconds — if you're behind, cut beat 1 (what
-shipped) to "16 packages, published to npm" and go straight to the hard part.
-**Floor: you must tell the hard part — the tool-emulation + the hallucinated-
-filter bug and its fix.** That one story is the entire proof-of-real; the
-package count and the rough-edge sentence are reinforcement you can drop.
+If the slot is tight, cut beat 1 and compress the hard part to one
+sentence: "The hard part was teaching a tool-less local model to call
+tools — and fixing the retrieval bug when it hallucinated a filter
+that wiped every result." The floor: the hard part must survive in
+some form. It's the only thing in this chapter that's load-bearing —
+cut the inventory before the obstacle.
 
-## The one-page run sheet
+## One-page run sheet — BUILD STORY
 
 ```
-  ┌─ THE BUILD STORY — 8:00 to 8:45 ─────────────────────────────────┐
-  │ BEAT 1 (~10s) what shipped: "16 packages on npm, 6 agents,       │
-  │   Studio, + buffr swaps in-memory store for live Supabase        │
-  │   pgvector — same contract."                                     │
-  │ BEAT 2 (~25s) THE HARD PART (the spine):                         │
-  │   • taught tool-less Gemma to call tools (render tools into      │
-  │     prompt, parse JSON back, retry on bad JSON)                  │
-  │   • that flushed a bug: hallucinated filter key wiped ALL        │
-  │     results → fix: absent keys ignored → regression test         │
-  │   • test name: "a hallucinated filter does not wipe results"     │
-  │ BEAT 3 (~10s) own it: "in-browser demo uses a deterministic stub │
-  │   embedder BY DESIGN — real one is nomic on Ollama, same contract"│
-  │                                                                   │
-  │ NAIL THIS LINE:                                                   │
-  │   "The hard part: teaching a tool-less local model to call tools │
-  │    — and the retrieval bug that uncovered, fixed and tested."    │
-  │                                                                   │
-  │ IF IT BREAKS: say it from memory; offer the file path, don't open.│
-  │ TIGHTEN: cut beat 1 to one phrase. Floor: tell the hard part.    │
-  └───────────────────────────────────────────────────────────────────┘
+  ┌──────────────────────────────────────────────────────────────┐
+  │ BUILD STORY            8:00–8:45          (no money shot)      │
+  │                                                                │
+  │ BEAT 1 (15s) — what shipped, one line:                         │
+  │  • "16-package toolkit on npm, 6 agents on one loop, Studio    │
+  │     with a static demo, an eval suite that scores retrieval."  │
+  │                                                                │
+  │ BEAT 2 (30s) — the hard part (spend the budget here):          │
+  │  • "Local model — Gemma — has no tool-calling, so I taught it: │
+  │     render tools into the prompt, demand JSON, parse, retry."  │
+  │  • "It hallucinated a filter that wiped every result. Fix: a   │
+  │     filter key only excludes a chunk that HAS it; ignore       │
+  │     hallucinated keys. Plus a top-k floor and a regression     │
+  │     test."                                                     │
+  │                                                                │
+  │ OWN IT: "browser uses a stub embedder by design; real          │
+  │          embeddings run on local Ollama."                      │
+  │ NAIL: the hard-part two-liner                                  │
+  │ IF LONG: drop beat 1, keep the hard part                       │
+  │ TIGHTEN: hard part to one sentence; never cut the hard part    │
+  └──────────────────────────────────────────────────────────────┘
 ```

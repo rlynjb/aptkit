@@ -1,52 +1,60 @@
-# Design an object-detection / computer-vision system
+# Design an On-Device Object Detection System
 
-- **The prompt:** "Design a system that detects and localizes objects in images or a video stream in real time."
+- **The prompt:** "Design a computer vision system that detects objects in real-time video, on-device."
 
-- **Standard architecture:** The whiteboard is a frame pipeline from capture through a detection model to post-processing, with the training path that produces the model shown alongside.
+- **Standard architecture:**
 
-  ```
-  Object detection — frame pipeline + training path
-  ┌────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌────────┐
-  │ frame  │ → │ preprocess│ → │ detection│ → │   NMS    │ → │ boxes  │
-  │ capture│   │ (resize) │   │  model   │   │ + thresh │   │ + class│
-  └────────┘   └──────────┘   └────┬─────┘   └──────────┘   └────────┘
-                                   ▲
-                              ┌────┴─────────────────────┐
-                              │      training path        │
-                              │ labeled images → augment  │
-                              │ → train CNN → quantize     │
-                              └───────────────────────────┘
-  ```
-
-  The detection model is the system; everything else is feeding it frames and cleaning up its boxes.
+```
+        camera frames (30fps)
+              │
+              ▼
+   ┌──────────────────────────┐
+   │ Preprocessing             │  resize, normalize, color convert
+   └────────────┬─────────────┘
+                │
+                ▼
+   ┌──────────────────────────┐
+   │ Detection model           │  CNN detector / MediaPipe landmark
+   │ (quantized, GPU delegate) │
+   └────────────┬─────────────┘
+                │  raw detections
+                ▼
+   ┌──────────────────────────┐
+   │ Post-processing           │  confidence threshold, NMS,
+   │                           │  temporal smoothing, tracking
+   └────────────┬─────────────┘
+                │  stable detections
+                ▼
+   ┌──────────────────────────┐
+   │ Downstream consumer        │  rep counter / form classifier / AR
+   └──────────────────────────┘
+```
 
 - **Data model:**
-  - Labeled image set — images with bounding boxes + class labels, the training ground truth.
-  - Model weights — versioned trained detector (and a quantized variant for the edge).
-  - Anchor/class config — the box priors and label taxonomy the model was trained against.
-  - Inference log — frames, predicted boxes, confidences, for monitoring and hard-example mining.
-  - Augmentation config — the transforms (crop, flip, color jitter) applied at train time, recorded for reproducibility.
+  - frame buffer `{frame, ts}` — bounded ring buffer; drop frames under back-pressure rather than queue latency.
+  - per-frame detection `{boxes|landmarks, confidence, model_version, ts}` — the model output for one frame.
+  - tracking state `{track_id, last_pos, velocity, age}` — links detections across frames so a single object isn't N independent blips.
+  - inference log `{ts, latency_ms, fps, device, model_version}` — on-device telemetry for the latency/battery story.
 
 - **Key components:**
-  - Preprocessing resizes and normalizes frames to the model's input spec; choice: fixed input resolution trades detection of tiny objects for predictable latency.
-  - Detection model predicts boxes + classes in one pass; choice: a single-stage detector (YOLO/SSD family) over two-stage (R-CNN) when real-time latency matters more than peak accuracy.
-  - Non-max suppression collapses overlapping boxes to one per object; choice: IoU-threshold NMS as the standard dedup, tuned per class.
-  - Quantization/edge runtime shrinks the model for on-device inference; choice: int8 quantization to hit frame-rate on constrained hardware, accepting a small mAP drop.
+  - Preprocessing — resizes and normalizes frames to model input; choice: do it on the GPU/accelerator, not the CPU — at 30fps the CPU copy alone can blow the frame budget.
+  - Detection model — produces boxes or landmarks per frame; choice: a quantized mobile architecture (int8/fp16) with a hardware delegate, because a server-grade model misses the 33ms budget on a phone.
+  - Post-processing — thresholds, suppresses duplicates, smooths, tracks; choice: temporal smoothing across frames so a one-frame dropout doesn't flicker the downstream output.
+  - Downstream consumer — turns stable detections into the user-facing signal (rep count, form check, AR overlay); choice: keep it pure of the model so you can swap detectors without rewriting the product logic.
 
 - **Scale concerns:**
-  - At ~30 fps real-time the model inference time per frame is the hard constraint; a model slower than ~33ms/frame drops frames.
-  - At edge deployment memory and compute are capped; you must quantize, accepting an mAP drop for the frame-rate.
-  - At ~1k classes the long tail has few labeled examples and detection accuracy collapses there; you need class-balanced sampling and hard-example mining.
-  - At high resolution (4K) preprocessing and model cost scale with pixels; tile or downsample, trading small-object recall for throughput.
+  - At ~30fps each frame's full inference must finish in <33ms → quantize (int8/fp16), use the GPU/NNAPI delegate, and skip frames before you ever miss the budget.
+  - On older devices the model is simply too big for the budget → ship a smaller variant and select by device class at install/runtime.
+  - Battery and thermal — sustained inference drains and throttles → pause when no object is present, drop fps when backgrounded or hot.
 
-- **Eval framing:** Offline, measure mean average precision (mAP) at IoU thresholds (mAP@0.5, mAP@0.5:0.95) on a held-out labeled set — this is precision/recall over boxes, with IoU defining a correct localization. Online, track inference latency per frame, dropped-frame rate, and a sampled human-audit precision on production frames. The offline mAP and the online experience diverge when production frames differ from the training distribution.
+- **Eval framing:** Offline: mAP and per-class precision/recall on a labeled validation set. Online: latency p95/p99 measured on *real devices* (not the dev machine), sustained FPS under thermal load, battery cost per session, and the downstream task accuracy (did the rep counter actually count right). Always measure the domain gap explicitly — train on public data, evaluate on self-collected real-usage footage, and report the drop.
 
 - **Common failure modes:**
-  - Domain shift — production lighting/angles/cameras differ from training data; mitigate with augmentation covering the deployment conditions and periodic retraining on production samples.
-  - Small-object miss — fixed input resolution loses tiny objects; mitigate with tiling or a higher-resolution input where latency allows.
-  - Class imbalance — rare classes are under-detected; mitigate with class-balanced sampling and hard-example mining.
-  - Quantization accuracy loss — the edge model drops boxes the full model caught; mitigate with quantization-aware training rather than post-hoc quantization.
+  - Domain gap — public training data ≠ real users' lighting/angles/bodies → fine-tune on self-collected footage from the actual use context.
+  - Occlusion — object partly hidden, detection drops → temporal smoothing and tracking carry the track through the gap.
+  - Deployment drift — input distribution shifts post-launch (new device cameras, new user population) → monitor the output distribution on-device and alert on shift.
+  - Battery / thermal throttling — the chip slows under sustained load, fps collapses → degrade gracefully (lower fps, smaller model) rather than stutter.
 
-- **Applies to this codebase:** `no`. aptkit has no vision capability whatsoever — no image input, no frames, no MediaPipe, no CNN, no on-device runtime, no quantization. It is a text/LLM-application toolkit; nothing in the architecture above maps to a real aptkit component. You'd only reach for this template in an interview if explicitly asked to design a CV system, in which case you walk the canonical pipeline above on its own merits and do not force an aptkit mapping. Pretending the retrieval or agent layers are a detection system would be dishonest.
+- **Applies to this codebase:** `no`. aptkit has no computer vision, no on-device model, no video pipeline, no image preprocessing — it is a server/local-LLM agent toolkit (retrieval contracts, RAG, analytics agents over `runAgentLoop`). None of the boxes above map onto aptkit code. This template's natural anchor is the reader's own on-device CV work in contrl (MediaPipe pose → rep counter, running on-device with the exact latency/battery/domain-gap constraints above) — that is where the real CV experience lives, not aptkit.
 
-- **How to make it apply:** It doesn't, and you should say so rather than contrive a mapping. Computer vision is entirely out of aptkit's shape: there is no frame source to detect over, no labeled image set, and no model to train. If a CV system were genuinely required, it would be a new subsystem built from scratch — a separate package with its own image-ingestion path, a trained detector, and an NMS/serving layer — sharing nothing with the current retrieval and agent packages beyond, at most, the buffr persistence layer for logging inference results. CV is `not yet exercised` and outside the toolkit's domain.
+- **How to make it apply:** This template does not map onto aptkit, and forcing a mapping would be dishonest. In an interview, say so directly: "I haven't built CV inside aptkit — that's an LLM-agent toolkit — but I shipped on-device pose detection in contrl, and I'd walk the canonical architecture from that: MediaPipe landmarks, quantized on-device inference, temporal smoothing into a rep counter, and the domain-gap problem of training on public pose data but running on real users in real gyms." Anchor the design to lived CV experience; don't retrofit it onto a server toolkit.

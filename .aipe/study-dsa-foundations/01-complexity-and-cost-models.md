@@ -1,210 +1,155 @@
 # Complexity & Cost Models
 
-**Industry name(s):** asymptotic analysis · Big-O / Big-Θ · amortized analysis · cost models — *Industry standard*
-
----
+**Asymptotic analysis / Big-O · amortized cost · the right cost model** — Language-agnostic.
 
 ## Zoom out, then zoom in
 
-Before any single algorithm, here's the lens you hold over the whole repo. Complexity analysis isn't a topic in aptkit — it's the *question you ask of every other file*. Where it lives: nowhere and everywhere.
+Every "is this fast enough?" question in aptkit traces back to one number you can read straight off a `for` loop. Here's where the cost actually accrues in the running system.
 
 ```
-  Zoom out — the cost lens over aptkit's hot paths
+  Zoom out — where cost is paid in aptkit
 
-  ┌─ Retrieval layer ───────────────────────────────────────────┐
-  │  chunkText            O(n) over doc length    (one-time index)│
-  │  ★ InMemoryVectorStore.search ★               (EVERY query)   │
-  │     cosine per chunk  O(d) × n chunks  +  sort  O(n log n)    │
-  │     = O(n·d + n log n) per query   ← the dominant cost        │
-  └───────────────────────────┬─────────────────────────────────┘
-                              │
-  ┌─ Service layer ───────────▼─────────────────────────────────┐
-  │  runAgentLoop  O(maxTurns) model calls — each call dwarfs    │
-  │  everything above; the network/LLM cost is the real budget   │
-  └───────────────────────────┬─────────────────────────────────┘
-                              │ swap for production
-  ┌─ buffr (companion) ───────▼─────────────────────────────────┐
-  │  PgVectorStore + HNSW   ≈ O(log n) per query (ANN)           │
-  │  the asymptotic win the whole linear-scan story is about     │
-  └──────────────────────────────────────────────────────────────┘
+  ┌─ Service layer — packages/runtime ───────────────────────────┐
+  │  agent loop: ≤ maxTurns model calls                           │
+  │    cost dominated by the NETWORK call, not the loop           │ ← cost lives
+  │  parseAgentJson: O(n) over output text                        │   in the model
+  └───────────────────────────────┬───────────────────────────────┘   call here
+                                   │
+  ┌─ Storage layer — packages/retrieval ─────────────────────────┐
+  │  ★ vector search: O(n · d) scan + O(n log n) sort ★            │ ← THIS is the
+  │    n = #chunks, d = 768 dims                                   │   algorithmic
+  │  chunker: O(L) over document length L                         │   cost model
+  └───────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: you already know Big-O cold. What this file does is pin the *right* cost model onto aptkit's two hottest paths — the per-query vector search and the per-run agent loop — and show why the dominant term is different from where a CS-textbook instinct would point.
-
----
+Zoom in: the cost model is the discipline of asking *which input grows, and what does the work do as it grows?* For aptkit the answer is almost never "the loop is slow" — it's "the model call costs 800ms and the vector scan is `O(n·d)` where `n` is small today and unbounded tomorrow." Picking the right `n` is the entire skill. You already do this when you reason about a render pass over a `.map()` of rows; same move, different `n`.
 
 ## Structure pass
 
-**Layers:** index-time (chunk + embed + upsert, paid once) vs query-time (embed + scan + sort, paid every request) vs loop-time (model calls, paid per turn).
-
-**Axis — cost (latency / compute per unit of work):** trace "what's the dominant term?" down the layers.
-
 ```
-  One axis — "what dominates the cost?" — traced down the layers
+  layers:  per-request work  →  per-corpus work  →  per-document work
+  axis held constant: "what is n, and what does cost do as n grows?"
 
-  ┌──────────────────────────────────────────┐
-  │ index-time:  embed n chunks   (one-time)  │ → embedding network call dominates
-  └──────────────────────────────────────────┘
-      ┌──────────────────────────────────────┐
-      │ query-time: scan n chunks  (per query)│ → O(n·d) scan dominates in-memory
-      └──────────────────────────────────────┘
-          ┌──────────────────────────────────┐
-          │ loop-time: maxTurns model calls   │ → the LLM call dominates EVERYTHING
-          └──────────────────────────────────┘
-
-  the answer flips at each altitude — that contrast is the lesson:
-  the scan looks expensive in isolation, but a single model.complete()
-  call costs more wall-clock than scanning thousands of chunks.
+  ┌─ agent loop (per request) ──┐   n = maxTurns (a CONSTANT, ≤8)
+  │  cost = O(turns) × model RTT │   → bounded by design, not by input
+  └──────────────┬───────────────┘
+                 │  seam: input size flips from "fixed cap" to "corpus size"
+  ┌─ vector scan (per corpus) ──┐   n = #chunks (UNBOUNDED, grows with docs)
+  │  cost = O(n · d) + O(n log n)│   → this is the one that bites at scale
+  └──────────────┬───────────────┘
+                 │  seam: input size flips to "one document's length"
+  ┌─ chunker (per document) ────┐   n = L = doc char length
+  │  cost = O(L)                 │   → linear, runs once at index time
+  └──────────────────────────────┘
 ```
 
-**Seam — the cost model flips at the in-memory→ANN boundary.** Inside aptkit, `search` is `O(n)` in corpus size. Cross into buffr's `PgVectorStore` and it becomes ~`O(log n)` via HNSW. The asymptotic class changes across that one boundary — which is exactly why it's the seam worth studying (file **05**).
-
----
+The load-bearing seam is the middle one. The agent loop's cost is capped by a constant (`maxTurns`); the scan's cost grows with the corpus. When someone asks "will aptkit scale," they mean *that* `n`.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know `.map()` over an array is `O(n)`, and sorting it is `O(n log n)`. The cost model is just: **find the term that grows fastest as input grows, drop the constants, and check whether you pay it once or every request.** The trap in aptkit isn't computing the Big-O — it's picking the right *input size*. The corpus has two sizes that matter: `n` (number of chunks) and `d` (embedding dimension, fixed at 768). Conflate them and your analysis is wrong.
+Big-O is a function that answers one question: *as the input grows, how does the work grow?* You don't count operations — you count the **shape** of the growth and throw away constants. A loop over `n` items is `O(n)`. A loop inside a loop is `O(n²)`. A sort is `O(n log n)`. That's 90% of what you ever need to read off real code.
 
 ```
-  Pattern — three cost classes, three payment schedules
+  Big-O is the SHAPE of the growth curve, constants discarded
 
-   input grows ──►
-   O(1)        ████                      paid: per call    (Set.has, Map.get)
-   O(d)        ████████                  paid: per chunk   (cosine, d=768 fixed)
-   O(n·d)      ████████████████████      paid: per QUERY   (scan all chunks)
-   O(n log n)  ██████████████████        paid: per QUERY   (sort the hits)
-   O(maxTurns) ██ (small const × HUGE)   paid: per RUN     (model calls)
-
-   "fixed d" collapses O(n·d) toward O(n) in practice — but the
-   sort's O(n log n) then becomes the leading term as n grows.
+  work
+   │            O(n²)   ← nested loop
+   │          ╱
+   │        ╱   O(n log n)  ← sort
+   │      ╱  ╭─────
+   │    ╱ ╭──        O(n)   ← single scan
+   │   ╱╭─    ────────
+   │  ╱─  ──────────── O(1)  ← Set.has(), Map.get()
+   │ ╱──────────────────────
+   └──────────────────────────► n (input size)
 ```
 
-### Move 2 — the walkthrough
+The trap is picking the wrong `n`. In aptkit the agent loop *looks* expensive (a loop with model calls inside) but its `n` is a constant cap — the real `O(n)` lives in the vector scan where `n` is the corpus.
 
-#### Amortized vs per-call: the index path is paid once, the query path every time
+### Move 2 — walking aptkit's actual cost
 
-The first cost-model move in aptkit is separating one-time from per-request work. `indexDocument` (`packages/retrieval/src/pipeline.ts:32-47`) chunks, embeds, and upserts — that's `O(n·d)` work, but you pay it **once**, when a document enters the corpus. `queryKnowledgeBase` (`pipeline.ts:50-59`) embeds the query once then calls `store.search` — and that's paid on **every** request.
-
-```
-  Amortized split — the same O(n) work, two schedules
-
-  ┌─ index-time (amortized to ~0 per query) ─┐
-  │  doc → chunkText → embed → upsert         │  paid once per doc
-  └───────────────────────────────────────────┘
-  ┌─ query-time (the real recurring cost) ───┐
-  │  query → embed → search(scan+sort) → top-k│  paid every request
-  └───────────────────────────────────────────┘
-```
-
-The boundary condition: if your workload is read-heavy (many queries, rare indexing), the per-query scan is what you optimize — and the index cost is noise. If it's write-heavy, the embed-on-index cost matters too. aptkit's RAG agents are overwhelmingly read-heavy, so the scan is the target.
-
-#### The dominant term in `search`: O(n·d) scan, then O(n log n) sort
-
-Here's the actual hot path, annotated:
+**The vector scan — `O(n · d)` to score, `O(n log n)` to rank.** This is the one cost model worth memorizing in this repo. Open `in-memory-vector-store.ts:25`:
 
 ```ts
-// packages/retrieval/src/in-memory-vector-store.ts:25-33
-async search(vector: number[], k: number): Promise<VectorHit[]> {
-  this.assertDimension(vector, 'query vector');
-  const hits: VectorHit[] = [];
-  for (const chunk of this.chunks.values()) {        // ← n iterations
-    hits.push({ id: chunk.id,
-      score: cosineSimilarity(vector, chunk.vector),  // ← O(d) each, d=768
-      meta: chunk.meta });
+  async search(vector: number[], k: number): Promise<VectorHit[]> {
+    this.assertDimension(vector, 'query vector');
+    const hits: VectorHit[] = [];
+    for (const chunk of this.chunks.values()) {          // ← O(n): n = #chunks
+      hits.push({ id: chunk.id,
+        score: cosineSimilarity(vector, chunk.vector),    // ← O(d): d = 768 dims
+        meta: chunk.meta });
+    }
+    hits.sort((a, b) => b.score - a.score);              // ← O(n log n): full sort
+    return hits.slice(0, Math.max(0, k));                // ← O(k): take top-k
   }
-  hits.sort((a, b) => b.score - a.score);            // ← O(n log n)
-  return hits.slice(0, Math.max(0, k));              // ← O(k)
-}
 ```
 
-Total: `O(n·d) + O(n log n) + O(k)`. Because `d` is a fixed 768, the textbook would write `O(n + n log n) = O(n log n)`. But in *wall-clock* terms `n·d` flop-heavy cosine work is the real spend for small `n`, and the sort dominates only once `n` is large. This is the gap between asymptotic class and measured cost that `study-performance-engineering` picks up.
+Read it line by line. The `for` loop touches every chunk once — that's the `n`. Inside, `cosineSimilarity` walks all 768 dimensions — that's the `d`. So scoring is `O(n · d)`. Then a full `.sort()` is `O(n log n)`, and `slice(k)` is `O(k)`. Total: **`O(n·d + n log n)`**. With `d` fixed at 768, the scoring term dominates until `n` gets large, then the sort term catches up.
 
-The boundary condition that bites: this is `O(n)` in *corpus size, per query*. Ten thousand chunks and a hundred queries per second is a million cosine computations a second. That's the wall the linear scan hits — and the reason the production store is an ANN graph.
+Here's the boundary condition that matters: this is *exact*. Every chunk is scored, the ranking is provably correct. The cost you pay for that exactness is linear in the corpus — there is no index, no shortcut. The moment `n` is millions, this is too slow, and that's exactly the line buffr crosses by swapping in HNSW (see file 06 and 05).
 
-#### O(1) membership: the cheap operations that hide in plain sight
-
-Not everything is `O(n)`. The tool allowlist is a `Set` lookup:
+**The agent loop — `O(maxTurns)`, a bounded constant.** Now contrast `run-agent-loop.ts:98`:
 
 ```ts
-// packages/tools/src/tool-policy.ts:15-22
-const allowed = new Set(policy.allowedTools);        // O(m) build, once
-return allTools
-  .filter((tool) => allowed.has(tool.name))          // O(1) per tool
-  ...
+  for (let turn = 0; turn < maxTurns; turn += 1) {   // ← maxTurns defaults to 8
+    ...
+    const response = await model.complete({ ... });  // ← the REAL cost: network RTT
 ```
 
-`Set.has` is amortized `O(1)`. Same shape in `recall`'s per-conversation `Map<string, number>` counter (`packages/memory/src/conversation-memory.ts:71,78-79`): `Map.get`/`Map.set` are `O(1)`. These never show up in a latency profile — naming them as `O(1)` is how you know *not* to optimize them. (Full treatment in file **02**.)
+The loop runs at most `maxTurns` times — a constant (8 by default, line 87). So the loop's *algorithmic* cost is `O(1)` in any input you'd grow. The actual wall-clock cost is `maxTurns × (model round-trip time)`, which is dominated by the network, not the CPU. This is the cost-model lesson: **the expensive thing here isn't the algorithm, it's the I/O the algorithm waits on.** Counting loop iterations would mislead you completely.
 
-#### The cost that dwarfs all of the above: the model call
-
-`runAgentLoop` runs up to `maxTurns` iterations (default 8, `packages/runtime/src/run-agent-loop.ts:87`), each doing one `await model.complete(...)`. The loop is `O(maxTurns)` in model calls — a small constant. But each model call is hundreds of milliseconds to seconds of network + inference. So the *honest* cost model for an agent run is: `O(maxTurns)` × (a cost so large the entire retrieval scan rounds to zero next to it). The DSA instinct — "optimize the `O(n log n)` sort!" — is the wrong instinct here. Optimize the number of turns and tokens first.
+**Amortized cost — the chunker's overlap.** The chunker (`chunker.ts:24`) steps through a string with `step = size - overlap`. It re-reads `overlap` characters on every window — wasted work. But it runs *once per document at index time*, never on the query hot path. Amortized over the document's whole life in the corpus, that re-read cost is zero. The cost-model lesson: **where work happens matters as much as how much.** Index-time waste is free; query-time waste is the bill.
 
 ### Move 3 — the principle
 
-**Pick the input size and the payment schedule before you pick the Big-O.** The same `O(n)` scan is irrelevant when amortized over indexing and critical when paid per query; the same loop is trivial in iteration count and dominant in wall-clock because each iteration is a network call. Asymptotic class tells you how cost *scales*; the cost model tells you which cost *matters*.
-
----
+The cost model is not Big-O notation — it's choosing *which* `n` you're measuring and *where* the work lands. aptkit's loops are cheap; its scan grows with the corpus; its real latency is network I/O. Read the right `n` and the bottleneck names itself.
 
 ## Primary diagram
 
-The full cost picture across aptkit's layers.
-
 ```
-  aptkit cost model — every load-bearing path, with its dominant term
+  aptkit's cost model — one frame
 
-  INDEX (amortized, once per doc)
-   chunkText O(n_chars) → embed O(chunks·network) → upsert O(chunks)
+  REQUEST PATH (per call)              INDEX PATH (per document, once)
+  ──────────────────────               ──────────────────────────────
+  agent loop   O(maxTurns) ≈ O(1)      chunker     O(L)
+     │  bounded by cap                    │  linear, amortized to ~0
+     ▼  real cost = network RTT           ▼
+  vector scan  O(n·d + n log n)        embed       O(chunks · model)
+     │  n = corpus (UNBOUNDED) ★          │
+     ▼  EXACT, no index                   ▼
+  parseAgentJson O(output length)      store.upsert O(chunks)
 
-  QUERY (per request)  ──────────────────────────────── the recurring cost
-   embed query O(network)
-   InMemoryVectorStore.search:
-     ├ scan:  n × cosine(d)   = O(n·d)     ← grows with corpus
-     ├ sort:  O(n log n)                   ← leading term as n grows
-     └ slice: O(k)
-   → swap to buffr PgVectorStore + HNSW ⇒ ≈ O(log n)   [the asymptotic win]
-
-  LOOP (per run)
-   runAgentLoop: O(maxTurns) × model.complete()
-   ← each call >> all retrieval cost combined; THIS is the real budget
-
-  CHEAP / O(1) (ignore in profiling)
-   Set.has (tool policy) · Map.get/set (memory id counter, p@k seen-set)
+  ★ = the only term that grows without bound; the scale story lives here
 ```
-
----
 
 ## Elaborate
 
-Amortized analysis comes from the analysis of dynamic arrays and hash tables — the question "what does an operation cost *on average over a sequence*, even if one operation is occasionally expensive?" The dynamic array's `push` is the canonical example: usually `O(1)`, occasionally `O(n)` when it resizes, but `O(1)` *amortized*. aptkit's index/query split is the same idea at a coarser grain: the expensive embedding work is amortized across the many cheap-relative queries that follow.
-
-The deeper lesson aptkit teaches about cost models: in an LLM system, the traditional DSA cost (scans, sorts) is almost always dominated by I/O and inference cost. The discipline isn't "make the algorithm faster" — it's "know which layer's cost is the leading term so you optimize the right one." Read `study-performance-engineering` next for the measured-cost half of this.
-
----
+Big-O came out of algorithm analysis (Knuth, 1970s) to compare algorithms independent of hardware. The thing textbooks underemphasize and production teaches hard: **constants and the choice of `n` decide real systems.** An `O(n²)` algorithm on `n=10` beats an `O(n log n)` one with a huge constant. aptkit's exact `O(n·d)` scan is the *right* choice while the corpus is small — simpler, exact, zero index-build cost — and the wrong one once it's large. That crossover point is a measurement question, which is why **study-performance-engineering** owns the "when do you switch" decision and this file only owns the "what's the growth shape" model.
 
 ## Interview defense
 
-**Q: What's the time complexity of a single `search_knowledge_base` call in aptkit?**
-
-> `O(n·d + n log n)` where `n` is corpus chunk count and `d` is the 768-dim embedding. The scan computes cosine against every chunk (`O(n·d)`), then sorts all hits (`O(n log n)`), then slices top-k (`O(k)`). With `d` fixed it's `O(n log n)`-bounded. It's `O(n)` *per query* in corpus size — which is exactly why production uses an ANN index instead.
+**Q: What's the time complexity of aptkit's vector search, and what's `n`?**
+Lead with the answer: `O(n·d + n log n)`, where `n` is the number of chunks in the corpus and `d` is the embedding dimension (768). The scoring loop is `O(n·d)`, the rank is `O(n log n)`, the slice is `O(k)`.
 
 ```
-  scan (n × O(d)) ──► sort (O(n log n)) ──► slice (O(k))
-  dominant: O(n·d) flop-wise small n / O(n log n) large n
+  search() cost
+  ┌──────────────────┬──────────┐
+  │ score every chunk│ O(n · d) │  for-loop × cosine over d dims
+  │ sort by score    │ O(n logn)│  full .sort()
+  │ take top-k       │ O(k)     │  slice
+  └──────────────────┴──────────┘
 ```
 
-**Q: So is the scan the bottleneck you'd optimize first?**
+Anchor: "It's exact — every chunk scored — and that exactness is why it's linear in the corpus. buffr trades exactness for `O(log n)` via HNSW."
 
-> No — and that's the load-bearing point. Each agent run makes up to `maxTurns` model calls, and one `model.complete()` costs more wall-clock than scanning thousands of chunks. The first optimization is fewer turns / fewer tokens, not a faster scan. You optimize the scan only when the corpus is large enough that it competes with inference latency — and at that point you swap the linear store for buffr's HNSW.
-
-Anchor: *the dominant cost in an LLM system is the model call, not the data-structure operation.*
-
----
+**Q: The agent loop has a network call inside a loop. Isn't that the bottleneck to optimize?**
+The loop is capped at `maxTurns` (8), so it's `O(1)` algorithmically — you can't optimize the iteration count meaningfully. The cost is `maxTurns × RTT`; the lever is fewer turns or a faster model, not loop micro-optimization. Naming that the loop's `n` is a *constant* is the signal you read the cost model right, not just the code.
 
 ## See also
 
-- **02-arrays-strings-and-hash-maps.md** — the `O(n)` scan and `O(1)` membership in full.
-- **06-sorting-searching-and-selection.md** — the `O(n log n)` sort and why it's a full sort, not a top-k heap.
-- **05-graphs-and-traversals.md** — HNSW, the `O(log n)` ANN graph that replaces the scan.
-- `study-performance-engineering` — the measured wall-clock half of every claim here.
+- `02-arrays-strings-and-hash-maps.md` — the scan and the `O(1)` membership it relies on
+- `06-sorting-searching-and-selection.md` — the top-k selection this file costs out
+- `07-recursion-backtracking-and-dynamic-programming.md` — the bounded loop as a state space
+- **study-performance-engineering** — measuring the scan, finding the crossover point

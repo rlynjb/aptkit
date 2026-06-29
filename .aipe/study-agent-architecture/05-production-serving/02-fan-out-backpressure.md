@@ -1,107 +1,95 @@
-# Fan-out Backpressure
+# Fan-Out Backpressure
 
-**Industry standard.** "Concurrency limiting," "fan-out backpressure," "semaphore over agents." Type label: serving optimization. **In this codebase: not yet exercised** — aptkit runs no concurrent agents and no fan-out, so it has no concurrency limiter. Single-agent runs issue one outbound call at a time.
+**Industry term:** fan-out backpressure (concurrency cap + upward backpressure). *Industry standard.*
 
 ## Zoom out, then zoom in
 
-A single call has one outbound request to rate-limit. A fan-out topology (SECTION C's parallel pattern) fires many concurrent calls from one task — and a supervisor spawning workers can fan out faster than the provider's rate limit allows. aptkit doesn't fan out, so this is the control it'd need the moment it did.
+A single call has one outbound request to rate-limit. A fan-out topology fires many concurrent calls from one task, and a supervisor can fan out faster than the provider's rate limit allows. aptkit has no fan-out, so this is `not yet exercised` — but the primitive is one you ship daily.
 
 ```
-  Zoom out — fan-out backpressure (not in aptkit)
+  Zoom out — not built; aptkit runs tools sequentially within a turn
 
-  Supervisor decomposes → 12 worker calls at once
-                       │
-  ┌────────────────────▼─────────────────────────────────────┐
-  │  Concurrency limiter (semaphore) — pop ≤ N, queue rest    │ ← would be here
-  └────────────────────┬──────────────────────────────────────┘
-                       ▼
-  Provider — receives at most N at a time
+  ┌─ Runtime layer ─────────────────────────────────────────────┐
+  │  runAgentLoop: for (toolUse of toolUses) — SEQUENTIAL         │ ← we are here
+  │  no concurrent fan-out, so no backpressure needed yet         │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-## Structure pass
-
-**Axis: how many concurrent outbound calls, and what bounds them?** A single agent: one at a time, naturally bounded. A fan-out: N at once, bounded only by a limiter you add. Trace the failure: without a limiter, a supervisor spawning 12 workers fires 12 concurrent calls and trips the provider's rate limit (429s). The seam: serial single-agent (self-limiting) vs concurrent fan-out (needs an explicit semaphore + upward backpressure).
+Zoom in: **Not yet exercised in aptkit.** Tool calls within a turn run one at a time (`run-agent-loop.ts:139`), and there's no supervisor spawning concurrent workers. Backpressure becomes relevant only with the fan-out topology ([../03-multi-agent-orchestration/04-parallel-fan-out.md](../03-multi-agent-orchestration/04-parallel-fan-out.md)).
 
 ## How it works
 
-### Move 1 — the mental model
+**Use case it would fit:** a research-assistant supervisor decomposing into 12 worker retrievals at once — more than the provider's concurrent rate limit allows.
 
-`Promise.all()` with a concurrency cap — the same thing you reach for with 200 independent requests when you don't want 200 open connections at once. The agent version adds backpressure *upward*: when the worker queue grows, the supervisor should stop decomposing rather than queue unbounded work.
+### Move 1 — the flow control
 
-```
-  Fan-out backpressure = Promise.all with a cap + upward backpressure
-
-  12 worker calls → ┌─ semaphore (N=4) ─┐ → provider gets ≤ 4 at a time
-                    │  pop ≤ N, queue   │
-                    └───────────────────┘
-  queue too big? → supervisor STOPS decomposing (upward backpressure)
-```
-
-### Move 2 — what aptkit has, and the limiter it'd need
-
-**aptkit is self-limiting today.** A single `runAgentLoop` issues one `model.complete` per turn, sequentially. There's no fan-out, so there's no concurrency to limit — the loop is naturally bounded to one outbound call at a time. The closest thing to flow control aptkit has is the *sequential fallback chain* (a provider that tries Anthropic, then OpenAI, then local) — but that's failover, not concurrency control.
-
-**The limiter fan-out would need.** If aptkit fanned out the rag-query agent (SECTION C file 04) to answer "compare X, Y, Z" with three concurrent searches, the naive version is `Promise.all([answer(X), answer(Y), answer(Z)])`. At three workers that's fine; at twelve it trips the provider rate limit. The fix is a semaphore: pop up to N concurrent, queue the rest.
+It's `Promise.all()` with a concurrency cap — the thing you reach for when you have 200 independent requests but don't want 200 open connections at once.
 
 ```
-  Fan-out limiter for aptkit (would-be)
-
-  supervisor splits → [w1, w2, ..., w12]
-       │ instead of Promise.all (all 12 at once):
-       ▼
-  semaphore(N=4): run 4, queue 8, refill as each finishes
-       │
-       ▼ AND: if the queue exceeds a threshold,
-  supervisor stops spawning more workers (upward backpressure)
+  Supervisor decomposes → 12 worker calls at once
+                       │
+                       ▼
+  ┌───────────────────────────────────────────────┐
+  │  Concurrency limiter (semaphore)               │
+  │   pop up to N concurrent (N = 4)               │
+  │   queue the rest                               │
+  └────────────────────┬──────────────────────────┘
+                       ▼
+  ┌───────────────────────────────────────────────┐
+  │  Provider — receives at most N at a time       │
+  └───────────────────────────────────────────────┘
 ```
 
-**The tradeoff and the breakpoint.** A low concurrency cap protects the provider but serializes the fan-out — you lose the parallel-latency win that made fan-out worth it. The breakpoint is the provider's rate limit divided by per-call duration: cap concurrency just under that. And if the task needs more throughput than the limit allows, the answer is request a higher limit or batch — *not* a higher local cap that just trades queueing for 429s. aptkit's local Gemma has no rate limit at all (it's a local HTTP server), which is another reason fan-out backpressure hasn't been needed — the local model is the bottleneck, not a provider quota.
+### Move 2 — the walkthrough
+
+**aptkit's current shape sidesteps it.** Sequential tool execution within a turn means there's never a burst of concurrent provider calls from one agent. That's correct for a single debuggable agent — and it's why backpressure isn't wired. The problem only appears when you parallelize at the agent level.
+
+**The agent-specific addition: backpressure *upward*.** A plain concurrency cap throttles the outbound calls. The agent version adds a second control: when the worker queue grows past a threshold, the *supervisor* should stop decomposing further rather than queue unbounded work. A runaway supervisor that keeps spawning workers is the multi-agent version of an unbounded queue — the cap throttles execution, but only upward backpressure stops the supervisor from generating infinite work.
+
+**The tradeoff and the breakpoint.** A low concurrency cap protects the provider but serializes the fan-out — you lose the parallel-latency win that made fan-out worth it. The breakpoint is the provider's rate limit divided by per-call duration: cap concurrency just under that. And if the task needs more throughput than the limit allows, the answer is request a higher limit or batch — not a higher local cap that just trades queueing for 429s.
+
+**What it would cost aptkit.** A semaphore around the worker `runAgentLoop` calls (the fan-out doesn't exist yet, so this is hypothetical), plus a supervisor-side check that halts decomposition when the queue is deep. **Not yet exercised.**
 
 ### Move 3 — the principle
 
-Fan-out backpressure is `Promise.all` with a cap plus upward backpressure: a runaway supervisor that keeps spawning workers is the multi-agent version of an unbounded queue. aptkit doesn't need it yet because it runs one agent serially against a local model with no quota. The control becomes mandatory the moment it fans out against a rate-limited provider — and the cap should sit just under (rate limit ÷ per-call duration).
+Fan-out backpressure is `Promise.all` with a concurrency cap, plus upward backpressure that stops a runaway supervisor from generating unbounded work. The cap's breakpoint is the rate limit over per-call duration; pushing the local cap higher than that just trades queueing for 429s. aptkit's sequential execution avoids the problem entirely today — correct until it wants parallel workers.
 
 ## Primary diagram
 
 ```
-  Fan-out backpressure for aptkit (would-be) — full frame
+  Fan-out backpressure — the two controls (not yet exercised)
 
-  ┌─ Supervisor (decompose) ─────────────────────────────────┐
-  │  split task → N worker calls                              │
-  │  queue > threshold? → STOP decomposing (upward backpressure)│
-  └───────────────────────────┬──────────────────────────────┘
-                              ▼
-  ┌─ Concurrency limiter (semaphore, N=4) ────────────────────┐
-  │  run ≤ N concurrent · queue the rest · refill on finish    │
-  │  cap = provider rate limit ÷ per-call duration             │
-  └───────────────────────────┬──────────────────────────────┘
-                              ▼
-  ┌─ Provider ─────────────────────────────────────────────────┐
-  │  receives ≤ N at a time (no 429 storm)                     │
-  │  (aptkit's local Gemma: no quota — limiter not yet needed)  │
-  └─────────────────────────────────────────────────────────────┘
+  supervisor → N worker calls
+        │ semaphore: at most N concurrent, queue the rest   (downward cap)
+        │ if queue deep → supervisor STOPS decomposing       (upward backpressure)
+        ▼
+  provider receives ≤ N at a time
+
+  aptkit today: tools run SEQUENTIALLY within a turn → no burst → no cap needed yet
+  breakpoint: cap ≈ rate_limit / per_call_duration (higher = 429s, not throughput)
 ```
 
 ## Elaborate
 
-Fan-out backpressure is the agent-scale version of a classic concurrency problem: independent work that can swamp a downstream dependency if you fire it all at once. The two halves — a semaphore *down* (cap concurrent calls) and backpressure *up* (stop the supervisor decomposing) — together prevent both the 429 storm and the unbounded queue. aptkit's serial single-agent design sidesteps both, and its local model has no quota to trip, so the control is genuinely not yet needed. It's the first thing to add when fan-out meets a paid, rate-limited provider.
+Backpressure is the control that keeps a fan-out from becoming a self-inflicted DDoS on your own provider quota. The naive parallel agent — supervisor spawns a worker per sub-task, all at once — hits the rate limit and gets a wall of 429s, which is *slower* than a capped fan-out. The two-part fix (concurrency cap + upward backpressure) is standard async-systems hygiene applied to agents; the upward half is the agent-specific twist, because a supervisor can generate work faster than any cap can drain it. aptkit's sequential-within-a-turn execution means it has never needed this — and adopting fan-out without it would be the classic mistake.
 
 ## Interview defense
 
-**Q: How do you keep a fan-out from tripping the rate limit?**
-A concurrency cap — a semaphore that runs at most N workers at once and queues the rest — plus upward backpressure, where the supervisor stops decomposing if the queue grows too big. It's `Promise.all` with a cap. aptkit doesn't fan out yet, so it has no limiter, and its local model has no quota to trip — but the moment I fan out against a paid provider, the cap goes in, set just under rate-limit ÷ per-call duration.
+**Q: If a supervisor fanned out to many workers, how would you keep it from hitting the rate limit?**
+
+Two controls. A concurrency cap — a semaphore that lets at most N worker calls run at once and queues the rest, sized just under the provider's rate limit divided by per-call duration. And upward backpressure — if the worker queue gets deep, the supervisor stops decomposing instead of queuing unbounded work. A higher local cap doesn't buy throughput past the rate limit; it just trades queueing for 429s.
 
 ```
-  semaphore down (cap concurrent) + backpressure up (stop decomposing)
+  cap (semaphore): throttle concurrent calls
+  upward backpressure: stop the supervisor generating infinite work
 ```
-*Anchor: a runaway supervisor spawning workers is the multi-agent unbounded queue.*
 
-**Q: Why not just raise the local cap if you need more throughput?**
-That trades queueing for 429s — it doesn't add capacity. If the task needs more than the limit allows, the answer is request a higher limit or batch, not a higher local cap.
+I'd note aptkit sidesteps this today by running tools sequentially within a turn — no burst, no cap needed yet.
+
+*Anchor: the cap's breakpoint is rate_limit / per_call_duration; past that, request a higher limit, don't raise the local cap.*
 
 ## See also
 
-- `03-multi-agent-orchestration/04-parallel-fan-out.md` — the topology this serves
-- `03-per-tool-circuit-breaking.md` — the next serving control
-- `03-multi-agent-orchestration/09-coordination-failure-modes.md` — the cascade/cost-blowup failures this bounds
-- `study-ai-engineering/06-production-serving/` — single-call rate limiting (cross-ref)
+- [../03-multi-agent-orchestration/04-parallel-fan-out.md](../03-multi-agent-orchestration/04-parallel-fan-out.md) — the topology this controls.
+- [03-per-tool-circuit-breaking.md](03-per-tool-circuit-breaking.md) — the other compounding-failure control.
+- Single-call rate-limiting and backpressure: `.aipe/study-ai-engineering/06-production-serving/`.

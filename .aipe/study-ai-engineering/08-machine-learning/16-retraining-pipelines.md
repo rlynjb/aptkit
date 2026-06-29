@@ -1,340 +1,213 @@
-# Retraining pipelines
+# Retraining Pipelines
 
-**Subtitle:** the file-01 pipeline put on a trigger, with a promotion gate · *Language-agnostic*
+> retraining pipeline · ML lifecycle automation
+
+Blunt as ever: **aptkit retrains nothing because aptkit trains nothing.** No scheduler, no trigger policy, no champion/challenger gate lives in `packages/`. New ground, buildable in buffr. Anchor to contrl: you shipped the pose-landmark rep counter, drift detection (`15-drift-detection.md`) flagged a PSI spike when that new wide-FOV phone landed, and now the question is operational — *when do you retrain, and how do you avoid shipping a worse model than the one you have?* A retraining pipeline is the automation that answers both without a human babysitting it.
 
 ## Zoom out, then zoom in
 
-File 01 drew the supervised pipeline as a straight arc: data → features → split →
-fit → serve. A retraining pipeline is that exact arc bent into a circle. Serving
-feeds a monitor, the monitor arms a trigger, the trigger re-runs the arc, and a
-gate decides whether the new model ever reaches serving. The starred boxes — the
-TRIGGER and the GATE — are the only parts that don't already exist in file 01.
+A retraining pipeline isn't one stage — it's a *loop* that re-enters the pipeline at DATA and re-runs everything, gated at DEPLOY. The trigger logic and the promotion gate are the new parts.
 
 ```
-  Zoom out — the supervised pipeline bent into a loop
-
-  ┌─ Serving layer ──────────────────────────────────────────────────┐
-  │  current model f_live serves; every run logged (file 14)         │◄──┐
-  └───────────────────────────┬───────────────────────────────────────┘   │
-                              │ metrics + replay artifacts                 │
-  ┌─ Monitor layer ───────────▼───────────────────────────────────────┐   │
-  │  drift (PSI, file 15) · live metric vs floor · calendar clock      │   │
-  └───────────────────────────┬───────────────────────────────────────┘   │
-                              │ condition crosses threshold                │
-  ┌─ Trigger layer ───────────▼───────────────────────────────────────┐   │ deploy
-  │  ★ TRIGGER ★  scheduled | drift | performance — fires a retrain    │   │ (only if
-  └───────────────────────────┬───────────────────────────────────────┘   │  gate
-                              │ collect fresh labels → re-run files 01–04  │  passes)
-  ┌─ Retrain layer ───────────▼───────────────────────────────────────┐   │
-  │  fit candidate f_new on accumulated data, fixed held-out set       │   │
-  └───────────────────────────┬───────────────────────────────────────┘   │
-                              │ score candidate on held-out               │
-  ┌─ Gate layer ──────────────▼───────────────────────────────────────┐   │
-  │  ★ PROMOTION GATE ★  f_new ships only if metric ≥ f_live's         │───┘
-  └─────────────────────────────────────────────────────────────────────┘
+Where the retraining pipeline lives
+┌──────────────────────────────────────────────────────────────────────┐
+│                                                                        │
+│   ★ TRIGGER ──► DATA ──► FEATURES ──► TRAIN/VAL/TEST ──► MODEL ──► ★GATE│
+│      ▲          (new       │              │              │         │   │
+│      │           labeled    │              │              │         ▼   │
+│      │           data)      │              │              │     DEPLOY  │
+│      │                                                     │      │     │
+│      └──────────────── champion/challenger feedback ◄──────┘──────┘     │
+│                                                                        │
+│   ★ = the two new pieces: the TRIGGER (when) and the GATE (promote?)   │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-Now zoom in. Nothing in the Retrain layer is new — it is files 01–04 verbatim.
-What turns a one-shot pipeline into a *pipeline* is the loop's two new boxes: the
-condition that decides *when* to fire, and the gate that decides *whether the
-output is allowed to replace the incumbent*. An LLM person already owns the gate
-half of this without realizing it — you already run evals to decide if an output
-regressed. The gate here is the same eval, pointed at a model swap instead of a
-prompt change.
+The loop starts at a **trigger**, re-runs the standard pipeline on fresh labeled data to produce a *challenger* model, then a **gate** decides whether the challenger beats the current *champion* in prod. Only a winner gets promoted. A loser gets discarded and prod is untouched. The two starred pieces are the only genuinely new machinery; everything between them is the same training pipeline you already have.
 
 ## Structure pass
 
-**Layers.** Serving → monitor → trigger → retrain → gate → back to serving. The
-retrain layer is the entire file-01 arc collapsed into one box; the loop is the
-contribution of *this* file. Each pass around the loop either swaps the model or
-keeps the old one — never silently degrades.
+One axis: **when do you retrain, and how do you avoid regression on promote?** Two seams:
 
-**Axis — what fires the retrain?** Trace the trigger backward and you find three
-distinct signals, in increasing directness and increasing cost. A *clock* fires
-on the calendar (cheapest signal, blindest). *Drift* fires when the input
-distribution moves (file 15 — catches the cause before the symptom). *Performance*
-fires when the live metric drops below a floor (the symptom itself — most direct,
-but needs fresh labels to measure). Pick by how fast your data shifts and how
-expensive labels are.
+- **The trigger** — *when.* Three strategies, not one: SCHEDULED, DRIFT-TRIGGERED, PERFORMANCE-TRIGGERED. Most real systems run more than one at once (a schedule as a floor, drift/performance as interrupts).
+- **The gate** — *promote or not.* Champion/challenger: the new model must *beat the incumbent on the same held-out evaluation* before it goes live. No "newer is better" assumption. Worse challenger → roll back, keep champion.
 
-**Seam.** The load-bearing boundary is **the promotion gate** — the single
-comparison `metric(f_new) ≥ metric(f_live)` on a *fixed* held-out set. Above it:
-a freshly fitted candidate, unproven. Below it: production traffic. The gate is
-the one place that guarantees retraining can only hold steady or improve, never
-regress. Remove it and "retraining" becomes "deploying an untested model on a
-timer."
+The mistake people make is building only the trigger and auto-deploying whatever it produces. That's how you ship a regression on a bad data week.
 
 ## How it works
 
-### Move 1 — the mental model
+### Move 1 — Mental model
 
-You already run `scorePrecisionAtK` (`packages/evals/src/precision-at-k.ts`) to
-decide whether an output regressed: take the candidate's retrieved ids, take the
-known-relevant ids, compute `matched / min(k, retrieved)`, refuse to ship if the
-score dropped. A promotion gate is *that same call*, except the thing being
-graded is a retrained model instead of a new prompt. Same metric, same held-out
-fixtures, same refuse-on-regression rule — different artifact under test.
+Three triggers, one gate. The triggers are independent OR conditions; the gate is the single AND everything must pass.
 
 ```
-  Pattern — the eval gate you already run, now gating a model swap
-
-  prompt change ──┐                          model swap ──┐
-                  ▼                                        ▼
-        ┌───────────────────┐                   ┌───────────────────┐
-        │ scorePrecisionAtK │   same gate, same  │ scorePrecisionAtK │
-        │  on fixtures      │ ◄── metric, same ──►│  on held-out set  │
-        └─────────┬─────────┘   threshold rule    └─────────┬─────────┘
-                  │                                          │
-       ship only if ≥ baseline                   promote only if ≥ incumbent
+Three triggers (OR) → one gate (AND)
+        ┌─────────────────────────────────────────────┐
+        │  SCHEDULED:    every N days                  │
+        │  DRIFT:        PSI > 0.20  (→ 15-drift)       │ any one fires
+        │  PERFORMANCE:  live_metric < floor           │ ──────────────┐
+        └─────────────────────────────────────────────┘               │
+                                                                       ▼
+                                                            ┌──────────────────┐
+                                                            │ RETRAIN producing │
+                                                            │ a CHALLENGER      │
+                                                            └────────┬─────────┘
+                                                                     ▼
+                                                            ┌──────────────────┐
+                                                            │ GATE: challenger  │
+                                                            │ > champion ?      │
+                                                            └──────────────────┘
 ```
 
-The gate doesn't care whether the change upstream was a reworded system prompt or
-a refit reranker. It cares only: did the score on the frozen set hold or improve?
+### Move 2 — Step by step
 
-### Move 2 — the loop, one box at a time
+**Part A: The three triggers**
 
-**Trigger A — scheduled.** Retrain every N days regardless of state. Simplest to
-reason about, fully predictable, and it needs no monitoring infrastructure. The
-cost: you either retrain when nothing changed (wasted compute) or you lag a sudden
-shift that lands the day after a run.
+Each trigger answers "when" from a different signal. Build them as independent predicates.
 
 ```
-  Scheduled trigger — fire on the clock, ignore state
-
-  ┌──────────┐  every 7d  ┌──────────┐
-  │  clock   │ ─────────► │ retrain  │   (no signal from the data at all)
-  └──────────┘            └──────────┘
+Trigger predicates (any true → retrain)
+┌────────────────────┬──────────────────────────────────────────┐
+│ SCHEDULED          │ now - last_train >= N days                │
+│ DRIFT-TRIGGERED    │ psi(feature) > 0.20    (from 15-drift)     │
+│ PERFORMANCE-TRIG.  │ live_metric < floor    (e.g. acc < 0.85)   │
+└────────────────────┴──────────────────────────────────────────┘
 ```
 
 ```python
-# Scheduled trigger — the whole condition is the calendar.
-def should_retrain_scheduled(last_run_at, now, interval_days=7):
-    return (now - last_run_at).days >= interval_days   # that is the entire check
+# not yet exercised in aptkit — no retraining machinery exists in packages/
+def should_retrain(state) -> bool:
+    scheduled   = (now() - state.last_train) >= timedelta(days=state.N)
+    drift       = state.max_feature_psi > 0.20        # cross-ref 15
+    performance = state.live_metric < state.floor
+    return scheduled or drift or performance
 ```
 
-**Trigger B — drift-triggered.** Retrain when the input distribution moves — reuse
-the PSI computation from file 15. Catches the *cause* (inputs changed) before the
-*symptom* (metric drops), and needs no fresh labels to fire. The cost: drift does
-not always hurt the metric, so you can retrain on a shift that didn't matter.
+Scheduled is the safety floor — it bounds staleness even if no alarm fires. Drift and performance are interrupts that fire *between* scheduled runs when reality moves faster than your calendar.
+
+**Part B: The champion/challenger gate**
+
+Retraining produces a challenger. Never auto-promote. Evaluate both models on the *same* frozen eval set and compare.
 
 ```
-  Drift trigger — fire when inputs move past a threshold
-
-  ┌──────────────┐  PSI > 0.2  ┌──────────┐
-  │ PSI(live vs  │ ──────────► │ retrain  │
-  │  training)   │             └──────────┘
-  └──────────────┘   (file 15 supplies PSI)
-```
-
-```python
-# Drift trigger — arm on distribution shift (PSI from file 15).
-def should_retrain_drift(psi_value, threshold=0.2):
-    return psi_value > threshold     # 0.1–0.2 = watch, >0.2 = significant shift
-```
-
-**Trigger C — performance-triggered.** Retrain when the monitored metric falls
-below a floor. The most direct signal — it fires on the actual harm, not a proxy.
-The cost: you need *fresh labels* to measure live precision, and on buffr's
-single-user corpus those labels accrue slowly (you only generate so many real
-queries a week).
-
-```
-  Performance trigger — fire when the live metric drops below the floor
-
-  ┌──────────────┐  p@k < 0.70  ┌──────────┐
-  │ live p@k on  │ ───────────► │ retrain  │
-  │ recent labels│              └──────────┘
-  └──────────────┘   (needs fresh ground-truth labels)
+Champion / challenger promotion
+   ┌──────────────┐        same eval set        ┌──────────────┐
+   │  CHAMPION     │ ──► metric_champ            │  CHALLENGER   │
+   │ (in prod now) │                              │ (just trained)│ ──► metric_chal
+   └──────────────┘                              └──────────────┘
+            │                                            │
+            └────────────────┬───────────────────────────┘
+                             ▼
+              metric_chal > metric_champ + margin ?
+                   │ yes                  │ no
+                   ▼                      ▼
+              PROMOTE challenger     KEEP champion,
+              (becomes new prod)     discard challenger (ROLL BACK)
 ```
 
 ```python
-# Performance trigger — arm when measured live metric breaches the floor.
-def should_retrain_performance(live_p_at_k, floor=0.70):
-    return live_p_at_k < floor       # requires labeled recent traffic to compute
+# not yet exercised in aptkit
+def gate(champion, challenger, eval_set, margin=0.005):
+    m_champ = evaluate(champion,  eval_set)
+    m_chal  = evaluate(challenger, eval_set)
+    if m_chal > m_champ + margin:
+        return promote(challenger)   # new prod model
+    return keep(champion)            # roll back, log the loss
 ```
 
-**The collect → train → eval → gate → deploy loop.** Whichever trigger fires, the
-body is identical. Collect fresh labeled data (buffr's corpus has grown since last
-run), re-run the file-01 pipeline to fit a candidate, score the candidate on a
-*frozen* held-out set, and pass it through the gate. The held-out set must not
-change between runs — if it moves, the comparison is meaningless.
+The `margin` stops you from churning prod for noise-level improvements. A challenger that's 0.1% better isn't better — it's lucky.
 
-```
-  The retrain body — one pass around the loop
+**Part C: Every retrain logs back to the run log**
 
-  ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐
-  │ collect  │──►│ re-train │──►│  eval on │──►│ PROMOTION│──►│  deploy  │
-  │ fresh    │   │ (files   │   │  FIXED   │   │  GATE ★  │   │ (shadow/ │
-  │ labels   │   │  01–04)  │   │ held-out │   │          │   │  canary) │
-  └──────────┘   └──────────┘   └──────────┘   └────┬─────┘   └──────────┘
-                                                    │ fail
-                                          keep f_live, log, wait
-```
+Each challenger is a training run, and it gets logged exactly like any other (cross-ref `14-training-run-logging.md`): data version, seed, code commit, metrics, confusion matrix. The gate's decision (promoted / rolled back) and the champion it was compared against go in the row too. That's how, months later, you answer "why did we promote run-847 over run-846?"
 
-```python
-# Promotion gate — the seam. Score both on the SAME frozen set; swap only if won.
-def promote_if_better(f_new, f_live, held_out):
-    new_score  = score_precision_at_k(f_new(held_out.queries),  held_out.relevant)
-    live_score = score_precision_at_k(f_live(held_out.queries), held_out.relevant)
-    log_run(candidate=f_new, new=new_score, incumbent=live_score)   # file 14
-    if new_score >= live_score:        # ≥, not > : ties keep the simpler/newer fit
-        return f_new                   # promote — begin shadow/canary rollout
-    return f_live                      # regression — keep incumbent, no deploy
-```
+**`not yet exercised in aptkit`** — buffr has no trigger scheduler, no champion/challenger gate, and no model registry. This is buildable, not built.
 
-Even when the gate passes, you don't hard-swap. The promoted model goes out as a
-shadow (runs in parallel, serves nothing) or a canary (serves a slice), and the
-loop closes: serving logs again, the monitor watches again, the next trigger arms.
+### Move 3 — Principle
 
-**Move 2.5 — the aptkit reality.** Not yet exercised in aptkit — aptkit runs
-pre-trained LLMs, not trained models. The pattern is taught here as study ground.
-The closest real artifacts are the eval bridge (`scorePrecisionAtK` /
-`scoreRecallAtK` in `packages/evals/src/precision-at-k.ts`) and the per-run replay
-logs under `/Users/rein/Public/aptkit/artifacts/replays/*.json`. Those replays are
-the eval substrate: the same JSON that today proves an LLM output didn't regress
-is exactly the held-out evidence a promotion gate would score a retrained model
-against. buffr, being single-user with a corpus that grows over time, is the
-natural place a personal reranker or intent classifier *would* be retrained.
-
-### Move 3 — the principle
-
-A retraining pipeline is just the file-01 pipeline put on a trigger, with a
-promotion gate. The retrain step is not new engineering — it is the supervised arc
-you already built. The new engineering is (1) a condition that decides *when* to
-fire and (2) a gate that decides *whether the result is allowed to ship*. The gate
-is the same eval gate you already run on outputs; here it gates a model swap. Build
-the gate first — an automated retrain without one is an automated regression.
+**A retraining pipeline's job is not to ship new models — it's to refuse to ship worse ones.** The trigger is the cheap half; the gate is the half that earns its keep. Automate the loop, but make promotion *prove* itself against the incumbent every single time.
 
 ## Primary diagram
 
 ```
-  The closed retraining loop, with the trigger and the gate marked
-
-                     ┌──────────────────────────────────────────┐
-                     │                                          ▼
-  ┌──────────┐  log  ┌──────────┐  signal  ┌──────────┐  fire  ┌──────────┐
-  │  SERVE   │ ────► │ MONITOR  │ ───────► │ ★TRIGGER★│ ─────► │ RETRAIN  │
-  │ f_live   │       │ drift /  │          │ sched |  │        │ files    │
-  │          │       │ metric / │          │ drift |  │        │ 01–04 →  │
-  └────▲─────┘       │ clock    │          │ perf     │        │ f_new    │
-       │             └──────────┘          └──────────┘        └────┬─────┘
-       │ promote (shadow/canary)                                    │ score on
-       │                                                            │ FIXED
-       │             ┌──────────────────────────────────────┐      │ held-out
-       └──────────── │ ★PROMOTION GATE★                     │ ◄────┘
-            f_new     │ scorePrecisionAtK(f_new) ≥           │
-                     │ scorePrecisionAtK(f_live) ? promote   │
-         pass ──────►│ : keep f_live    ──► fail (no deploy) │
-                     └──────────────────────────────────────┘
+Retraining loop, end to end
+┌─────────────────────────────────────────────────────────────────────┐
+│                                                                       │
+│  ┌────────── TRIGGERS (any fires) ──────────┐                         │
+│  │ scheduled (N days) │ PSI>0.20 (→15) │ metric<floor │              │
+│  └──────────────────────┬─────────────────────────────┘              │
+│                         ▼                                             │
+│  collect NEW labeled data ──► retrain ──► CHALLENGER model           │
+│                         │                                             │
+│                         ▼                                             │
+│        ┌──────── evaluate on frozen eval set ────────┐                │
+│        │  champion metric   vs   challenger metric    │                │
+│        └───────────────────┬───────────────────────────┘              │
+│                            ▼                                          │
+│            chal > champ + margin ?                                    │
+│             │ yes                    │ no                             │
+│             ▼                         ▼                               │
+│        PROMOTE                    ROLL BACK                           │
+│        (challenger → prod)        (keep champion, discard challenger) │
+│             │                         │                               │
+│             └─────────┬───────────────┘                               │
+│                       ▼                                               │
+│        LOG the run + decision ──► 14-training-run-logging            │
+│        (data_ver, seed, commit, metrics, confmat, promoted?)         │
+└───────────────────────────────────────────────────────────────────────┘
 ```
 
-Trigger-strategy comparison — pick by how fast data shifts and label cost:
-
-```
-  ┌────────────────┬──────────────────┬───────────────┬────────────────────┐
-  │ Strategy       │ Fires on         │ Needs labels? │ Failure mode       │
-  ├────────────────┼──────────────────┼───────────────┼────────────────────┤
-  │ SCHEDULED      │ the calendar     │ no (to fire)  │ wastes compute OR  │
-  │                │ (every N days)   │               │ lags a sudden shift│
-  ├────────────────┼──────────────────┼───────────────┼────────────────────┤
-  │ DRIFT-         │ PSI > threshold  │ no (to fire)  │ retrains on shifts │
-  │ TRIGGERED      │ (file 15)        │               │ that didn't hurt   │
-  ├────────────────┼──────────────────┼───────────────┼────────────────────┤
-  │ PERFORMANCE-   │ live metric <    │ YES — must    │ slow to fire if    │
-  │ TRIGGERED      │ floor            │ measure live  │ labels accrue slow │
-  └────────────────┴──────────────────┴───────────────┴────────────────────┘
-   most teams run scheduled + drift as the floor, performance when labels are cheap
-```
+Before the loop, a contrl drift spike requires a human to notice, manually retrain, eyeball whether it's better, and manually deploy. After, the PSI > 0.20 from `15` fires the drift trigger, a challenger trains on freshly-labeled new-phone footage, the gate refuses it unless it actually beats the shipped counter, and `14` records the whole decision.
 
 ## Elaborate
 
-The hard-won lesson of retraining pipelines is that the retrain step is the easy
-part — it's code you already wrote in file 01. The failures cluster in the two new
-boxes. A trigger with no gate ships untested models on a timer; that is the most
-common way a "self-improving" system silently degrades. A gate whose held-out set
-is *not frozen* — say it's regenerated from recent traffic each run — makes the
-incumbent-vs-candidate comparison incoherent, because the two models are scored
-against different rulers. And the choice of trigger is a data-velocity decision,
-not a sophistication contest: a corpus that barely moves wants a slow scheduled
-clock; a corpus under a sudden distribution shift wants drift detection (file 15)
-arming the trigger before the metric ever drops. The gate itself is the part you
-already own from the eval side — `scorePrecisionAtK` over the replay set is the
-exact same machinery, which is why the bridge from "I run evals" to "I run a
-retraining pipeline" is shorter than it looks. Read `15-drift-detection.md` for
-the drift trigger's PSI, and `14-training-run-logging.md` for what each loop pass
-records.
+- **Run multiple triggers together.** Scheduled-only goes stale between runs; drift-only never retrains on a slow-rotting concept that doesn't move `P(X)`. Combine: scheduled floor + drift interrupt + performance interrupt.
+- **The eval set must be frozen and shared.** Champion and challenger evaluated on *different* sets is not a comparison, it's a coin flip. Freeze a held-out set; both models face the identical exam.
+- **Shadow before promote, for the cautious version.** A stronger gate runs the challenger in *shadow* (scoring live traffic without serving its answers) and compares to the champion on real prod inputs before promoting. More infra, fewer surprises.
+- **Roll-back must be one switch.** If promotion is hard to reverse, you won't promote aggressively. Keep prod model selection a pointer (the `model_uri` from `14`) so rollback is "repoint to the previous champion," not "redeploy."
+- **New labeled data is the bottleneck, not compute.** Drift-triggered retraining assumes you *can* get fresh labels for the drifted population. For contrl that means labeling rep boundaries on new-phone footage — often the slow, human part of the whole loop. Build the labeling path before you build the trigger, or the trigger fires into a void.
 
 ## Project exercises
 
-### Build a promotion-gate script for a learned reranker
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a script that fits a candidate reranker on buffr's
-  accumulated labeled data, scores both the candidate and the current retrieval
-  baseline on a *frozen* held-out set with `scorePrecisionAtK`, and promotes the
-  candidate only if its p@k is `>=` the incumbent's — otherwise keeps the
-  incumbent and logs the rejected run.
-- **Why it earns its place:** the promotion gate is the load-bearing seam of the
-  whole loop; building it proves you can turn an eval into a deploy decision, the
-  exact bridge from output-grading to model-promotion.
-- **Files to touch:** new `/Users/rein/Public/buffr/eval/promotion-gate.ts`,
-  reading `/Users/rein/Public/buffr/eval/queries.json` and using
-  `scorePrecisionAtK` from
-  `/Users/rein/Public/aptkit/packages/evals/src/precision-at-k.ts`.
-- **Done when:** the script prints both scores and a `PROMOTE` / `KEEP` decision,
-  and a deliberately-worse candidate is correctly rejected against the held-out
-  set.
+### EX-ML-16a — retraining-trigger policy
+
+- **Exercise ID:** `EX-ML-16a` (Phase 5 — ML hardening; trigger policy is operational automation layered over a working training loop)
+- **What to build:** A `shouldRetrain(state)` policy combining all three triggers as independent OR predicates: scheduled (`now - lastTrain >= N days`), drift (`maxFeaturePsi > 0.20`, consuming `15`'s scorer output), performance (`liveMetric < floor`). Returns `{ retrain: bool, reasons: string[] }` so the firing trigger(s) are recorded, not just the boolean.
+- **Why it earns its place:** It's the entry point of the whole loop and the consumer of `15`'s PSI output — it turns a drift score into an action. Returning `reasons` (not just a bool) is what lets the run log in `14` record *why* a retrain happened.
+- **Files to touch:** `Case B (new)` — `/Users/rein/Public/buffr/src/ml/retrain/triggerPolicy.ts` (new); `/Users/rein/Public/buffr/src/ml/retrain/triggerPolicy.test.ts` (new).
+- **Done when:** Each trigger fires independently in a unit test (only-scheduled, only-drift, only-performance), `reasons` lists exactly the triggers that fired, and all-quiet returns `{ retrain: false, reasons: [] }`.
 - **Estimated effort:** `1–4hr`
 
-### Build a scheduled-retrain harness over the replay artifacts
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a harness that treats
-  `/Users/rein/Public/aptkit/artifacts/replays/*.json` as the held-out eval
-  substrate, checks a scheduled trigger condition (last-run timestamp vs an
-  interval), and on fire runs the collect → eval → gate sequence end to end,
-  appending a one-line run record per pass.
-- **Why it earns its place:** wires a trigger to the gate over *real* logged
-  artifacts, making the closed loop concrete instead of diagrammed — you see the
-  loop refuse to deploy when the candidate doesn't beat the incumbent.
-- **Files to touch:** new
-  `/Users/rein/Public/aptkit/packages/evals/test/retrain-harness.test.ts`,
-  reading `/Users/rein/Public/aptkit/artifacts/replays/` and
-  `/Users/rein/Public/aptkit/packages/evals/src/precision-at-k.ts`.
-- **Done when:** `node --test` shows the trigger firing on an elapsed interval and
-  the gate emitting `PROMOTE` / `KEEP` per replay-backed run.
+### EX-ML-16b — champion/challenger promotion gate
+
+- **Exercise ID:** `EX-ML-16b` (Phase 5 — ML hardening; the regression guard on top of `16a`)
+- **What to build:** A `gate(championMetric, challengerMetric, margin)` that promotes only when `challenger > champion + margin`, otherwise keeps the champion; plus a thin recorder that writes the decision (`promoted` | `rolledBack`, the two metrics, the champion's `model_uri`) into the `training_runs` row from `14`.
+- **Why it earns its place:** It's the half of the pipeline that prevents regressions — the part that makes automated retraining safe enough to leave unattended. Wiring the decision into `14`'s row closes the loop: every promotion is auditable.
+- **Files to touch:** `Case B (new)` — `/Users/rein/Public/buffr/src/ml/retrain/gate.ts` (new); test `/Users/rein/Public/buffr/src/ml/retrain/gate.test.ts` (new); writes into the `agents.training_runs` table created in `EX-ML-14a`.
+- **Done when:** A challenger within `margin` of the champion is *not* promoted; a clear winner is promoted; and each decision appends a row recording both metrics and the outcome, queryable as "why was run-X promoted over run-Y?"
 - **Estimated effort:** `1–2 days`
 
 ## Interview defense
 
-**Q: "How is a retraining pipeline different from a training pipeline?"**
-It isn't, at the core — the retrain step *is* the training pipeline (files 01–04).
-What's added is a loop: a trigger that decides *when* to re-run it, and a promotion
-gate that decides *whether* the result is allowed to replace the live model. Strip
-those two boxes and you have file 01 again.
+**Q: Why not auto-deploy every retrained model? It's trained on fresher data.**
 
 ```
-  training:    data ─► fit ─► serve
-  retraining:  data ─► fit ─► GATE ─► serve ─► monitor ─► TRIGGER ─┐
-                                ▲                                  │
-                                └──────────────────────────────────┘
+fresh data ──► CHALLENGER ──► auto-deploy?  ──► NO
+                                  │
+              a bad data week / mislabeled batch can make
+              the challenger WORSE than the champion
+                                  │
+              ──► gate: promote ONLY if challenger > champion + margin
 ```
-*Anchor: a retraining pipeline is the file-01 pipeline put on a trigger, with a gate.*
 
-**Q: "How do you make sure automated retraining never degrades production?"**
-A promotion gate. Score the candidate and the incumbent on the *same frozen*
-held-out set with the same metric — `scorePrecisionAtK` over the replay fixtures —
-and promote only if the candidate ties or beats the incumbent. It's the same eval
-gate you run to decide if an output regressed, pointed at a model swap. No gate
-means a timer that ships untested models.
+Fresher isn't automatically better — a mislabeled batch or a quiet week produces a worse model. The gate forces every challenger to beat the incumbent on a frozen eval set. One-line anchor: *the pipeline's real job is refusing to ship regressions, not shipping novelty.*
 
-```
-  f_new  ─► scorePrecisionAtK ─┐
-                               ├─► new ≥ live ? promote : keep f_live
-  f_live ─► scorePrecisionAtK ─┘   (same frozen held-out set, same metric)
-```
-*Anchor: the promotion gate is the eval gate — ship only if it beats the incumbent.*
+**Q: You have a scheduled retrain every 30 days. Why also wire up drift and performance triggers?**
+
+A 30-day schedule can't see a drift spike on day 3 — that's 27 days of silent degradation. Drift and performance triggers are interrupts that fire when reality outpaces the calendar; the schedule is just the staleness floor. One-line anchor: *the schedule bounds staleness; the interrupts catch surprises* (drift from `15`, performance from a live metric).
 
 ## See also
 
-- `15-drift-detection.md` — the PSI signal that arms the drift trigger
-- `14-training-run-logging.md` — what each pass around the loop records
-- `01-supervised-pipeline.md` — the arc the retrain step re-runs verbatim
+- [`15-drift-detection.md`](./15-drift-detection.md) — the PSI > 0.20 condition behind the drift trigger
+- [`14-training-run-logging.md`](./14-training-run-logging.md) — where each retrain run and gate decision is recorded
+- [`06-domain-gap.md`](./06-domain-gap.md) — the population mismatch that retraining on fresh labeled data is meant to close

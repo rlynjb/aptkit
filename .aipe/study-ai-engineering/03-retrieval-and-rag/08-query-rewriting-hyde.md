@@ -1,229 +1,174 @@
-# Query rewriting and HyDE
+# Query rewriting & HyDE
+> Query transformation · Industry standard
 
-**Subtitle:** Query transformation · reshaping the query before retrieval · *Industry standard*
+The user's query and your indexed text are written by different people for different reasons — and they often don't share vocabulary or shape. The user types "why is my thing slow"; your docs say "latency degradation under load." Dense retrieval helps, but there's a gap. Query transformation closes it by rewriting the query *before* it hits the retriever. Two flavors: **query rewriting** (an LLM rewrites the messy query into a clean, retrieval-friendly one) and **HyDE** (the LLM writes a *fake answer* and you embed *that*, because a hypothetical answer looks more like real corpus passages than a question does). aptkit does neither — `queryKnowledgeBase` embeds the raw query as-is. This is `not yet exercised`, and the cost to add it is one extra LLM call.
 
 ## Zoom out, then zoom in
 
-Query transformation fixes the gap between *how a user asks* and *how the corpus is
-written*. It sits before retrieval, as a pre-step that rewrites or expands the query
-into something that embeds closer to the right chunks. aptkit embeds the raw query
-verbatim, so both techniques here are `not yet exercised` — taught as the pattern
-and its insertion point in the rag-query agent.
+Query transformation would sit at the very top of the query path, before the embed.
 
 ```
-  Zoom out — transformation sits BEFORE embedding
-
-  ┌─ rag-query agent ───────────────────────────────────────────┐
-  │  user query ─► ★ rewrite / HyDE ★ ─► search_knowledge_base   │ ← we are here
-  └───────────────────────────┬─────────────────────────────────┘
-                              │ today: raw query straight to embed
-  ┌─ pipeline.query (pipeline.ts:56) ▼──────────────────────────┐
-  │  embed([query]) — verbatim, no transform                     │
-  └──────────────────────────────────────────────────────────────┘
+the query path, with the transform gap
+┌──────────────────────────────────────────────────────────┐
+│  user query (messy, conversational, underspecified)         │
+└───────────────┬────────────────────────────────────────────┘
+                ▼
+┌──────────────────────────────────────────────────────────┐
+│  ★ query transform ★   rewrite / HyDE   ✗ not yet exercised │  ← the gap
+└───────────────┬────────────────────────────────────────────┘
+                ▼  (today: raw query goes straight here)
+┌──────────────────────────────────────────────────────────┐
+│  queryKnowledgeBase → embed → store.search   (exists ✓)     │
+└──────────────────────────────────────────────────────────┘
 ```
 
-Now zoom in. You've normalized a search box before — lowercase, strip stop words,
-expand "NYC" to "New York City" so the index matches. Query transformation is that
-idea with an LLM doing the normalization, and the target isn't a keyword index but
-an embedding space. Two flavors: *rewrite* (expand the terse query into a fuller
-one) and *HyDE* (write a fake answer and search with *that*). Both fight the same
-problem — short queries embed poorly.
+Today the raw user query flows straight into `embed` at `pipeline.ts:56`. There's no transform step — what the user types is what gets vectorized. That's fine when the query is already well-formed, but conversational or vocabulary-mismatched queries embed into a region of the space that's just *near* the right answers instead of *on* them. The transform's job is to move the query vector closer to where the answers live, before search ever runs.
 
 ## Structure pass
 
-**Layers.** Transform (rewrite / HyDE — an LLM step) → embed (the existing
-`pipeline.ts:56`) → search (unchanged). The transform is a new top layer; everything
-below it is untouched.
+Pick the **cost** axis: what does the transform buy, and what does it spend?
 
-**Axis — control.** Trace who controls *what gets embedded*. Today the user's raw
-text controls it directly (`pipeline.ts:56`). With a transform, an LLM sits in
-between and controls it — the embedded text is the model's rewrite, not the user's
-words. Control over the query vector moves from the user up to a pre-retrieval LLM
-call.
+```
+cost vs benefit of the transform
+  NO TRANSFORM (aptkit today)        WITH TRANSFORM
+  ┌──────────────────────┐          ┌──────────────────────────┐
+  │ embed(raw query)       │          │ LLM call → rewrite/HyDE   │
+  │ 1 embed call           │          │ THEN embed(transformed)   │
+  │ fast, cheap            │          │ +1 LLM call, +latency     │
+  │ vocabulary gap remains │          │ vocabulary gap closed     │
+  └──────────────────────┘          └──────────────────────────┘
+       ▲ seam: an extra LLM call on the hot path — is the recall worth it? ▲
+```
 
-**Seam.** The would-be seam is a pre-retrieval step in the rag-query agent, *before*
-it calls `search_knowledge_base`. The pipeline's `queryKnowledgeBase`
-(`pipeline.ts:50`) doesn't change — it still embeds whatever string it's handed. The
-transform changes *what string* reaches it, not the pipeline.
+The seam is that extra LLM call. It sits on the *query hot path*, so every search now waits on a generation before it can even start retrieving — real latency, real tokens. You spend that to close the query/corpus vocabulary gap. It's worth it when your queries are genuinely messy (conversational agents, voice, vague users) and not worth it when they're already keyword-clean. Like reranking (file 07), you measure before you add it.
 
 ## How it works
 
-### Move 1 — the mental model
-
-You know "search query expansion" — the box where typing "js array dedup" silently
-becomes "javascript array remove duplicates" so it matches docs that never say
-"dedup." That's an LLM-free rewrite. Now let an LLM do it, and add a second trick:
-instead of improving the *question*, write a plausible *answer* and search for docs
-that look like the answer. Questions and answers live in different regions of
-embedding space; HyDE moves the query into the answer's neighborhood.
+**Move 1 — two transforms, same slot.** Both run before embed; they differ in *what they produce*:
 
 ```
-  Query and answer live in different regions of embedding space
-
-  question region            answer region
-  "fix auth?"  ●                          ● "verify the JWT signature, check exp…"
-       │ raw query embeds HERE                   │ but the relevant CHUNK is HERE
-       └────────── far in cosine space ──────────┘
-   HyDE: embed a fake ANSWER ─► land in the answer region ─► closer to real chunks
+query rewriting vs HyDE
+  QUERY REWRITING                    HyDE (Hypothetical Document Embeddings)
+  ┌──────────────────────┐          ┌──────────────────────────────┐
+  │ "why is my thing slow"│          │ "why is my thing slow"         │
+  │        ↓ LLM           │          │        ↓ LLM: "write the answer"│
+  │ "causes of high        │          │ "Slowness is usually caused by │
+  │  latency under load"   │          │  CPU saturation, lock          │
+  │ (a better QUERY)       │          │  contention, or..." (fake ANSWER)│
+  │        ↓ embed         │          │        ↓ embed the FAKE ANSWER  │
+  │ search                 │          │ search                          │
+  └──────────────────────┘          └──────────────────────────────┘
+   embeds a cleaner question          embeds something shaped LIKE the corpus
 ```
 
-### Move 2 — the two transforms, and where they slot
+The HyDE insight is counterintuitive and clever: your corpus is made of *answers* (passages), so a query embedded as a question lands in question-space, slightly off from answer-space. But a *hypothetical answer* — even a wrong one — is shaped like the real passages, so it embeds right into the neighborhood of the true answer. You don't care if the fake answer is factually correct; you only use its *vector* to retrieve the real one.
 
-**Query rewrite: expand the terse query.** An LLM turns a sloppy query into an
-explicit one before embedding. The target is the same chunks, but the rewritten
-query embeds closer to them because it uses the corpus's vocabulary.
-
-```
-  Query rewrite (PSEUDOCODE — not yet exercised)
-
-  user: "fix auth"
-     │ LLM rewrite
-     ▼
-  "debug authentication: token verification, session expiry, login failure"
-     │ embed THIS ─► search       (the chunks say "token verification", not "auth")
-```
-
-**HyDE: embed a hypothetical answer.** HyDE (Hypothetical Document Embeddings) goes
-further — the LLM writes a fake answer to the question, and *that* gets embedded.
-Corpus chunks *are* answers, so an embedded answer lands near real answers even when
-the question's vocabulary doesn't.
-
-```
-  HyDE (PSEUDOCODE — not yet exercised)
-
-  user: "how do I rotate the signing key?"
-     │ LLM writes a hypothetical answer
-     ▼
-  "To rotate the signing key, generate a new keypair, publish the public key to
-   JWKS, and set a grace period before retiring the old kid…"
-     │ embed the FAKE ANSWER ─► search ─► finds the real key-rotation chunk
-```
-
-**Where both slot in aptkit.** Today the agent hands the raw query to the tool, and
-the pipeline embeds it as-is (`pipeline.ts:56`):
+**Move 2 — where it plugs in.** aptkit's `queryKnowledgeBase` is the exact insertion point. `not yet exercised`:
 
 ```ts
-const [vector] = await wiring.embedder.embed([query]);   // verbatim, no transform
+// packages/retrieval/src/pipeline.ts:50-59  (the slot, TODAY)
+export async function queryKnowledgeBase(query, wiring, topK = 5): Promise<VectorHit[]> {
+  assertWiring(wiring);
+  const [vector] = await wiring.embedder.embed([query]);  // ← raw query embedded as-is
+  if (!vector) return [];                                 //   NO transform happens here
+  return wiring.store.search(vector, topK);
+}
 ```
 
-The transform is a pre-tool LLM call in the rag-query agent — the agent rewrites
-*before* invoking `search_knowledge_base`. The pipeline never knows:
-
 ```
-  Transformed retrieval (PSEUDOCODE — not yet exercised)
-
-  agent turn:
-     rewritten = await llm.rewrite(userQuery)        # or llm.hydeAnswer(userQuery)
-     toolCall  = search_knowledge_base(rewritten)    # pipeline embeds the rewrite
-   pipeline.ts:56 unchanged — it embeds whatever string it's given
+proposed transform wrapper (pseudocode — DOES NOT EXIST)
+function queryWithTransform(query, wiring, transform, topK = 5):
+    effectiveQuery = transform                       # optional step
+        ? await transform.run(query)                 # LLM rewrites or writes fake answer
+        : query                                       # falls back to raw (today's behavior)
+    [vector] = await wiring.embedder.embed([effectiveQuery])  # embed the TRANSFORMED text
+    return wiring.store.search(vector, topK)
 ```
 
-**The cost to weigh.** Each transform adds an LLM call *before* retrieval — latency
-and tokens spent on every query, plus a new failure mode (a bad rewrite retrieves
-worse than the raw query). So gate it on a measured retrieval lift: precision@k
-(`packages/evals/src/precision-at-k.ts:47`) before and after the rewrite.
+The cleanest design makes the transform *optional and injectable* — same move as the embedding transport. When absent, behavior is identical to today; when present, it rewrites or HyDE's before the embed. The store and the search tool never change.
 
-### Move 2.5 — current state vs future state
+**HyDE's embed target.** The one subtlety: HyDE embeds the *generated answer*, not the query — so the thing you pass to `embed` is LLM output, which means HyDE inherits the LLM's latency *and* a small risk the fake answer drifts off-topic:
 
 ```
-  Phase A (aptkit, now)             Phase B (transform — not yet exercised)
-  ┌────────────────────────┐        ┌──────────────────────────────────┐
-  │ raw query ─► embed      │        │ query ─► LLM rewrite/HyDE ─► embed │
-  │ pipeline.ts:56 verbatim │  add   │ pre-tool step in rag-query agent  │
-  │ terse queries embed weak│ LLM    │ embeds corpus-vocab / answer text │
-  │ no extra LLM call       │ step   │ +1 LLM call per query (gate on @k) │
-  └────────────────────────┘        └──────────────────────────────────┘
+HyDE failure mode to watch
+  good HyDE:  query → plausible on-topic fake answer → embeds near real answers ✓
+  bad HyDE:   query → LLM hallucinates an off-topic answer → embeds into the WRONG
+                                                              neighborhood → worse recall
+   mitigation: average the query vector AND the HyDE vector (hedge the bet)
 ```
 
-### Move 3 — the principle
+A common hedge is to embed *both* the raw query and the hypothetical answer and average the vectors — so a bad hallucination can't fully drag retrieval off course.
 
-The query is the weakest link in retrieval: users type three words, the corpus is
-written in paragraphs, and the two embed far apart. Spend an LLM call to close that
-gap — rewrite to match the corpus vocabulary, or HyDE to jump into the answer
-region — but only when a precision@k measurement says the lift beats the added
-latency. The pipeline stays vocabulary-agnostic; all the intelligence lives in the
-pre-retrieval step, which is why it slots into the agent and not the contracts.
+**Move 3 — the principle.** Query transformation trades an LLM call for closing the vocabulary/shape gap between how users ask and how your corpus answers. It's optional by design — the raw-query path must stay the default, because most well-formed queries don't need it and you don't want to pay a generation on every search. Add it where queries are demonstrably messy, measure the recall lift against the latency cost (same gate discipline as reranking), and for HyDE, hedge against hallucinated fake-answers by blending in the original query vector.
 
 ## Primary diagram
 
 ```
-  Query transformation in aptkit terms
-
-  user query "fix auth"
-     │ rag-query agent, BEFORE the tool call (not yet exercised)
-     ├─ rewrite ─► "debug authentication token verification, session expiry"
-     └─ HyDE ────► "<hypothetical answer paragraph>"
-                       │ search_knowledge_base(transformed)
-                       ▼
-  pipeline.query ─► embed (pipeline.ts:56, UNCHANGED) ─► cosine ─► top-k
-                       │
-            gate the whole thing on precision@k (precision-at-k.ts:47)
+query transformation (the buildable target)
+   user query "why is my thing slow"
+        │
+        ▼  optional transform (LLM call) ─── falls back to raw if absent
+   ┌──────────────────────┬──────────────────────────┐
+   │ REWRITE               │ HyDE                      │
+   │ → cleaner query        │ → fake answer passage     │
+   └──────────┬───────────┴────────────┬─────────────┘
+              ▼                          ▼
+        embed(rewritten)          embed(fake answer)   [optionally avg with embed(query)]
+              └────────────┬─────────────┘
+                           ▼
+                   store.search(vector, k)   ← unchanged
 ```
+
+One optional LLM step moves the query vector closer to the answers before search runs; everything downstream is untouched.
 
 ## Elaborate
 
-Rewrite and HyDE attack the same defect from opposite ends. Rewrite improves the
-*question* so it shares words with the chunks; HyDE abandons the question and
-fabricates an *answer* so the search lands in the answer region of embedding space.
-HyDE is stronger when the question and answer vocabularies diverge sharply (terse
-question, technical corpus); rewrite is cheaper and safer when they're merely terse.
-Both are premature for aptkit until a precision@k gap shows queries — not chunks or
-ranking — are the bottleneck. The insertion point is deliberately the agent, not the
-pipeline: keeping the pipeline vocabulary-agnostic is what lets you A/B a rewrite
-without touching retrieval. Read `01-embeddings.md` for why short text embeds poorly
-and `07-reranking.md` for the post-retrieval counterpart.
+HyDE is Gao et al., 2022 ("Precise Zero-Shot Dense Retrieval without Relevance Labels") — the surprising result that embedding a hallucinated answer beats embedding the query. Query rewriting shows up everywhere agents hold conversations: **multi-query** (generate N rewrites, retrieve for each, union the results), **step-back prompting** (rewrite to a more general question first), and **conversational query rewriting** (resolve "it"/"that" against chat history before retrieving — directly relevant to aptkit's conversation memory in sub-section 04). The tradeoff is always the same: more LLM calls, more recall, more latency. Read next: `07-reranking.md` (the other measure-first, LLM-cost retrieval add-on) and `11-rag.md` (the loop the transform feeds).
 
 ## Project exercises
 
-### Add an LLM query-rewrite step to the rag-query agent and gate on precision@k
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a pre-retrieval step that asks the local model to expand the
-  user query, passes the rewrite to `search_knowledge_base`, and an eval comparing
-  precision@k on raw vs rewritten queries over a small labeled set.
-- **Why it earns its place:** query rewriting is a top-asked RAG technique, and
-  gating it on a measured lift proves you treat an extra LLM call as a cost to
-  justify, not a free win.
-- **Files to touch:** the rag-query agent (`packages/.../rag-query-agent.ts`),
-  optionally `packages/retrieval/src/search-knowledge-base-tool.ts`,
-  `packages/evals/src/precision-at-k.ts` (reuse), a new test in
-  `packages/evals/test/` or `packages/retrieval/test/`.
-- **Done when:** a test reports precision@k for raw vs rewritten queries on the same
-  labeled set, and the agent uses the rewrite path.
+### Add an optional query-rewrite step before queryKnowledgeBase
+
+- **Exercise ID:** `EX-RAG-08a`
+- **What to build:** A `QueryTransform { run(query): Promise<string> }` contract and a `queryWithTransform` wrapper that runs an injectable rewrite/HyDE step before embedding, defaulting to the raw query when absent.
+- **Why it earns its place:** It makes the transform a clean, optional adapter (like the embedding transport) rather than a hardcoded branch, and gives aptkit a real lever for messy conversational queries — exactly what a chat agent produces. Case B. Phase 2B.
+- **Files to touch:** new `packages/retrieval/src/query-transform.ts`; wrap `queryKnowledgeBase` (`packages/retrieval/src/pipeline.ts:50-59`); reuse the Gemma chat transport pattern for the LLM call (mirrors `OllamaEmbeddingProvider`'s injectable transport).
+- **Done when:** a query with a deterministic stub rewriter retrieves a chunk the raw query misses, the raw-query path is unchanged when no transform is wired, and a test pins both.
+- **Estimated effort:** `1–4hr`
+
+### Implement HyDE with a query/hypothesis vector blend
+
+- **Exercise ID:** `EX-RAG-08b`
+- **What to build:** A HyDE `QueryTransform` that generates a hypothetical answer, embeds it, and averages it with the raw-query embedding to hedge hallucination, returning the blended vector to `store.search`.
+- **Why it earns its place:** HyDE is the non-obvious, high-signal transform, and the blend is the production-grade detail that stops a bad fake answer from wrecking recall. Case B; depends on `EX-RAG-08a`. Phase 2B.
+- **Files to touch:** extend `packages/retrieval/src/query-transform.ts`; needs a vector-returning variant of the query path in `packages/retrieval/src/pipeline.ts`.
+- **Done when:** on a vocabulary-mismatched fixture, HyDE-blend beats raw-query recall, and a degenerate hallucinated answer doesn't drop recall below raw (the blend saves it).
 - **Estimated effort:** `1–2 days`
 
 ## Interview defense
 
-**Q: "What's HyDE and when does it beat plain query rewriting?"**
-HyDE embeds a *hypothetical answer* instead of the question. The LLM writes a
-plausible answer to the query, and that text gets embedded and searched. It wins when
-the question and the corpus answers use very different vocabulary — questions and
-answers occupy different regions of embedding space, and HyDE jumps the query into
-the answer region. Plain rewrite just expands the question's terms; it's cheaper and
-safer when the query is merely terse, not vocabulary-mismatched.
+**Q: HyDE embeds a hallucinated answer that might be factually wrong. How is that not garbage in, garbage out?**
 
 ```
-  rewrite: improve the QUESTION (same region, richer terms)
-  HyDE:    embed a fake ANSWER (jump to the answer region)
+corpus = ANSWERS (passages)         query = a QUESTION (different shape)
+  embed(question) → lands in question-space, off from answers
+  embed(fake answer) → lands in ANSWER-space → near the real answer
+   you use the fake answer's VECTOR, never its words — facts don't matter
 ```
-Anchor: *rewrite improves the question; HyDE replaces it with an answer-shaped query.*
 
-**Q: "Where would this live in your pipeline, and what does it cost?"**
-A pre-retrieval LLM step in the rag-query agent, *before* `search_knowledge_base`.
-The pipeline's `queryKnowledgeBase` (`pipeline.ts:56`) embeds whatever string it's
-handed, so it never changes — the transform only changes *what string* arrives. The
-cost is one extra LLM call per query plus a new failure mode (a bad rewrite retrieves
-worse), so I gate it on precision@k before/after.
+Anchor: HyDE exploits *shape*, not facts — a hypothetical answer looks like corpus passages, so its vector retrieves the real ones; you discard the fake text entirely.
+
+**Q: When should you NOT add a query transform?**
 
 ```
-  agent: rewrite ─► tool(rewritten) ─► pipeline embeds it (pipeline.ts:56 unchanged)
-  cost: +1 LLM call/query ─► must clear a precision@k bar
+queries already clean (keyword-y, well-formed) → transform adds latency, no recall lift
+   every search now waits on an LLM call on the hot path
 ```
-Anchor: *the transform lives in the agent; the pipeline stays vocabulary-agnostic.*
+
+Anchor: the transform costs an LLM call per query; you add it only when queries are measurably messy enough that the recall gain beats the latency — measure first, same as reranking.
 
 ## See also
 
-- `01-embeddings.md` — why short queries embed poorly
-- `07-reranking.md` — the post-retrieval counterpart to pre-retrieval transforms
-- `11-rag.md` — the raw-query embed step (pipeline.ts:56) these replace
-- `04-agents-and-tool-use/03-react-pattern.md` — the agent step that hosts the rewrite
-- `05-evals-and-observability/01-eval-set-types.md` — precision@k as the gate
+- [07-reranking.md](07-reranking.md) — the other measure-first, LLM-cost add-on
+- [01-embeddings.md](01-embeddings.md) — what the transformed text becomes
+- [11-rag.md](11-rag.md) — the retrieve-then-generate loop this feeds

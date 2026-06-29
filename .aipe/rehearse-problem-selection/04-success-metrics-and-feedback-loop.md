@@ -1,148 +1,131 @@
 # Success Metrics and Feedback Loop
 
-*Brief-answer 9: the observable outcomes that say the substrate earned its
-keep, and the loop that keeps them honest.*
+Answer 9: how "it worked" becomes **observable** — not a feeling, a measurement — and the loop that closes so success keeps being true as the code changes. Coach posture: a metric a reviewer can't picture you checking is a wish, not a metric. Every one below names *what you run* and *what number or state you read.*
 
-No vanity metrics. No invented numbers. Three observable checks, each
-grounded in code that exists in the repos today. Two measure "the RAG
-works." The third measures "the *substrate* works" — the thing the build
-decision was actually betting on.
+## The honest framing first
+
+There are no users, so there are **no user-outcome metrics** — no retention, no conversion, no DAU. Inventing them would be the fastest way to lose the room. The metrics here measure the two things this problem is actually about: **does the retrieval work** (quality), and **is the substrate actually reusable** (the premise).
 
 ```
-  The three metrics, mapped to what each one proves
+  TWO FAMILIES OF METRIC — quality + reuse, no user metrics
 
-  metric                     proves                    evidence (real file)
-  ──────                     ──────                    ────────────────────
-  1. precision@k /           retrieval surfaces the    scorePrecisionAtK /
-     recall@k                right chunks, not noise   scoreRecallAtK
-     (over a small                                     (packages/evals/src/
-      REAL corpus)                                      precision-at-k.ts:47,68)
-
-  2. rubric-judge score      the generated answer is   rubric-judge
-                             grounded + cited, not     (packages/evals/src/
-                             hallucinated              rubric-judge.ts)
-
-  3. the swap held           the CONTRACT is the       PgVectorStore
-     (InMemory → Pg,          right boundary — the     implements VectorStore
-      one line, two           build premise itself     (buffr/src/
-      repos) + clean-                                  pg-vector-store.ts:19),
-      clone build                                      wired buffr/src/
-                                                       session.ts:41
-```
-
----
-
-## Metric 1 — retrieval quality: precision@k / recall@k
-
-```
-  Ranked-retrieval scoring — the shape
-
-  query ──► embed ──► search store ──► ranked hits [h1 h2 h3 ... hk]
-                                              │
-                                  ┌───────────┴───────────┐
-                                  ▼                       ▼
-                       precision@k = relevant     recall@k = relevant
-                       among top-k / k            found / all relevant
-```
-
-▸ **What it measures:** does the from-scratch retrieval pipeline put the
-  right chunks in the top-k for a *real* corpus (not a synthetic toy set)?
-▸ **Why it's the first metric:** RAG answer quality is capped by retrieval
-  quality. If the right chunk isn't retrieved, no model fixes it.
-▸ **The honest caveat:** the corpus is small and real, not a benchmark
-  dataset. The number is directional for *this* substrate, not a
-  leaderboard claim. State it that way.
-
----
-
-## Metric 2 — answer quality: rubric-judge
-
-▸ **What it measures:** given retrieved context, is the answer grounded in
-  it and cited — or did the model wander off the source?
-▸ **Why it's separate from metric 1:** you can retrieve perfectly and still
-  generate a bad answer. Metric 1 grades the retrieval; metric 2 grades
-  the generation on top of it. Both, or you can't tell which half failed.
-▸ **The mechanism behind it:** the rag-query agent
-  (`packages/agents/rag-query`) composes Gemma + `search_knowledge_base` +
-  `injectProfile` so the model *decides when to search* and answers with
-  citations — rubric-judge then scores that output.
-
----
-
-## Metric 3 — the swap held (the load-bearing metric)
-
-This is the one that validates BUILD over ADOPT. The other two would pass
-even if aptkit were a single-app library. Only this one proves the contract
-crosses a repo boundary.
-
-```
-  The one-line swap, across two repos — what the contract bought
-
-  ┌─ aptkit (the substrate) ─────────────────────────────────┐
-  │  VectorStore  ◄── contract (load-bearing)                 │
-  │  InMemoryVectorStore  implements VectorStore              │
-  │  (cosine scan, dev/test default)                          │
-  └────────────────────────────┬───────────────────────────────┘
-                               │  published as @rlynjb/aptkit-core@0.4.1
-                               │  buffr pins "^0.4.1"
-                               ▼
-  ┌─ buffr (the consumer) ───────────────────────────────────┐
-  │  PgVectorStore  implements VectorStore  ← SAME contract   │
-  │  (buffr/src/pg-vector-store.ts:19)                        │
-  │  wired in:  const store = new PgVectorStore({...})        │
-  │  (buffr/src/session.ts:41)                                │
+  ┌─ QUALITY (does RAG return the right thing?) ─────────────┐
+  │  precision@k / recall@k over a small REAL corpus          │
+  │  rubric-judge score on grounded answers                   │
   └────────────────────────────────────────────────────────────┘
-
-  swap cost = one line: which VectorStore you new up.
-  no rewrite of the RAG pipeline, the agent, or the eval harness.
+  ┌─ REUSE (is the substrate actually reusable?) ────────────┐
+  │  one-line VectorStore swap verified across TWO repos       │
+  │  clean-clone `npm install` builds in buffr                 │
+  └────────────────────────────────────────────────────────────┘
 ```
 
-▸ **What it measures, concretely:**
-  1. `PgVectorStore implements VectorStore` — the swap is satisfying one
-     contract, not forking the pipeline. **Verified** (file:line above).
-  2. **Clean-clone build:** `npm install @rlynjb/aptkit-core` in a fresh
-     buffr checkout builds and runs RAG against Supabase/pgvector.
-▸ **Why it's load-bearing:** if this fails, the substrate is a single-app
-  library wearing a contract costume, and the skeptic's "just adopt
-  LangChain" wins retroactively. This metric is the build decision's
-  scoreboard.
+## The three success metrics
 
-┃ The strongest in-repo confirmation arrived *before* buffr: `@aptkit/memory`
-┃ reuses the same `EmbeddingProvider`/`VectorStore` contracts with zero new
-┃ infrastructure (`remember` = index path, `recall` = query path). A second
-┃ consumer of the contract existed inside aptkit itself — buffr's
-┃ `PgVectorStore` is the cross-repo confirmation on top.
-
----
-
-## The feedback loop — how the metrics stay honest
-
-The metrics aren't a one-time report card. They run on a replay-centric
-loop that turns a live run into a regression baseline.
+### Metric 1 — retrieval quality: precision@k / recall@k over a small real corpus
 
 ```
-  Replay-centric feedback loop (context.md: the testing/observability backbone)
-
-  ┌─ live run ──┐   ┌─ artifact ──┐   ┌─ eval ──────────────┐
-  │ agent loop  │──►│ JSON trace  │──►│ structural-diff /   │
-  │ emits NDJSON│   │ + output    │   │ detection /         │
-  │ trace       │   │ (artifacts/ │   │ rubric-judge /      │
-  └─────────────┘   │  replays/)  │   │ precision@k         │
-        ▲           └─────────────┘   └──────────┬──────────┘
-        │                                        │ promote
-        │           ┌─ deterministic replay ─────▼──────────┐
-        └───────────│ FixtureModelProvider replays recorded │
-          regression│ ModelResponse[] → same eval, no model │
-          guard     │ calls (promoted fixtures = baselines) │
-                    └────────────────────────────────────────┘
+  WHAT YOU RUN                          WHAT YOU READ
+  ─────────────                          ─────────────
+  scorePrecisionAtK(ranked, relevant)  → precision@k  (0..1)
+  scoreRecallAtK(ranked, relevant)     → recall@k     (0..1)
+  over a SMALL, REAL corpus              trend across runs, not
+  (not a synthetic benchmark)            an absolute target
 ```
 
-▸ A good run gets **promoted to a fixture** — a frozen correctness baseline
-  (`fixtures/promoted/*.json`). Replaying it later, deterministically,
-  catches regressions without spending model calls.
-▸ This closes the loop: metric 1 and 2 don't drift silently, because the
-  promoted fixture re-runs the same scorers on the same recorded responses.
+- **EVIDENCE:** the scorers exist and are the published surface — `scorePrecisionAtK` / `scoreRecallAtK` in `packages/evals/src/precision-at-k.ts`. The corpus is deliberately small and real (`02` in-scope trims).
+- **What "success" means here:** retrieval ranks relevant chunks above irrelevant ones, *measurably*, so a regression shows up as a number dropping — not as a user complaint that never comes (there are no users). **No target number is invented**; the metric is the *instrument*, and the success criterion is that the instrument exists and the number is tracked across runs.
 
-**Known loop gap (honest):** `rubric-improvement` has no `replay:promoted`
-script wired into the root pipeline (context.md notes/open items). The loop
-is real but not yet uniform across every agent.
+### Metric 2 — answer quality: rubric-judge on grounded answers
+
+```
+  WHAT YOU RUN                  WHAT YOU READ
+  ─────────────                  ─────────────
+  rubric-judge over an          → per-dimension scores +
+  agent's grounded answer         weakest dimension
+  (LLM-as-judge against          (feeds the rubric-improvement
+   an explicit rubric)            agent's next-action loop)
+```
+
+- **EVIDENCE:** `rubric-judge` in `packages/evals/src/rubric-judge.ts`; the `rubric-improvement` agent scores a subject against a rubric and emits the weakest dimension + next action (`context.md` agents). This is the qualitative complement to precision@k — precision@k says *did we retrieve right*, rubric-judge says *did we answer right*.
+
+### Metric 3 — the reuse proof: one-line VectorStore swap, two repos, clean install
+
+This is **the metric that validates the whole premise.** The other two measure quality; this one measures whether "reusable" is true.
+
+```
+  THE REUSE PROOF — observable in TWO states
+
+  state 1: THE SWAP WORKS
+  ┌──────────────────┐  same VectorStore contract  ┌──────────────────┐
+  │ aptkit           │ ──────────────────────────► │ buffr            │
+  │ InMemoryVector   │                             │ PgVectorStore    │
+  │ Store (cosine)   │  swap = ONE binding at edge │ (Supabase        │
+  │                  │  agent code UNTOUCHED        │  pgvector)       │
+  └──────────────────┘                             └──────────────────┘
+        verified by: buffr/test/pg-vector-store.test.ts passes
+
+  state 2: CLEAN-CLONE INSTALL BUILDS
+  ┌──────────────────────────────────────────────────────────┐
+  │  fresh clone → npm install @rlynjb/aptkit-core → build     │
+  │  succeeds in buffr (the standalone bundle is self-          │
+  │  contained: 16 bundledDependencies, no monorepo needed)    │
+  └──────────────────────────────────────────────────────────┘
+```
+
+- **EVIDENCE (state 1):** two implementations of one `VectorStore` contract — `InMemoryVectorStore` in `packages/retrieval/src/in-memory-vector-store.ts`, `PgVectorStore` in `/Users/rein/Public/buffr/src/pg-vector-store.ts` — with the contract at `packages/retrieval/src/contracts.ts:33`. Tested at `/Users/rein/Public/buffr/test/pg-vector-store.test.ts`.
+- **EVIDENCE (state 2):** buffr depends on `"@rlynjb/aptkit-core": "^0.4.1"` (`buffr/package.json`); the standalone tarball inlines all 16 internal packages via `bundledDependencies` (`scripts/pack-core-standalone.mjs`, `context.md` publishing).
+- **PARTIALLY OPEN (honest):** "clean-clone install builds" is the one metric the brief flags as *verify, don't assume* (`01` discovery questions). The success criterion is binary: a fresh clone + `npm install @rlynjb/aptkit-core` + build in buffr exits zero. Run it; read the exit code.
+
+## The feedback loop — how success stays true
+
+A metric without a loop decays the moment the code changes. aptkit's loop is its **replay-centric evaluation backbone**, and it's already wired.
+
+```
+  THE FEEDBACK LOOP — live run → artifact → eval → fixture → replay
+
+  ┌─ live run ─────┐   emits NDJSON trace + output
+  │ agent loop     │ ─────────────────────────────────►┐
+  └────────────────┘                                    │
+                                                        ▼
+  ┌─ artifact ─────────────────────────────────────────────┐
+  │  artifacts/replays/*.json  (output + trace + eval)       │
+  └────────────────────────────┬─────────────────────────────┘
+                               │ score it
+  ┌─ eval ─────────────────────▼─────────────────────────────┐
+  │  structural-diff · detection-scorer · rubric-judge ·      │
+  │  precision-at-k   → ReplayArtifactEvalSummary             │
+  └────────────────────────────┬─────────────────────────────┘
+                               │ promote the good ones
+  ┌─ fixture ──────────────────▼─────────────────────────────┐
+  │  fixtures/promoted/*.json  — timestamped correctness       │
+  │  baselines, replayed by FixtureModelProvider               │
+  └────────────────────────────┬─────────────────────────────┘
+                               │ replay deterministically
+  ┌─ replay ───────────────────▼─────────────────────────────┐
+  │  re-run against the baseline → regression shows as a       │
+  │  number/diff, NOT a silent drift                           │
+  └────────────────────────────────────────────────────────────┘
+```
+
+- **EVIDENCE:** this is `context.md`'s "Replay-centric evaluation" seam — live run → artifact → eval → promote to fixture → deterministic replay, named "the testing/observability backbone." The pieces: `replay-runner` + `ReplayArtifactEvalSummary` (`packages/evals`), promoted fixtures replayed by `FixtureModelProvider`, scripts `eval-replay-artifacts` / `promote-replay-to-fixture` / `replay-promoted-fixtures`.
+- **Why the loop closes the metrics:** Metric 1 (precision@k) and Metric 2 (rubric-judge) aren't run once and forgotten — they're scorers *inside* this loop, so every promoted fixture carries a baseline a future change is measured against. A drop in precision@k on replay is the regression signal that, without users, you'd otherwise never get.
+- **Honest gap in the loop:** the `rubric-improvement` agent has **no `replay:promoted` script wired into the root pipeline** while the others do (`context.md` notes). So the loop is closed for most agents and *open at one node*. Naming the open node is the metric-honesty move.
+
+## What is NOT a success metric (and why)
+
+```
+  ✗ user retention / DAU / conversion  — no users, by design
+  ✗ revenue / cost savings             — no customers; not a product
+  ✗ a third consumer existing          — >1 consumer is a non-goal (02)
+  ✗ benchmark-leading precision@k      — small REAL corpus, not a
+                                          leaderboard; trend > absolute
+```
+
+▸ The load-bearing metric is **Metric 3, the reuse proof** — it's the only one that tells you the *problem* got solved, not just that a component works. precision@k and rubric-judge can both look great while the substrate is still un-reusable. The two-repo swap is what closes the loop on the premise itself.
+
+## See also
+
+- `02-scope-cuts-and-non-goals.md` — the small-real-corpus trim behind Metric 1
+- `05-skeptical-reviewer-questions.md` — "how do you know it works with no users?" defended
+- `/Users/rein/Public/aptkit/packages/evals/src/precision-at-k.ts` — the ranked-retrieval scorers
+- `/Users/rein/Public/buffr/test/pg-vector-store.test.ts` — the reuse proof, executable

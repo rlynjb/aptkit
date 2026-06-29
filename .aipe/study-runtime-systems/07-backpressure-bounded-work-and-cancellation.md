@@ -1,231 +1,211 @@
-# Backpressure, Bounded Work, and Cancellation — the limits that keep a run finite
+# Backpressure, Bounded Work, and Cancellation
 
-**Industry name(s):** bounded work / iteration budgets · cooperative cancellation (`AbortSignal`) · backpressure · graceful shutdown · **Type:** Industry standard
+**Subtitle:** bounded loops / cooperative cancellation (the `AbortSignal`) / graceful shutdown — *the bounded agent loop* (Industry standard, project term).
 
 ## Zoom out, then zoom in
 
-This is the file where aptkit's runtime story is strongest *and* weakest. Strongest: the agent loop is rigorously bounded and cleanly cancellable — `maxTurns`, `maxToolCalls`, a forced final turn, and `signal.throwIfAborted()` threaded all the way down. Weakest: there is no backpressure, no concurrency limiter, and no graceful-shutdown handler — the bounds are on *one run's iteration count*, not on *system throughput*.
+This is where aptkit's runtime design is strongest *and* where its biggest honest gap lives. Verdict first: aptkit bounds work **within a single agent run** beautifully — a hard turn cap, a hard tool-call cap, a forced final turn, and an `AbortSignal` threaded through every await. But it does **nothing** to bound work *across* runs — no concurrency limiter, no queue, no backpressure — and it has **no graceful shutdown** (no `SIGTERM` handler). The bounds are vertical (inside one loop), not horizontal (across many loops).
 
 ```
-  Zoom out — where bounds and cancellation live
+  Zoom out — where work is bounded in the runtime
 
-  ┌─ Caller ──────────────────────────────────────────────────────────┐
-  │   passes maxTurns, maxToolCalls, signal (AbortSignal)              │
-  └──────────────────────────────────┬─────────────────────────────────┘
-  ┌─ Runtime: runAgentLoop ───────────▼─────────────────────────────────┐
-  │   ★ for turn < maxTurns ★   ★ budgetSpent check ★   ★ forceFinal ★ │ ← we are here
-  │   ★ signal?.throwIfAborted() every turn ★                          │
-  └──────────────────────────────────┬─────────────────────────────────┘
-  ┌─ Provider / tools ────────────────▼─────────────────────────────────┐
-  │   signal forwarded to fetch · gemma retry loop · structured retry    │
-  └──────────────────────────────────────────────────────────────────────┘
-
-  MISSING (not yet exercised): producer-side backpressure, p-limit
-  concurrency caps, rate limiting, SIGTERM/SIGINT graceful shutdown
+  ┌─ Capability layer ──────────────────────────────┐
+  │  agent.answer() — configures the bounds          │
+  └───────────────────────┬───────────────────────────┘
+  ┌─ Runtime layer ───────▼──────────────────────────┐
+  │  ★ runAgentLoop ★                                 │ ← THIS CONCEPT
+  │   maxTurns · maxToolCalls · forced synthesis turn │   the bounding kernel
+  │   signal.throwIfAborted() at every await          │
+  └───────────────────────┬───────────────────────────┘
+  ┌─ MISSING ─────────────▼──────────────────────────┐
+  │  no limiter · no queue · no backpressure ·        │   not yet exercised
+  │  no SIGTERM handler                                │
+  └────────────────────────────────────────────────────┘
 ```
 
-**Zoom in.** "Bounded work" means: no matter what the model does, the run terminates in a known number of steps. "Cancellation" means: a caller can stop a run in flight and have it actually stop, releasing its work. "Backpressure" means: when work arrives faster than it can be processed, the system slows the producer instead of piling up unbounded. aptkit nails the first two and doesn't attempt the third — and the honest version of this file is saying exactly which is which.
+**Zoom in.** Three mechanisms carry the bounding, all inside `runAgentLoop`: the iteration budget (you cannot loop forever), the forced final synthesis turn (the model is *made* to answer when the budget runs out), and cooperative cancellation (a caller can stop the loop mid-flight). The most load-bearing is the forced synthesis turn — it's what turns "budget exhausted" from a thrown error into a useful answer. The biggest surprise is that cancellation is wired everywhere but *shutdown* is wired nowhere — and that's a deliberate consequence of aptkit being a library, not a service.
 
-## Structure pass
+## The structure pass
 
-Trace the **control** axis on termination — what *forces* a run to end?
+Trace the axis **"what stops this work?"** across the levels.
 
 ```
-  Axis: "what makes this run stop?" — the termination conditions
+  One axis — "what stops the work?" — by level
 
-  ┌──────────────────────────────────────────────────────────┐
-  │ model returns text with no tool calls                      │  → natural finish
-  │   (run-agent-loop.ts:132 — toolUses.length === 0)          │     (the common case)
-  └───────────────────┬────────────────────────────────────────┘
-      ┌───────────────▼────────────────────────────────────────┐
-      │ turn === maxTurns - 1  OR  budgetSpent                   │  → forced final turn:
-      │   (run-agent-loop.ts:101-102)                            │     tools stripped, must answer
-      └───────────────┬────────────────────────────────────────┘
-          ┌───────────▼────────────────────────────────────────┐
-          │ signal.throwIfAborted() (run-agent-loop.ts:99)       │  → caller cancelled:
-          │                                                      │     throws, unwinds the loop
-          └────────────────────────────────────────────────────┘
+  ┌─ within one turn ────────────┐   the AbortSignal
+  │  signal.throwIfAborted()      │   → caller cancels → loop throws, unwinds
+  └──────────────┬─────────────────┘
+  ┌─ across turns (one run) ─────┐   maxTurns / maxToolCalls + forced synthesis
+  │  the for-loop budget          │   → budget hit → final answer forced
+  └──────────────┬─────────────────┘
+  ┌─ across runs (the system) ───┐   NOTHING — no limiter, no queue
+  │  concurrency control          │   → unbounded; nothing throttles parallel runs
+  └───────────────────────────────┘
+  ┌─ process lifetime ───────────┐   NOTHING — no SIGTERM handler
+  │  graceful shutdown            │   → in-flight work not drained on stop
+  └───────────────────────────────┘
 ```
 
-The load-bearing seam: **the boundary between "the model decides to stop" and "the loop forces it to stop."** A naive agent loop trusts the model to eventually answer — and a model that keeps requesting tools forever runs forever. aptkit's loop removes that trust: at `maxTurns - 1` (or when the tool budget is spent), it strips the tools and demands an answer. That's the single most important bounded-work mechanism in the repo, and it's the part people forget when they build an agent loop from scratch.
+Two seams flip the axis:
+
+- **Seam 1 — "one run" → "many runs."** Inside a run, work is rigorously bounded. Across runs, there's no bound at all — fire a thousand `agent.answer()` calls and a thousand loops run, each making its own `fetch`es, with nothing to limit concurrency. The flip is **bounded → unbounded**. → this is the backpressure gap.
+- **Seam 2 — "running" → "stopping."** A *caller* can cancel a run via the signal, but the *process* can't stop a run on `SIGTERM` because nobody listens for it. The flip is **caller-cancellable → not-process-cancellable**. Both gaps trace to the same root: aptkit doesn't own the process or the dispatch (`01-runtime-map.md`).
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know a `for` loop with a hard counter can't run forever, and you know an `AbortController` lets you cancel a `fetch`. aptkit's loop is exactly those two primitives, composed: a counter-bounded loop where every iteration first checks an abort signal. The twist is the *forced final turn* — the loop doesn't just stop at the limit, it changes the model's options on the last turn so the run produces a usable answer instead of a dangling tool request.
+You've built the safe version of this without naming it: a retry loop with `for (let i = 0; i < maxRetries; i++)` instead of `while (true)`. The bound is the `maxRetries`. An agent loop is the same shape with higher stakes — a confused model can ask for "one more search" indefinitely, so the loop *must* have a hard ceiling, and it must have a plan for what happens when the ceiling is hit. The plan can't be "throw" (you'd have nothing to show the user); it has to be "make the model answer now."
 
 ```
-  The bounded agent loop — the kernel
+  The bounded-loop kernel — budget + escape + cancellation
 
-  for turn in 0 .. maxTurns-1:
-      if signal aborted: THROW                  ← cancellation: bail now
-      forceFinal = (turn == last) OR (tool budget spent)
-      response = await model.complete(
-          tools = forceFinal ? NONE : toolSchemas  ← strip tools on final turn
-      )
-      if response has no tool calls: finalText = text; BREAK   ← natural finish
-      run the tool calls, append results, loop
-
-  guarantees: terminates in ≤ maxTurns iterations,
-              always with finalText (the forced turn ensures it)
+        ┌─ for turn = 0 .. maxTurns ──────────────────────┐
+        │  signal.throwIfAborted()   ← caller can stop here │
+        │  budgetSpent = toolCalls >= maxToolCalls          │
+        │  forceFinal = lastTurn OR budgetSpent             │
+        │       │                                           │
+        │  if forceFinal: strip tools, add synthesis nudge  │ ← the escape
+        │  call model                                       │
+        │  no tool calls? → finalText, break                │
+        │  else run tools, loop                             │
+        └───────────────────────────────────────────────────┘
 ```
 
-The strategy: **make the loop's termination independent of the model's cooperation** — a hard turn cap plus a forced answer-only final turn means the run ends and produces output no matter how the model behaves.
+Named by what breaks if each part is removed:
+- **`maxTurns` / `maxToolCalls`** — remove the budget and a model that keeps emitting tool calls loops forever, burning tokens and never returning. This is the non-termination bug the budget exists to kill.
+- **The forced synthesis turn** — remove it and the loop *terminates* at the budget but returns empty or half-finished text, because the model's last act was asking for more data, not answering. This is the most-forgotten part and the most load-bearing.
+- **`signal.throwIfAborted()`** — remove it and a cancelled request keeps running to completion anyway, wasting work and (worse) the model spend the caller tried to stop.
 
-### Move 2 — the bounds, the cancellation, and the gaps
+### Move 2 — the three mechanisms, walked
 
-**The hard turn cap.** `run-agent-loop.ts:98` with the default at `:87`:
+**The iteration budget — two ceilings, checked every turn.** The loop computes whether the budget is spent on each pass:
 
 ```ts
-const { maxTurns = 8, /* ... */ } = options;
-for (let turn = 0; turn < maxTurns; turn += 1) {
-  // ...
+// packages/runtime/src/run-agent-loop.ts:98-109
+for (let turn = 0; turn < maxTurns; turn += 1) {       // ceiling 1: turns
+  signal?.throwIfAborted();
+  const budgetSpent = maxToolCalls !== undefined && toolCalls.length >= maxToolCalls;  // ceiling 2
+  const forceFinal = turn === maxTurns - 1 || budgetSpent;
+  const response = await model.complete({
+    system: forceFinal && synthesisInstruction ? `${system}\n\n${synthesisInstruction}` : system,
+    messages,
+    tools: forceFinal ? undefined : toolSchemas,        // ← tools STRIPPED on final
+    maxTokens,
+    signal,
+  });
+```
+
+Each agent picks its own numbers: rag-query `6/4` (`rag-query-agent.ts:75-76`), query and monitoring `8/6` (`query-agent.ts:94-95`, `monitoring-agent.ts:76-77`), recommendation `6/4`, rubric `6/3`. Two independent ceilings: even if `maxTurns` isn't reached, hitting `maxToolCalls` flips `forceFinal`. The loop *cannot* run past `maxTurns` iterations, full stop.
+
+**The forced synthesis turn — the escape that produces an answer.** This is the mechanic to spotlight. When `forceFinal` is true, two things change in the model call: `tools: forceFinal ? undefined : toolSchemas` *removes the tools entirely*, and the system prompt gets the synthesis instruction appended. The model literally cannot call a tool — there are none in the request — so it must produce text.
+
+```ts
+// packages/runtime/src/run-agent-loop.ts:72-74  (the nudge)
+export function buildSynthesisInstruction(middle: string): string {
+  return `You have NO more tool calls available. ${middle} Do not say you need more queries.`;
 }
+// rag-query-agent.ts:77-79 supplies the middle:
+//   'Now answer the question directly and concisely, citing the sources you retrieved.'
 ```
 
-Eight turns, default. The loop variable is the bound — nothing the model returns can extend it. The recommendation agent overrides this to 6 (per the package's loop config). This is the floor of bounded work: a finite, caller-controlled iteration budget.
+```
+  Execution trace — the budget driving to a forced answer (rag-query, maxToolCalls 4)
 
-**The tool-call budget.** `run-agent-loop.ts:101`:
-
-```ts
-const budgetSpent = maxToolCalls !== undefined && toolCalls.length >= maxToolCalls;
-const forceFinal = turn === maxTurns - 1 || budgetSpent;
+  turn 0:  forceFinal? no  → tools offered → model calls search (toolCalls=1)
+  turn 1:  forceFinal? no  → tools offered → model calls search (toolCalls=2)
+  turn 2:  forceFinal? no  → model calls search (toolCalls=3)
+  turn 3:  forceFinal? no  → model calls search (toolCalls=4)
+  turn 4:  budgetSpent! (4>=4) → forceFinal → tools STRIPPED + synthesis nudge
+           → model has no tools → MUST answer → finalText, loop ends
 ```
 
-A second, finer bound: even within the turn limit, once the run has made `maxToolCalls` total tool calls, the next turn is forced final. This caps *work* (tool executions, each potentially an HTTP call or a scan) independently of turn count — a single turn could request many tools, so bounding turns alone wouldn't bound tool work.
+This is why the budget is safe to set low: hitting it doesn't fail, it *forces a grounded answer from what's already retrieved*. The belt-and-suspenders backup is the recovery turn (`run-agent-loop.ts:192-228`): if `parseResult` still returns null after the loop, one more isolated call runs with a "conclude now, output only the structured answer" system prompt. Two layers ensuring the loop always yields something usable.
 
-**The forced final synthesis turn — the load-bearing mechanic.** `run-agent-loop.ts:103-109`:
-
-```ts
-const response = await model.complete({
-  system: forceFinal && synthesisInstruction ? `${system}\n\n${synthesisInstruction}` : system,
-  messages,
-  tools: forceFinal ? undefined : toolSchemas,   // ← tools stripped when forced
-  maxTokens,
-  signal,
-});
-```
-
-When `forceFinal` is true, two things change: the tool schemas are withheld (`tools: undefined`), so the model *can't* request a tool — it has to produce text — and a synthesis instruction is appended to the system prompt (`buildSynthesisInstruction`, `:72`: "You have NO more tool calls available. … Do not say you need more queries."). This is what turns "the loop hit its limit" into "the loop produced an answer." Without it, a run that exhausted its budget mid-investigation would return whatever half-formed text was last emitted, or empty. Name this in an interview — it's the part of a bounded agent loop people routinely forget to build.
+**Cooperative cancellation — the signal threaded end to end.** A caller passes an `AbortSignal`; aptkit checks it at every await boundary so a cancel takes effect promptly instead of after the current model call finishes.
 
 ```
-  Forced final turn — the difference it makes
+  Layers-and-hops — the AbortSignal threaded through one turn
 
-  WITHOUT forced final:           WITH forced final (aptkit):
-  turn maxTurns-1: model says       turn maxTurns-1: tools stripped +
-   "let me search again" (tool)      synthesis instruction →
-  loop ends → finalText = ""         model MUST answer with text
-  → useless empty result             → usable grounded answer
+  ┌─ caller ─────────┐  passes signal
+  │  controller.abort()│ ───────────────────────────────────────┐
+  └───────────────────┘                                         │
+  ┌─ runAgentLoop ───┐  throwIfAborted() at loop top (:99) ◄─────┤
+  │  await model ─────┼─► provider: throwIfAborted() (gemma :53,:63)
+  │                   │   fallback :52 · context-guard :58       │
+  │  await callTool ──┼─► registry: throwIfAborted() (:55) ──────┤
+  │                   │   embedder: throwIfAborted() (:51)        │
+  └───────────────────┘   ndjson stream: throwIfAborted() (:112,:123)
 ```
 
-**Cooperative cancellation via `AbortSignal`.** Threaded top to bottom. At the loop top, `run-agent-loop.ts:99`:
+The pattern is uniform: `signal?.throwIfAborted()` at the top of the turn loop (`run-agent-loop.ts:99`), again inside every provider before and after the network call, inside the tool registry, the embedder, and the NDJSON decoder. The signal is even *forwarded into `fetch`* (`gemma-provider.ts:73`, `ollama-embedding-provider.ts:55`), so an abort tears down the in-flight HTTP request itself, not just the JS loop around it. And abort is distinguished from real failures: the fallback provider re-throws an abort instead of trying the next provider (`fallback-provider.ts:65`), and structured-generation re-throws it instead of returning a failure result (`structured-generation.ts:76`). That's correct — a cancellation isn't a provider failure to recover from.
 
-```ts
-for (let turn = 0; turn < maxTurns; turn += 1) {
-  signal?.throwIfAborted();        // ← checked before every model call
-```
-
-The signal is forwarded into `model.complete({ ..., signal })` (`:108`) and into `tools.callTool(..., { signal })` (`:159`). So an abort interrupts the run at the next checkpoint: either between turns (the explicit `throwIfAborted`) or inside an in-flight `fetch` (the signal aborts the HTTP request itself, since it's passed to `fetch` at `gemma-provider.ts:204`). Providers respect it too — the fallback chain re-throws abort errors immediately rather than treating them as a provider failure to retry (`fallback-provider.ts:65`), and structured generation does the same (`structured-generation.ts:76`). This is *cooperative* cancellation: nothing is forcibly killed; the code checks the signal at known points and unwinds cleanly when it's set.
+**The gaps — backpressure and shutdown.** Here's the honest part:
 
 ```
-  Cancellation — cooperative, checked at known points
+  Comparison — what's bounded vs. what isn't
 
-  caller: controller.abort()
-            │ sets signal.aborted = true
-            ▼
-  loop top: signal.throwIfAborted() ──► THROWS between turns
-  in-flight fetch: signal passed to fetch ──► HTTP request aborts mid-flight
-  providers: isAbortError(e) ──► re-throw immediately, don't retry/fallback
-
-  result: the run stops at the next checkpoint, no orphaned retries
+  BOUNDED (within a run)              NOT BOUNDED (across runs / lifetime)
+  ─────────────────────               ────────────────────────────────────
+  maxTurns ≤ 8           ┐            concurrency limiter      → none
+  maxToolCalls           ├ present     queue / backpressure     → none
+  forced synthesis turn  │            SIGTERM/SIGINT handler   → none
+  AbortSignal everywhere ┘            in-flight drain on stop   → none
 ```
 
-**The retry loops are themselves bounded.** Gemma's tool-call retry (`gemma-provider.ts:62`, `maxToolCallAttempts` default 2) and `generateStructured`'s validation retry (`structured-generation.ts:62`, `maxAttempts` default 2) are both hard-capped `for` loops. So even the error-recovery paths can't spin — a model that keeps emitting malformed JSON gets retried a fixed number of times, then the run gives up with a recorded error. Bounded work all the way down.
-
-**What's NOT here — and when it'd matter.** Three real concerns the repo doesn't exercise:
-
-- **Producer-side backpressure / concurrency limiting.** There's no queue, no `p-limit`, no semaphore. If a caller fired 1,000 `runAgentLoop` calls at once, all 1,000 would be in flight simultaneously, all hitting Ollama/the cloud at once — nothing throttles them. The bounds are *per-run* (turns, tool calls), not *system-wide* (concurrent runs). This is `not yet exercised`: it becomes relevant the moment aptkit is embedded in a server taking concurrent requests (buffr's job). The fix is a concurrency limiter at the call site, not inside the loop.
-- **Rate limiting / deadlines.** No wall-clock timeout on a run (only the turn count bounds it), and no rate limiter on outbound model calls. A run with slow tools could take arbitrarily long in wall-clock time even within 8 turns. `not yet exercised` — a deadline would be an `AbortSignal.timeout(ms)` passed in, which the existing cancellation plumbing already supports for free. That's the nice part: the cancellation machinery is *already* deadline-ready; nobody's wired a timeout to it yet.
-- **Graceful shutdown.** No `process.on('SIGTERM')` / `process.on('SIGINT')` anywhere. A `kill` mid-run drops the run with no drain, no flush of in-flight traces, no cleanup. `not yet exercised` and arguably correct for a library — graceful shutdown is the *host process's* responsibility (buffr), and the host has the `AbortSignal` plumbing to drive it: on SIGTERM, abort the in-flight runs' signals and let the cooperative cancellation unwind them.
+There is **no concurrency limiter and no queue** — nothing stops a caller from launching arbitrarily many `runAgentLoop`s at once, each opening its own Ollama `fetch`. Backpressure (slowing intake when downstream is saturated) is `not yet exercised`. And there is **no `SIGTERM`/`SIGINT` handler** in any product package — on process stop, in-flight runs are killed mid-await with no draining. Both gaps are real, and both are deliberate: aptkit doesn't own the process or the request dispatch, so the limiter, the queue, and the shutdown handler belong to the consumer (buffr). The cancellation primitive aptkit *does* provide (`AbortSignal`) is exactly the hook a graceful shutdown would use — buffr would abort in-flight signals on `SIGTERM`. aptkit built the cooperative half; the process-owning half is buffr's.
 
 ### Move 3 — the principle
 
-Bounded work and cancellation are two halves of the same discipline: a long-running operation must terminate by *limit* even if it never terminates by *success*, and a caller must be able to revoke it in flight. aptkit gets both right at the unit of one run — the hard turn cap and tool budget guarantee termination, the forced final turn guarantees a usable result at the limit, and `AbortSignal` threaded to every `await` makes cancellation actually stop the work. What it doesn't do is bound the *system*: there's no backpressure, because aptkit is a library and throughput control belongs to whatever embeds it. The clean separation is the lesson — bound the algorithm inside the library, bound the throughput at the deployment, and use the same `AbortSignal` primitive to bridge them (a server's shutdown or per-request deadline becomes an abort the library already knows how to honor).
+Any loop driven by a model needs a hard budget *and* a defined terminal behavior — the budget alone prevents non-termination, but only the forced-final turn turns "budget hit" into "useful answer." That's the transferable lesson: bounding work isn't just "stop at N," it's "stop at N *with a plan for what to return*." And cancellation should be cooperative and pervasive — a signal checked at every await — so it's prompt and so it tears down I/O, not just JS. The backpressure and shutdown gaps teach the inverse: a library bounds *its own* work but can't bound the *system's* work or own the process; those bounds live with whoever owns the lifecycle.
 
 ## Primary diagram
 
-The complete bounding-and-cancellation picture: per-run bounds and cancellation present, system-wide controls absent.
-
 ```
-  aptkit bounded work + cancellation — complete
+  Bounded work and cancellation in aptkit — complete
 
-  ┌─ PER-RUN BOUNDS (present, rigorous) ─────────────────────────────────┐
-  │  for turn < maxTurns (default 8)        ← hard iteration cap          │
-  │  budgetSpent: toolCalls >= maxToolCalls ← hard work cap               │
-  │  forceFinal → tools stripped + synthesis instruction                 │
-  │             → guarantees a usable answer at the limit ★              │
-  │  retry loops (gemma 2x, structured 2x)  ← bounded recovery           │
-  └────────────────────────────────────────────────────────────────────────┘
-  ┌─ CANCELLATION (present, cooperative) ─────────────────────────────────┐
-  │  signal.throwIfAborted() every turn → bail between turns              │
-  │  signal → fetch → aborts in-flight HTTP                               │
-  │  providers re-throw abort errors (no retry/fallback on cancel)        │
-  │  ALREADY deadline-ready: AbortSignal.timeout would just drop in       │
-  └────────────────────────────────────────────────────────────────────────┘
-  ┌─ NOT YET EXERCISED (system-wide controls) ────────────────────────────┐
-  │  ✗ backpressure / p-limit / semaphore  → host's job (buffr)           │
-  │  ✗ rate limiting / wall-clock deadline → wire to existing AbortSignal │
-  │  ✗ SIGTERM/SIGINT graceful shutdown    → host aborts run signals      │
-  └────────────────────────────────────────────────────────────────────────┘
+  ┌─ runAgentLoop (the bounding kernel) ──────────────────────────┐
+  │  for turn 0..maxTurns:                                         │
+  │    signal.throwIfAborted()  ◄── caller cancels (cooperative)   │
+  │    budgetSpent = toolCalls >= maxToolCalls                     │
+  │    forceFinal  = lastTurn OR budgetSpent                       │
+  │       │                                                        │
+  │    forceFinal → STRIP tools + synthesis nudge → model MUST     │
+  │                 answer ──────────────────────► finalText       │
+  │    else → run tools, loop                                      │
+  │  (+ recovery turn if parse still fails)                        │
+  └───────────────────────────────┬────────────────────────────────┘
+                                   │ signal forwarded into fetch
+                          ┌────────▼─────────┐
+                          │ Ollama (abort     │  in-flight request torn down
+                          │ tears down socket)│
+                          └───────────────────┘
+
+  NOT IN APTKIT (consumer/buffr's job): concurrency limiter,
+  queue/backpressure, SIGTERM handler, in-flight drain.   ← not yet exercised
 ```
 
 ## Elaborate
 
-The forced-final-turn pattern is specific to agent loops and is the thing that separates a toy loop from a production one: an LLM, left to its own devices, will sometimes never decide it's done, so the loop must impose termination *and* coerce a final answer rather than just halting. `AbortSignal` is the web/Node standard for cooperative cancellation — the same primitive `fetch`, `setTimeout`'s `AbortSignal.timeout`, and event listeners all accept — which is why aptkit threading it everywhere means deadlines and shutdown are "wire it up," not "build it." The missing pieces — backpressure, rate limiting, concurrency caps — are deliberately out of scope for a library: they're throughput concerns that depend on the deployment (how many cores, what rate limits the cloud provider imposes, how many concurrent users), and baking them into the loop would couple the library to a deployment it's designed not to assume. See `study-distributed-systems` for backpressure and queueing across processes, `study-performance-engineering` for throughput measurement, and `02` for why no concurrency limiter is needed inside a single-threaded loop (the limit there is the event loop itself).
+The bounded agent loop with a forced synthesis turn is the canonical safe shape for any LLM-driven control flow — it's the agent-systems version of "never write `while(true)` without a break condition you can prove is reached." The forced-final turn is the part most implementations forget, and it's why naively-built agents either loop forever or return half-thoughts. Cancellation via `AbortSignal` is the web-platform standard (the same object that cancels a `fetch` or a DOM event listener), threaded here through the whole call tree the way `context.Context` is in Go — a single token that propagates "stop now" everywhere. The missing pieces — a limiter (think a semaphore capping concurrent runs), a queue with backpressure, and a `SIGTERM` drain — are exactly the operational scaffolding a *service* adds around a library; their absence is the correct boundary for aptkit and the correct to-do for buffr. → `study-distributed-systems` for partial-failure handling across runs, `study-performance-engineering` for where a limiter protects throughput.
 
 ## Interview defense
 
-**Q: What stops `runAgentLoop` from running forever?**
+**Q: What stops aptkit's agent loop from running forever?**
+Two hard ceilings checked every turn — `maxTurns` (≤ 8) and `maxToolCalls` — plus a forced synthesis turn. When either budget is hit, the loop strips the tools out of the model request and appends a "you have no more tool calls, answer now" instruction, so the model *can't* ask for more data and must produce a grounded answer. The budget prevents non-termination; the forced turn makes termination *useful*.
 
 ```
-  three independent bounds:
-    1. for turn < maxTurns (default 8)     ← hard iteration cap
-    2. budgetSpent: toolCalls >= maxToolCalls ← hard work cap
-    3. forceFinal on the last turn: tools STRIPPED + synthesis prompt
-       → model can't request another tool, MUST answer ★
-  → terminates in ≤ maxTurns AND always produces finalText
+  budget hit → strip tools + synthesis nudge → model must answer (not error out)
 ```
+*Anchor: bounding work means "stop at N *with a plan for what to return*," not just "stop."*
 
-Anchor: "The hard turn cap guarantees termination; the forced final turn — strip the tools, demand an answer — guarantees the run ends with a usable result, not a dangling tool request. That's the mechanic people forget when they build an agent loop."
-
-**Q: How does cancellation work, and could you add a per-run deadline?**
-
-```
-  AbortSignal threaded to every await:
-    loop top: signal.throwIfAborted()  ← bail between turns
-    fetch + tools get the signal       ← abort in-flight I/O
-    providers re-throw abort (no retry on cancel)
-  deadline: pass AbortSignal.timeout(ms) as the signal —
-            the cancellation plumbing already honors it, zero new code
-```
-
-Anchor: "Cancellation is cooperative `AbortSignal` checked at every await — and because it's already plumbed everywhere, a deadline is just `AbortSignal.timeout` passed in; nobody's wired it yet but the machinery's there."
-
-**Q: Is there backpressure?**
-
-```
-  no — and that's deliberate. bounds are per-run (turns, tool calls),
-  not system-wide (concurrent runs). no queue, no p-limit, no rate limit.
-  throughput control belongs to the host (buffr), bridged via the same
-  AbortSignal (SIGTERM → abort in-flight signals → cooperative unwind)
-```
-
-Anchor: "No backpressure inside the library — that's a deployment concern; the library bounds the algorithm, the host bounds the throughput, and `AbortSignal` bridges them."
+**Q: How does cancellation work, and what's missing?**
+Cooperative `AbortSignal`, threaded through every await — the loop, every provider, the tool registry, the embedder, the NDJSON stream — and forwarded into the `fetch` itself, so an abort tears down the live HTTP request. Aborts are distinguished from failures (the fallback chain re-throws them instead of retrying). What's missing: no `SIGTERM` handler and no concurrency limiter or queue. Those are deliberate — aptkit is a library and doesn't own the process or the dispatch; buffr does, and it'd use aptkit's `AbortSignal` to drain in-flight runs on shutdown.
 
 ## See also
 
-- `02-processes-threads-and-tasks.md` — why no concurrency limiter is needed inside the single-threaded loop
-- `03-event-loop-and-async-io.md` — the await points where `throwIfAborted` interrupts the run
-- `study-distributed-systems` — backpressure and queueing once work crosses process boundaries (buffr)
-- `study-performance-engineering` — throughput and latency measurement
+- `01-runtime-map.md` — why aptkit doesn't own the process (the root of both gaps)
+- `02-processes-threads-and-tasks.md` — the task fan-out a limiter would bound
+- `03-event-loop-and-async-io.md` — the awaits where the signal is checked
+- `study-distributed-systems` — partial failure and coordination across runs
+- `study-performance-engineering` — throughput and where a limiter protects it

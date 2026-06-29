@@ -1,292 +1,183 @@
-# Error recovery in agents
+# Error Recovery in Agents
+*Error recovery in agents · bounded failure handling (Industry standard)*
 
-**Subtitle:** Agent error handling / robustness · bounded loop + tolerant tools · *Industry standard*
+An agent loop has more ways to go wrong than a function call, and the difference between a demo and a production agent is whether every one of them has a defined exit. aptkit's recovery isn't one mechanism — it's a *table* of failure modes, each with a specific handler, spread across the loop and the provider. A tool throws? The error goes back to the model as an observation. The loop runs long? A hard `forceFinal` stops it. The model emits junk JSON? A retry nudge re-prompts. The model says nothing? A fallback answer. The caller cancels? `throwIfAborted`. Five failure modes, five handlers, all bounded.
+
+The one people forget — and the one an interviewer will dig for — is the **hard iteration budget**. There's no clever loop-detection here. aptkit does *not* notice the model calling the same tool with the same args three turns running. The only thing standing between you and an infinite loop is a counter: `maxTurns` and `maxToolCalls`. Blunt, but it's the safety net that always catches, and naming its bluntness honestly is the whole point.
 
 ## Zoom out, then zoom in
 
-Agents fail in more ways than chains — the model loops, a tool errors, the model
-emits a bad call, the loop never terminates. aptkit's recovery lives in two places:
-the bounded agent loop (which caps the failure), and the search tool (which
-tolerates a weak model's bad arguments). This file is also where the repo's
-signature bug lives.
+Map each failure mode to where it's caught. Some land in the loop, some in the provider.
 
 ```
-  Zoom out — where recovery sits
-
-  ┌─ Agent loop (run-agent-loop.ts) ───────────────────────────┐
-  │  ★ maxTurns / maxToolCalls / forced synthesis / recovery ★ │ ← cap the failure
-  └───────────────────────────┬─────────────────────────────────┘
-                              │ callTool
-  ┌─ Tools ───────────────────▼─────────────────────────────────┐
-  │  search_knowledge_base: ★ minTopK floor + tolerant filter ★  │ ← tolerate bad args
-  └──────────────────────────────────────────────────────────────┘
+Failure-mode table → aptkit's real handler
+┌──────────────────────────┬──────────────────────────────────────────────┐
+│ FAILURE                  │ HANDLER (where)                                │
+├──────────────────────────┼──────────────────────────────────────────────┤
+│ tool throws              │ catch → result becomes an OBSERVATION  (loop)  │
+│ loop runs too long       │ forceFinal hard stop: tools off + synth (loop)★│
+│ invalid tool-call JSON   │ RETRY_NUDGE re-prompt              (gemma prov) │
+│ empty final output       │ FALLBACK_ANSWER                    (agent)     │
+│ caller cancels           │ signal.throwIfAborted()            (loop)      │
+├──────────────────────────┼──────────────────────────────────────────────┤
+│ repeated identical call  │ NOT DETECTED — only the hard budget stops it  │
+└──────────────────────────┴──────────────────────────────────────────────┘
 ```
 
-Now zoom in. The interesting recovery here isn't "catch the exception" — it's the
-two failure modes a *weak local model* creates that a strong model wouldn't, and
-the specific guards aptkit added after hitting them in practice. One of them (the
-hallucinated filter) is the clearest "I built this and it broke in a way I had to
-diagnose" story in the codebase.
+The ★ is the backstop that catches everything the others miss, including the un-handled repeated-call case. Every other handler is a *graceful* recovery; the budget is the *guaranteed* one. A production agent needs both — the graceful ones keep quality up, the hard one keeps you from a runaway bill.
 
 ## Structure pass
 
-**Layers.** Loop (bounds turns/calls) → tool registry (runs tools, catches errors)
-→ individual tool (guards its own inputs).
+Trace **failure** through one turn and watch where each mode exits.
 
-**Axis — failure containment.** Where does a failure get contained? Trace it: a
-tool *exception* is caught in the loop and passed back to the model as an
-observation (`run-agent-loop.ts:163`); a *runaway loop* is contained by
-`maxTurns`/`maxToolCalls`; a *bad argument* is contained inside the tool itself
-(`matchesFilter`, `minTopK`). Each failure is contained at the lowest layer that
-can see it.
+A turn opens with cancellation: `signal?.throwIfAborted()` (`run-agent-loop.ts:99`). If the caller aborted, the loop throws here — clean exit, no partial work charged forward.
 
-**Seam.** `tools.callTool(name, args)` (`run-agent-loop.ts:159`). On one side the
-loop, which never trusts a call to succeed; on the other the tool, which never
-trusts its args. Both sides assume the other can be wrong — that mutual distrust
-is the recovery design.
+Then the budget check sets the tone for the whole turn: `forceFinal = turn === maxTurns - 1 || budgetSpent` (`:101-102`). If this is the last turn or the tool budget is spent, the turn runs *without tools* and *with* a synthesis instruction — failure-by-exhaustion is pre-empted into a forced answer.
+
+Inside tool dispatch, a thrown tool is caught and *converted*, not propagated: the `catch` at `:163-168` packs the error message into a `tool_result` with `isError: true`. The failure becomes data the model observes next turn — the model can read "that tool failed" and try another path. That's the seam: a tool failure doesn't crash the loop, it *re-enters as an observation*.
+
+The invalid-JSON mode never reaches the loop at all — it's caught one layer down in the Gemma provider's retry loop. And the empty-output mode is caught one layer *up*, in the agent's `finalText.trim() || FALLBACK_ANSWER`. Failure handling is layered: provider, loop, agent.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-Think of the agent loop like a `for` loop with a hard iteration cap and a
-try/catch around the body — because a model deciding its own steps is exactly a
-loop whose termination you don't control. You add the cap so it *can't* run
-forever, and the catch so one bad step doesn't kill the run.
+Every failure mode either *re-enters the loop as information* (tool error, retry nudge) or *terminates the loop safely* (budget, abort, fallback). Nothing is allowed to crash silently or spin forever.
 
 ```
-  Agent recovery — the kernel
-
-  for turn in 0..maxTurns:                  ← hard cap (can't loop forever)
-    response = model(...)
-    if no tool calls: finalText = text; break
-    for each tool call:
-      try: result = callTool(...)           ← catch → pass error to model
-      catch: result = {error}               ← model retries or picks another tool
-    if budget spent: force a final answer   ← maxToolCalls + synthesis
+The kernel: re-enter as info, or terminate safely
+  recoverable → feed back as observation → model adapts → loop continues
+  fatal/exhausted → forced answer / fallback / throw → loop ends, bounded
 ```
 
-### Move 2 — the recovery mechanisms
+### Move 2 — the moving parts
 
-**Mechanism 1 — bounded turns and tool calls.** The loop runs at most `maxTurns`
-times, and once `maxToolCalls` is spent it stops offering tools
-(`run-agent-loop.ts:101`):
+**Tool error → observation.** The dispatch wraps every `callTool` in try/catch and turns a throw into a result block. The model sees the error and can route around it.
+
+```
+callTool throws ──catch──► tool_result{ content:{error}, isError:true } ──► next turn input
+```
 
 ```ts
-const budgetSpent = maxToolCalls !== undefined && toolCalls.length >= maxToolCalls;
-const forceFinal = turn === maxTurns - 1 || budgetSpent;
-const response = await model.complete({
-  system: forceFinal && synthesisInstruction ? `${system}\n\n${synthesisInstruction}` : system,
-  messages,
-  tools: forceFinal ? undefined : toolSchemas,   // drop tools on the final turn
-  ...
-});
-```
-
-Dropping `tools` on the final turn is the trick: with no tools available, the model
-*must* produce a text answer. The rag-query agent sets `maxTurns: 6, maxToolCalls: 4`
-(`rag-query-agent.ts:75`) — generous enough for multi-step retrieval, tight enough
-to bound cost.
-
-```
-  Bounded loop — forced termination
-
-  turn 0..4: tools offered, model may search
-  budget hit (4 calls) OR turn 5: forceFinal
-       │ tools = undefined + synthesisInstruction appended
-       ▼
-  model has no tools → must answer in text → loop ends
-```
-
-**Mechanism 2 — forced synthesis.** When the loop forces a final turn, it also
-appends a synthesis instruction (`buildSynthesisInstruction`, `run-agent-loop.ts:72`):
-"You have NO more tool calls available. … Do not say you need more queries." Without
-it, a weak model on its last turn often replies "let me search again" — and there's
-no turn left. The instruction converts the dead end into an answer.
-
-```
-  Forced synthesis — convert dead-end into answer
-
-  last turn, no tools  ─►  system += "NO more tool calls; answer now; don't ask for more"
-                              │
-                              ▼
-                       model writes the final grounded answer
-```
-
-**Mechanism 3 — tool error as observation.** When a tool throws, the loop doesn't
-crash — it catches and feeds the error back to the model as a `tool_result` with
-`isError` (`run-agent-loop.ts:163`):
-
-```ts
+// packages/runtime/src/run-agent-loop.ts:158-186
 try {
   const { result, durationMs } = await tools.callTool(toolUse.name, toolUse.input, { signal });
   toolCall.result = result; resultContent = truncate(JSON.stringify(result));
 } catch (error) {
   isError = true;
-  toolCall.error = error instanceof Error ? error.message : String(error);
-  resultContent = truncate(JSON.stringify({ error: toolCall.error }));   // model SEES the error
+  const message = error instanceof Error ? error.message : String(error);
+  toolCall.error = message;
+  resultContent = truncate(JSON.stringify({ error: message }));   // ◄── error becomes data
 }
+// ...
+toolResults.push({ type: 'tool_result', toolUseId: toolUse.id, content: resultContent,
+  ...(isError ? { isError: true } : {}) });   // ◄── flagged, fed back as observation
 ```
 
-The model reads the error on its next turn and can retry or pick a different tool —
-ReAct's "observation" step doing recovery work. (Note `truncate` also caps results
-at 16k chars so a huge result can't blow the context window.)
-
-```
-  Tool error → observation
-
-  callTool throws ─► catch ─► tool_result {isError:true, content:{error}}
-                                   │ appended as a message
-                                   ▼
-                          model reads error → retry / switch tool
-```
-
-**Mechanism 4 — the hallucinated-filter bug (the signature story).** The
-`search_knowledge_base` tool accepts an optional `filter` (exact-match over chunk
-meta). A weak local model would *hallucinate* a filter key — e.g.
-`{textContains: "ORM"}` — that no chunk's meta actually has. The naive
-implementation (`hit.meta[key] === value` for every filter key) then excluded
-*every* chunk, because no chunk has a `textContains` key. Retrieval returned empty;
-the agent answered "I couldn't find anything" on a corpus that clearly had the
-answer. The fix (`search-knowledge-base-tool.ts:101`):
+**Budget exceeded → forceFinal hard stop.** The blunt backstop. On the final turn or when tool calls hit the cap, tools are stripped and a synthesis instruction forces an answer.
 
 ```ts
-function matchesFilter(hit, filter) {
-  // A filter key only EXCLUDES hits that HAVE that key with a different value.
-  // Keys absent from a chunk's meta are ignored, so a weak model's hallucinated
-  // filter (e.g. {textContains: "x"}) can't silently wipe every result.
-  return Object.entries(filter).every(
-    ([key, value]) => !(key in hit.meta) || hit.meta[key] === value
-  );
-}
+// packages/runtime/src/run-agent-loop.ts:101-109
+const budgetSpent = maxToolCalls !== undefined && toolCalls.length >= maxToolCalls;
+const forceFinal = turn === maxTurns - 1 || budgetSpent;     // ◄── hard iteration budget
+const response = await model.complete({
+  system: forceFinal && synthesisInstruction ? `${system}\n\n${synthesisInstruction}` : system,
+  messages,
+  tools: forceFinal ? undefined : toolSchemas,   // ◄── no tools → model MUST answer
+  maxTokens, signal,
+});
 ```
 
-The flip is `!(key in hit.meta) ||` — an absent key passes instead of failing. A
-real filter (`{docId: "setup.md"}`) still works because chunks *have* `docId`; a
-hallucinated key is simply ignored. The tool also over-fetches `topK * 4` when
-filtering (`:88`) so the post-filter still has candidates to return.
+The loop bound itself is the outer guarantee: `for (let turn = 0; turn < maxTurns; turn += 1)` (`:98`, default `maxTurns = 8`). It cannot run more than `maxTurns` times no matter what the model does.
 
-```
-  The filter bug and the fix
+**Invalid tool-call JSON → retry nudge.** Handled in the Gemma provider, not the loop. A malformed-but-attempted call earns a corrective re-prompt, bounded by `maxToolCallAttempts`.
 
-  model hallucinates filter {textContains:"ORM"}  (no chunk has this key)
-
-  BEFORE: every chunk lacks 'textContains' → fails equality → 0 results ✗
-  AFTER:  key absent from meta → IGNORED → real ranking survives ✓
-
-  guard: matchesFilter ignores keys no chunk carries
+```ts
+// packages/providers/gemma/src/gemma-provider.ts:62-89 (condensed)
+const messages = attempt === 0 ? baseMessages : [...baseMessages, { role: 'user', content: RETRY_NUDGE }];
+// ...
+const call = parseToolCall(raw);
+if (call) return /* tool_use */;
+if (looksLikeToolAttempt(raw)) continue;   // ◄── retry on botched JSON, up to maxToolCallAttempts
 ```
 
-**Mechanism 5 — the `minTopK` floor.** A related weak-model failure: the model
-passes `top_k: 1`, starving a multi-part question of context. The tool floors it
-(`search-knowledge-base-tool.ts:81`): `topK = Math.max(requestedTopK, minTopK)` —
-so the model can't shrink retrieval below a safe minimum.
+**Empty output → fallback answer.** Caught in the agent, above the loop. If the loop returns empty text, the agent substitutes a sane default instead of returning "".
+
+```ts
+// packages/agents/rag-query/src/rag-query-agent.ts:31, 82
+const FALLBACK_ANSWER = "I couldn't find anything in the knowledge base to answer that.";
+// ...
+return finalText.trim() || FALLBACK_ANSWER;   // ◄── never return empty
+```
+
+**Cancellation → throwIfAborted.** Checked every turn (`:99`) and passed into each tool call's `{ signal }` (`:159`). An aborted run stops at the next turn boundary.
 
 ### Move 3 — the principle
 
-Recovery in an agent is *defense in depth against a model you don't control*. Bound
-the loop so it can't run forever; force a final answer so it can't dead-end; feed
-tool errors back so one failure isn't fatal; and make tools tolerant of the bad
-arguments a weak model will pass. The hallucinated-filter fix is the lesson in
-miniature: don't trust the model's arguments to be sane — make the tool degrade to
-"ignore the nonsense" instead of "return nothing."
+Give every failure mode a defined exit, and layer them: recover gracefully where you can (errors-as-observations, retry nudges, fallbacks) and bound hard where you must (the iteration budget, the abort signal). The graceful handlers protect answer *quality*; the hard budget protects you from *cost and runaway* when the graceful ones don't fire. Never trust the model to terminate on its own.
 
 ## Primary diagram
 
 ```
-  Agent error recovery — all five mechanisms
-
-  ┌─ Agent loop ───────────────────────────────────────────────────────┐
-  │  [1] maxTurns / maxToolCalls — hard caps                            │
-  │  [2] forceFinal: drop tools + synthesisInstruction — no dead-ends   │
-  │  [3] callTool in try/catch → error becomes a tool_result observation│
-  │      (+ truncate to 16k so a big result can't blow the window)      │
-  └───────────────┬─────────────────────────────────────────────────────┘
-                  │ search_knowledge_base
-  ┌─ Tool guards ─▼─────────────────────────────────────────────────────┐
-  │  [4] matchesFilter — absent filter keys IGNORED (hallucination-safe) │
-  │  [5] minTopK — floor top_k so the model can't starve retrieval       │
-  └──────────────────────────────────────────────────────────────────────┘
+Where each failure exits — one runAgentLoop run
+┌──────────────────────────────────────────────────────────────────────────┐
+│ turn start ─► signal.throwIfAborted()        ──cancel──► THROW (clean)      │
+│        │                                                                   │
+│        ▼  forceFinal = last turn OR budgetSpent ──► tools off + synth ─► END│
+│        │                                            (hard budget backstop) │
+│        ▼  model.complete                                                   │
+│        │   invalid JSON? ──► RETRY_NUDGE (in provider, bounded) ──► retry   │
+│        ▼                                                                   │
+│   callTool ─► throws? ──catch──► tool_result{error} ──► observation, loop ↑ │
+│        │                                                                   │
+│        ▼  no tool_use ─► finalText ─► (empty? ─► FALLBACK_ANSWER) ─► END     │
+└──────────────────────────────────────────────────────────────────────────┘
+   NOT handled: repeated identical tool call — only the budget eventually stops it
 ```
 
 ## Elaborate
 
-Most agent-recovery writing assumes a strong model that mostly behaves. aptkit's
-recovery is shaped by the opposite assumption — a 9B local model that frequently
-misbehaves — which makes the guards unusually concrete and the failure modes
-unusually real. The filter bug is the kind of thing you only find by running the
-thing: retrieval "worked" (no error, returned a valid empty list) but answers were
-wrong. The fix turned a silent correctness bug into a tolerated no-op. There's also
-a structured-output recovery turn (`run-agent-loop.ts:204`, `runRecoveryTurn`) that
-re-prompts once for a clean structured answer when parsing fails. Read
-`02-tool-calling.md` for the provider-side retries and
-`05-evals-and-observability/01-eval-set-types.md` for how a bug like this becomes a
-frozen regression test.
+The honest gap, stated plainly: there is no loop-detection. If the model calls `search_knowledge_base{query:"x"}`, gets thin results, and calls `search_knowledge_base{query:"x"}` again unchanged, aptkit does nothing special — it dispatches it again, every time, until `maxToolCalls` is hit and `forceFinal` ends the run. The budget is the *only* thing that stops a stuck model. That's fine as a safety net (you never spin forever) but wasteful (you pay for the repeats). The exercise below closes exactly this gap. Also note tool cancellation is only `AbortSignal` pass-through — there's no per-tool timeout; a hung tool blocks until the caller aborts.
 
 ## Project exercises
 
-### Freeze the hallucinated-filter case as a regression test
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a unit test that indexes a small corpus, calls the search tool
-  with a hallucinated filter (`{textContains: "x"}`), and asserts the ranked
-  results survive (not empty) — locking the `matchesFilter` behavior so a refactor
-  can't reintroduce the bug.
-- **Why it earns its place:** turning a real production bug into a frozen
-  regression case is the single most credible testing story you can tell; it shows
-  the eval loop closing on a real defect.
-- **Files to touch:** `packages/retrieval/test/search-knowledge-base-tool.test.ts`,
-  reading `packages/retrieval/src/search-knowledge-base-tool.ts`.
-- **Done when:** the test fails against the naive `hit.meta[key] === value`
-  implementation and passes against the shipped `!(key in hit.meta) ||` one.
-- **Estimated effort:** `1–4hr`
+### Add repeated-identical-tool-call detection
 
-### Add a repeated-tool-call detector to the loop
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** detect when the model calls the same tool with the same args N
-  turns in a row and inject a "try a different approach" message (a recovery the
-  loop doesn't have today — it only bounds total calls).
-- **Why it earns its place:** "LLM loops on the same tool" is a named failure mode
-  the bounded counter doesn't address; handling it shows you recognize *kinds* of
-  loops, not just total count.
-- **Files to touch:** `packages/runtime/src/run-agent-loop.ts`,
-  `packages/runtime/test/`.
-- **Done when:** a fixture that repeats one call triggers the nudge before
-  `maxToolCalls` is hit.
+- **Exercise ID:** `EX-ERR-06a`
+- **What to build:** Inside the dispatch loop, hash each `(toolName, args)` pair and detect when the model issues an identical call it already made this run. On a repeat, short-circuit: return the prior result (or a "you already called this, here's what it returned" observation) instead of re-dispatching, so the model is nudged to change course before the budget runs out. This is the Phase 4 robustness rep that closes the named honest gap.
+- **Why it earns its place:** It's the documented missing piece — today only `maxToolCalls` stops a stuck model, and that's late and wasteful. Detecting the repeat early saves tool work and turns a silent spin into a corrective observation, exactly the kind of bounded-failure thinking interviewers probe.
+- **Files to touch:** `packages/runtime/src/run-agent-loop.ts` (the dispatch loop, `:139-189`).
+- **Done when:** A run where the model issues the same `(toolName, args)` twice executes the underlying tool only once and feeds back a repeat-signal observation, proven by a unit test counting `callTool` invocations.
 - **Estimated effort:** `1–4hr`
 
 ## Interview defense
 
-**Q: "Tell me about a real bug you found and fixed in your AI system."**
-The search tool let the model pass a metadata `filter`. A weak local model would
-hallucinate a filter key no chunk actually has — `{textContains: "ORM"}` — and the
-naive exact-match check excluded every chunk, so retrieval returned empty and the
-agent said "I couldn't find anything" on a corpus that had the answer. No error, no
-crash — a silent correctness bug. The fix: ignore filter keys absent from a chunk's
-meta, so a hallucinated key is a no-op while real filters still work. Then I froze
-it as a regression test.
+**Q: What stops your agent from looping forever?**
 
 ```
-  hallucinated {textContains}  →  before: 0 results (silent)  →  after: ignored, ranking survives
-  matchesFilter: !(key in meta) || meta[key]===value
+maxTurns (default 8) + maxToolCalls → forceFinal: tools off + "answer now"
 ```
-Anchor: *don't trust the model's args — degrade to "ignore nonsense," not "return nothing."*
 
-**Q: "How does your agent loop guarantee it terminates and answers?"**
-Three bounds. `maxTurns` caps iterations. `maxToolCalls` caps tool use; once spent,
-the loop drops the `tools` array so the model *must* answer in text. And a
-synthesis instruction on the final turn tells it "no more calls — answer now," so a
-weak model can't dead-end with "let me search again." Tool exceptions are caught and
-fed back as observations rather than crashing the run.
+A: A hard iteration budget. The loop is `for (turn < maxTurns)` and there's a `maxToolCalls` cap; hitting either flips `forceFinal`, which strips the tools and injects a synthesis instruction so the model is forced to answer with what it has. It's blunt but it always catches. Anchor: `run-agent-loop.ts:101-109`.
+
+**Q: What happens when a tool throws mid-loop?**
 
 ```
-  cap turns + cap calls + drop tools on final turn + "answer now" = always terminates with an answer
+catch → tool_result{ error, isError:true } → model observes it → adapts
 ```
-Anchor: *bounded loop + forced synthesis — the loop can't run forever or dead-end.*
+
+A: It's caught and converted, not propagated. The dispatch wraps `callTool` in try/catch and packs the error into a `tool_result` flagged `isError`, which becomes the model's observation next turn — so the model can try a different tool. The loop never crashes on a tool failure. Anchor: `run-agent-loop.ts:163-186`.
+
+**Q: Does it detect the model calling the same tool over and over?**
+
+```
+NO automatic loop-detection — only the hard maxToolCalls budget eventually stops it
+```
+
+A: Honestly, no — there's no repeated-call detection today. Identical calls dispatch every time until `maxToolCalls` is spent and `forceFinal` ends the run. The budget guarantees termination but pays for the repeats. Adding `(toolName, args)` hashing to short-circuit repeats is the obvious next improvement. That's the part people forget — they assume there's loop-detection, and there isn't; there's a budget.
 
 ## See also
 
-- `02-tool-calling.md` — provider-side retries (Gemma nudge)
-- `03-react-pattern.md` — the observation step that consumes tool errors
-- `04-tool-routing.md` — least-privilege limits the blast radius of a bad call
-- `03-retrieval-and-rag/11-rag.md` — the pipeline the filter guards protect
-- `05-evals-and-observability/01-eval-set-types.md` — the regression set
+- [03-react-pattern.md](03-react-pattern.md) — forceFinal and the synthesis turn in the loop's normal flow.
+- [02-tool-calling.md](02-tool-calling.md) — the RETRY_NUDGE handler for invalid tool-call JSON.
+- [01-agents-vs-chains.md](01-agents-vs-chains.md) — the bounds (`maxTurns`/`maxToolCalls`) set at the call site.

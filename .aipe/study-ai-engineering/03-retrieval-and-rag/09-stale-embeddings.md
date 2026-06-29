@@ -1,246 +1,170 @@
-# Stale embeddings — the freshness problem
+# Stale embeddings
+> The freshness problem · Industry standard
 
-**Subtitle:** Embedding freshness · keeping vectors in sync with their text · *Industry standard*
+Here's a bug that doesn't crash anything and silently rots your retrieval: someone edits a document, the *text* updates, but the *vector* doesn't. Now your store ranks chunks by what they used to say. The citation shows the new text; the ranking was computed from the old. Retrieval drifts from reality and nothing throws — there's no dimension mismatch, no error, just slowly-wrong results. aptkit doesn't track staleness at all, and buffr has the *slot* for it (an `embedding_model` column) but no freshness flag. This is `not yet exercised`, and the fix is a re-embed-on-edit trigger plus a staleness column.
 
 ## Zoom out, then zoom in
 
-A stale embedding is retrieval's quietest bug: the search succeeds, returns a
-confident chunk, and the chunk is *wrong* — because the text changed but its vector
-still points at the old meaning. It lives at the store layer, where vectors and
-their source text are supposed to agree. aptkit has the *primitive* to fix it
-(upsert-by-id) but not automatic staleness *tracking* — that's `not yet exercised`.
+Staleness is a property of the stored vector relative to the text it was computed from — it lives in the store's durable state.
 
 ```
-  Zoom out — staleness is a vector/text disagreement
-
-  ┌─ source text (edited over time) ────────────────────────────┐
-  │  "We use Drizzle ORM"  ──edit──►  "We use Prisma ORM"        │ ← we are here
-  └───────────────────────────┬─────────────────────────────────┘
-                vector lags    │ if not re-embedded
-  ┌─ VectorStore ──────────────▼────────────────────────────────┐
-  │  chunk.vector still points at "Drizzle" — retrieval lies     │
-  └──────────────────────────────────────────────────────────────┘
+where staleness hides
+┌──────────────────────────────────────────────────────────┐
+│  source doc (edited)        text = "ten business days"      │
+└───────────────┬────────────────────────────────────────────┘
+                │ re-index?  ← if this DOESN'T run on edit...
+                ▼
+┌──────────────────────────────────────────────────────────┐
+│  ★ stored chunk ★   text="ten business days" (updated)      │  ← drift lives here
+│                     embedding = vector of "five days" (OLD) │
+│  buffr: embedding_model col exists; embedding_stale_at: ✗   │
+└──────────────────────────────────────────────────────────┘
 ```
 
-Now zoom in. You know a cache-invalidation bug: the database row changed but the
-cached copy didn't, so reads return stale data with full confidence. A stale
-embedding is *exactly* a cache-invalidation bug, where the "cache" is the vector and
-the "source" is the text. Two ways it goes stale: the text was edited, or the
-embedding *model* was upgraded. Both leave a vector that no longer represents its
-chunk.
+The danger is that text and vector live in the *same row* but update on *different triggers*. If the edit path writes new `content` but skips re-embedding, the row is internally inconsistent — and nothing in the schema or the contracts catches it. There's no `assertDimension`-style guard for "this vector matches this text," because that's not a thing you can check cheaply. Staleness is the failure mode that has no loud version.
 
 ## Structure pass
 
-**Layers.** Source text (`meta.text` / the `content` column) → embedding (the vector)
-→ store. Freshness is the invariant "the vector represents the current text"; staleness
-is its violation.
+Pick the **trust** axis: can you trust that a stored vector reflects its current text?
 
-**Axis — lifecycle.** Trace a chunk's life. Indexed: text and vector agree. Edited:
-text changes, vector doesn't — *stale*. Re-embedded: agreement restored. The axis "do
-the vector and text still agree?" flips at the edit and flips back at the re-embed.
-aptkit detects the flip manually (re-index the doc); automatic detection is the gap.
+```
+trust of vector-vs-text across the edit lifecycle
+  index time          edit time              query time
+  ┌──────────┐        ┌──────────────┐       ┌──────────────┐
+  │ text v1   │        │ text → v2     │       │ search uses   │
+  │ vec(v1)   │        │ vec STILL v1  │       │ vec(v1) vs q  │
+  │ CONSISTENT│        │ INCONSISTENT  │       │ ranks by v1   │
+  └──────────┘        └──────┬───────┘       └──────────────┘
+                              ▼
+                  ★ seam: edit updates text but not vector ★
+                     trust silently breaks here
+```
 
-**Seam.** The freshness primitive is `upsert` keyed by chunk id — `Map.set`
-in-memory (`in-memory-vector-store.ts:21`), `on conflict (id) do update`
-(`/Users/rein/Public/buffr/src/pg-vector-store.ts:50`). Re-indexing a doc overwrites
-its chunks *cleanly* by id. The detection hook is buffr's `embedding_model` column
-(`/Users/rein/Public/buffr/sql/001_agents_schema.sql:23`).
+The seam is the edit path. At index time, text and vector agree — they were computed together. The moment an edit updates text without re-embedding, trust breaks, and it stays broken until something re-indexes. Without a staleness marker, you can't even *tell* which rows are inconsistent. The fix isn't to prevent edits; it's to *record* when a vector is suspect so a background job can re-embed it.
 
 ## How it works
 
-### Move 1 — the mental model
-
-You know the cache-invalidation rule: when the source changes, the cache must be
-invalidated, or readers get stale data while believing it's current. An embedding is
-a derived cache of a chunk's meaning. Edit the chunk and the embedding is a stale
-cache entry — and unlike a normal cache it has no TTL and no version check, so it
-silently serves the old meaning until something re-embeds it.
+**Move 1 — the mental model: vector is a cache of text.** Treat the embedding as a derived cache, and staleness is plain cache invalidation:
 
 ```
-  Stale embedding = cache invalidation, with no TTL
-
-  text  "Drizzle ORM"  ──edit──►  "Prisma ORM"
-  vector  v(Drizzle)   ──────────  v(Drizzle)   ← never invalidated
-                                       │
-  query "what ORM?" ─► matches v(Drizzle) ─► answers "Drizzle"  ← WRONG, confidently
+embedding as a cache (the right mental model)
+   text  ──embed()──►  vector        (vector is DERIVED from text)
+    │                                  cache key = (text, model)
+    ▼ edit text
+   text'  ──??──►  vector (unchanged)  ← STALE: cache key changed, value didn't
+   fix: on text change OR model change → invalidate → re-embed
 ```
 
-### Move 2 — the two staleness sources and the primitive that fixes them
+Two things invalidate the cache: the *text* changed (edit) or the *model* changed (file 02's one-way door). buffr already records the second — every chunk carries the model that produced it.
 
-**Source 1: edited text.** The dangerous case. Retrieval still *works* — it returns
-a high-cosine chunk — but the chunk's vector encodes deleted text, so the model
-grounds its answer in something the corpus no longer says. There's no error; the
-answer is just wrong. The fix is to re-embed on edit.
-
-```
-  Edited-text staleness — succeeds AND lies
-
-  edit chunk text ─► (no re-embed) ─► vector unchanged
-  retrieval: high score ✓   grounding: stale text ✗   user: misled, no error
-```
-
-**Source 2: model upgrade.** Switch from `nomic:v1.5` to a newer model and every old
-vector lives in a different embedding space (the one-way door,
-`02-embedding-model-choice.md`). buffr records the model per chunk so this is
-*detectable* — `embedding_model text not null default 'nomic-embed-text:v1.5'`
-(`/Users/rein/Public/buffr/sql/001_agents_schema.sql:23`):
+**What buffr has — the model slot, no staleness flag.** The schema stamps the model but has no freshness column:
 
 ```sql
-embedding_model text not null default 'nomic-embed-text:v1.5',
+-- buffr/sql/001_agents_schema.sql:22-25
+embedding vector(768) not null,
+embedding_model text not null default 'nomic-embed-text:v1.5',  -- ← model provenance (the slot)
+meta jsonb not null default '{}'
+-- MISSING: no embedding_stale_at, no content_hash, no embedded_at
 ```
 
-A query like `where embedding_model != $currentModel` finds every chunk that needs
-re-embedding. That column *is* the staleness hook — it's not used for automatic
-tracking yet, but it's the foothold.
-
 ```
-  Model-upgrade staleness — detectable via embedding_model
-
-  current model: nomic:v2          rows with embedding_model = 'nomic:v1.5'
-       │                                 │ ← stale: wrong embedding space
-       └─ where embedding_model != current ─► the re-embed worklist
+what buffr can vs can't answer today
+   "which chunks were embedded with the OLD model?"  → YES (filter embedding_model) ✓
+   "which chunks' text changed since they were embedded?" → NO (no signal) ✗
 ```
 
-**The primitive that makes re-embedding safe: upsert by id.** Both stores upsert
-keyed by chunk id, so re-indexing a doc *overwrites* its chunks in place rather than
-duplicating them. In-memory (`in-memory-vector-store.ts:18`):
+So buffr can detect *model* staleness (re-embed everything not on the current model — that's the file-02 migration) but cannot detect *content* staleness. The edit path could write new `content` via `upsert` and leave a stale vector, and the schema would happily store the inconsistency.
 
-```ts
-async upsert(chunks: VectorChunk[]): Promise<void> {
-  for (const chunk of chunks) {
-    this.assertDimension(chunk.vector, `chunk "${chunk.id}"`);
-    this.chunks.set(chunk.id, chunk);     // same id ─► overwrite, no dup
-  }
-}
+**Move 2 — the fix: a staleness marker + re-embed.** `not yet exercised`. Add a column and a trigger:
+
+```sql
+-- proposed schema addition (DOES NOT EXIST yet)
+alter table agents.chunks add column content_hash text;          -- hash of the text at embed time
+alter table agents.chunks add column embedding_stale_at timestamptz;  -- set when text changes
 ```
 
-buffr does the same in SQL (`/Users/rein/Public/buffr/src/pg-vector-store.ts:50`):
-`insert … on conflict (id) do update set … embedding = excluded.embedding`. Because
-chunk ids are stable (`${docId}#${i}`, `pipeline.ts:42`), re-indexing the doc maps
-each new chunk onto its old id and the fresh vector lands on top of the stale one.
-
 ```
-  Re-embed = re-index the doc — id-stable overwrite
-
-  indexDocument(doc) again ─► chunk "doc#0" upserts onto existing "doc#0"
-   in-memory: Map.set     pg: on conflict (id) do update     ← fresh vector wins
-```
-
-### Move 2.5 — current state vs future state
-
-```
-  Phase A (aptkit, now)             Phase B (tracked freshness — not yet exercised)
-  ┌────────────────────────┐        ┌──────────────────────────────────┐
-  │ re-index doc MANUALLY   │        │ embedding_stale_at column,         │
-  │ upsert-by-id overwrites │  add   │ re-embed on edit automatically     │
-  │ embedding_model recorded│ track- │ where embedding_model != current   │
-  │ no auto staleness check │ ing    │  ─► scheduled re-embed worklist    │
-  └────────────────────────┘        └──────────────────────────────────┘
-   the OVERWRITE primitive exists; the DETECTION/scheduling does not
+re-embed-on-edit flow (pseudocode)
+on document edit:
+    for each chunk of the doc:
+        if hash(chunk.newText) != chunk.content_hash:    # text actually changed
+            mark embedding_stale_at = now()              # flag it, don't block the edit
+    # background worker (or synchronous if small):
+    for chunk where embedding_stale_at is not null:
+        vec = embed(chunk.content)                       # recompute the cache
+        upsert(chunk with new vec, content_hash = hash(content), embedding_stale_at = null)
 ```
 
-### Move 3 — the principle
+The key design choice: *flag, don't block*. The edit completes immediately (write text, mark stale); re-embedding happens async. That keeps writes fast and makes staleness *visible and queryable* — `where embedding_stale_at is not null` is your re-embed work queue. aptkit's `${doc.id}#${i}` id scheme (file 10) means the re-embed `upsert` overwrites the same rows in place.
 
-Treat an embedding as a derived cache of its text, and apply cache-invalidation
-discipline: when the source changes, the vector must be regenerated. Build the safe
-overwrite first — id-stable upsert means re-embedding never duplicates or corrupts —
-then add detection: a timestamp for edits, the `embedding_model` column for model
-drift. aptkit has the hard part (the clean overwrite); the gap is the bookkeeping
-that knows *when* to fire it.
+**Move 3 — the principle.** An embedding is a cache of (text, model), and like every cache it goes stale when its inputs change. The two invalidation triggers are content edits and model swaps. The failure is silent — no exception, just drift — so the only defense is to *record* staleness (a flag, a content hash, an embedded-at timestamp) and re-embed on a cadence. Don't try to prevent stale vectors; make them visible and have a job that reconciles them.
 
 ## Primary diagram
 
 ```
-  Freshness lifecycle
-
-  index ─► text & vector AGREE
-    │
-    ├─ text edited ────────────► STALE (succeeds + lies)
-    │      detect: edit timestamp / embedding_stale_at  (not yet exercised)
-    │
-    ├─ model upgraded ─────────► STALE (wrong space)
-    │      detect: where embedding_model != current  (column exists, sql:23)
-    │
-    └─ re-index doc ───────────► FRESH
-           upsert by id overwrites cleanly (in-memory:18, pg on conflict:50)
+the staleness lifecycle and the fix
+   index:  text v1 ──embed──► vec(v1), content_hash = h(v1)   [CONSISTENT]
+                                         │
+   edit:   text → v2 ─────────────────► content_hash != h(v2)
+                                         │ trigger
+                                         ▼
+                              embedding_stale_at = now()        [FLAGGED]
+                                         │ background worker
+                                         ▼ re-embed
+                              vec(v2), content_hash = h(v2), stale_at = null  [CONSISTENT]
+   ─────────────────────────────────────────────────────────────────────
+   aptkit today: no tracking   |   buffr today: model slot only, no stale flag
 ```
+
+Flag on edit, re-embed async, clear the flag — the stale-marker column is what turns silent drift into a visible work queue.
 
 ## Elaborate
 
-The reason stale embeddings are more dangerous than a missing chunk is that they
-*pass* retrieval — high cosine score, plausible citation — while grounding the model
-in deleted facts. A miss is honest ("I couldn't find that"); a stale hit is a
-confident lie. aptkit's design makes the *cure* trivial (re-index the doc, ids stay
-stable, vectors overwrite) and leaves only the *diagnosis* unbuilt. buffr's
-`embedding_model` column (`/Users/rein/Public/buffr/sql/001_agents_schema.sql:23`) is
-the deliberate seed for model-drift detection; an `embedding_stale_at` timestamp
-would close the edit case. Read `02-embedding-model-choice.md` for the one-way door
-that makes model upgrades a staleness event and `10-incremental-indexing.md` for the
-upsert-by-id mechanics and the orphan-chunk shrink case.
+This is classic cache invalidation wearing a RAG hat — Phil Karlton's "two hard things" joke applies directly. Adjacent patterns: **content-addressed embeddings** (key the vector by a hash of its text + model, so re-indexing unchanged text is a no-op cache hit — the cheap way to avoid re-embedding everything), **embedding versioning** (the `embedding_model` column generalized to a full version so you can run two model versions side by side during migration), and **TTL-based re-embed** (re-embed everything older than N days regardless, for corpora where source-of-truth changes outside your edit path). The model-staleness half connects straight to file 02's one-way door. Read next: `02-embedding-model-choice.md` (model-side staleness) and `10-incremental-indexing.md` (the upsert-by-id that makes re-embed cheap).
 
 ## Project exercises
 
-### Track edit-staleness and re-embed on change
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** record a content hash (or `embedding_stale_at`) per document; on
-  re-index, re-embed only chunks whose source text changed, relying on id-stable
-  upsert to overwrite them.
-- **Why it earns its place:** staleness is the subtlest RAG correctness bug; wiring
-  detection onto the existing overwrite primitive shows you close the
-  cache-invalidation loop, not just describe it.
-- **Files to touch:** `packages/retrieval/src/pipeline.ts` (hash compare in
-  `indexDocument`), `/Users/rein/Public/buffr/sql/001_agents_schema.sql` (add the
-  column), a new test in `packages/retrieval/test/`.
-- **Done when:** a test shows re-indexing an unchanged doc skips re-embedding and an
-  edited chunk gets a fresh vector under the same id.
+### Add embedding_stale_at to buffr's schema + re-embed-on-edit
+
+- **Exercise ID:** `EX-RAG-09a`
+- **What to build:** Add `content_hash` and `embedding_stale_at` columns to `agents.chunks`, flag chunks stale when their text changes, and a re-embed worker that processes `where embedding_stale_at is not null` and clears the flag.
+- **Why it earns its place:** It turns buffr's silent content-drift into a visible, queryable work queue — the difference between "retrieval slowly rots and nobody knows" and "there's a stale-chunk count on a dashboard." Case B. Phase 2B.
+- **Files to touch:** `buffr/sql/001_agents_schema.sql:14-30` (columns + maybe an index on `embedding_stale_at`); `buffr/src/pg-vector-store.ts:38-65` (`upsert` writes `content_hash`, clears `stale_at`); new re-embed worker under `buffr/src/`.
+- **Done when:** editing a chunk's text flags it stale, the worker re-embeds and clears the flag, and a query before the worker runs is provably ranking on the old vector (the bug) vs after (the fix).
 - **Estimated effort:** `1–2 days`
 
-### Detect model-drift via the embedding_model column
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a query/script over `agents.chunks` that lists chunks whose
-  `embedding_model` differs from the current provider's id, producing a re-embed
-  worklist.
-- **Why it earns its place:** turns the dormant `embedding_model` column into a
-  working staleness detector, proving you understood why it was added.
-- **Files to touch:** `/Users/rein/Public/buffr/src/pg-vector-store.ts` (add a
-  `staleChunkIds(currentModel)` method), a new test against the schema.
-- **Done when:** the method returns ids of chunks embedded by any model other than
-  the current one.
+### Content-addressed skip-re-embed on unchanged text
+
+- **Exercise ID:** `EX-RAG-09b`
+- **What to build:** In `indexDocument`/`upsert`, compute `content_hash` per chunk and skip the embed call when the stored hash matches — re-indexing unchanged text becomes a no-op.
+- **Why it earns its place:** Re-indexing a 1000-chunk doc to fix one paragraph shouldn't re-embed 999 unchanged chunks. Content-addressing makes incremental indexing (file 10) actually cheap.
+- **Files to touch:** `packages/retrieval/src/pipeline.ts:32-47` (`indexDocument`); `buffr/src/pg-vector-store.ts:38-65` (compare hash before embed).
+- **Done when:** re-indexing a doc with one changed chunk issues exactly one embed call, proven by counting calls on an injected transport.
 - **Estimated effort:** `1–4hr`
 
 ## Interview defense
 
-**Q: "How do you keep embeddings in sync with changing documents?"**
-Treat the vector as a cache of the text and re-embed on change. The safe primitive is
-id-stable upsert: chunk ids are `${docId}#${i}` (`pipeline.ts:42`), so re-indexing a
-doc overwrites its chunks in place — `Map.set` in-memory
-(`in-memory-vector-store.ts:18`), `on conflict (id) do update` in pg
-(`pg-vector-store.ts:50`) — no duplicates. The detection side (re-embed *when* the
-text or model changes) is the gap; buffr's `embedding_model` column is the hook for
-model drift.
+**Q: A user edited a doc and search results got subtly worse but nothing errored. What happened?**
 
 ```
-  edit ─► re-embed ─► upsert by id ─► fresh vector overwrites stale, no dup
+edit path wrote new TEXT but not a new VECTOR
+   row: content = "v2", embedding = vec("v1")   ← internally inconsistent
+   ranking computed from v1, citation shows v2 → silent drift, no exception
 ```
-Anchor: *an embedding is a cache of its text — when the text changes, invalidate it.*
 
-**Q: "Why is a stale embedding worse than a missing one?"**
-Because it passes retrieval. A stale chunk still scores high and returns a clean
-citation, so the model grounds its answer in text the corpus no longer contains — a
-confident wrong answer with no error. A miss is honest; the agent can say "I couldn't
-find that." A stale hit lies. That's why freshness is a correctness invariant, not a
-performance nicety.
+Anchor: the vector is a cache of the text; an edit that updates text without re-embedding leaves a stale vector, and there's no loud failure — only drift. You need a staleness marker to even detect it.
+
+**Q: buffr stores `embedding_model` per chunk. Does that solve staleness?**
 
 ```
-  miss  ─► "couldn't find it"   (honest)
-  stale ─► high score + old text ─► confident wrong answer  (silent)
+embedding_model → detects MODEL staleness (re-embed off-version chunks) ✓
+   detects CONTENT staleness (text changed since embed)?  ✗ no signal
 ```
-Anchor: *a stale hit is a confident lie; a miss is an honest no.*
+
+Anchor: the model column catches the one-way-door migration but not content edits — you need a `content_hash` or `embedding_stale_at` for the edit case, which buffr lacks.
 
 ## See also
 
-- `02-embedding-model-choice.md` — the one-way door that makes model upgrades stale
-- `10-incremental-indexing.md` — upsert-by-id mechanics and the orphan-chunk case
-- `04-vector-databases.md` — the `embedding_model` column on the chunks table
-- `11-rag.md` — stable chunk ids (`${docId}#${i}`) that make overwrite clean
-- `05-evals-and-observability/01-eval-set-types.md` — catching staleness with evals
+- [02-embedding-model-choice.md](02-embedding-model-choice.md) — model-side staleness, the one-way door
+- [10-incremental-indexing.md](10-incremental-indexing.md) — upsert-by-id makes re-embed in place
+- [04-vector-databases.md](04-vector-databases.md) — where the stale state lives

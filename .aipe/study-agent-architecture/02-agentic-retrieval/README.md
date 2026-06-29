@@ -1,13 +1,13 @@
-# 02 — Agentic Retrieval
+# B — Agentic Retrieval
 
-**Anchor: single-agent (primary).**
+The shift from retrieval as a one-shot pipeline step to retrieval as a control loop the agent drives. This is aptkit's headline pattern.
 
-The standout pattern in aptkit. This sub-section does **not** re-teach retrieval mechanics (embeddings, chunking, vector DBs, RRF, reranking — those live in `study-ai-engineering/03-retrieval-and-rag/`). It covers the shift from retrieval as a *one-shot pipeline step* to retrieval as a *control loop the agent drives* — purely an agent-architecture concern, and the most interesting decision in the repo.
+Anchor: single-agent (primary).
 
-The key move: **retrieval is exposed as a tool the model calls when it judges it needs grounding**, not a prompt-splice the framework injects. The model owns *when* to retrieve; the loop owns the *budget*. `search_knowledge_base` (`packages/retrieval/src/search-knowledge-base-tool.ts`) is that tool; `rag-query` (`packages/agents/rag-query/src/rag-query-agent.ts`) is the agent that drives it.
+This sub-section does NOT re-teach retrieval mechanics (embeddings, chunking, vector stores, ranking) — those live in `.aipe/study-ai-engineering/03-retrieval-and-rag/`. It covers the agent-architecture concern: the model owns *when* to retrieve, the loop owns the *budget*.
 
-Read in order:
+## Files
 
-1. `01-agentic-rag.md` — retrieval as a tool the model drives; the rag-query agent.
-2. `02-self-corrective-rag.md` — aptkit's partial version: the `minTopK` floor + hallucination-tolerant `matchesFilter` guard.
-3. `03-retrieval-routing.md` — not yet exercised; one store today, the multi-source refactor.
+1. [01-agentic-rag.md](01-agentic-rag.md) — **the headline.** Retrieval as a tool the model decides to call (`search_knowledge_base`). ReAct whose primary tool is retrieval.
+2. [02-self-corrective-rag.md](02-self-corrective-rag.md) — grade chunks before generating. aptkit's `minTopK` floor + hallucination-tolerant filter are partial, structural versions of this.
+3. [03-retrieval-routing.md](03-retrieval-routing.md) — route a query to the right source. aptkit has one source (the vector store); buffr adds pgvector behind the same contract.

@@ -1,180 +1,242 @@
-# 05 · Transactions, Isolation, and Anomalies
+# Transactions, Isolation, and Anomalies
 
-**Industry name(s):** ACID transactions, isolation levels, read/write anomalies. **Type:** Industry standard.
+**Industry name:** ACID transactions / isolation levels / atomicity boundary · *Industry standard*
 
-## Zoom out, then zoom in
+## Zoom out — where transactions wrap
 
-You know "all-or-nothing" from a form submit that should either fully save or not touch the DB at all. That's atomicity. This repo has exactly one place that reaches for it — the multi-chunk upsert — and everything else runs on Postgres's default isolation without ever naming it.
-
-```
-  Zoom out — where transactions live
-
-  ┌─ Pipeline (aptkit) ────────────────────────────────────┐
-  │  store.upsert(chunks)   — no transaction concept here   │
-  └────────────────────────────┬────────────────────────────┘
-                               │
-  ┌─ Store layer ──────────────▼────────────────────────────┐
-  │  InMemory: no transaction — single-threaded JS tick      │
-  │  Postgres: ★ begin / commit / rollback per upsert ★      │ ← we are here
-  └────────────────────────────┬────────────────────────────┘
-                               │
-  ┌─ Postgres ─────────────────▼────────────────────────────┐
-  │  READ COMMITTED (default) · MVCC snapshots               │
-  └──────────────────────────────────────────────────────────┘
-```
-
-Zoom in: the concept is **the transaction boundary** — the span where a set of writes is atomic and isolated. buffr draws exactly one: a document's chunks all land or none do. aptkit draws none (it doesn't need to — see below). And the isolation *level* — what one transaction can see of another's in-flight writes — is whatever Postgres defaults to: READ COMMITTED. No code sets it, so no stronger guarantee is claimed.
-
-## The structure pass
-
-**Layers.** The transaction matters at the store layer only. Above it, the pipeline and tools issue logical operations ("index this document") with no transactional vocabulary. Below it, buffr wraps the physical writes; aptkit relies on the JS event loop.
-
-**Axis — trace "what's the atomic unit, and what can a concurrent reader see mid-write?":**
+buffr uses explicit transactions in exactly two places. Knowing *which two*
+— and which operations are left *outside* a transaction — is the lesson:
 
 ```
-  One question across the stores: "what is atomic, and what's visible mid-write?"
+  Zoom out — transaction boundaries in buffr
 
-  ┌─ InMemory ──────────────────────────┐
-  │  atomic unit: the whole upsert call  │ → JS is single-threaded; the loop
-  │  visible mid-write: N/A              │   runs to completion in one tick,
-  │                                      │   no other code interleaves
-  └──────────────────────────────────────┘
-  ┌─ Postgres (PgVectorStore) ──────────┐
-  │  atomic unit: ONE document's chunks  │ → begin..commit; rollback on error
-  │  visible mid-write: nothing (other   │   READ COMMITTED: a reader sees only
-  │  txns see pre-commit state)          │   committed rows, never the half-loop
-  └──────────────────────────────────────┘
+  ┌─ Application (buffr) ──────────────────────────────────────┐
+  │  runMigration()    ─► begin / DDL / commit  (migrate.ts:8) │
+  │  PgVectorStore.upsert ─► begin / N inserts / commit        │ ← we are here
+  │                          (pg-vector-store.ts:40-64)        │
+  │                                                            │
+  │  indexDocumentRow  ─► INSERT documents  (no txn)           │
+  │                       then upsert()     (its own txn)      │ ← the seam
+  │  persistMessage    ─► single INSERT      (no explicit txn) │
+  └────────────────────────────────────────────────────────────┘
 ```
 
-**Seam.** The boundary is `begin`/`commit` in `PgVectorStore.upsert`. Inside it: a multi-row loop that's atomic. Outside it: the document-text insert into `agents.documents` and the chunk insert are **separate operations** — the FK was dropped (01), so there's no transaction spanning "write the document row" and "write its chunks." That's the anomaly surface: document and chunks can drift apart.
+## Zoom in — what this file covers
+
+The question: **what's atomic, what isn't, and which isolation level does
+buffr run under?** Verdict first: the per-document chunk write is atomic; the
+document-plus-chunks operation is *not*; and the isolation level is Postgres's
+default Read Committed, never set anywhere.
+
+## Structure pass
+
+**Layers.** Statement (one `INSERT`, atomic on its own) → explicit
+transaction (`begin`/`commit` wrapping several statements) → the logical
+operation the application *intends* (which may span more than one
+transaction).
+
+**Axis — trace "is this all-or-nothing?" up the layers.**
+
+```
+  One question up the layers: "all-or-nothing?"
+
+  one INSERT chunk            → yes (every statement is atomic)
+  upsert(all chunks of a doc) → yes (begin/commit wraps the loop)
+  index a document            → NO  (documents row in TXN A,
+   (documents row + chunks)        chunks in TXN B — two txns)
+
+  the atomicity guarantee FLIPS at the document boundary:
+  inside one upsert it holds; across the document write it breaks
+```
+
+**Seam.** The load-bearing seam is `indexDocumentRow` (`runtime.ts:5-18`):
+it writes the `documents` row, then calls `pipeline.index()` (the upsert) as
+a separate transaction. The atomicity axis flips right there — that's the
+boundary where "all-or-nothing" stops being true.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-A transaction is a `try/finally` with teeth: everything between `begin` and `commit` either all happens or the `rollback` in the `catch` undoes it. You've written the JS shape a hundred times; the database version adds durability and isolation on top.
+A transaction is the same idea as wrapping several state updates so a React
+component never renders a half-updated store — either all the updates land or
+none do. In SQL it's `begin ... commit`, and the "render a half-state"
+failure becomes "leave the database half-written after a crash."
 
 ```
-  The transaction kernel — begin, body, commit-or-rollback
+  The atomicity kernel (begin/commit/rollback)
 
-   begin
-     │
-     ├─ INSERT chunk 0
-     ├─ INSERT chunk 1        ← if ANY throws here...
-     ├─ INSERT chunk 2
-     │
-   commit   ──────────────►  all chunks durable, visible together
-     │
-   (on throw) rollback ────►  NONE of the chunks exist; clean slate
+  begin                          ← open a transaction
+    INSERT chunk 0               ┐
+    INSERT chunk 1               │ all buffered against the same snapshot
+    ...                          │
+    INSERT chunk N               ┘
+  commit                         ← all become visible at once, durably
+    │
+    └─ on any error: rollback    ← none of them happened
 ```
 
-The kernel parts, each named by what breaks without it: lose `begin` and each insert auto-commits individually (partial document on a mid-loop crash); lose `rollback` and a failed insert leaves the earlier chunks orphaned; lose `commit` and nothing persists. All three are present in buffr.
+Name each part by what breaks without it:
+- Drop **begin/commit** → each insert auto-commits on its own; a crash
+  mid-loop leaves *some* chunks written. The document is half-indexed.
+- Drop **rollback on error** → a failed insert mid-loop leaves the earlier
+  inserts committed. Same half-written corruption.
 
-### Move 2 — the walkthrough
+### Move 2 — the moving parts
 
-**The one real transaction — atomic per document.** This is the entire transactional surface of the codebase:
+**The atomic upsert — what buffr gets right.**
 
 ```ts
-// buffr/src/pg-vector-store.ts:40-65
-const client = await this.pool.connect();           // dedicated connection for the txn
+// buffr/src/pg-vector-store.ts:40-64 (the skeleton)
+const client = await this.pool.connect();   // one connection for the txn
 try {
-  await client.query('begin');                      // open the transaction
+  await client.query('begin');
   for (const c of chunks) {
-    ...
-    await client.query(`insert into agents.chunks (...) on conflict (id) do update set ...`, [...]);
+    await client.query(`insert into agents.chunks (...) on conflict (id) do update ...`);
   }
-  await client.query('commit');                     // all chunks land together
+  await client.query('commit');             // all chunks land together
 } catch (err) {
-  await client.query('rollback');                   // any failure → none land
+  await client.query('rollback');           // or none do
   throw err;
 } finally {
-  client.release();                                 // return the connection to the pool
+  client.release();                         // give the connection back
 }
 ```
 
-Walk it. `pool.connect()` pulls a *dedicated* connection — transactions are connection-scoped, so you can't `begin` on the pool and run inserts on arbitrary pooled connections. `begin` opens it. The loop inserts every chunk. `commit` makes them all durable and visible at once. If insert #7 of 50 throws, `rollback` erases chunks 0–6 — the document's vectors are all-or-nothing. `finally` releases the connection back to the pool no matter what. This is correct, minimal, textbook atomicity for the unit "one document's chunks."
+Read the load-bearing details. The whole loop runs on **one pooled
+connection** (`pool.connect()`, not `pool.query()`) — a transaction is
+connection-scoped, so you must hold one connection across `begin`→`commit`.
+The `finally { client.release() }` returns it to the pool no matter what.
+And the `on conflict (id) do update` makes each insert an *upsert*, so
+re-indexing the same document overwrites its chunks rather than erroring on
+the PK — re-indexing is safe to retry. This is solid: a document's chunks are
+all-or-nothing.
 
-**The migration runner uses the same pattern.** Schema changes are also atomic:
-
-```ts
-// buffr/src/migrate.ts:8-20
-await client.query('begin');
-await client.query(sql);                            // the whole 001_agents_schema.sql
-await client.query('commit');
-// catch → rollback; finally → release
-```
-
-The entire schema script runs in one transaction — partial schema application is impossible. Same kernel, applied to DDL.
-
-**The isolation level is never set — so it's READ COMMITTED.** Search every `query` call in buffr: none issue `set transaction isolation level`. Postgres's default is **READ COMMITTED**, so that's what every transaction here runs at. What that buys: a statement sees only data committed *before the statement began*. What it does *not* prevent: non-repeatable reads (re-read the same row mid-transaction, get a different value if another txn committed in between) and phantom reads (a range query returns new rows on re-run). For this workload — single-writer upserts, search reads that don't re-read — READ COMMITTED is enough, and nobody claimed more. No `serializable`, no `repeatable read`, no `select ... for update`: **`not yet exercised`**.
-
-**The anomaly that IS reachable — document/chunk drift.** Here's the real exposure, and it comes straight from the dropped FK (01). Indexing a document is *two* unrelated writes:
+**The non-atomic document write — the anomaly buffr can hit.**
 
 ```
-  Layers-and-hops — the NON-atomic span across documents and chunks
+  index a document — two transactions, a gap between (runtime.ts:11-17)
 
-  ┌─ application (buffr) ─┐
-  │ 1. INSERT agents.documents row   ──┐   (one statement, its own implicit txn)
-  │                                    │   ★ NO transaction spans these two ★
-  │ 2. PgVectorStore.upsert(chunks) ───┘   (begin..commit — its own txn)
-  └────────────────────────────────────┘
-        │
-        ▼ if the process dies between 1 and 2:
-   a documents row exists with ZERO chunks  — or chunks exist with no documents row
-   (the dropped FK means the engine won't catch either)
+  ┌─ TXN A ──────────────────┐
+  │ INSERT into documents     │  ← commits independently
+  └───────────┬───────────────┘
+              │  ← CRASH HERE
+              ▼
+  ┌─ TXN B (upsert) ─────────┐
+  │ begin; INSERT chunks; commit │  ← never runs if we crashed above
+  └───────────────────────────┘
+
+  result after a crash in the gap:
+    a documents row exists  +  zero chunks for it
+    → the dropped FK (001_agents_schema.sql:16) means nothing complains
 ```
 
-Because there's no FK and no enclosing transaction across "insert the document" and "insert the chunks," a crash between them leaves the two tables inconsistent — orphan chunks or a chunk-less document — and Postgres won't complain. The per-document upsert transaction protects the *chunks among themselves*, not the *document-to-chunks* relationship. That's the deliberate cost of parity (01) showing up as a consistency anomaly. Today it's tolerable because indexing is a manual, low-frequency, single-writer operation; it becomes a real bug under concurrent or automated indexing.
+This is a real **write skew / partial-write anomaly**, and the dropped
+foreign key is what lets it pass silently. With a hard FK from `chunks` to
+`documents`, this exact split wouldn't even be expressible the same way — but
+the FK was dropped *on purpose* to keep the `VectorStore.upsert` contract
+clean (it knows nothing about a documents row, → `00`, `01`). So buffr trades
+"documents and chunks can never drift" for "the storage contract stays a
+drop-in." The cost is named, not hidden: a crash between the two writes leaves
+an orphan documents row. The fix if it ever matters: wrap both in one
+transaction in `indexDocumentRow`, passing the client down into the pipeline
+— which would mean the pipeline takes a transaction handle, a contract
+change. buffr judged the orphan acceptable for a single-user reindex. `not
+yet exercised` — no recovery code handles this.
+
+**Isolation level — Read Committed, by inheritance.** buffr never issues
+`set transaction isolation level` anywhere (`not yet exercised`). So every
+transaction runs at Postgres's default: **Read Committed**. What that buys and
+what it doesn't:
+
+```
+  Read Committed (Postgres default, what buffr runs)
+
+  each STATEMENT sees a fresh snapshot of committed data
+    → no dirty reads (never sees uncommitted rows)
+    → DOES allow non-repeatable reads: the same SELECT twice
+      in one txn can return different rows if another txn committed between
+    → DOES allow phantom reads
+
+  buffr's upsert is single-writer-per-doc and reads nothing it
+  re-reads, so these anomalies don't bite — but it's by luck of
+  the access pattern, not by a chosen isolation level
+```
+
+The honest read: Read Committed is the right default for buffr because its
+write transactions don't read-then-write the same rows and there's
+effectively one writer (a single-user laptop). If buffr ever did
+read-modify-write inside a transaction under concurrency, Read Committed's
+non-repeatable reads would start to matter and you'd reach for
+`REPEATABLE READ` or explicit locking (→ `06`).
 
 ### Move 3 — the principle
 
-A transaction is only as wide as you draw it, and READ COMMITTED is what you get when you draw none around isolation. buffr draws the boundary tightly around "one document's chunks" and accepts that the document-to-chunks link sits outside any transaction — a direct consequence of dropping the FK for contract parity. The general lesson: atomicity protects exactly the span you wrap, and every guarantee you don't explicitly request defaults to the engine's weakest acceptable one.
+Atomicity is a property of a *transaction boundary*, and the bug is almost
+never inside the boundary — it's the operation that quietly spans *two*
+boundaries. buffr's upsert is correctly atomic; the anomaly is the document
+write that lives in one transaction and the chunk write in another, with a
+crash-gap between them. When you reason about a write path, the question
+isn't "is there a transaction" — it's "does *one* transaction cover the whole
+logical operation."
 
 ## Primary diagram
 
 ```
-  Full transaction picture — what's atomic, what isn't
+  Transactions recap — buffr
 
-  ┌─ ATOMIC (one txn each) ────────────────────────────────────────┐
-  │  PgVectorStore.upsert:  begin → INSERT chunk×m → commit/rollback│
-  │  migrate.runMigration:  begin → run whole schema → commit       │
-  └─────────────────────────────────────────────────────────────────┘
-  ┌─ NOT ATOMIC (no spanning txn) ─────────────────────────────────┐
-  │  INSERT documents row    ─┐  crash here → orphans               │
-  │  upsert(chunks)          ─┘  (FK dropped → engine won't catch)  │
-  └─────────────────────────────────────────────────────────────────┘
-  ┌─ ISOLATION ────────────────────────────────────────────────────┐
-  │  READ COMMITTED (Postgres default — never set in code)          │
-  │  serializable / repeatable read / FOR UPDATE: NOT EXERCISED     │
-  └─────────────────────────────────────────────────────────────────┘
-  ┌─ aptkit InMemory: no txn — single JS tick is the atomic unit ──┐
-  └─────────────────────────────────────────────────────────────────┘
+  ATOMIC (one txn covers the operation)        NOT ATOMIC (two txns)
+  ─────────────────────────────────────        ─────────────────────
+  upsert(chunks of one doc):                    index a document:
+    begin                                         INSERT documents   TXN A
+      INSERT chunk 0..N (on conflict update)      └ crash gap ─┐
+    commit  / rollback on error                   upsert chunks TXN B
+    one pooled connection, released in finally
+
+  isolation level: Read Committed (Postgres default, never set)
+    no dirty reads · allows non-repeatable + phantom reads
+    safe here only because writes don't re-read rows under concurrency
 ```
 
 ## Elaborate
 
-ACID's "A" and "I" are what this file covers; "D" (durability) is 07 and "C" (consistency) leans on the constraints the FK *would* have enforced (data-modeling). The interesting historical note is that buffr *had* a `chunks_document_id_fkey` and explicitly dropped it (`001_agents_schema.sql:26-27`) — so the document/chunk anomaly is a known, accepted trade, not an oversight. If automated re-indexing ever runs concurrently, the move is either to restore a deferred FK (`deferrable initially deferred`, checked at commit) or to wrap document+chunk writes in one transaction at the application layer — both reintroduce the spanning boundary the contract gave up. Read next: 06 for the locking and MVCC under READ COMMITTED, 07 for durability.
+ACID's "A" (atomicity) and "I" (isolation) are the two this file touches; "C"
+(consistency) is partly *given away* here via the dropped FK, and "D"
+(durability) is `07`. The pattern buffr follows — explicit `begin/commit`
+with rollback in a `try/catch/finally` on a pooled connection — is the
+canonical Node `pg` transaction idiom, and it appears identically in
+`migrate.ts:8-20` for DDL. What's missing is any *defense* against the
+two-transaction gap, because at single-user scale the gap is a reindex away
+from being fixed by hand. The instant buffr had concurrent indexers or a
+multi-step write that must not half-apply, the move is to thread one
+transaction through the whole logical operation.
 
 ## Interview defense
 
-**Q: What's atomic in this system, and what isn't?**
+**Q: Is indexing a document atomic?**
+Half of it. The chunk write is — `upsert` wraps all of a document's chunks in
+one `begin/commit` on a single connection, with rollback on error. But the
+*documents* row is written in a separate transaction before that, so a crash
+between them orphans the documents row. The dropped FK lets that pass
+silently.
 
 ```
-  atomic:    [ begin → chunk0..chunkM → commit ]   ← one document's vectors
-  NOT atomic: INSERT documents  ╳  upsert chunks    ← no txn spans them
-                                 (FK dropped)
+  INSERT documents (TXN A) ──gap──► upsert chunks (TXN B)
+                            crash here = orphan row
 ```
 
-Answer: "One document's chunks are atomic — `begin/commit/rollback` around the insert loop (`pg-vector-store.ts:40-65`), so a mid-loop failure rolls back every chunk. What's *not* atomic is the document row plus its chunks: they're separate writes with no spanning transaction, and the FK was dropped for contract parity, so a crash between them leaves orphans and the engine won't catch it. It's an accepted trade today because indexing is single-writer and manual." Anchor: *atomic per document, not across document-and-chunks.*
+**Q: What isolation level, and why?**
+Read Committed — Postgres's default, never explicitly set. It's fine here
+because the write transactions don't read-then-write the same rows and
+there's effectively one writer. Under concurrent read-modify-write I'd move
+to Repeatable Read or take explicit locks.
 
-**Q: What isolation level do you run at?**
-
-Answer: "READ COMMITTED — the Postgres default, because the code never sets one. That's the honest answer: no `set transaction isolation level` anywhere. It's fine for this workload — single-writer upserts, search reads that don't re-read rows, so non-repeatable reads and phantoms don't bite. If I added a read-modify-write on the same row under concurrency, I'd reach for `repeatable read` or `select ... for update`." Anchor: *no level set means READ COMMITTED — name the default, don't pretend it's stronger.*
+**Anchor:** "Atomic per document's chunks; not atomic across the document row
+and its chunks — and the dropped FK is why nothing complains."
 
 ## See also
 
-- `01-database-systems-map.md` — the dropped FK that creates the cross-table anomaly.
-- `06-locks-mvcc-and-concurrency-control.md` — what READ COMMITTED does under concurrency.
-- `07-wal-durability-and-recovery.md` — the "D" that commit triggers.
-- study-data-modeling — the FK decision and integrity constraints.
-- study-distributed-systems — the best-effort writes (memory, trace flush) outside any txn.
+- `06-locks-mvcc-and-concurrency-control.md` — what Read Committed rests on (MVCC).
+- `07-wal-durability-and-recovery.md` — what `commit` actually durably guarantees.
+- `01-database-systems-map.md` — the two-transaction index path, mapped.
+- study-data-modeling — the dropped-FK decision as a schema call.

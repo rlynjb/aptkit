@@ -1,118 +1,187 @@
-# RFC: Publish one bundle, not sixteen packages
+# RFC 03 — Publish one bundle, not sixteen packages
 
-## 1. Summary
+**Summary:** Keep the monorepo root `"private": true` and publish exactly one
+public package — `@rlynjb/aptkit-core@0.4.1` (`packages/core`) — whose
+`bundledDependencies` inlines all **16** internal `@aptkit/*` packages into a
+single self-contained npm tarball, built by `scripts/pack-core-standalone.mjs`,
+with the public API defined by `packages/core/src/index.ts`.
 
-The monorepo has 16 internal `@aptkit/*` packages but publishes **exactly one** to npm: `@rlynjb/aptkit-core` (`0.4.1`). Its `package.json` lists all 16 as `bundledDependencies`, so `npm pack` inlines their built `dist/` into a single self-contained tarball. The repo root is `"private": true`, the public surface is one file (`packages/core/src/index.ts`), and a custom packer (`scripts/pack-core-standalone.mjs`) assembles the tarball. Consumers like buffr depend on one name and import everything from it.
+## Context / problem
 
-## 2. Context / problem
+AptKit is a workspaces monorepo of 16 internal packages — runtime, tools,
+context, prompts, evals, workflows, retrieval, memory, two providers, six
+agents, and the core composition. The internal packages are versioned `0.0.0`
+and reference each other by workspace name (`@aptkit/runtime`, etc.).
 
-aptkit is a workspaces monorepo where the internal packages are all versioned `0.0.0` and split by concern — runtime, tools, context, retrieval, memory, five providers, six agents, etc. That split is good for *development* (clean boundaries, independent builds). It's a problem for *distribution*: a consumer doesn't want to install and version-pin 16 interdependent packages whose internal versions are all `0.0.0` and whose dependency graph they'd have to resolve themselves.
+A consumer (buffr) needs the agent capabilities on its laptop runtime. The
+question is what to *ship*. The natural npm answer is "publish each package" —
+that's what a monorepo's per-package `tsc -b` setup is built for. But that
+answer drags in a versioning matrix (16 packages each with their own version,
+each depending on specific versions of the others), and AptKit has exactly one
+consumer with no need for partial adoption. The constraint is real but the
+demand for granularity is not — yet.
 
-So the question is purely a packaging-and-release decision: **how does this 16-package monorepo reach a consumer as something installable?** The internal split has to stay; the external footprint has to collapse.
+There's also a sharp, non-obvious failure mode lurking in the packaging itself
+(see Tradeoffs) that makes "just publish the packages" more dangerous than it
+looks.
 
-## 3. Goals & non-goals
+## Goals & non-goals
 
-**Goals**
-- One `npm install @rlynjb/aptkit-core` gives a consumer the entire surface.
-- One version number to track; one semver contract to honor.
-- Internal packages keep their `0.0.0` dev versions and clean boundaries — distribution doesn't leak into development.
-- The repo root is never publishable by accident.
+**Goals:**
 
-**Non-goals**
-- Independent versioning of sub-packages. A consumer can't take `@aptkit/retrieval@0.5` and `@aptkit/runtime@0.4` separately — it's all or nothing.
-- Publishing the monorepo root or any `@aptkit/*` package directly to npm.
-- A monorepo release tool (changesets / Lerna / Nx release). The packer is ~75 lines of Node.
+- One install for the consumer: `npm i @rlynjb/aptkit-core`, import everything
+  from it.
+- The published tarball is self-contained — no internal `@aptkit/*` package
+  needs to resolve from npm (they don't exist there).
+- The repo root can never be published by accident.
+- A documented, repeatable release: build → pack → publish → verify.
 
-## 4. The decision
+**Non-goals:**
 
-`bundledDependencies` is the lever. List the 16 internal packages there, and `npm pack` copies their `node_modules/@aptkit/*` directories *into the tarball* — the consumer installs one package and gets all 16 inlined, no separate resolution.
+- Independent versioning of the internal packages. They move together at `0.0.0`
+  and ship under one external version.
+- Publishing any `@aptkit/*` package to npm. They are internal-only.
+- Supporting multiple consumers on different versions of different sub-packages.
+  That's the explicit flip condition, not today's requirement.
 
-```
-  Single-bundle publishing — 16 packages → 1 tarball
+## The decision
 
-  ┌─ Repo (private, never published) ───────────────────────────────────┐
-  │  root package.json: "private": true   ← bare `npm publish` = EPRIVATE│
-  │                                                                     │
-  │  packages/runtime  tools  context  prompts  evals  workflows        │
-  │  retrieval  memory  provider-gemma  provider-local                  │
-  │  agents/{anomaly-monitoring, diagnostic-investigation, query,       │
-  │          recommendation, rubric-improvement, rag-query}             │
-  │        = 16 internal @aptkit/* packages, each versioned 0.0.0       │
-  └──────────────────────────────────┬──────────────────────────────────┘
-                                      │ re-export composition
-                                      ▼
-  ┌─ packages/core = @rlynjb/aptkit-core@0.4.1 ─────────────────────────┐
-  │  src/index.ts          ← THE public API (one file of re-exports)    │
-  │  dependencies:         all 16 @aptkit/* at "0.0.0"                   │
-  │  bundledDependencies:  the SAME 16 names                            │
-  │  files: ["README.md", "dist/src"]                                   │
-  └──────────────────────────────────┬──────────────────────────────────┘
-                                      │ scripts/pack-core-standalone.mjs
-                                      │  1. npm pack -w each of the 16
-                                      │  2. untar each into stage/node_modules/@aptkit/*
-                                      │  3. npm pack the staged core
-                                      ▼
-  ┌─ npm registry ──────────────────────────────────────────────────────┐
-  │  rlynjb-aptkit-core-0.4.1.tgz  (16 packages inlined, self-contained) │
-  └──────────────────────────────────┬──────────────────────────────────┘
-                                      │ npm install @rlynjb/aptkit-core
-                                      ▼
-  ┌─ Consumer (buffr) ──────────────────────────────────────────────────┐
-  │  import { VectorStore, runAgentLoop, ... } from '@rlynjb/aptkit-core' │
-  │  one name, one version, everything inside                            │
-  └─────────────────────────────────────────────────────────────────────┘
-```
-
-The kernel — what breaks if each part is gone:
-
-- **`bundledDependencies` (core/package.json lines 49–66)** — the 16 names that tell `npm pack` to inline them. *Remove it:* npm tries to *fetch* `@aptkit/runtime@0.0.0` from the registry on install — and it was never published, so the consumer's install fails.
-- **Root `"private": true`** — makes a bare `npm publish` at the root fail with `EPRIVATE` (RELEASE.md). *Remove it:* you can accidentally publish the entire monorepo, app logic and all.
-- **`packages/core/src/index.ts`** — the single re-export file *is* the public API. *Remove a re-export:* a symbol silently drops out of the published surface even though its package is bundled.
-- **`scripts/pack-core-standalone.mjs` (lines 10–65)** — packs each of the 16 workspaces, untars them into a staging `node_modules`, strips `devDependencies`, then packs core. *Remove it:* you'd hand-assemble the tarball, and the staging step that makes the inlined packages resolvable is gone.
-
-**The real scar — `"files": ["dist/src"]` on every bundled package.** This is the part that bit and the part a reviewer should hear about, because it's non-obvious. aptkit's `.gitignore` ignores `dist/`, and **`npm pack` honors `.gitignore` by default.** So a bundled package without an explicit `files` allowlist ships with *no compiled output* — the tarball inlines the package's `package.json` but none of its `.js`/`.d.ts`, and the consumer gets `has no exported member …` type errors. RELEASE.md documents this exact failure hitting `@aptkit/provider-gemma` and `@aptkit/provider-local` when they were first bundled. Every bundled package's `package.json` must carry `"files": ["README.md", "dist/src"]` or the bundle ships hollow.
-
-That's why adding a 17th package is a **five-place change** (RELEASE.md): `index.ts` re-export, core `package.json` (both `dependencies` and `bundledDependencies`), core `tsconfig.json` references, root `build:core:deps`, and the packer's `packageSpecs`. Miss one and the bundle ships incomplete.
-
-## 5. Alternatives considered
-
-**A. Publish all 16 packages independently.** The "proper" monorepo answer — each `@aptkit/*` is a real npm package, the core just depends on them by version. *Why it lost:* 16 packages to version, 16 to publish in dependency order, and a consumer's `package.json` becomes a wall of pinned `@aptkit/*` lines whose versions must stay mutually compatible. For a single bundle with one consumer (buffr), that's all cost and no benefit. Flip condition: **multiple consumers needing different versions of different parts** — the moment one app wants `retrieval@0.6` while another stays on `0.4`, independent publishing earns its complexity.
-
-**B. Git dependencies (`"@aptkit/core": "github:rlynjb/aptkit#..."`).** Skip npm entirely — point the consumer at a git ref. *Why it lost:* git deps don't run the build, so the consumer pulls source and has to compile the whole monorepo, and there's no semver — you pin a commit hash. It trades the publish step for a worse install story and no version contract.
-
-## 6. Tradeoffs accepted
-
-We chose one bundle, accepting **producer-side pack complexity** — the custom packer, the five-place add-a-package checklist, and the `"files"` gotcha that ships a hollow bundle if you forget it. That complexity lives entirely on the *producer* side and is paid once per release; the *consumer* side is dead simple (one install, one import, one version). For a repo with one real consumer, moving the complexity to the producer is the right trade: the person who understands the monorepo eats the packing cost so the person consuming it doesn't.
-
-The second accepted cost: **no granular versioning.** A consumer takes all 16 at one version or none. That's fine while buffr is the only consumer; it becomes a constraint the day a second consumer wants a different slice (the flip condition above).
-
-## 7. Risks & mitigations
+Publish a single standalone bundle. The 16 internal packages are listed in
+`@rlynjb/aptkit-core`'s `bundledDependencies`, so `npm pack` inlines their built
+`dist/` into the tarball's `node_modules/`. The consumer gets one package that
+carries its own dependencies inside it.
 
 ```
-  Risk → guard
+  Single-bundle publishing — 16 packages → one tarball
 
-  accidental root publish        ─► root "private": true → EPRIVATE
-  bundle ships with no dist       ─► "files": ["dist/src"] per package
-                                     (documented scar, RELEASE.md)
-  add pkg, forget a step          ─► RELEASE.md 5-place checklist
-  unpublished dep fetched on      ─► bundledDependencies inlines them;
-    install                          nothing is fetched from registry
-  symbol dropped from surface     ─► single index.ts re-export is the contract
-  stale dist in tarball           ─► build:core:deps ordered chain before pack
+  ┌─ Monorepo (root: "private": true — never publishes) ───────────┐
+  │                                                                 │
+  │  @aptkit/runtime  tools  context  prompts  evals  workflows     │
+  │  retrieval  memory  provider-gemma  provider-local              │
+  │  agent-{anomaly,diagnostic,query,recommendation,rubric,rag}     │
+  │       └──────────────── 16 internal pkgs ──────────────┘        │
+  │                              │ re-exported by                   │
+  │                   packages/core/src/index.ts (public API)       │
+  │                              │                                   │
+  │            packages/core/package.json:                          │
+  │              dependencies + bundledDependencies = all 16        │
+  └──────────────────────────────┬─────────────────────────────────┘
+                                 │ pack-core-standalone.mjs:
+                                 │  1. npm pack each of the 16 → .tgz
+                                 │  2. extract each into stage/node_modules/
+                                 │  3. npm pack the staged core dir
+                                 ▼
+  ┌─ npm registry ─────────────────────────────────────────────────┐
+  │  @rlynjb/aptkit-core@0.4.1.tgz                                   │
+  │   └─ dist/src/ + node_modules/@aptkit/* (16, inlined)           │
+  └──────────────────────────────┬─────────────────────────────────┘
+                                 │ npm i @rlynjb/aptkit-core
+  ┌─ Consumer (buffr, separate repo) ──────────────────────────────┐
+  │  import { VectorStore, runAgentLoop, ... } from                 │
+  │         '@rlynjb/aptkit-core'   (one package, self-contained)   │
+  └─────────────────────────────────────────────────────────────────┘
 ```
 
-The risk with the thinnest guard is the five-place checklist — it's documentation, not automation. Forgetting the `bundledDependencies` entry or the `"files"` allowlist produces a tarball that installs but fails at the consumer's type-check, and nothing fails earlier.
+The load-bearing parts, by what breaks if you remove each:
 
-## 8. Rollout / migration
+- **Root `"private": true`.** The guard against publishing the monorepo. A bare
+  `npm publish` at root fails with `EPRIVATE` on purpose (`RELEASE.md`). Remove
+  it and one stray command leaks the whole repo.
+- **`bundledDependencies`** (`packages/core/package.json:49–66`, all 16 listed
+  alongside `dependencies`). This is what tells `npm pack` to inline the
+  packages rather than list them as registry deps. Drop a package from this list
+  and the bundle ships incomplete — the consumer gets `has no exported member`.
+- **`packages/core/src/index.ts`** — the public API. It re-exports the internal
+  packages; what it exports *is* the compatibility surface (semver `0.4.x`).
+- **`scripts/pack-core-standalone.mjs`** — the producer. It `npm pack`s each of
+  the 16 workspaces to a `.tgz`, extracts each into a staging
+  `node_modules/@aptkit/<name>/`, copies core's own `dist/src` + README +
+  cleaned `package.json` into the stage, then `npm pack`s the stage into the
+  final tarball. The `packageSpecs` array (lines 10–27) is the authoritative
+  list of what gets bundled — it must stay in sync with `bundledDependencies`.
 
-Already shipped: `0.4.0` is the last version published to npm, `0.4.1` is the repo dev version. The consumer migration on a new release is mechanical (RELEASE.md "Updating consumers"): bump `@rlynjb/aptkit-core` in buffr's `package.json`, blow away `node_modules` + lockfile, reinstall, test, commit. **The compatibility contract is the re-exported surface** — the names coming out of `index.ts` are semver-governed, and the `@aptkit/core ↔ @rlynjb/aptkit-core` alias must keep working for hosts that alias `npm:@rlynjb/aptkit-core`.
+## Alternatives considered
 
-## 9. Open questions
+**1. Publish N packages independently** — each `@aptkit/*` to npm with its own
+version, consumer installs the ones it wants. *Why it lost:* it buys
+granularity AptKit doesn't need today and pays for it with a 16-way version
+matrix and 16 release pipelines. One consumer, no partial-adoption demand.
+**The flip condition is explicit:** the moment a *second* consumer needs a
+*different version* of a sub-package than the first, the single bundle stops
+fitting and this becomes the right answer. Until then it's overhead for a
+problem nobody has.
 
-- **When does the second consumer arrive?** That's the flip condition for the whole decision. The day two apps want different slices at different versions, single-bundle stops paying and independent publishing (Alternative A) wins. Worth pre-deciding the trigger.
-- **Should the five-place checklist be a script or a test?** A `verify-bundle-complete` check that diffs `bundledDependencies` against the packer's `packageSpecs` and asserts each has `"files"` would convert the documented scar into a failing build.
-- **The packer hard-codes `0.0.0` tarball names** (`aptkit-<name>-0.0.0.tgz`, packer lines 11–27). If an internal package ever takes a real version, the packer breaks silently — is pinning `0.0.0` a permanent invariant or a latent bug?
+**2. Git dependencies** — consumer points its `package.json` at the GitHub repo
+or a subdirectory. *Why it lost:* it ships *source*, not built `dist/`, so the
+consumer has to build the monorepo's TypeScript itself (and resolve the
+workspace graph) — or it ships the whole repo including everything `private`
+should keep in. No clean public surface, no semver, no `npm view version`. It
+trades the pack-script complexity for consumer-side build complexity, which is
+worse.
 
----
+**3. A bundler (esbuild/rollup) that flattens everything into one `.js`.** *Why
+it lost:* it would erase the package boundaries that make the internal structure
+legible and the types per-package, and it fights the per-package `tsc -b` setup
+the repo already runs. `bundledDependencies` keeps each package intact inside
+the tarball — same structure, just shipped together.
 
-**Coach note.** A reviewer will ask "why not just publish them all properly?" — and the trap is sounding like you didn't know you *could*. You did; you chose against it. The framing that holds: *"One consumer, so I moved all the version complexity to the producer side and gave the consumer one install. The day a second consumer wants a different slice, that's the documented flip to independent publishing."* Then drop the scar — *"and the non-obvious cost was that `npm pack` honors `.gitignore`, so a bundled package without a `files` allowlist ships with no compiled `dist`; it bit us on the two providers."* Naming that gotcha is the thing that proves you actually shipped this and didn't read it in a guide.
+## Tradeoffs accepted
+
+We chose one bundle, accepting producer-side pack complexity: a 76-line script,
+a `packageSpecs` array that must mirror `bundledDependencies`, and a five-step
+checklist (`RELEASE.md`) every time a new internal package joins the surface
+(re-export, `dependencies`, `bundledDependencies`, `tsconfig` reference,
+`build:core:deps`, `packageSpecs`). We own that complexity on purpose — it lives
+in one script and one doc, and it buys the consumer a single trivial install.
+
+**The real scar — and it's worth stating plainly because it shipped broken
+twice:** every bundled package's `package.json` **must** declare
+`"files": ["dist/src"]` (or `["README.md", "dist/src"]`). AptKit's `.gitignore`
+ignores `dist/`, and `npm pack` honors `.gitignore` by default — so a bundled
+package *without* an explicit `files` allowlist ships with its built `dist/`
+silently excluded. The tarball then contains the package's `package.json` but
+none of its `.js`/`.d.ts`, and the consumer gets `has no exported member …` type
+errors at compile time, not at pack time. This bit `@aptkit/provider-gemma` and
+`@aptkit/provider-local` when they were first bundled (`RELEASE.md`). The cost is
+accepted; the mitigation is that it's now the loudest line in the release doc.
+
+## Risks & mitigations
+
+- **A new package is added but not bundled** → it ships missing, consumer breaks.
+  Mitigation: the five-step checklist in `RELEASE.md`; `packageSpecs` and
+  `bundledDependencies` are the two lists that must agree.
+- **Bundled package missing `"files"`** → empty `dist/` in the tarball.
+  Mitigation: the gotcha is documented as the headline release risk; the fix is
+  one line per package.
+- **Accidental root publish** → root `"private": true` makes it fail loud
+  (`EPRIVATE`).
+- **Stale `dist/` packed** → `npm run build:core` (ordered `build:core:deps`
+  chain) runs before pack; the script packs from `dist/`, so an unbuilt package
+  packs empty rather than stale — caught by the consumer's compile.
+- **2FA blocks automated publish** → granular access token (`@rlynjb` scope,
+  read+write, bypass-2FA) in `~/.npmrc`, per `RELEASE.md`.
+
+## Rollout / migration
+
+Already in production: `0.4.0` is the last version published to npm, `0.4.1` is
+the current repo dev version. The consumer migration is documented — bump
+buffr's `"@rlynjb/aptkit-core"` range, `rm -rf node_modules package-lock.json &&
+npm install`, `npm test`. Versioning follows semver against the *re-exported
+surface*: patch for fixes, minor for new packages/exports, major for breaking
+API changes. The `@aptkit/core` ↔ `@rlynjb/aptkit-core` alias must stay
+interchangeable for host apps that alias `npm:@rlynjb/aptkit-core`.
+
+## Open questions
+
+- **When does the second consumer arrive?** The whole single-bundle case rests
+  on one consumer. The day a second consumer needs a different sub-package
+  version, revisit alternative 1. Worth a periodic check, not a present action.
+- **The two-list invariant is manual.** `packageSpecs` (the script) and
+  `bundledDependencies` (the manifest) must list the same 16 packages, kept in
+  sync by hand and a checklist. A single source of truth (generate one from the
+  other) would remove a class of "ships incomplete" bugs. Not built.
+- **No automated tarball verification.** Nothing asserts post-pack that every
+  bundled package has a non-empty `dist/src` — the `"files"` scar is caught by
+  the *consumer's* compile, not by the release pipeline. A pack-time check that
+  each inlined package exports what `index.ts` imports would catch it before
+  publish.

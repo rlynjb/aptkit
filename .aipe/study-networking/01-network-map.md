@@ -1,176 +1,210 @@
 # Network Map
 
-**Industry name:** network boundary map / trust-and-transport topology · *Project-specific*
+**The on-the-wire path · the network boundary inventory** — *Project-specific*
 
-## Zoom out, then zoom in
+## Zoom out — where the network lives
 
-Before any single protocol, here's the whole thing in one picture: every place a byte leaves a process in this system, and what carries it.
-
-```
-  Zoom out — every network boundary in aptkit + buffr
-
-  ┌─ UI layer ────────────────────────────────────────────────┐
-  │  Studio React app (browser)                                │
-  │    fetch('/api/...')  ·  reads NDJSON ReadableStream       │
-  └───────────────────────────┬────────────────────────────────┘
-                              │  hop A: HTTP (same-origin, dev)
-                              │         or static files (Pages, prod)
-  ┌─ Service layer ──────────▼─────────────────────────────────┐
-  │  Studio vite middleware (dev only)                         │
-  │    runReplay() → agent loop → ModelProvider.complete()     │
-  └───────────────────────────┬────────────────────────────────┘
-                              │  hop B: ModelProvider.complete() — a CONTRACT,
-                              │         not always a network call
-        ┌─────────────────────┼─────────────────────┐
-        ▼                     ▼                     ▼
-  ┌─ FixtureProvider ─┐ ┌─ GemmaProvider ──┐ ┌─ Anthropic/OpenAI ─┐
-  │  in-memory        │ │ ★ fetch POST ★   │ │  vendor SDK         │
-  │  NO wire          │ │ localhost:11434  │ │  owns the wire      │
-  └───────────────────┘ └────────┬─────────┘ └─────────┬──────────┘
-                                 │ hop C: HTTP          │ hop D: HTTPS
-                                 ▼ (loopback, no TLS)   ▼ (TLS, not our code)
-                          ┌─ Ollama daemon ─┐    ┌─ api.anthropic.com ─┐
-                          │ Gemma + nomic   │    │ api.openai.com      │
-                          └─────────────────┘    └─────────────────────┘
-
-  ┌─ Storage layer (buffr, companion repo) ────────────────────┐
-  │  PgVectorStore → pg.Pool ── hop E: pg wire / TCP ──► Supabase Postgres
-  └────────────────────────────────────────────────────────────┘
-```
-
-The box marked ★ is the only socket aptkit's own code opens. Everything else is either a pure in-process call (FixtureProvider), a contract that a dependency turns into bytes (the SDKs, `pg`), or static file serving (Pages).
-
-**Zoom in.** A network map is just the inventory of *boundaries* — the lines in that diagram where data leaves one address space for another — plus, for each line, the protocol and who owns it. You build it once so that every later file ("is there TLS here?", "is there a timeout here?") has a place to point. The pattern this file teaches: **find every boundary, then ask one question across all of them.**
-
-## Structure pass
-
-Five hops, three layers. Here's the skeleton before we trace anything.
-
-**Layers:** UI (browser) → Service (Studio middleware / agent loop) → Provider (Ollama / cloud SDK) and, separately, Storage (buffr → Postgres).
-
-**Axis — trust: "who can see or tamper with the bytes on this hop?"** Trace it across the five hops and the boundaries pop:
+You've shipped a RAG app (AdvntrCue) where the browser hits a serverless function that hits Postgres and GPT-4. aptkit is the opposite shape: almost everything runs *in one process on one machine*, and the only wire that leaves that process in the default path goes to a daemon on the same box. Here's the whole system as bands, with the network boundaries marked.
 
 ```
-  One axis — trust — traced across every hop
+  Zoom out — aptkit's layers, network boundaries starred
 
-  hop A  browser → Studio middleware   same machine, dev     → trusted (localhost)
-  hop B  middleware → ModelProvider     in-process function   → no wire at all
-  hop C  Gemma → Ollama                 loopback, plain HTTP  → trusted (localhost), NO TLS
-  hop D  SDK → cloud API                public internet       → TLS, key auth (SDK owns)
-  hop E  pg.Pool → Supabase             public internet       → TLS expected (pg/PaaS owns)
+  ┌─ Caller layer ─────────────────────────────────────────────┐
+  │  CLI script · agent (rag-query) · Studio React UI           │
+  └───────────────────────────┬─────────────────────────────────┘
+                              │  in-process function calls (no wire)
+  ┌─ Runtime layer ───────────▼─────────────────────────────────┐
+  │  runAgentLoop → ModelProvider.complete() (the contract)      │
+  └───────────────────────────┬─────────────────────────────────┘
+                              │  in-process (no wire)
+  ┌─ Provider/adapter layer ──▼─────────────────────────────────┐
+  │  GemmaModelProvider · OllamaEmbeddingProvider                │
+  │     ★ NETWORK BOUNDARY ★  → the only wire aptkit owns        │ ← we are here
+  └───────────────────────────┬─────────────────────────────────┘
+                              │  HTTP POST, plain, loopback
+  ┌─ External process ────────▼─────────────────────────────────┐
+  │  Ollama daemon  localhost:11434  /api/chat · /api/embed      │
+  └───────────────────────────────────────────────────────────────┘
 ```
 
-**Seams (where the trust answer flips):**
-- **hop B is the big one** — `ModelProvider.complete()` is a seam where control flips from "guaranteed in-process" to "maybe a socket." That's why it's the contract the whole repo depends on (`packages/runtime`).
-- **hop C → hop D** — trust flips from "loopback, no encryption needed" to "public internet, must encrypt." Same `ModelProvider` contract on the near side; completely different wire on the far side.
+## Zoom in — the concept
+
+A **network map** is the inventory of every point where your code hands bytes to something it can't reach into and call directly — every socket, every origin, every protocol. Before you can reason about timeouts or TLS or retries, you need the *list*: how many wires are there, where do they go, and who owns each one? For aptkit the list is short, and that shortness is the most important fact about it.
+
+## Structure pass — the skeleton
+
+**Layers** (outer → inner): caller → runtime → provider adapter → *wire* → external daemon. Only one layer boundary is a network boundary; the rest are plain in-process calls.
+
+**Axis traced — "is there a socket here?"** Hold that one question constant down the stack:
+
+```
+  One question down the stack: "is there a socket here?"
+
+  ┌──────────────────────────────────┐
+  │ caller → runtime                  │  → NO  (function call)
+  └──────────────────────────────────┘
+      ┌──────────────────────────────┐
+      │ runtime → provider.complete() │  → NO  (function call, the contract)
+      └──────────────────────────────┘
+          ┌──────────────────────────┐
+          │ provider → defaultHttp    │  → YES ★ the seam flips here
+          │            Transport       │
+          └──────────────────────────┘
+              ┌──────────────────────┐
+              │ Ollama daemon         │  → it's the other end of the socket
+              └──────────────────────┘
+
+  the answer flips exactly once — that boundary is the whole map
+```
+
+**Seam — `ModelProvider.complete()` vs the HTTP transport.** The contract (`model-provider.ts`) promises "give me a request, get a response" and says *nothing* about a network. The socket only appears one layer deeper, inside the adapter's default transport. That's the load-bearing boundary: above it, no network; below it, exactly one.
 
 ## How it works
 
-#### Move 1 — the mental model
+### Move 1 — the mental model
 
-You already build network maps without naming them: when you draw a frontend talking to an API talking to a DB, you're drawing boundaries. A network map is that drawing made exhaustive — *every* boundary, labelled with its protocol and its trust level. The shape is a list of hops, each one a `from → [protocol] → to`.
-
-```
-  The pattern — a hop is from · protocol · to · trust
-
-  ┌────────┐   protocol    ┌────────┐
-  │ source │ ───────────►  │  dest  │
-  └────────┘   + trust     └────────┘
-       │                        │
-       └─── different address ──┘
-            spaces = a boundary
-```
-
-The kernel: a boundary exists wherever data crosses an address-space line. In-process function calls (hop B when the provider is a fixture) are *not* boundaries — no bytes serialize, nothing can be intercepted mid-flight. That distinction is the whole point of the injectable-transport design.
-
-#### Move 2 — walking the real hops
-
-**The provider contract is the seam that may or may not be a wire.** Every agent in the repo calls `model.complete(request)`. That call is defined in `packages/runtime` as a pure interface. Whether it touches the network depends entirely on which implementation got injected.
+Think of aptkit's network as a `fetch()` you'd write in a React component — except instead of hitting your API, it hits `localhost`, and instead of being scattered through components, it's funneled through a single injectable function. The shape:
 
 ```
-  Layers-and-hops — the ModelProvider seam
+  The one-wire pattern — funneled through an injectable port
 
-  ┌─ Service: agent loop ──────────────────────────────┐
-  │  runAgentLoop → model.complete(request)            │
-  └──────────────────────────┬─────────────────────────┘
-                  hop B: complete() — same call, three fates
-        ┌─────────────────────┼─────────────────────┐
-        ▼                     ▼                     ▼
-   in-process            fetch to loopback      SDK to internet
-   (no bytes)            (HTTP, hop C)          (HTTPS, hop D)
+         caller code
+             │
+             ▼
+   ModelProvider.complete(request)        ← contract, no network
+             │
+             ▼
+   this.chat(payload)                      ← the seam (GemmaChatTransport)
+             │
+   ┌─────────┴──────────┐
+   │ default            │  test
+   │ defaultHttp        │  injected mock
+   │ Transport (fetch)  │  (recorded JSON)
+   └─────────┬──────────┘
+             │  POST http://localhost:11434/api/chat
+             ▼
+         Ollama daemon
 ```
 
-The Gemma default transport is the concrete wire (`packages/providers/gemma/src/gemma-provider.ts:201-215`):
+Every wire in aptkit goes through a port like this. Swap the function, swap the network — that's why tests never open a socket.
+
+### Move 2 — walking the boundaries
+
+**Boundary 1 — the Gemma chat wire.** This is the primary one. The client (the Gemma provider) builds a JSON payload and the default transport `POST`s it to the chat endpoint.
 
 ```ts
+// packages/providers/gemma/src/gemma-provider.ts:201-215
 function defaultHttpTransport(host: string): GemmaChatTransport {
-  const base = host.replace(/\/$/, '');           // strip trailing slash
+  const base = host.replace(/\/$/, '');           // normalize trailing slash
   return async ({ signal, ...payload }) => {
-    const res = await fetch(`${base}/api/chat`, {  // ← hop C, the only socket aptkit opens
-      method: 'POST',
+    const res = await fetch(`${base}/api/chat`, {  // ← the only outbound wire
+      method: 'POST',                               // one verb
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(payload),               // non-streaming JSON body
-      ...(signal ? { signal } : {}),               // caller's AbortSignal, if any
+      body: JSON.stringify(payload),                // {model, messages, stream:false, options}
+      ...(signal ? { signal } : {}),                // cancellation pass-through
     });
-    if (!res.ok) {
-      throw new Error(`ollama HTTP ${res.status}: ${await res.text()}`); // throw on non-2xx
+    if (!res.ok) {                                  // fail-loud, no retry
+      throw new Error(`ollama HTTP ${res.status}: ${await res.text()}`);
     }
     return (await res.json()) as OllamaChatResponse;
   };
 }
 ```
 
-Line by line: `base` normalizes `http://localhost:11434`; `fetch` opens the connection; the body is one JSON object (`stream: false` is set by the caller in `complete`); there's no timeout; a non-OK status throws with the body text appended.
+Line by line: `host` defaults to `http://localhost:11434` (`gemma-provider.ts:48`); the path is hardcoded `/api/chat`; the body is the whole request object minus `signal`; non-2xx throws with the status and body text. No timeout, no retry, no headers beyond `content-type`.
 
-**hop D — the cloud SDKs — is a boundary aptkit doesn't manage.** `AnthropicModelProvider` constructs `new Anthropic({ apiKey })` (`packages/providers/anthropic/src/...:25`) and `OpenAIModelProvider` constructs `new OpenAI({ apiKey })` (`packages/providers/openai/src/openai-provider.ts:30`). From there the SDK does DNS, TLS, retries, pooling. aptkit's map records the boundary but the protocol details belong to the dependency.
+**Boundary 2 — the embeddings wire.** Same shape, different path and a body remap.
 
-**hop A / Studio — same-origin HTTP in dev, static files in prod.** The browser calls `fetch('/api/model-status')` and friends (`apps/studio/src/api.ts:11`, `:126`). In dev these hit vite middleware (`apps/studio/vite.config.ts:201-526`). In the GitHub Pages build there is no server — the static bundle ships with recorded fixtures (the RAG page uses an in-browser fake embedder), so hop A degenerates to fetching static assets.
+```ts
+// packages/retrieval/src/ollama-embedding-provider.ts:60-75
+function defaultHttpTransport(host: string): EmbedTransport {
+  const base = host.replace(/\/$/, '');
+  return async ({ signal, ...payload }) => {
+    const res = await fetch(`${base}/api/embed`, {              // ← second wire
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: payload.model, input: payload.texts }),
+      ...(signal ? { signal } : {}),
+    });
+    if (!res.ok) throw new Error(`ollama HTTP ${res.status}: ${await res.text()}`);
+    const json = (await res.json()) as OllamaEmbedResponse;
+    return json.embeddings ?? [];                                // [] when absent
+  };
+}
+```
 
-**hop E — buffr's database wire.** `createPool(databaseUrl)` builds a `pg.Pool` (`buffr/src/db.ts:4`); `PgVectorStore.search` runs a cosine query over it (`buffr/src/pg-vector-store.ts:67-86`). This is the pg binary wire protocol over TCP, and it's the only long-lived connection in the whole system.
+Note the body translation: the transport takes `{texts}` but sends `{input}` — Ollama's `/api/embed` wants `input`. That remap is the only protocol-shaping these transports do.
 
-#### Move 3 — the principle
+**Boundary 3 — Studio dev server (HTTP middleware).** Not an outbound wire — an *inbound* one the React UI hits. Vite's `configureServer` registers handlers like `/api/model-status` and the NDJSON streaming routes.
 
-A network map is worth drawing because **most bugs and most attacks live on the boundaries, not inside the layers.** Once you can name all five hops and the trust level of each, every other networking question has a place to land. The deeper principle here: aptkit deliberately keeps its *own* boundary count to one (hop C), pushing the rest onto dependencies or out to buffr — fewer boundaries you own means fewer places to get TLS, retries, and timeouts wrong.
+```
+  Layers-and-hops — Studio dev request flow
+
+  ┌─ Browser (UI) ─┐  hop1: POST /api/stream/query/replay   ┌─ Vite dev ──┐
+  │  React fetch() │ ────────────────────────────────────► │  middleware │
+  └────────────────┘  hop2: x-ndjson chunks (event,event…) └──────┬──────┘
+        ▲                ◄─────────────────────────────────       │ runs agent
+        └──── hop3: result record ◄──────────────────────────────┘  in-process
+                                                          (no further wire;
+                                                           fixtures, not Ollama)
+```
+
+This wire is `127.0.0.1:4187` (`playwright.studio.config.ts:10,16`), HTTP/1.1, and it streams NDJSON via `streamReplayResponse` (`vite.config.ts:888-919`). In the *production* Pages build there's no dev server at all — the UI is static assets fetched from GitHub Pages over HTTPS, and the agents run fully in-browser against recorded fixtures.
+
+**Boundary 4 — the cloud SDKs (not on the default path).** `AnthropicModelProvider` and `OpenAIModelProvider` wrap vendor SDKs that own their own HTTPS wire to `api.anthropic.com` / `api.openai.com`. aptkit doesn't construct those sockets; the SDK does. They're only reached if a caller wires them (e.g. through the `FallbackModelProvider`), and `/api/model-status` (`vite.config.ts:202-216`) just reports whether the keys exist — it never calls out.
+
+**Boundary 5 — buffr's `pg` wire (different repo).** The durable store reaches Supabase Postgres over a TCP connection pool (`buffr/src/db.ts:4-6`). That's a different protocol (Postgres wire, not HTTP) in a different repo. aptkit's `VectorStore` contract is what buffr's `PgVectorStore` implements — the seam is in aptkit, the socket is in buffr.
+
+### Move 3 — the principle
+
+A network map's value is its *length*. aptkit has exactly two outbound HTTP wires it owns, both to `localhost`, both behind an injectable port. When the map is this short and this funneled, every network property — timeout, TLS, retry — has exactly one place to live. The risk isn't sprawl; it's that the one place is currently *empty* of timeout logic.
 
 ## Primary diagram
 
-The full map, recapped with protocol and trust on every hop.
+The complete network map: every boundary, who owns the socket, what protocol.
 
 ```
-  aptkit + buffr — complete network map
+  aptkit network map — boundaries, owners, protocols
 
-  Browser ──A: HTTP/static──► Studio middleware ──B: complete() in-proc──► provider
-                                                                              │
-                            ┌─────────────────────────────────────────────────┤
-                            │ C: HTTP loopback (no TLS)     D: HTTPS (SDK)      │
-                            ▼                               ▼                   │
-                      Ollama :11434                   cloud API                 │
-                      Gemma + nomic                   Anthropic/OpenAI          │
-                                                                                │
-  buffr: PgVectorStore ──E: pg wire over TCP (TLS expected)──► Supabase Postgres
+  ┌─────────────────────────────────────────────────────────────────┐
+  │ BOUNDARY            OWNER              PROTOCOL        WHERE       │
+  ├─────────────────────────────────────────────────────────────────┤
+  │ 1 Gemma chat        aptkit (default    HTTP/1.1 POST   gemma-      │
+  │   →localhost:11434  transport)         plain, no TLS   provider   │
+  │                                                        .ts:201    │
+  │ 2 embeddings        aptkit (default    HTTP/1.1 POST   ollama-    │
+  │   →localhost:11434  transport)         plain, no TLS   embedding  │
+  │                                                        .ts:60     │
+  │ 3 Studio dev API    Vite middleware    HTTP/1.1 +      vite.      │
+  │   127.0.0.1:4187    (inbound)          NDJSON stream   config:202 │
+  │ 4 cloud SDKs        vendor SDK         HTTPS           anthropic/ │
+  │   api.*.com         (not default path) (SDK-owned)     openai pkg │
+  │ 5 Postgres (buffr)  buffr pg.Pool      TCP, pg wire    NOT this   │
+  │   Supabase                             protocol        repo       │
+  └─────────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-Network maps come from threat-modeling and SRE practice — you can't reason about failure or security without first enumerating the boundaries. The discipline of marking in-process calls as *non*-boundaries is what makes the injectable-transport pattern legible: the same `complete()` call is a boundary or not depending on injection, and the map makes that explicit. Read `01` of `study-system-design` for where these boundaries sit architecturally; read `08` here for the ranked risks on each hop.
+The reason the map is this short is deliberate: aptkit is the deployment-*agnostic* core. Anything that would add a real network boundary — a hosted vector DB, a managed LLM, a sync server — is pushed into the "body" repo (buffr) behind a contract. That's why `ModelProvider`, `EmbeddingProvider`, and `VectorStore` exist: each is a seam where a network adapter *could* live, but in aptkit the adapter is either local-HTTP or in-memory. The map you'd draw for buffr is bigger; the map for aptkit is intentionally one machine.
 
 ## Interview defense
 
-**Q: "Walk me through every network call your system makes."**
-Answer with the map. "One socket I own: a plain HTTP POST to a local Ollama daemon. Two boundaries I delegate to vendor SDKs: Anthropic and OpenAI over HTTPS. One static-file boundary: Studio on GitHub Pages. And one database connection in the companion repo: a pg pool to Supabase Postgres." The signal is that you can enumerate them *and* distinguish the one you own from the ones you delegate.
+**Q: Walk me through every network call your system makes.**
+Two outbound HTTP wires, both to a local Ollama daemon: `POST /api/chat` and `POST /api/embed`, plain HTTP on `localhost:11434`. Both go through an injectable transport port so tests use no network. Studio's dev server adds an inbound HTTP middleware on `127.0.0.1:4187` that streams NDJSON. Cloud SDKs (Anthropic/OpenAI) own their own HTTPS but aren't on the local default path. The Postgres wire lives in the companion repo, not the core.
 
 ```
-  sketch while you talk: 5 hops, mark the one you own
-
-  A browser   B in-proc   C ★OLLAMA★   D cloud-SDK   E pg-pool
-                          (only socket
-                           I write code for)
+  caller → contract (no wire) → adapter → ★fetch★ → localhost Ollama
+                                  └ injectable: tests swap the fetch
 ```
+Anchor: *"two wires, one origin, one verb, fully injectable."*
 
-Anchor: *the in-process call is not a boundary — that's the whole point of the injectable transport.*
+**Q: Why is the network surface so small?**
+Because the core is deployment-agnostic by design. Every place a real network adapter would go is a contract (`ModelProvider`/`VectorStore`); the production sockets live in buffr. aptkit ships the seam, not the socket.
 
 ## See also
 
-- `02-dns-routing-and-addressing.md` — why every endpoint here skips DNS
-- `03-tcp-udp-connections-and-sockets.md` — the connection lifecycle of hop C
-- `08-networking-red-flags-audit.md` — ranked risks per hop
+- `03-tcp-udp-connections-and-sockets.md` — the socket lifecycle under that one `fetch`
+- `05-http-semantics-caching-and-cors.md` — the verb, status, and header choices
+- `07-timeouts-retries-pooling-and-backpressure.md` — what's missing at the boundary
+- `00-overview.md` — ranked findings and `not yet exercised` list

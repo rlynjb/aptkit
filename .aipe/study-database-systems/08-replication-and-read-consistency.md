@@ -1,160 +1,220 @@
-# 08 · Replication and Read Consistency
+# Replication and Read Consistency
 
-**Industry name(s):** streaming replication, read replicas, replication lag, stale reads, failover. **Type:** Industry standard.
+**Industry name:** streaming replication / read replicas / replica lag / stale reads · *Industry standard*
 
-## Zoom out, then zoom in
+## Zoom out — where replication would sit (but doesn't)
 
-Replication is "keep a second copy of the database so reads can scale and a failover has somewhere to go." You know the read-your-own-write problem from frontend: you POST an update, immediately GET, and the GET hits a stale cache that hasn't seen your write. Replication lag is that exact problem at the database tier. The headline here is short and honest: **buffr uses one Postgres endpoint, one connection pool, no replicas.** So this file teaches the mechanism and names precisely where it would attach — almost all of it is `not yet exercised`.
-
-```
-  Zoom out — where replication would sit (but doesn't, yet)
-
-  ┌─ Application (buffr) ──────────────────────────────────┐
-  │  one pg.Pool → one DATABASE_URL → one Postgres endpoint │
-  └────────────────────────────┬────────────────────────────┘
-                               │  every read AND write
-  ┌─ Postgres (Supabase) ──────▼────────────────────────────┐
-  │  PRIMARY (single)                                        │ ← we are here
-  │  ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄ │
-  │  read replica(s): NONE wired (Supabase could provide)    │
-  └──────────────────────────────────────────────────────────┘
-```
-
-Zoom in: the concept is **read consistency under replication** — when you have copies, which copy does a read hit, and how stale can it be? buffr's answer today is trivially strong: there's one copy, so every read is up-to-date, no lag, no stale reads. That simplicity is a *choice* (single-tenant laptop runtime), and the file's job is to show what changes the moment a replica appears.
-
-## The structure pass
-
-**Layers.** Replication concerns three altitudes: the connection layer (how many endpoints the app talks to — buffr: one), the routing layer (which reads go to a replica — buffr: none), and the engine (WAL streaming from primary to replica — buffr: not configured).
-
-**Axis — trace "how fresh is a read, and where does it go?":**
+This is the most honest file in the guide: buffr has **no replication**. One
+Supabase primary, one connection pool, every read and write hitting the same
+node. Here's the shape — with the box that *doesn't exist* drawn dashed so you
+can see the gap:
 
 ```
-  One question down the layers: "read freshness and destination?"
+  Zoom out — buffr's topology (single primary)
 
-  ┌─ connection (buffr) ────────────────────┐
-  │  one pg.Pool, one DATABASE_URL           │ → all reads hit the PRIMARY
-  └──────────────────────────────────────────┘
-  ┌─ routing ────────────────────────────────┐
-  │  no read/write split                      │ → no routing decision exists
-  └──────────────────────────────────────────┘
-  ┌─ engine ─────────────────────────────────┐
-  │  no replica → no WAL stream → no lag      │ → reads ALWAYS fresh (trivially)
-  └──────────────────────────────────────────┘
-
-  freshness is perfect BECAUSE there is one copy — not because lag is handled
+  ┌─ Application (buffr) ──────────────────────────────────────┐
+  │  createPool(DATABASE_URL)  (db.ts:5) — one pool, one URL    │
+  └───────────────────────────┬────────────────────────────────┘
+                              │ reads AND writes
+  ┌─ Primary (Supabase Postgres) ────────▼─────────────────────┐
+  │  ★ the only node — reads + writes both land here ★         │ ← we are here
+  └────────────────────────────────────────────────────────────┘
+            ┊  (would stream WAL to...)
+  ┌─ Read replica ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┐
+  ┊  DOES NOT EXIST — not yet exercised             ┊
+  └┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┘
 ```
 
-**Seam.** The boundary that *would* matter is the read/write split — the routing decision "send this read to a replica or the primary." It doesn't exist in buffr (one pool, `buffr/src/db.ts:4-6`). Naming the absent seam is the lesson: the moment you add a replica, that seam appears, and with it the stale-read problem.
+## Zoom in — what this file covers
+
+The question: **does buffr ever read stale data from a replica?** Answer: no,
+because there is no replica — every read is read-your-writes consistent by
+construction. This file teaches what replication *would* introduce, so you can
+recognize the consistency problems buffr has *avoided* by staying single-node,
+and name when they'd appear.
+
+## Structure pass
+
+**Layers.** Single-primary (what buffr runs) → primary + async replicas (what
+buffr would grow into). The consistency model flips entirely between them.
+
+**Axis — trace "can a read see a write that already committed?"**
+
+```
+  One question across topologies: "read-your-writes?"
+
+  single primary (buffr today)  → ALWAYS. write commits, next read sees it.
+  primary + sync replica        → yes, but writes are slower (wait for replica)
+  primary + async replica       → NO guarantee. replica lags; a read routed
+   (route reads to replica)        there can miss a just-committed write
+
+  buffr sits at the leftmost column — strongest consistency, zero
+  config — precisely because it never added a replica
+```
+
+**Seam.** The seam *would be* the read-routing decision — "send this read to
+the primary or a replica?" — and it does not exist in buffr. There's one pool,
+one URL (`db.ts:5`), so every read goes to the writer. The consistency
+question never arises because the routing seam was never created.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-Replication is the WAL (07) put to a second use: instead of only replaying the log locally for crash recovery, *stream* it to another Postgres that replays it to stay a copy. The replica is always slightly behind — it's replaying a log that's still being written — and that gap is replication lag.
+Replication is the same idea as a cache that follows a source of truth: the
+primary is canonical, replicas are copies kept current by replaying the
+primary's change stream (the WAL, → `07`). The catch is the same as any cache
+— the copy can be *behind*. Read from a lagging replica right after a write and
+you see the old value: a stale read.
 
 ```
-  Streaming replication — the WAL as a feed to a copy
+  Async replication — and where staleness enters
 
-  PRIMARY                                    REPLICA
-  ┌──────────────┐  WAL stream (async)       ┌──────────────┐
-  │ writes commit│ ────────────────────────► │ replays WAL  │
-  │ WAL appended │                           │ stays behind │
-  └──────────────┘                           └──────────────┘
-       ▲                                          ▲
-   writes go here                          reads CAN go here
-                                           but see state from
-                                           "lag" milliseconds ago  ◄ stale-read window
+  ┌─ Primary ─┐  WAL stream   ┌─ Replica ─┐
+  │ write X=2 │ ────────────► │ X=1 still │  ← replica hasn't applied
+  │ commit    │  (lag: ms-s)  │           │     the WAL record yet
+  └─────┬─────┘               └─────┬─────┘
+        │ read X → 2 (fresh)        │ read X → 1 (STALE)
+        ▼                           ▼
+   read-your-writes            broken read-your-writes
+
+  buffr only ever has the LEFT node, so only the fresh read exists
 ```
 
-The kernel: **the replica replays the primary's WAL and is always `lag` behind.** A read routed to the replica sees the database as of `now - lag`. Read your own write through a replica inside that window, and you don't see your write — the canonical stale read.
+### Move 2 — the moving parts
 
-### Move 2 — the walkthrough
-
-**The single endpoint — one pool, everything.** buffr's entire connection story is one function:
+**One pool, one node — the whole topology.** buffr's data access is a single
+`pg.Pool` over a single `DATABASE_URL`:
 
 ```ts
-// buffr/src/db.ts:4-6
+// buffr/src/db.ts:1-6
 export function createPool(databaseUrl: string): pg.Pool {
-  return new pg.Pool({ connectionString: databaseUrl });   // ONE url, ONE pool
+  return new pg.Pool({ connectionString: databaseUrl });
 }
+//   ^ one URL → one primary. No read-replica URL, no routing logic,
+//     no "reads here, writes there" split anywhere in buffr.
 ```
 
-One `DATABASE_URL` (`config.ts:11`), one `pg.Pool`, shared by every read and every write. The chat session creates exactly one pool and holds it for the session lifetime (`buffr/src/session.ts:39, 72-74`). Searches, upserts, message inserts, profile reads — all go through this single pool to the single primary. There is no second connection string, no replica URL, no read-only pool. So there is no routing decision to get wrong, and no lag to reason about: **every read is strongly consistent because there's only one copy.**
+A connection pool is *not* replication — it's several connections to the
+*same* node. The vector search (`pg-vector-store.ts:67`) and the chunk upsert
+(`pg-vector-store.ts:38`) both draw from this one pool, both hit the primary.
+The consequence: index a document, then search — the search always sees the
+just-written chunks. Read-your-writes holds for free.
 
-**Read-your-own-write — currently free, the moment a replica appears it's not.** The session's flow is read-after-write heavy: index a document, then immediately search it; remember a turn, then recall it next turn (`session.ts:60-70`). Today that's safe — the search hits the same primary the upsert committed to, so it sees the write. Trace what breaks if you add a replica and route searches to it:
+**Read consistency buffr gets for free.** Because there's one node:
 
 ```
-  Layers-and-hops — read-your-own-write, today vs with a replica
+  buffr's read-your-writes — guaranteed by topology, not config
 
-  TODAY (one primary)                      WITH A REPLICA (hypothetical)
-  ┌─ session ─┐ upsert → PRIMARY           ┌─ session ─┐ upsert → PRIMARY
-  │           │ search → PRIMARY ✓ fresh   │           │ search → REPLICA
-  └───────────┘                            └───────────┘          │
-                                                      lag window ▼
-                                            REPLICA hasn't replayed the upsert yet
-                                            → search returns ZERO hits for the doc
-                                              just indexed  ◄ stale read = silent RAG miss
+  session.ask(q):
+    persistMessage(user turn)   ─► primary   (commit)
+    agent.answer(q)
+      └ search_knowledge_base   ─► primary   ← sees every prior commit
+    memory.remember(turn)       ─► primary   (commit)
+    next ask() recalls it       ─► primary   ← memory is immediately findable
 ```
 
-This is the concrete consequence to hold onto: in a RAG system, a stale read isn't a wrong number on a dashboard — it's the model retrieving *nothing* for a document it was just told about, then confidently answering "I don't have information on that." The fix when replicas arrive is read-your-own-write routing: send reads that follow a write to the primary, or wait for the replica's LSN to catch up. None of that exists yet — **`not yet exercised`**.
+The episodic memory loop (`session.ts:60-71`) depends on this without stating
+it: `remember` writes to the store, and a *future* turn's
+`search_knowledge_base` must find it. On a single primary that's automatic. On
+an async replica, a memory written one turn could be missing from the next
+turn's recall if that read hit a lagging replica — the conversation would
+"forget" something it just learned. buffr never risks this because it never
+splits reads off the primary.
 
-**Failover — Supabase's job, untested here.** If the primary dies, a managed Supabase plan can promote a standby and the `DATABASE_URL` endpoint repoints. buffr's code does nothing for this:
+**What replication would cost — named, not invented.** If buffr ever needed
+read replicas (it doesn't — single user), three problems arrive at once, and
+the code would have to answer each:
 
-- **No connection retry/reconnect logic** beyond what `pg.Pool` does by default — a failover mid-query surfaces as a connection error to the caller.
-- **No health check or endpoint failover** in the app.
-- **No tested failover drill.**
+- **Replica lag** — async replicas trail the primary by milliseconds to
+  seconds. The vector search routed to a replica could miss freshly indexed
+  chunks.
+- **Stale reads / read-your-writes breakage** — the memory-recall loop above
+  breaks unless writes-then-reads are pinned to the primary or the session is
+  sticky.
+- **Failover** — if the primary dies and a replica is promoted, any writes
+  that hadn't replicated are lost (with async). buffr's best-effort memory
+  write (`07`) already tolerates loss; the chunk upserts would not.
 
-So failover resilience is inherited from Supabase and **`not yet exercised`** at the application layer — a mid-query failover today would propagate as an error, not a transparent retry.
+All three are `not yet exercised`. The right framing: buffr has the *strongest*
+read consistency a Postgres app can have, and it got there by not scaling out.
+That's a legitimate choice for a single-user laptop runtime — you don't add
+replicas you don't need just to practice the consistency problems they bring.
 
-**Why this is the right call now.** buffr is a *laptop runtime* (`context.md`: "Supabase-backed laptop runtime") — single user, single writer, a small corpus. A read replica would add lag and a routing seam to solve a scaling problem buffr doesn't have. One primary is the honest, correct choice for the deployment; the file's value is showing the reader the exact seam that appears the day the deployment isn't single-user anymore.
+**Failover and HA — Supabase's territory.** Whatever high-availability
+Supabase provides (standby promotion, connection re-routing) is managed and
+unconfigured by buffr (`not yet exercised`). buffr's only resilience code is
+the pool itself reconnecting and the best-effort memory swallow — there's no
+retry-on-failover, no read-replica fallback, no health check. At single-user
+scale, a primary outage simply means the CLI errors and the user retries.
 
 ### Move 3 — the principle
 
-Replication is the WAL stream reused to keep a copy, and the copy is always `lag` behind — which turns "read your own write" into a real hazard the instant you route reads to a replica. In a RAG system that hazard is uniquely nasty: a stale read is a retrieval *miss*, which the model launders into a confident wrong answer. The general lesson: every replica you add buys read capacity and a failover target at the cost of a new consistency seam — and you don't get to ignore that seam, you get to *route* it.
+Replication trades read scalability for consistency: more nodes to read from,
+but now a read can be stale and a failover can lose un-replicated writes.
+Read-your-writes — "after I commit, my next read sees it" — is free on a single
+primary and becomes something you have to *engineer* (sticky sessions, primary
+pinning, sync replicas) the moment you scale reads out. The instinct worth
+keeping: don't add replicas to look scalable. Add them when read load actually
+demands it, and budget for the consistency work that comes with them.
 
 ## Primary diagram
 
 ```
-  Full replication picture — what exists, what would attach
+  Replication recap — buffr
 
-  ┌─ EXISTS in buffr ──────────────────────────────────────────────┐
-  │  one pg.Pool ── one DATABASE_URL ── one PRIMARY                 │
-  │  all reads + writes → primary → strongly consistent, zero lag   │
-  │  (correct for a single-user laptop runtime)                     │
-  └─────────────────────────────────────────────────────────────────┘
-  ┌─ NOT EXERCISED (the seam that appears with a replica) ─────────┐
-  │  read replica · WAL streaming · replication lag                 │
-  │  read/write split routing · read-your-own-write handling        │
-  │  failover promotion · reconnect/retry · failover drill          │
-  │     │                                                           │
-  │     └─► RAG-specific risk: stale read = retrieval MISS =        │
-  │         model answers "no information" on a just-indexed doc    │
-  └─────────────────────────────────────────────────────────────────┘
+  WHAT EXISTS                          WHAT DOESN'T (not yet exercised)
+  ───────────                          ───────────────────────────────
+  one pg.Pool (db.ts:5)                read replicas
+  one DATABASE_URL                     read/write routing seam
+  one Supabase primary                 replica-lag handling
+  reads + writes → same node           stale-read mitigation
+                                       failover/promotion logic
+  CONSISTENCY buffr HAS                 sync-vs-async replica choice
+  ─────────────────────
+  read-your-writes (free, by topology)
+  memory recall always sees prior remember()
+  no stale reads possible — there's nowhere stale to read from
 ```
 
 ## Elaborate
 
-Streaming replication is asynchronous by default (the primary doesn't wait for the replica to confirm), which is why lag exists; synchronous replication eliminates the stale-read window but adds commit latency — a tradeoff buffr never has to make at one node. The reason this file is mostly `not yet exercised` is the same reason it's honest: buffr's system-design choice (local-first, single-user) deliberately sidesteps the whole category. When that changes — multi-user, or read-heavy enough to need replicas — the first thing to design is read-your-own-write for the index→search and remember→recall paths, because those are where a stale read becomes a silent correctness bug rather than a visible one. Read next: 07 for the WAL that replication streams, study-system-design for the scaling decision, study-distributed-systems for consistency under partial failure.
+This file is mostly about a problem buffr doesn't have, and that's the point: a
+study guide that invents a replication tier to look complete would be lying.
+The single-primary choice is the same instinct as AdvntrCue colocating vector
+and relational data in one Postgres — keep the topology flat until load forces
+your hand, because every node you add is a consistency boundary you now own.
+The bridge to distributed systems (the neighboring guide): replica lag is just
+the CAP tradeoff made concrete — under a partition you pick the stale read
+(availability) or the blocked read (consistency), and async replication has
+silently chosen availability for you. buffr sidesteps the whole tradeoff by
+having one node, which is the most honest thing a single-user app can do.
 
 ## Interview defense
 
-**Q: How do you handle replication lag and stale reads?**
+**Q: How do you handle replica lag and stale reads?**
+I don't have to — buffr is a single Supabase primary, one connection pool, one
+URL. Every read and write hits the same node, so read-your-writes is free: I
+index a doc and the next search sees it; I `remember` a turn and the next turn
+recalls it. There's nowhere stale to read from.
 
 ```
-  today: one primary → no replica → no lag → no stale reads (trivially)
-  with a replica: upsert→primary, search→replica, lag window → search MISSES the doc
+  one pool → one primary → reads + writes same node → no staleness
 ```
 
-Answer: "Today I don't have to — buffr is one primary, one connection pool, so every read is strongly consistent. That's a deliberate single-user-laptop choice, not lag handling. The moment a read replica is added, the index→search and remember→recall paths become read-your-own-write hazards: a search routed to a lagging replica returns zero hits for a doc just indexed, and the model answers 'no information.' The fix is routing those reads to the primary or waiting on the replica's LSN. It's `not yet exercised` because the deployment doesn't need replicas." Anchor: *in RAG, a stale read is a retrieval miss, not a stale number.*
+**Q: What breaks if you add read replicas?**
+Three things at once: the vector search could miss freshly indexed chunks off
+a lagging replica; the conversation-memory recall loop breaks read-your-writes
+unless I pin writes-then-reads to the primary; and async failover could lose
+un-replicated writes. I'd only take that on when read load demanded it — not to
+look scalable.
 
-**Q: What happens on a database failover?**
-
-Answer: "At the app layer, honestly nothing graceful. There's one `pg.Pool` to one endpoint; a mid-query failover surfaces as a connection error, not a transparent retry. Supabase can promote a standby and repoint the endpoint, but buffr has no reconnect logic, health check, or failover drill — so it's inherited and untested. For a laptop runtime that's acceptable; for multi-user I'd add pool-level reconnect and a tested failover." Anchor: *failover is Supabase's mechanism, untested at the app layer.*
+**Anchor:** "Single primary, so read-your-writes is free — I avoided every
+replication consistency problem by not having replicas I don't need."
 
 ## See also
 
-- `07-wal-durability-and-recovery.md` — the WAL stream replication consumes.
-- `01-database-systems-map.md` — the single pg.Pool endpoint.
-- `09-database-systems-red-flags-audit.md` — replication gaps ranked.
-- study-system-design — the local-first/single-user choice that defers replication.
-- study-distributed-systems — read-your-own-write and consistency under partial failure.
+- `07-wal-durability-and-recovery.md` — the WAL stream replicas would consume.
+- `06-locks-mvcc-and-concurrency-control.md` — single-node concurrency, no cross-replica coordination.
+- study-distributed-systems — replica lag as the CAP tradeoff made concrete.
+- study-system-design — when buffr's topology would need to scale out.

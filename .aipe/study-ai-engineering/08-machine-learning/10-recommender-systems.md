@@ -1,301 +1,216 @@
-# Recommender systems
+# Recommender Systems
 
-**Subtitle:** what-to-show-next · content vs collaborative vs hybrid · *Industry standard*
+> recommender system · ranking / personalization
+
+Blunt version: aptkit trains no model and ships no recommender. There's no user-item matrix, no ranker, no personalization layer in `packages/` or in buffr. This is new ground — study material plus a buildable exercise, not a tour of shipped code. `not yet exercised in aptkit` appears wherever you might otherwise assume something's running.
+
+And there's a structural fact about your situation that changes the whole conversation: **buffr is a single-user personal agent.** That one constraint quietly deletes half of the recommender playbook before you even start, and knowing *why* is the most useful thing in this file.
 
 ## Zoom out, then zoom in
 
-A recommender is not a new kind of model — it is the supervised pipeline (file
-01) pointed at one specific question: *given who you are and what you've
-engaged with, which items go at the top of the list?* The starred box is the
-ranking model; everything around it is the same data plumbing you already know.
+A recommender mostly lives at the Model and Deploy steps — it consumes features and produces a ranked list. But the interesting structure is in Features, where it decides *what* to compare: items, users, or both.
 
 ```
-  Zoom out — a recommender is a specialized supervised pipeline
-
-  ┌─ Interaction layer ────────────────────────────────────────────┐
-  │  who engaged with what (clicks, reads, likes) — or, single-user, │
-  │  just one person's own corpus of items                          │
-  └───────────────────────────┬─────────────────────────────────────┘
-                              │ feature engineering (file 02)
-  ┌─ Feature layer ───────────▼─────────────────────────────────────┐
-  │  item embeddings + user signal → (user, item) feature vectors   │
-  └───────────────────────────┬─────────────────────────────────────┘
-                              │ fit + select
-  ┌─ Model layer ─────────────▼─────────────────────────────────────┐
-  │  ★ ranking model: score(user, item) → relevance ★              │
-  └───────────────────────────┬─────────────────────────────────────┘
-                              │ sort by score, take top-k
-  ┌─ Serving layer ───────────▼─────────────────────────────────────┐
-  │  ranked list of k items; grade with precision@k / recall@k      │
-  └──────────────────────────────────────────────────────────────────┘
+Generic supervised-ML pipeline · where a recommender sits
+┌────────┐  ┌──────────┐  ┌────────────────────┐  ┌─────────┐  ┌────────┐
+│  Data  │─▶│ Features │─▶│  Train / Val / Test │─▶│  Model  │─▶│ Deploy │
+└────────┘  └────┬─────┘  └────────────────────┘  └────┬────┘  └────────┘
+                 │                                      │
+        ┌────────▼─────────┐                  ┌─────────▼──────────┐
+        │ item features    │                  │ ★ RECOMMENDER      │
+        │ user-item matrix │                  │  score & rank      │
+        └──────────────────┘                  │  candidates        │
+                                              └────────────────────┘
+   what you compare ────────────▶ decides content vs collaborative
+   what you output ─────────────▶ a ranked list, not a single label
 ```
 
-Now zoom in. The whole field splits on one question asked at the interaction
-layer: *where does the signal for the recommendation come from?* It can come
-from the items themselves (content-based), from other users (collaborative), or
-both (hybrid). That single choice decides what data you need, and — the point
-for this reader — it decides whether a single-user system like buffr can use the
-technique at all.
+The output isn't one prediction; it's an *ordering*. And the choice of what features feed it — properties of items, or the pattern of who-liked-what across many users — is the fork that splits the whole field into content-based, collaborative, and hybrid.
 
 ## Structure pass
 
-**Layers.** Interactions → features → ranking model → ranked list → eval. Same
-five-layer shape as the supervised pipeline; the only specialization is that the
-inference unit is a `(user, item)` pair and the output is a *sorted* list, not a
-single label.
+Lay the three families along one axis: how much they lean on *other users*.
 
-**Axis — what signal does the rec come from?** Trace the source of "you might
-like this." Content-based: from the item's own features ("similar to things you
-engaged with"). Collaborative: from other users ("people like you liked this").
-Hybrid: from both. This axis is the entire taxonomy, and it is also a data
-requirement — collaborative needs many users and an interaction log; content-
-based needs neither.
+```
+The recommender families · axis = reliance on a user population
+NONE ◀──────────────────────────────────────────────────▶ TOTAL
 
-**Seam.** The load-bearing boundary is the **item embedding function** — the
-code that maps an item to a vector. Content-based recommendation *is* nearest-
-neighbor search in that vector space. It is the exact same seam as your RAG
-retrieval: `embed(item) → vector`, then sort by similarity. When that function
-exists, you already have a content-based recommender.
+┌─────────────────┐     ┌─────────────────┐     ┌──────────────────┐
+│ CONTENT-BASED   │     │ HYBRID          │     │ COLLABORATIVE     │
+│                 │     │                 │     │ FILTERING         │
+│ "items like the │     │ blend both      │     │ "what users like  │
+│  ones you liked"│     │ signals         │     │  YOU also liked"  │
+│                 │     │                 │     │                   │
+│ uses ITEM       │     │ uses BOTH       │     │ uses USER-ITEM    │
+│ features only   │     │                 │     │ matrix            │
+└────────┬────────┘     └────────┬────────┘     └─────────┬────────┘
+         │                       │                        │
+   works with         needs SOME population        needs MANY users
+   ONE user ✔         (degrades w/ few)            (dead with one ✘)
+```
+
+The seam that matters for buffr is on the right edge. Collaborative filtering's entire mechanism is "find users similar to you, recommend what they liked." With exactly one user there is no neighbor population — the similarity computation has nobody to compare against. That family is simply off the table. So is the collaborative half of any hybrid. You're left with the left edge: content-based plus explicit rules.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You already have a content-based recommender. buffr's `PgVectorStore.search`
-(`/Users/rein/Public/buffr/src/pg-vector-store.ts`) takes a query vector and `k`
-and returns `Hit[]` of `{id, score, meta}` sorted by similarity. Swap the word
-"query" for "an item the user engaged with" and that *is* content-based
-recommendation: find items whose embeddings are nearest to the ones you liked.
-No second user required.
+The mental model for the family you *can* use: **content-based recommendation is a similarity search in item-feature space.** You build a profile of what the user liked, represent each candidate item as a feature vector, and rank candidates by closeness to the profile.
 
 ```
-  Pattern — content-based rec = the similarity search you already run
-
-  an item the                      ┌──────────────┐   sorted neighbors
-  user engaged with ──embed──► v ─►│ vector store │─► [{id, score}, …]
-  (a note, a doc)                  │  search(v,k) │      = recommendations
-                                   └──────────────┘
-   no other users · no interaction log · just item ↔ item similarity
+Pattern · content-based = similarity in item space
+ liked items ─▶ ┌──────────────┐
+                │ user profile │  (centroid / weighted avg
+                │  = avg of    │   of liked item vectors)
+                │ liked vectors│
+                └──────┬───────┘
+                       │ cosine / dot
+ candidate items ──────▶ score = similarity(candidate, profile) ─▶ rank ▼
 ```
 
-You don't need a ratings matrix to start. You need an embedding and a sort.
+No other users anywhere in that picture — which is exactly why it survives the single-user constraint. The user *is* the population.
 
-### Move 2 — the three families, one box at a time
+### Move 2 — the steps
 
-**Content-based — recommend items like the ones you engaged with.** Build a
-profile from the user's own items, then rank candidates by similarity to that
-profile. Needs item features (or embeddings) and *nothing about other users*.
+**Step A — featurize items.** Turn each buffr item into a vector. Tags, categories, recency, source, and an embedding of its text all concatenate into one feature vector per item.
 
 ```
-  Content-based: item features only
-
-  user's engaged items        candidate item
-  [▓ embeddings ▓] ──avg──► profile vector
-                                 │  cosine
-  candidate ──embed──► v ────────┴────► score, then sort
+Item → vector
+item ─▶ [ tag onehot | category | recency | text embedding ] ─▶ v_item
 ```
 
 ```python
-# Content-based: rank candidates by similarity to the user's own profile.
-def content_based(engaged_items, candidates, embed):
-    profile = mean([embed(i) for i in engaged_items])   # user profile = avg of liked items
-    scored = [(c, cosine(profile, embed(c))) for c in candidates]
-    return sort_desc_by_score(scored)[:k]               # top-k by item↔item similarity
-# needs: item embeddings. needs NOT: any other user.
+# not yet exercised in aptkit — buffr has no item-feature pipeline today
+def featurize(item):
+    return concat(onehot(item.tags), onehot(item.category),
+                  recency(item.created_at), embed(item.text))
 ```
 
-**Collaborative filtering — recommend what similar *users* liked.** Build a
-user×item matrix of interactions, find users (or items) with similar patterns,
-and recommend the gaps. This is the family that needs *many users and history*.
+**Step B — build the user profile.** Aggregate the vectors of items the user engaged with into one profile vector. A weighted centroid (recent/strong signals weigh more) is the simplest honest choice.
 
 ```
-  Collaborative: the user–item interaction matrix
-
-            item1  item2  item3  item4  item5
-  userA  [    5      ?      3      ?      1   ]
-  userB  [    4      2      ?      ?      1   ]
-  userC  [    ?      2      4      5      ?   ]   ← similar to userA on item3
-  userD  [    1      5      ?      4      ?   ]
-           ▲                  ▲
-           known ratings      ? = the cells we predict (and recommend the high ones)
-
-  userA and userC overlap on item3 → recommend userC's item4 to userA.
+Profile = weighted centroid of liked-item vectors
+liked: v1 (w=1.0)  v2 (w=0.6)  v3 (w=0.3)
+profile = (1.0·v1 + 0.6·v2 + 0.3·v3) / (1.0+0.6+0.3)
 ```
 
 ```python
-# Collaborative (matrix factorization): learn latent user & item vectors,
-# then predict the empty cells as their dot product.
-def collaborative(matrix):                 # matrix[user][item] = rating or None
-    U, V = factorize(matrix, rank=d)        # U: users×d, V: items×d (fit on KNOWN cells)
-    def score(user, item):
-        return dot(U[user], V[item])        # predicted rating for an UNSEEN cell
-    return score
-# needs: many users + an interaction LOG. with one user, every row but one is missing —
-# there are no "similar users" to borrow from. CF is structurally impossible single-user.
+# not yet exercised in aptkit
+def profile(liked):
+    vs = [featurize(i) * weight(i) for i in liked]
+    return sum(vs) / sum(weight(i) for i in liked)
 ```
 
-**Hybrid — combine both.** Score with content-based *and* collaborative, then
-blend (weighted sum, or one as a fallback for the other). Hybrids exist mostly
-to cover collaborative's weakness on new items/users (cold-start, file 11).
+**Step C — score and rank candidates.** Score every candidate by similarity to the profile, sort descending.
 
 ```
-  Hybrid: blend the two signals
-
-  content score ─┐
-                 ├─► w₁·content + w₂·collaborative ─► final rank
-  collab  score ─┘   (collab handles popularity; content handles new items)
-```
-
-**Single-user case — content + rules, not collaborative.** A single-user agent
-(buffr: one person's `work.md` / `stack.md` / `coffee.md`) has exactly one row
-in the user–item matrix. There are no other users to be "similar" to, so
-collaborative filtering has nothing to factor. The correct design is *content-
-based + heuristic rules*: embedding similarity over the user's own corpus, plus
-hand-written rules (recency, source weight, must-include tags).
-
-```
-  Single-user: content similarity + rules (the right design here)
-
-  user's corpus ──embed+search──► candidate items by similarity
-                                        │
-                          apply rules ──┤  recency boost
-                                        ├─ source weight (work.md > coffee.md)
-                                        └─ hard filters (exclude stale)
-                                        ▼
-                                   ranked recommendations
+Ranking
+candidates ─▶ score_i = cosine(v_i, profile)
+           ─▶ sort desc ─▶ top-K
 ```
 
 ```python
-# Single-user recommender = content similarity + rules. No CF.
-def single_user_recommend(query_item, store, rules):
-    hits = store.search(embed(query_item), k=20)        # PgVectorStore.search → Hit[]
-    scored = [(h, h.score * rules.weight(h.meta)        # rule-based reweighting
-                       + rules.recency_boost(h.meta)) for h in hits]
-    scored = [s for s in scored if rules.keep(s[0].meta)]  # hard filters
-    return sort_desc(scored)[:k]
-# this IS buffr's retrieval with a reweighting pass — already 90% built.
+# not yet exercised in aptkit
+ranked = sorted(candidates, key=lambda i: cosine(featurize(i), prof), reverse=True)
 ```
 
-**Move 2.5 — the aptkit reality.** Not yet exercised in aptkit — aptkit runs
-pre-trained LLMs, not trained models. The pattern is taught here as study
-ground. aptkit *does* ship a recommendation agent, but it is an LLM generating
-recommendations from anomaly + diagnosis context — there is no interaction log,
-no user×item matrix, and no fitted ranking model. It is LLM-over-context, not a
-trained recommender. The honest closest real artifact is buffr's vector search,
-which is a content-based recommender's retrieval half.
+**Step D — apply a rules layer.** Pure similarity is monotonous (it keeps recommending near-duplicates). A thin deterministic rules layer on top enforces business logic the math won't: dedupe, recency floors, hard excludes, diversity caps.
+
+```
+Rules layer · deterministic, runs AFTER scoring
+ranked list ─▶ [ drop already-seen ]
+            ─▶ [ cap N per category  ]  (diversity)
+            ─▶ [ pin / boost pinned  ]
+            ─▶ final list ▼
+```
+
+```python
+# not yet exercised in aptkit
+def apply_rules(ranked, seen, max_per_cat=3):
+    out, counts = [], {}
+    for it in ranked:
+        if it.id in seen: continue
+        if counts.get(it.category, 0) >= max_per_cat: continue
+        counts[it.category] = counts.get(it.category, 0) + 1
+        out.append(it)
+    return out
+```
 
 ### Move 3 — the principle
 
-Pick the family by the data you actually have, not the one you read about.
-Collaborative filtering is the famous one, but it is a *multi-user* technique
-that is structurally impossible with one user. For a single-user agent the right
-answer is content-based + rules — which, for buffr, is the retrieval you already
-run plus a reweighting pass. The trained learning-to-rank reranker (this
-section's running example) is a content-based component, and you grade it with
-precision@k / recall@k exactly as a multi-user system grades its ranked list.
+The principle: **your data shape decides your algorithm, not your ambition.** One user means no collaborative signal exists to mine — and no amount of model sophistication conjures a neighbor population out of one person. Content-based + rules isn't a downgrade you settled for; it's the *correct* tool for the data you actually have.
 
 ## Primary diagram
 
-The taxonomy as one decision, with the single-user verdict marked.
-
 ```
-  Content vs collaborative vs hybrid — and the single-user verdict
-
-                        what signal does the rec come from?
-                                      │
-        ┌─────────────────────────────┼─────────────────────────────┐
-        ▼                             ▼                             ▼
-  ┌───────────┐               ┌───────────────┐             ┌────────────┐
-  │ CONTENT   │               │ COLLABORATIVE │             │  HYBRID    │
-  │ item      │               │ other users'  │             │ both,      │
-  │ features  │               │ interactions  │             │ blended    │
-  └─────┬─────┘               └───────┬───────┘             └─────┬──────┘
-        │ needs: embeddings           │ needs: many users         │ needs: both
-        │ needs NOT: other users      │ + interaction LOG         │
-        ▼                             ▼                           ▼
-   works single-user            ✗ impossible single-user     ✗ needs the CF half
-        ★                       (one row, no neighbors)
-        │
-        └──► single-user (buffr) = CONTENT + RULES
-             = PgVectorStore.search + a reweighting pass
+Single-user content-based recommender · buffr shape
+        buffr items the user engaged with
+                     │
+                     ▼
+            ┌─────────────────┐
+            │ featurize each  │  tags|category|recency|embedding
+            └────────┬────────┘
+                     ▼
+            ┌─────────────────┐
+            │ user profile    │  weighted centroid (the user IS the population)
+            └────────┬────────┘
+                     │ cosine
+ candidate items ───▶ score & sort ──▶ ┌──────────────┐
+                                       │ RULES LAYER  │ dedupe / diversity / pins
+                                       └──────┬───────┘
+                                              ▼
+                                        ranked feed
+   (no user-item matrix anywhere — collaborative filtering is impossible here)
 ```
+
+Notice what's *absent*: there is no matrix of many users by many items, because there's only one user. That absence is the design, not a missing piece.
 
 ## Elaborate
 
-The hard-won lesson: collaborative filtering's power *is* its dependency — it
-borrows signal from the crowd, so with no crowd it has nothing. New systems
-discover this the painful way, by designing a ratings-matrix architecture for a
-product that will only ever have one user's data. The general rule extends to
-cold-start (file 11): even multi-user systems fall back to content-based for the
-*first* interactions of any new user or item, because there is no collaborative
-signal yet. So content-based is both the single-user answer and everyone's
-cold-start floor — which is why it is worth building well. The bridge to this
-repo is direct: a learned reranker over `PgVectorStore` hits is a content-based
-ranking model, and it is scored by `scorePrecisionAtK` / `scoreRecallAtK`
-(`packages/evals/src/precision-at-k.ts`) — the same offline metrics that grade
-any recommender's top-k.
+- **The single-user wall is hard, not soft.** People assume "I'll just add collaborative later when I have more data." But buffr is *architecturally* one user — a self-hosted personal agent. More data means more *items* and more *history for that one user*, never more users. Collaborative filtering doesn't get unlocked; it stays impossible by design.
+- **Cold start still bites.** Content-based dodges the user cold-start problem (you the user are known from item one) but a brand-new *item* with no engagement and a brand-new *profile* with no liked items both leave you with nothing to rank on. That's the item/user cold-start problem — see `11-cold-start.md`; your fallback there is rules and recency, not learned similarity.
+- **Filter bubble is the content-based failure mode.** Pure similarity converges on more-of-the-same and starves serendipity. The diversity cap in the rules layer is the deliberate counterweight — it's not optional polish.
+- **You don't need to train anything.** Content-based ranking with off-the-shelf embeddings plus cosine similarity is a *retrieval* problem, not a training problem. That fits aptkit's grain (it already leans on hosted models for embeddings) far better than standing up a training pipeline.
+- **Implicit vs explicit signals.** With one user you have rich implicit signal (what they opened, kept, dismissed) and can ask for explicit signal (pins, thumbs). Weight explicit higher; it's scarcer and cleaner.
 
 ## Project exercises
 
-### Build a content-based "more like this" over the buffr corpus
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a function that takes one item id from the user's corpus,
-  fetches its embedding, calls `PgVectorStore.search` with that vector, drops the
-  item itself, and returns the top-k neighbors as recommendations.
-- **Why it earns its place:** proves content-based recommendation is just
-  item↔item similarity search — no other users, no matrix, no training.
-- **Files to touch:** new `/Users/rein/Public/buffr/src/recommend-similar.ts`,
-  reading `/Users/rein/Public/buffr/src/pg-vector-store.ts`.
-- **Done when:** given a known item, the function returns k other items ordered
-  by descending similarity, with the seed item excluded.
-- **Estimated effort:** `1–4hr`
+### EX-ML-10a — Content-based ranker + rules layer over buffr items
 
-### Add a rules reweighting pass and grade it with precision@k
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a reweighting layer over the content-based recs above
-  (recency boost + source weight + a hard staleness filter), then an eval that
-  scores the reranked top-k against a hand-labeled relevant set using
-  `scorePrecisionAtK` / `scoreRecallAtK`.
-- **Why it earns its place:** this is the single-user "content + rules" design in
-  full, graded by the exact offline metric real recommenders use — and it shows
-  why collaborative filtering was never an option here.
-- **Files to touch:** new `/Users/rein/Public/buffr/src/recommend-rules.ts` and
-  `/Users/rein/Public/buffr/eval/recommend.test.ts`, importing
-  `packages/evals/src/precision-at-k.ts`.
-- **Done when:** the eval reports precision@k and recall@k for the reranked list,
-  and reweighting changes the score versus the raw similarity order.
-- **Estimated effort:** `1–2 days`
+- **Exercise ID:** EX-ML-10a (Phase 5 ML-hardening track — this is where buffr's feed stops being chronological and starts being ranked, the kind of personalization layer you harden once the basics ship).
+- **What to build:** A content-based ranker that featurizes buffr items (tags + category + recency + an embedding of the text), builds a weighted user profile from engaged items, scores candidates by cosine similarity, and passes the result through a deterministic rules layer (dedupe seen, cap per category for diversity, honor pins). Embeddings come from aptkit's existing hosted-model path — no training.
+- **Why it earns its place:** It's the *correct-by-construction* recommender for a single-user app and it makes the single-user constraint explicit in code, which is the exact insight an interviewer probes. It also reuses aptkit's retrieval/embedding muscle instead of inventing a training stack.
+- **Files to touch:** Case B (new) — `packages/retrieval/src/rank/content-based.ts` (featurize, profile, cosine scorer), `packages/retrieval/src/rank/rules-layer.ts` (dedupe/diversity/pins), a new buffr persistence surface `buffr/src/feed/ranked-feed.ts` (wires engaged-item history → ranker → feed) plus its `buffr/src/feed/ranked-feed.test.ts`.
+- **Done when:** Given a fixture of buffr items and a synthetic engagement history, the ranker returns items ordered by similarity to the profile, the rules layer demonstrably drops already-seen items and caps any single category, and a test asserts no collaborative-filtering code path exists (the function signature takes one user's history, never a user-item matrix).
+- **Estimated effort:** 1–2 days
 
 ## Interview defense
 
-**Q: "Why can't a single-user agent use collaborative filtering?"**
-Collaborative filtering predicts a user's missing cells by borrowing from
-*similar users'* known cells. With one user the matrix has one row — every other
-cell is empty and there are no neighbors to borrow from. The technique is
-structurally undefined. The right design is content-based + rules: rank the
-user's own items by embedding similarity, then reweight with heuristics.
+**Q: Why not collaborative filtering — isn't it the gold standard?**
 
 ```
-  one-row matrix:  userA [ 5  ?  3  ?  1 ]   ← no other rows ⇒ no "similar users"
-  fix: content-based — rank by item↔item similarity over THIS user's corpus
+collaborative needs a CROWD          buffr has ONE user
+ user-item matrix:                    matrix:
+   u1 [• • _ •]                         u? [• • _ •]
+   u2 [_ • • _]   find neighbors          (no other rows to compare)
+   u3 [• _ • •]   ─▶ recommend           ─▶ no neighbors ─▶ no signal ✘
 ```
-*Anchor: collaborative needs a crowd; single-user has none, so content + rules.*
 
-**Q: "How does a learned reranker relate to recommenders, and how do you grade it?"**
-A reranker scores `(query, candidate) → relevance` and sorts — that is a
-content-based ranking model, the model box of a recommender pipeline. You grade
-it offline exactly like any recommender's top-k: precision@k (of the k shown, how
-many were relevant) and recall@k (of all relevant, how many made the top-k), via
-`scorePrecisionAtK` / `scoreRecallAtK`.
+Collaborative filtering's mechanism is "users similar to you also liked X" — it requires a population to compute similarity over. buffr is a single-user personal agent, so the user-item matrix is one row; there are no neighbors and the signal doesn't exist. Anchor: same data-shape discipline as contrl, where the available signal (one person's pose stream) dictated the approach rather than the fanciest available algorithm.
+
+**Q: Pure content-based keeps recommending the same thing. How do you fix it without collaborative data?**
 
 ```
-  candidates ─► reranker score ─► sort ─► top-k ─► precision@k / recall@k
-                                                   (packages/evals/src/precision-at-k.ts)
+similarity alone ─▶ near-duplicates ─▶ filter bubble ✘
+similarity + rules layer:
+   score ─▶ [cap per category] ─▶ [recency floor] ─▶ diverse feed ✔
 ```
-*Anchor: a reranker is a content-based ranking model, graded by precision@k/recall@k.*
+
+The diversity comes from the deterministic rules layer, not the math — cap items per category, enforce recency, inject the occasional off-profile item. You buy serendipity with explicit rules because there's no crowd to borrow it from. Anchor: it's the same move as Platt-vs-isotonic in calibration — reach for the simplest deterministic correction before adding model machinery.
 
 ## See also
 
-- `01-supervised-pipeline.md` — the generic pipeline a recommender specializes
-- `11-cold-start.md` — why even multi-user systems fall back to content-based
-- `05-evals-and-observability/` — precision@k / recall@k as offline rec metrics
+- [Transfer learning](./07-transfer-learning.md)
+- [Confusion matrices](./08-confusion-matrices.md)
+- [Calibration](./09-calibration.md)
+- [Cold start](./11-cold-start.md)

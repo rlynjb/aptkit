@@ -1,193 +1,176 @@
-# Memory, Stack, Heap, GC, and Lifetimes — what lives, what grows, what gets collected
+# Memory: Stack, Heap, GC, and Lifetimes
 
-**Industry name(s):** heap allocation / GC · object lifetime · memory pressure · buffer-everything vs streaming · **Type:** Industry standard (V8 GC)
+**Subtitle:** allocation / heap retention / garbage collection (V8) / object lifetimes — *the heap* (Industry standard).
 
 ## Zoom out, then zoom in
 
-aptkit allocates almost everything on the heap, keeps it for the duration of one operation, and lets V8's garbage collector reclaim it. The interesting decisions are the *buffer-everything* choices — places that hold the whole thing in memory rather than streaming it — because those are where memory grows with input size.
+aptkit does **zero manual memory management** — no `--max-old-space-size` tuning, no manual `global.gc()`, no buffer pooling, no streaming to keep memory flat. It leans entirely on V8's garbage collector and lives within Node's default heap. The question worth asking: *what does aptkit retain, what's transient, and where does memory grow without bound?* There's exactly one place that grows without bound, and it's the one you'd guess.
 
 ```
-  Zoom out — where aptkit's memory lives
+  Zoom out — where memory accumulates in the runtime
 
-  ┌─ Stack (call frames) ─────────────────────────────────────────────┐
-  │   shallow: runAgentLoop's for-loop, cosine's inner loop. No deep   │
-  │   recursion anywhere. Stack depth is bounded and small.            │
-  └──────────────────────────────────┬─────────────────────────────────┘
-  ┌─ Heap (the interesting part) ─────▼─────────────────────────────────┐
-  │   ★ messages[] growing per turn (run-agent-loop.ts:94)            ★ │ ← we are here
-  │   ★ InMemoryVectorStore.chunks Map of 768-float arrays (:12)      ★ │
-  │   ★ NDJSON line buffer (ndjson-stream.ts:108)                     ★ │
-  │   replay artifacts read whole into memory (fs.promises, buffered)  │
-  └──────────────────────────────────┬─────────────────────────────────┘
-  ┌─ GC (V8, automatic) ──────────────▼─────────────────────────────────┐
-  │   generational mark-sweep. aptkit pins nothing, frees nothing       │
-  │   manually. lifetimes are scoped to one operation.                  │
-  └──────────────────────────────────────────────────────────────────────┘
+  ┌─ Runtime layer ──────────────────────────────────┐
+  │  runAgentLoop: messages[] grows PER TURN,         │
+  │   freed when the call returns (short-lived)       │
+  └───────────────────────┬───────────────────────────┘
+  ┌─ Provider layer ──────▼───────────────────────────┐
+  │  full-buffer reads: whole HTTP body in memory      │
+  │   (res.json(), res.text()) — transient per call    │
+  └───────────────────────┬───────────────────────────┘
+  ┌─ Store layer ─────────▼───────────────────────────┐
+  │  ★ InMemoryVectorStore.chunks ★  LONG-LIVED,       │ ← THIS CONCEPT'S
+  │   768 floats × n chunks, never evicted             │   one unbounded heap
+  └────────────────────────────────────────────────────┘
 ```
 
-**Zoom in.** Memory in a GC runtime is about *lifetimes*: when is an object reachable, and when does it become garbage? For aptkit almost every object's lifetime is "one agent run" or "one request" — born at the start, unreachable at the end, collected shortly after. The two exceptions that outlive a single operation are the vector corpus (`Map`) and the per-conversation counters, both of which grow with use. This file walks where memory scales with input and where it doesn't.
+**Zoom in.** Two lifetimes dominate. Most of aptkit's allocations are *request-scoped*: the `messages` array, the parsed response, the tool results — all born inside one `runAgentLoop` call and collectible the moment it returns. One allocation is *instance-scoped and unbounded*: the vector store's `chunks` `Map`, which holds a 768-float `Float64`-backed array per chunk forever (until the store is dropped). That's the heap shape in one sentence.
 
-## Structure pass
+## The structure pass
 
-Trace the **lifecycle** axis on memory — how long does each allocation stay reachable?
+Trace the axis **"how long does this live, and what frees it?"** across the layers.
 
 ```
-  Axis: "how long does this live?" — by allocation site
+  One axis — "lifetime + who frees it" — by allocation site
 
-  ┌──────────────────────────────────────────────────────────┐
-  │ messages[] in runAgentLoop (run-agent-loop.ts:94)          │  → one agent run
-  │   grows by 2 entries per turn, freed when the call returns │     (bounded by maxTurns)
-  └───────────────────┬────────────────────────────────────────┘
-      ┌───────────────▼────────────────────────────────────────┐
-      │ NDJSON buffer (ndjson-stream.ts:108)                     │  → one line at a time
-      │   sliced down as lines are yielded                       │     (bounded, streaming-ish)
-      └───────────────┬────────────────────────────────────────┘
-          ┌───────────▼────────────────────────────────────────┐
-          │ InMemoryVectorStore.chunks Map (:12)                 │  → process lifetime,
-          │   one 768-float array per chunk, never evicted        │     GROWS unbounded
-          └────────────────────────────────────────────────────┘
+  ┌─ stack / call-scoped ────────┐   lives: one call. freed: by GC after return
+  │  messages[], toolResults[]    │   → grows within a call, dies with it
+  └──────────────┬────────────────┘
+  ┌─ transient buffers ──────────┐   lives: one I/O round-trip. freed: after parse
+  │  full HTTP body (res.json)    │   → whole payload in RAM briefly
+  └──────────────┬────────────────┘
+  ┌─ instance-scoped ────────────┐   lives: as long as the store. freed: NEVER
+  │  chunks Map (768 floats × n)  │   → the only monotonic growth in aptkit
+  └───────────────────────────────┘
 ```
 
-The seam: **the boundary between per-operation lifetimes and process-lifetime state.** Below it, everything is short-lived and GC reclaims it between operations — memory is flat over time. Above it sits the corpus `Map`, which only ever grows (no eviction, no TTL). At aptkit's scale that's nothing; it's the one allocation whose size is a function of total data indexed rather than a single request.
+The seam is between **transient** and **instance-scoped** retention. Everything above the chunks `Map` is reclaimed automatically and quickly — the GC sees no live reference once a call returns. The chunks `Map` is different: it's held by a long-lived `InMemoryVectorStore` instance and has *no eviction path* — `upsert` only ever `.set`s (`in-memory-vector-store.ts:21`), never deletes. The axis-answer flips from "freed automatically" to "freed never (in this store's lifetime)" exactly there. That flip is why the in-memory store is a *demo* store and `PgVectorStore` (in buffr) is the durable one. → `study-performance-engineering` for memory-vs-corpus-size.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know that in JS you never `free()` — you just stop referencing an object and the GC reclaims it. Memory pressure isn't about leaks-by-forgetting-to-free; it's about *holding references too long* or *holding too much at once*. The two questions for any allocation: how long is it reachable, and does its size grow with input?
+You already manage lifetimes every time you write a React component: local `const`s die when the function returns; something you push into a module-level array or a long-lived ref *sticks around* until you remove it. The heap works the same way — an object lives exactly as long as something still points to it. The GC's whole job is: "find objects nothing points to anymore, reclaim them." Stack-local = short pointer chain, collected fast. Stored in a long-lived `Map` = pointed-to forever, never collected.
 
 ```
-  Object lifetime — reachable vs garbage
+  The lifetime kernel — reachability decides retention
 
-  function runAgentLoop():
-    messages = []        ← allocated, reachable
-    ... loop runs ...    ← messages grows, stays reachable
-    return result        ← messages goes out of scope
-                              │
-                              ▼ no more references
-                         GC reclaims it (next collection cycle)
+  GC root (the running call stack, the store instance)
+        │ points to
+        ▼
+   ┌─────────────┐   still reachable? → KEEP
+   │ object      │
+   └─────────────┘   nothing points here? → RECLAIM
+                     (next GC pass sweeps it)
 
-  the leak shape to avoid: a long-lived container that keeps
-  appending and never drops references (the corpus Map, by design)
+  short chain (call-local) → collected soon after return
+  rooted in a long-lived Map → collected NEVER (until Map drops it)
 ```
 
-The strategy: **scope every allocation to one operation so the GC reclaims it automatically, and accept exactly one growing structure — the corpus — because retrieval needs the whole index resident.**
+Named by what breaks if removed:
+- **Reachability from a GC root** — this is the *only* thing keeping an object alive. Drop the last reference and it's eligible for collection. The chunks `Map` is a root-adjacent holder: while the store lives, every chunk it points to lives.
+- **The lack of an eviction path** — remove an object from the `Map` (which aptkit never does) and it becomes collectible. Its absence is why corpus memory only grows.
 
-### Move 2 — the allocations that matter
+### Move 2 — the allocation sites, walked
 
-**The growing message array.** `run-agent-loop.ts:94` and `:124`, `:189`:
+**Call-scoped growth in the loop — born and freed per call.** Inside `runAgentLoop`, memory grows *within* a single call as the conversation accumulates:
 
 ```ts
+// packages/runtime/src/run-agent-loop.ts:94, 124, 189
 const messages: ModelMessage[] = [{ role: 'user', content: userPrompt }];
-// ... each turn:
-messages.push({ role: 'assistant', content: response.content });   // :124
-messages.push({ role: 'user', content: toolResults });             // :189
+// ...each turn:
+messages.push({ role: 'assistant', content: response.content });   // grows
+// ...
+messages.push({ role: 'user', content: toolResults });             // grows
 ```
 
-Per turn, two entries are appended — and the *whole* `messages` array is re-sent to the model each call. So memory and per-call payload both grow linearly with turn count. But it's bounded: `maxTurns` defaults to 8 (`run-agent-loop.ts:87`), and the array is freed when the function returns. There's also a cap on individual tool results — `MAX_TOOL_RESULT_CHARS = 16_000` with `truncate` (`run-agent-loop.ts:52`) — so a single huge tool output can't blow the array up. This is the right shape: growth is bounded by a hard turn limit, and the lifetime is one call.
+Each turn appends two messages (the assistant turn and the tool results), so `messages` grows linearly with turn count — but turn count is hard-capped at `maxTurns` (≤ 8, `run-agent-loop.ts:87`). The whole array is rooted only by the `runAgentLoop` stack frame, so the instant `runAgentLoop` returns, nothing points to `messages` and it's GC-eligible. There's also a guard against unbounded *per-message* growth: tool results are truncated to 16 KB (`run-agent-loop.ts:52-57`, `MAX_TOOL_RESULT_CHARS = 16_000`), so one giant tool result can't blow up the conversation buffer. This is well-behaved transient memory: bounded per call, freed on return.
 
 ```
-  messages[] growth — bounded by maxTurns
+  Execution trace — messages[] growth across a bounded loop
 
-  turn 0:  [user]                                    1 entry
-  turn 1:  [user, asst, toolResults]                 3 entries
-  turn 2:  [user, asst, tR, asst, tR]                5 entries
-  ...
-  turn N:  2N+1 entries, each tool result ≤ 16KB
-           └── hard ceiling at maxTurns (default 8) ──┘
-           freed when runAgentLoop returns
+  turn 0:  [user]                                   1 msg
+  turn 0:  + [assistant] + [tool_results]           3 msgs
+  turn 1:  + [assistant] + [tool_results]           5 msgs
+  ...      (capped at maxTurns ≤ 8)
+  return:  messages[] unreachable → GC reclaims      0 (freed)
 ```
 
-**The corpus Map — the one unbounded structure.** `in-memory-vector-store.ts:12`:
+**Transient full-buffer reads — the whole payload in RAM, briefly.** aptkit reads HTTP bodies *whole*, not streamed:
 
 ```ts
+// packages/providers/gemma/src/gemma-provider.ts:213
+return (await res.json()) as OllamaChatResponse;
+// packages/retrieval/src/ollama-embedding-provider.ts:72
+const json = (await res.json()) as OllamaEmbedResponse;
+```
+
+`res.json()` buffers the entire response body into memory before parsing. For a model completion (a few KB of text) and an embedding batch (n × 768 floats), that's small and transient — allocated, parsed into JS objects, and the buffer is collectible right after. The embedding response is the larger one: embedding 50 chunks pulls back ~50 × 768 ≈ 38K floats in one JSON parse. Still modest, still transient. The honest note: there's no streaming parse, so a pathologically large embedding batch would spike memory proportionally. At aptkit's batch sizes this is a non-issue; it's named because "read the whole body" is a deliberate simplicity choice with a known ceiling. → `06-filesystem-streams-and-resource-lifecycle.md` for the one place aptkit *does* stream (NDJSON out).
+
+**The one unbounded heap — the chunks `Map`.** This is the memory story that matters:
+
+```ts
+// packages/retrieval/src/in-memory-vector-store.ts:12, 18-23
 private readonly chunks = new Map<string, VectorChunk>();
-```
-
-Each entry holds a `vector: number[]` of the embedding dimension — 768 floats for nomic-embed, 64 for the Studio fake embedder. A JS `number[]` of 768 doubles is ~6KB of payload plus object overhead. The `Map` never evicts: `upsert` only ever adds (`in-memory-vector-store.ts:18`). So total resident memory is `(chunks indexed) × (~6KB + meta)`. At demo scale (dozens of chunks) that's kilobytes. The honest framing: **this is the only structure whose memory is a function of cumulative data, not per-request work — and it's resident for the whole process.** It's correct for an in-memory dev/test store; the production answer is buffr's `PgVectorStore`, where vectors live in Postgres and aptkit's heap holds only the current query and its top-k hits.
-
-**The NDJSON buffer — streaming-ish, bounded.** `ndjson-stream.ts:108`:
-
-```ts
-let buffer = '';
-for await (const chunk of chunks) {
-  buffer += typeof chunk === 'string' ? chunk : decoder.decode(chunk, { stream: true });
-  // ... slice complete lines out of buffer, yield them, shrink buffer
-  buffer = buffer.slice(newlineIndex + newlineLength);   // :119
+async upsert(chunks: VectorChunk[]): Promise<void> {
+  for (const chunk of chunks) {
+    this.assertDimension(chunk.vector, `chunk "${chunk.id}"`);
+    this.chunks.set(chunk.id, chunk);    // only ever .set — never .delete
+  }
 }
 ```
 
-This is the closest aptkit gets to true streaming memory behavior: it holds only the unparsed tail (a partial line) plus whatever the current chunk added, slicing complete lines out as they arrive. Memory is bounded by the longest single line, not the whole stream. Good — it doesn't buffer the entire trace before parsing.
+Every `VectorChunk` carries a `vector: number[768]` (`contracts` shape; nomic's fixed 768-dim, `ollama-embedding-provider.ts:40`). That's ~768 × 8 bytes ≈ 6 KB per chunk just for the vector, plus the `meta` (which includes the chunk's `text`, `pipeline.ts:44`). The `Map` is held by the `InMemoryVectorStore` instance, which a host keeps alive for the session. There is **no eviction, no TTL, no size cap** — index more documents, the `Map` grows, and it's freed only when the whole store instance is dropped. Memory grows `O(n_chunks × 768)`, monotonically. For a demo corpus that's nothing; for a real knowledge base it's exactly why you'd move to `PgVectorStore` (in buffr), where vectors live on disk in Postgres, not in V8's heap.
 
-**Buffer-everything elsewhere.** Replay artifacts and fixtures are read whole into memory via `fs.promises.readFile` (in `scripts/*.mjs`, `packages/evals/src/replay-runner.ts`, `apps/studio/vite.config.ts`) — no `createReadStream`. For JSON files of a few KB that's correct; parsing JSON needs the whole document anyway, so streaming wouldn't help. `06` walks the file-handle side.
-
-**Stack: shallow everywhere.** No deep recursion. The agent loop is iterative (`for`), the cosine scan is iterative, tree-walks in the workflow helpers are shallow. Stack depth is small and bounded — no stack-overflow surface.
+Note the same shape repeats for memory rows: `createConversationMemory` upserts `memory:<convId>:<n>` rows into a `VectorStore` (`conversation-memory.ts:82`) — when that's the in-memory store, episodic memory accumulates in the same unbounded `Map`. Same lifetime, same eviction story (none).
 
 ### Move 3 — the principle
 
-In a GC runtime, the memory question isn't "did I free it" — it's "what's reachable and for how long." aptkit's discipline is to scope nearly everything to one operation so the GC handles it for free, and to accept exactly one process-lifetime growing structure (the corpus) because retrieval genuinely needs the index resident. The lesson generalizes: a memory problem in a GC language is almost always a *lifetime* problem (something stays reachable too long) or a *bound* problem (something grows with input and has no cap), not a free-the-pointer problem. aptkit has no lifetime problems and exactly one structure without a cap — and that one is deliberately swappable for a database.
+Lifetime tracks reachability, and unbounded memory growth always comes from a long-lived container that only grows. aptkit's heap is clean *because* almost everything is rooted in a stack frame that returns quickly — the GC does all the work and you never think about it. The one exception, the chunks `Map`, is the canonical "in-memory cache with no eviction" shape: fine until it isn't, and the fix is never "tune the GC" but "give the data a real home with eviction or durability." That home is Postgres, behind the same `VectorStore` contract — which is the whole point of the contract.
 
 ## Primary diagram
 
-The complete memory picture: short-lived per-operation allocations the GC reclaims, one growing corpus, one streaming buffer, shallow stacks.
-
 ```
-  aptkit memory map — complete
+  Memory and lifetimes in aptkit — complete
 
-  ┌─ Stack: shallow, bounded ────────────────────────────────────────────┐
-  │   iterative loops only, no deep recursion → no overflow surface       │
-  └────────────────────────────────────────────────────────────────────────┘
-  ┌─ Heap: by lifetime ───────────────────────────────────────────────────┐
-  │                                                                        │
-  │  PER-OPERATION (GC reclaims after each call) — memory flat over time   │
-  │    runAgentLoop messages[]  ← grows 2/turn, capped by maxTurns (8)     │
-  │    tool results             ← each truncated to 16KB                   │
-  │    structured-gen attempts[]                                           │
-  │                                                                        │
-  │  STREAMING-BOUNDED                                                      │
-  │    NDJSON buffer ← holds one partial line, sliced down as it yields    │
-  │                                                                        │
-  │  PROCESS-LIFETIME, GROWS WITH DATA (the one to watch)                  │
-  │    InMemoryVectorStore.chunks ← (n chunks) × (768-float array + meta), │
-  │                                  never evicted; swap for PgVectorStore │
-  └────────────────────────────────────────────────────────────────────────┘
+  ┌─ V8 heap (default size, GC-managed, no tuning) ─────────────────┐
+  │                                                                 │
+  │  SHORT-LIVED (freed by GC right after the call returns)         │
+  │   ┌──────────────────────────────────────────────────────┐     │
+  │   │ runAgentLoop messages[] — grows per turn, capped ≤8    │     │
+  │   │ tool results — truncated to 16 KB each                 │     │
+  │   │ parsed HTTP body (res.json) — whole payload, transient │     │
+  │   └──────────────────────────────────────────────────────┘     │
+  │                          │ unreachable on return → reclaimed     │
+  │                          ▼                                       │
+  │  LONG-LIVED & UNBOUNDED (freed only when the store is dropped)   │
+  │   ┌──────────────────────────────────────────────────────┐     │
+  │   │ InMemoryVectorStore.chunks Map                         │     │
+  │   │  ~6 KB/chunk (768 floats) + text meta · NO eviction    │     │
+  │   │  grows O(n_chunks) → move to PgVectorStore at scale    │     │
+  │   └──────────────────────────────────────────────────────┘     │
+  └─────────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-V8's generational GC is tuned for exactly aptkit's allocation pattern: lots of short-lived objects (the "young generation") that die fast and get collected cheaply, plus a small set of long-lived objects (the corpus) that survive into the "old generation" and are collected rarely. Per-operation allocations cost almost nothing to reclaim. The classic Node memory leak — an ever-growing cache or event-listener set on a long-lived object — maps directly onto the corpus `Map` if aptkit ever ran as a long-lived server *and* kept indexing without eviction. It doesn't today (it's a library, runs are short-lived), and in production the corpus moves to Postgres anyway. The general escape hatches when an in-memory index outgrows the heap: a real ANN index with its own memory management, off-heap storage, or — aptkit's actual plan — a database behind the same `VectorStore` contract. See `03` for the CPU cost of scanning that same `Map`, and `study-performance-engineering` for measuring heap pressure.
+V8's generational GC is built for exactly aptkit's allocation shape: lots of short-lived objects (the "young generation" — request-scoped arrays, parsed responses) that die fast and get collected cheaply, plus a few long-lived ones (the chunks `Map`) that get promoted to the old generation and stay. You get good GC behavior for free by keeping per-request state on the stack. The trap the in-memory store illustrates is the oldest one in caching: a `Map` that only grows is a memory leak with a slow fuse. The textbook fixes are eviction (LRU, TTL) or offloading to durable storage; aptkit chose the latter via the `VectorStore` contract, so the in-memory store stays dead-simple and the durable concern lives in buffr's `PgVectorStore`. Manual heap tuning, `WeakMap`/`WeakRef` tricks, and streaming JSON parsers are all `not yet exercised` — and correctly so at this scale.
 
 ## Interview defense
 
-**Q: What's the one structure in aptkit whose memory grows unbounded, and is that a problem?**
+**Q: Where does aptkit's memory grow without bound, and why is that acceptable?**
+The `InMemoryVectorStore.chunks` `Map`. Every indexed chunk adds ~6 KB (a 768-float vector) plus its text, and there's no eviction — `upsert` only ever `.set`s. It grows `O(n_chunks)` for the store's whole lifetime. It's acceptable because the in-memory store is the *demo* store for a tiny corpus; the durable path is `PgVectorStore` behind the same contract, where vectors live in Postgres, not the V8 heap.
 
 ```
-  InMemoryVectorStore.chunks Map (in-memory-vector-store.ts:12)
-  one 768-float array per chunk, never evicted, process-lifetime
-  grows with TOTAL data indexed, not per-request work
-
-  problem? not at demo/test scale (KBs)
-  it's a dev/test adapter — production swaps PgVectorStore behind the
-  same VectorStore contract, so vectors live in Postgres, not the heap
+  long-lived Map + only-ever-grows = monotonic heap growth → offload, don't tune GC
 ```
+*Anchor: an in-memory cache with no eviction is a leak with a slow fuse; the fix is durability, not GC flags.*
 
-Anchor: "Everything else is per-operation and GC'd; the corpus `Map` is the one process-lifetime growing structure, and it's deliberately swappable for a database."
-
-**Q: How does `runAgentLoop` keep memory bounded?**
-
-```
-  messages[] grows 2 entries/turn but:
-    - maxTurns (default 8) caps turn count
-    - each tool result truncated to MAX_TOOL_RESULT_CHARS (16KB)
-    - whole array freed when the call returns (GC)
-  → bounded growth, one-call lifetime
-```
-
-Anchor: "The message array grows per turn but it's capped by `maxTurns` and 16KB-per-tool-result truncation, then GC'd when the run ends."
+**Q: Is the rest of aptkit's memory well-behaved?**
+Yes. The agent loop's `messages` array grows per turn but is hard-capped at `maxTurns ≤ 8` and freed on return; tool results are truncated to 16 KB so one huge result can't bloat the buffer; HTTP bodies are read whole but they're small and transient. It's all request-scoped, rooted in a stack frame, and reclaimed by V8 the moment the call returns.
 
 ## See also
 
-- `03-event-loop-and-async-io.md` — the CPU cost of scanning the same corpus `Map`
-- `06-filesystem-streams-and-resource-lifecycle.md` — the buffer-everything file reads
-- `07-backpressure-bounded-work-and-cancellation.md` — `maxTurns` as the bound that caps message growth
-- `study-performance-engineering` — measuring heap pressure and the corpus crossover point
+- `04-shared-state-races-and-synchronization.md` — the same chunks `Map`, viewed as shared state
+- `06-filesystem-streams-and-resource-lifecycle.md` — the streaming path that keeps memory flat
+- `03-event-loop-and-async-io.md` — the cosine scan over this same heap data
+- `study-performance-engineering` — memory cost vs. corpus size

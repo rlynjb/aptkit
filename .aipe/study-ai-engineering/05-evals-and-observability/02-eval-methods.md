@@ -1,297 +1,206 @@
 # Eval methods
 
-**Subtitle:** The cheap→expensive scoring ladder · four real scorers in `@aptkit/evals` · *Industry standard*
+> The cheap-to-expensive ladder (Industry standard)
+
+Every eval method trades cost against the kind of "correct" it can judge. Cheap methods check shape and exact values — fast, deterministic, but blind to meaning. Expensive methods judge meaning with another model — flexible, but slow, costly, and biased. The pro move isn't picking one; it's running the cheap rungs first and only paying for the expensive ones when the cheap ones can't answer the question. aptkit has the whole ladder as real code, and the precision@k rung is the one genuine bridge to classical ML in the whole repo.
 
 ## Zoom out, then zoom in
 
-Once you have an eval set, you have to *score* against it — and scoring methods
-form a ladder from cheap-and-strict to expensive-and-fuzzy. The principle is to
-climb only as high as the output demands: a fixed-shape JSON object can be checked
-with an exact rule; a free-form paragraph needs a model to judge it. aptkit has a
-scorer at four rungs of that ladder, each its own module in `@aptkit/evals`.
+Stack the four methods by cost. At the bottom, rule-based structural checks cost a JSON walk. Above that, the detection-scorer counts required categories. Above that, precision@k/recall@k compute a ranked-retrieval score — pure arithmetic, the same metric you'd use to grade any ranking system. At the top, the LLM-as-judge spends a whole model call to grade meaning.
 
 ```
-  Zoom out — the eval-method ladder (cheap/strict at the bottom)
+The eval ladder — cost vs. what it can judge (LAYERS)
 
-  ┌─ HUMAN ──────────────────────────────────────────────┐  expensive, slow,
-  │  a person reads it                                    │  highest fidelity
-  ├─ RUBRIC / LLM-AS-JUDGE ───────────────────────────────┤
-  │  ★ rubric-judge.ts — a model scores meaning ★         │  fuzzy outputs
-  ├─ RANKED RETRIEVAL ────────────────────────────────────┤
-  │  precision-at-k.ts — ordered list quality             │  retrieval
-  ├─ DETECTION SCORING ───────────────────────────────────┤
-  │  detection-scorer.ts — did it find the right things?  │  set membership
-  ├─ EXACT MATCH / STRUCTURAL RULES ──────────────────────┤
-  │  structural-diff.ts — does the shape/value hold?      │  cheap, strict,
-  └────────────────────────────────────────────────────────┘  deterministic
+  ┌─────────────────────────────────────────────────────────────┐
+  │ ★ LLM-AS-JUDGE   judges MEANING        $$$$  a model call     │  rubric-judge.ts
+  │   "is this recommendation actually good?"  biased, scalable   │
+  ├─────────────────────────────────────────────────────────────┤
+  │   PRECISION@K / RECALL@K   ranked-retrieval quality   $       │  precision-at-k.ts
+  │   "are the right docs in the top-k?"   the ML bridge          │  ← arithmetic
+  ├─────────────────────────────────────────────────────────────┤
+  │   DETECTION-SCORER   required categories/metrics      ¢       │  detection-scorer.ts
+  │   "did the monitor flag the anomalies it had to?"            │
+  ├─────────────────────────────────────────────────────────────┤
+  │   STRUCTURAL-DIFF   shape + exact values   (cheapest)  ~0     │  structural-diff.ts
+  │   "is the JSON well-formed with the right fields?"           │
+  └─────────────────────────────────────────────────────────────┘
+        run bottom-up; stop as soon as a rung answers "no"
 ```
 
-Now zoom in. The trap beginners fall into is reaching for the LLM judge first
-because it feels powerful. It's the opposite — the judge is the *last* resort,
-because it's slow, costs tokens, and is itself fallible (see
-`03-llm-as-judge-bias.md`). The skill is choosing the lowest rung that can
-actually catch the failure you care about. aptkit's modules let you do exactly
-that, picking the scorer per output type.
+The discipline is bottom-up: a malformed JSON fails the cheapest rung, so you never waste a model call judging garbage. The ★ rung is the only one that can judge "good," and it's the only one that can lie to you.
 
 ## Structure pass
 
-**Layers.** A capability produces output → a scorer at the right rung evaluates it
-→ the result (`{ok, issues}` or `{ok, score, ...}`) flows into a test assertion or
-a replay summary.
+One axis: **what counts as the ground truth the method compares against**.
 
-**Axis — cost (and with it, determinism).** Trace the cost of a single eval down
-the ladder. `evaluateStructuralDiff` is pure, synchronous, free, and
-deterministic (`structural-diff.ts:20`). `scoreDetections` and `scorePrecisionAtK`
-are the same — pure functions over arrays. `RubricJudge.judge` makes a *model
-call* (`rubric-judge.ts:92`) — async, costs tokens, non-deterministic. Cost and
-determinism move together: the cheap rungs are exact and repeatable, the expensive
-rung is fuzzy and variable. Pick the cheapest rung that still distinguishes pass
-from fail.
+- **Structural-diff** — ground truth is a *rule list* (`required`/`equals`/`number`/`arrayCount`/`containsText`/`arrayIncludes`). Deterministic, no model. `packages/evals/src/structural-diff.ts`.
+- **Detection-scorer** — ground truth is a *set of expectations* (required categories, metrics, min/max count). Still deterministic. `packages/evals/src/detection-scorer.ts`.
+- **precision@k / recall@k** — ground truth is a *relevant-id set*. The score is `matched / total` arithmetic over the top-k window. `packages/evals/src/precision-at-k.ts`.
+- **LLM-as-judge** — ground truth is a *rubric*, and the comparison is done by a model. `packages/evals/src/rubric-judge.ts`.
 
-**Seam.** The shared result shape. Every scorer returns an object with `ok:
-boolean` and either `issues` or `score` (`StructuralDiffResult`,
-`DetectionScoreResult`, `RetrievalScoreResult`). Above that seam, a test or a
-Studio summary treats all four uniformly; below it, each scorer is free to be as
-cheap or as expensive as its rung requires.
+The seam is uniform: every scorer returns an `ok` flag plus structured detail (`issues`, or `{score, matched, total}`), so the harness treats them interchangeably regardless of cost.
 
 ## How it works
 
-### Move 1 — the mental model
-
-This is the **assertion-strength** decision you already make in every test you
-write. `assert(x === 3)` is the strictest, cheapest check — exact equality.
-`assert(arr.includes('a'))` is looser — membership. `assert(result.score > 0.8)`
-is looser still — a threshold. And `assert(reviewer.approves(prose))` is the
-loosest and most expensive — judgment. You don't reach for the fuzzy assertion
-when an exact one works; the same instinct picks the eval rung.
+**Move 1 — the mental model.** Picture a funnel. Cheap rules at the wide top reject obviously-wrong outputs for free. Only the survivors reach the expensive judge at the narrow bottom. You spend model-call dollars only on outputs that already passed the free checks.
 
 ```
-  Assertion strength  ─analogy─►  eval-method rung
+The cheap-to-expensive funnel (PATTERN)
 
-  x === 3                 ─►   structural-diff: equals / required
-  arr.includes('a')       ─►   detection-scorer: required category found
-  score > 0.8             ─►   precision@k: ranked-list threshold
-  reviewer.approves(text) ─►   rubric-judge: model scores meaning
+  candidate output
+        │
+        ▼  structural-diff  (free)   ── malformed? reject here
+        │
+        ▼  detection-scorer (¢)      ── missing required category? reject
+        │
+        ▼  precision@k     ($)        ── wrong docs ranked? score it
+        │
+        ▼  rubric-judge    ($$$$)     ── only well-formed, on-topic outputs
+        ▼                                get the expensive meaning-check
+  graded
 ```
 
-A test fails loudly with a wrong assertion *type* — too strict and it's flaky,
-too loose and it passes garbage. Same here: scoring a paragraph with `equals`
-fails on whitespace; scoring a JSON shape with a rubric judge is slow and
-non-deterministic for no gain. Match the rung to the output.
+**Move 2 — walk the rungs.**
 
-### Move 2 — the four scorers, rung by rung
-
-**Rung 1 — exact match / structural rules (`structural-diff.ts`).** The cheapest
-scorer. `evaluateStructuralDiff` runs a list of typed rules against any JSON-like
-value and returns `{ok, issues}` (`structural-diff.ts:11`):
-
-```ts
-export type StructuralDiffRule =
-  | { type: 'required'; path: string }                                  // path exists
-  | { type: 'equals'; path: string; expected: unknown }                 // exact value
-  | { type: 'number'; path: string; expected: number; tolerance?: number } // ± tolerance
-  | { type: 'arrayCount'; path: string; exact?; min?; max? }            // length bounds
-  | { type: 'containsText'; path: string; text: string }               // substring
-  | { type: 'arrayIncludes'; path: string; value: unknown; itemPath? };// membership
-```
-
-This is the rung the whole replay backbone rides on:
-`assertReplayArtifactShape` is just a pile of `required` rules plus a few `equals`
-(`assertions.ts:58`) — `schemaVersion === 1`, `provider.id` present, an ISO
-`createdAt`, `eval.ok === true`. Note the `number` rule's `tolerance`
-(`structural-diff.ts:112`): for a metric you assert `42 ± 0.5`, because a float
-that drifts in the last digit shouldn't fail a test.
+**Rung 1 — structural-diff judges shape for free.** A rule list runs over the JSON; any violation becomes an issue.
 
 ```
-  Rung 1 — structural rules over a JSON value
-
-  artifact ─► [required schemaVersion, equals provider.id, number(42, tol .5), ...]
-                                │
-                                ▼
-                       { ok, issues:[{path, message}] }   deterministic, free
+structural-diff.ts (20-47)                   what it checks
+  for (const rule of rules) {          ─────  apply each rule
+    switch (rule.type) { required/      ────  field present?
+      equals/number/arrayCount/         ────  value matches?
+      containsText/arrayIncludes }      ────  array shape?
+  }
+  return { ok: issues.length === 0,     ─────  ok = zero violations
+           issues };
 ```
 
-**Rung 2 — detection scoring (`detection-scorer.ts`).** When the output is a *set*
-of findings — anomalies, categories — exact match is wrong (order and count vary).
-`scoreDetections` asks "did it find the things it should, and not too many extra?"
-(`detection-scorer.ts:29`). It tallies `matched` / `missed` / `unexpected` against
-`requiredCategories`/`metrics`/`scopes`/`severities` and `min`/`maxCount`, then
-returns a fractional `score` (`detection-scorer.ts:73`):
+`packages/evals/src/structural-diff.ts:46` returns `{ ok: issues.length === 0, issues }`. No model, no network — this is the rung you run first on everything.
 
-```ts
-const score = requirementCount === 0 ? 1
-  : Math.max(0, (requirementCount - failedCount) / requirementCount);
-return { ok: issues.length === 0, score, matched, missed, unexpected, issues };
-```
-
-This is the rung for the anomaly-monitoring agent: you don't care that it returned
-anomalies in a specific order, only that it caught the revenue drop (a required
-metric+scope) and didn't flood you with noise (`maxCount`). It's looser than exact
-match, still pure and deterministic.
+**Rung 2 — detection-scorer grades coverage of required signals.** It counts how many required categories/metrics the output actually flagged.
 
 ```
-  Rung 2 — set membership over detections
-
-  detections[] ─► required {category, metric, scope, severity} + min/maxCount
-                                │
-                                ▼
-              { ok, score, matched[], missed[], unexpected[] }
+detection-scorer.ts (73)                     the formula
+  score = requirementCount === 0          ── nothing required → perfect
+    ? 1
+    : (requirementCount - failedCount)     ── fraction of requirements met
+      / requirementCount
 ```
 
-**Rung 3 — ranked retrieval (`precision-at-k.ts`).** When the output is an
-*ordered list* — search results — you score the top of the list.
-`scorePrecisionAtK` counts distinct relevant ids in the top-k over the window size
-(`precision-at-k.ts:47`):
+`packages/evals/src/detection-scorer.ts:73` is the score line; it also flags unexpected categories (65-69). This is how the anomaly-monitoring agent gets graded — did it catch the anomalies it was supposed to?
 
-```ts
-export function scorePrecisionAtK(retrievedIds, relevantIds, k): RetrievalScoreResult {
-  if (k <= 0) return { ...NOT_WELL_FORMED };
-  const total = Math.min(k, retrievedIds.length);   // short list isn't penalised
-  if (total === 0) return { ...NOT_WELL_FORMED };
-  const matched = countDistinctHits(retrievedIds, relevantIds, k);
-  return { ok: true, score: matched / total, matched, total };
-}
-```
+**Rung 3 — precision@k / recall@k: the ML bridge.** This is the rung worth memorizing, because it's the exact metric used to evaluate *any* ranking system — search, recommendations, RAG retrieval. The math is small and exact.
 
-Read the `ok` semantics carefully (`precision-at-k.ts:1`): `ok` means
-**well-formed**, *not* "good." A perfectly valid score of `0.0` still has `ok:
-true`; `ok` is only `false` when the metric is undefined (`k <= 0`, empty
-retrieval). That separation — "did the computation make sense" vs "was the result
-good" — is the subtle part. Studio's RAG page scores a fixed corpus this way, and
-buffr grades `/Users/rein/Public/buffr/eval/queries.json` with the same metric.
+precision@k asks: *of the top-k I returned, what fraction are relevant?* The subtle part is the denominator — it's `min(k, retrievedIds.length)`, so a short result list isn't unfairly punished.
 
 ```
-  Rung 3 — precision@k over a ranked list
+scorePrecisionAtK — the walkthrough (precision-at-k.ts 47-57)
 
-  retrievedIds[top-k] ∩ relevantIds  ──►  matched / min(k, retrieved)
-                                            │
-                                            ▼
-                          { ok:well-formed, score, matched, total }
-              ok:false ONLY when k<=0 or nothing retrieved (NOT when score is low)
+  retrievedIds = [d3, d7, d1, d9, d3]    relevantIds = {d1, d3, d8}    k = 3
+                 └────top-3────┘
+  top-3 window           = [d3, d7, d1]
+  distinct relevant hits = {d3, d1}      → matched = 2   (27-34: dups count once)
+  denominator            = min(3, 5) = 3 → total   = 3   (53)
+  precision@3            = matched/total = 2/3 ≈ 0.67     (56)
+
+  return { ok: true, score: matched/total, matched, total }   (56)
 ```
 
-**Rung 4 — rubric / LLM-as-judge (`rubric-judge.ts`).** The top rung, for outputs
-only a reader can grade — a free-form answer, a recommendation's quality.
-`RubricJudge.judge` calls a model via `generateStructured` to score the subject
-against a `RubricDefinition` and returns per-dimension scores, a verdict, and one
-fix (`rubric-judge.ts:89`). It's async, costs tokens, and is non-deterministic —
-which is why it's the last rung, and why it has its own failure modes
-(`03-llm-as-judge-bias.md`).
-
 ```
-  Rung 4 — a model scores meaning
+scoreRecallAtK — same hits, different denominator (precision-at-k.ts 68-78)
 
-  subject + rubric ─► generateStructured ─► { dimensions:{score,reason}, verdict, fix }
-                          │ model call (async, costs tokens, fuzzy)
-                          ▼
-                  validated against the rubric's own score ranges
+  matched = 2  (the SAME distinct top-k hits)
+  total   = |relevantIds| = 3                 (74)
+  recall@3 = matched/total = 2/3 ≈ 0.67       (77)
 ```
 
-### Move 3 — the principle
+`packages/evals/src/precision-at-k.ts:55-56` is the precision return; `:74-77` is recall. The only difference between the two scorers is the denominator: precision divides by *how many you looked at* (`min(k, len)`), recall divides by *how many were relevant in total* (`|relevantIds|`). `countDistinctHits` (27-34) de-dupes — a relevant id appearing twice in the window counts as one hit, because you're measuring coverage, not frequency. And `ok` here means *well-formed*, not *good*: a perfectly valid score of 0 still returns `ok: true` (8). It's only `ok: false` when the metric is undefined — `k <= 0` or a zero denominator (52-54).
 
-Climb the ladder only as far as the output forces you to. A fixed-shape artifact?
-Structural rules — free and exact. A set of findings? Detection scoring. A ranked
-list? precision@k. Free-form prose where meaning is the thing? Only then the LLM
-judge. The win is twofold: cheap rungs are deterministic so they never flake, and
-reserving the judge for prose keeps your eval suite fast and your token bill near
-zero. The shared `{ok, ...}` shape means a test reads identically regardless of
-which rung produced it.
+**Rung 4 — the LLM-as-judge (`RubricJudge`) grades meaning.** When you need "is this answer actually *good*," rules can't help — you spend a model call.
+
+```
+rubric-judge.ts (89-104)                     why it's the top rung
+  judge(input) =>
+    generateStructured({
+      model: this.model,                ─────  the judge model is INJECTED (60)
+      system: buildRubricJudgeSystemPrompt,    rubric → prompt (107-161)
+      validate: createRubricJudgmentValidator  per-dimension bounds (170-224)
+    })
+```
+
+`packages/evals/src/rubric-judge.ts:89-104` runs the judge. It's the most expensive and the only biased rung — covered in full in [03-llm-as-judge-bias.md](03-llm-as-judge-bias.md).
+
+**Move 3 — the principle.** Cost and judgeable-meaning move together. You can't get cheap *and* meaning. So you build the ladder, run it bottom-up, and let each rung reject what it can before paying for the next. The precision@k rung is special: it's cheap arithmetic that nonetheless judges a *real quality signal* (ranking), which is why it's the bridge between classical ML evaluation and LLM evaluation.
 
 ## Primary diagram
 
 ```
-  The eval-method ladder — mapped to aptkit's real scorers
+The four scorers, one uniform seam
 
-  output type            rung                       module                cost
-  ───────────────────────────────────────────────────────────────────────────
-  fixed JSON shape   ►   exact / structural rules   structural-diff.ts    free, exact
-  set of findings    ►   detection scoring          detection-scorer.ts   free, exact
-  ranked list        ►   precision@k / recall@k     precision-at-k.ts     free, exact
-  free-form prose    ►   rubric / LLM-as-judge      rubric-judge.ts       tokens, fuzzy
-  anything           ►   human review               (not automated)       slowest
-
-  shared seam: every scorer returns { ok, issues } or { ok, score, ... }
-  rule: pick the LOWEST rung that distinguishes pass from fail
+  structural-diff   → { ok, issues }                deterministic, ~free
+  detection-scorer  → { ok, score, matched, missed } deterministic, ¢
+  precision@k       → { ok, score, matched, total }  arithmetic, $   ← ML bridge
+  recall@k          → { ok, score, matched, total }  arithmetic, $
+  rubric-judge      → { dimensions, verdict, fix }   model call, $$$$
+                       │
+                       └ all share an `ok`/score shape → harness treats them alike
 ```
 
 ## Elaborate
 
-The field calls these "exact match," "metrics-based," and "model-graded" evals;
-aptkit's four modules are one concrete scorer per band, plus human at the top. The
-detail that separates someone who's *used* these from someone who's read about
-them is the `ok`-vs-`score` distinction in `precision-at-k.ts`: conflating
-"well-formed" with "good" is the classic bug that makes an eval silently pass when
-retrieval returns nothing. aptkit's comment spells it out — `ok:false` only on an
-undefined metric, never on a low score. The other detail is `number` tolerance in
-`structural-diff.ts`: exact-matching a float is how you get a flaky eval, so the
-strict rung still has a knob for the real world. Read `01-eval-set-types.md` for
-*what* you score against, and `03-llm-as-judge-bias.md` for why the top rung is the
-one to distrust.
+The `min(k, len)` denominator in precision@k is the detail interviewers probe. Naive precision@k divides by `k` always; if you asked for 5 and only 3 docs exist, dividing by 5 caps your best possible score at 0.6 even when all 3 are relevant. aptkit divides by `min(k, len) = 3`, so a perfect short list scores 1.0. That's the correct behavior and the kind of thing that signals you've actually implemented the metric.
+
+Recall@k vs precision@k is the classic tension: raising `k` can only help recall (more chances to find the relevant ones) but tends to hurt precision (you're now including lower-ranked, likely-less-relevant docs). They share `countDistinctHits` as numerator and differ only in denominator — that symmetry is the cleanest way to remember them.
+
+NDCG is the obvious missing rung — precision@k treats a relevant doc at rank 1 the same as one at rank 5. That's the Case A exercise below.
 
 ## Project exercises
 
-### Add a precision@k regression test from the buffr eval set
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a test that loads `/Users/rein/Public/buffr/eval/queries.json`,
-  runs each query through buffr's retrieval, scores with `scorePrecisionAtK`, and
-  asserts the mean precision@k stays above a frozen threshold — turning the 3-doc
-  relevance set into a guarded regression check.
-- **Why it earns its place:** it connects a real relevance set to the actual
-  scorer and demonstrates the `ok`(well-formed) vs `score`(quality) distinction in
-  a real assertion.
-- **Files to touch:** buffr retrieval test dir, reading
-  `/Users/rein/Public/buffr/eval/queries.json` and
-  `packages/evals/src/precision-at-k.ts`.
-- **Done when:** the test passes at current retrieval quality and fails if a
-  relevant doc drops out of the top-k.
+### Add NDCG to the ranked-retrieval scorers
+
+- **Exercise ID:** `EX-EVAL-02a`
+- **What to build:** `scoreNDCGAtK(retrievedIds, relevanceById, k)` alongside the existing precision/recall scorers, returning the same `{ ok, score, ... }` shape. NDCG weights hits by rank (log discount), so a relevant doc at rank 1 scores higher than the same doc at rank 5 — capturing what precision@k throws away. This deepens the Phase 3 (evals) ranked-retrieval rung.
+- **Why it earns its place:** precision@k is position-blind; NDCG is the industry-standard fix and the metric most search/recsys interviews expect. Adding it next to the existing scorers proves you understand *why* rank-weighting matters, not just the formula.
+- **Files to touch:** `packages/evals/src/precision-at-k.ts` (or a sibling `ndcg.ts`); export from `packages/evals/src/`.
+- **Done when:** two retrieval orderings with identical precision@k but different rankings produce different NDCG scores, and `ok: false` is returned for `k <= 0`.
 - **Estimated effort:** `1–4hr`
 
-### Add a `number`-tolerance assertion to the monitoring eval
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** in the anomaly-monitoring tests, assert a detected anomaly's
-  `change.value` matches the expected magnitude within a tolerance using a
-  `structural-diff` `number` rule, instead of an exact equals — so a float that
-  drifts in the last digit doesn't flake the suite.
-- **Why it earns its place:** it shows you know that exact-matching floats is a
-  flakiness source and that the strict rung still needs a tolerance knob.
-- **Files to touch:** `packages/agents/anomaly-monitoring/test/`, reading
-  `packages/evals/src/structural-diff.ts`.
-- **Done when:** the test passes at the recorded value and at value ± tolerance,
-  and fails outside it.
-- **Estimated effort:** `<1hr`
+### Wire the funnel ordering explicitly
+
+- **Exercise ID:** `EX-EVAL-02b`
+- **What to build:** A small harness that runs structural-diff → detection-scorer → precision@k → rubric-judge in order and short-circuits, skipping the model call when a cheaper rung already failed.
+- **Why it earns its place:** It turns the conceptual ladder into enforced cost discipline — you never pay for a judge call on malformed output.
+- **Files to touch:** new module in `packages/evals/src/`; compose the existing scorers.
+- **Done when:** a malformed input is graded without any call to `RubricJudge.judge`.
+- **Estimated effort:** `1–4hr`
 
 ## Interview defense
 
-**Q: "How do you decide how to score an eval?"**
-By output type, on a cost ladder. Fixed-shape JSON gets exact structural rules —
-free and deterministic. A set of findings gets detection scoring
-(matched/missed/unexpected). A ranked list gets precision@k. Only free-form prose,
-where meaning is the thing, goes to the LLM judge — because it's slow, costs
-tokens, and is itself fallible. I climb the ladder only as far as the output
-forces me to, so most of my suite is deterministic and fast.
+**Q: Why is precision@k's denominator `min(k, len)` and not just `k`?**
 
 ```
-  fixed shape → structural-diff   set → detection-scorer
-  ranked list → precision@k       prose → rubric-judge (last resort)
+  asked for k=5, only 3 docs exist, all relevant
+  / k       = 3/5 = 0.6   ← unfairly caps a perfect short list
+  / min(k,len)=3/3 = 1.0   ← correct
 ```
-Anchor: *pick the cheapest rung that distinguishes pass from fail.*
 
-**Q: "Your precision@k returns ok:true on a score of zero. Bug?"**
-No — deliberate. `ok` means the metric is *well-formed*, not that the result is
-good. A valid retrieval that found nothing relevant has a true, well-defined score
-of 0.0, so `ok:true, score:0`. `ok` is only `false` when the metric is undefined —
-`k <= 0` or an empty retrieval set, where the denominator would be zero.
-Conflating the two is how an eval silently passes when retrieval returns nothing.
+Anchor: `precision-at-k.ts:53` — `total = Math.min(k, retrievedIds.length)`.
+
+**Q: What's the difference between precision@k and recall@k in this code?**
+
+Anchor: identical numerator (`countDistinctHits`, 27-34); precision divides by `min(k,len)` (53), recall by `|relevantIds|` (74). Same hits, different denominator.
+
+**Q: When do you reach for the LLM-as-judge instead of a rule?**
 
 ```
-  ok = "computation made sense"   score = "how good"
-  ok:false ONLY on k<=0 / empty retrieval, never on a low score
+  rules judge SHAPE+VALUES (free, exact)
+  judge  judges MEANING ($$$$, fuzzy) ← only when no rule can express "good"
 ```
-Anchor: *separate "well-formed" from "good" — conflating them hides the worst failure.*
+
+Anchor: `rubric-judge.ts:89-104` — run it last, only on outputs the cheap rungs already passed.
 
 ## See also
 
-- `01-eval-set-types.md` — what you score against
-- `03-llm-as-judge-bias.md` — why the top rung is the one to distrust
-- `03-retrieval-and-rag/11-rag.md` — the retrieval that precision@k scores
-- `04-llm-observability.md` — the artifact `assertReplayArtifactShape` checks
+- [03-llm-as-judge-bias.md](03-llm-as-judge-bias.md) — the cost and the bias of the top rung.
+- [01-eval-set-types.md](01-eval-set-types.md) — the sets these methods grade.
+- [04-llm-observability.md](04-llm-observability.md) — where scores get recorded.

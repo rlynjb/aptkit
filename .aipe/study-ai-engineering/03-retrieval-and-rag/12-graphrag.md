@@ -1,236 +1,179 @@
-# GraphRAG — retrieval over an entity graph
+# GraphRAG
+> Graph-traversal retrieval · Industry standard
 
-**Subtitle:** GraphRAG · traversing relations vector search can't see · *Industry standard*
+Vector RAG finds chunks that are *lexically/semantically similar* to your query. But some questions need chunks that are *structurally related* — connected through entities, not through shared words. "Which of our customers are affected by the bug in the auth service that Priya wrote?" touches customers, a bug, a service, and a person — and the chunks that answer it might share almost no vocabulary. Cosine can't follow that chain. GraphRAG can: extract entities and relationships into a graph, then *traverse* the graph from the query's entities to gather connected context. aptkit is pure dense vector RAG — there's no graph anywhere. This is `not yet exercised`, and your DSA background (you know graph traversal cold) makes it the most natural extension in this whole sub-section to build.
 
 ## Zoom out, then zoom in
 
-GraphRAG answers questions that vector search structurally cannot: "what connects
-these two things," "what depends on this." It sits beside the vector store as a
-*second* retrieval substrate — a graph of entities and relations rather than a flat
-pile of chunks. aptkit's corpus is flat (chunks with meta, no graph), so this is
-`not yet exercised` — taught as the pattern and where aptkit's metadata could seed
-one.
+GraphRAG is an alternative retrieval substrate — it would sit *beside* the vector store, not on top of it.
 
 ```
-  Zoom out — two retrieval substrates, aptkit ships one
-
-  ┌─ Retrieval substrates ──────────────────────────────────────┐
-  │  ★ FLAT: chunks + cosine ★         ← aptkit does this        │ ← we are here
-  │    GRAPH: entities + relations     ← not yet exercised       │
-  └───────────────────────────┬─────────────────────────────────┘
-                              │ aptkit's reality:
-  ┌─ VectorStore ─────────────▼─────────────────────────────────┐
-  │  chunk.meta {docId, chunkIndex, text} — NO relations         │
-  └──────────────────────────────────────────────────────────────┘
+two retrieval substrates (aptkit has only the left)
+┌──────────────────────────────────────────────────────────┐
+│  search tool → retrieve context for the agent               │
+└──────┬─────────────────────────────────────────┬───────────┘
+       ▼                                           ▼
+┌────────────────────────┐          ┌──────────────────────────────┐
+│ ★ VECTOR RAG (aptkit) ★ │          │ GRAPH RAG                      │
+│ embed → cosine → top-k  │          │  ✗ not yet exercised           │
+│ ranks by SIMILARITY     │          │ entities + edges → traverse    │
+│ flat chunks, no links   │          │ ranks by CONNECTION            │
+└────────────────────────┘          └──────────────────────────────┘
 ```
 
-Now zoom in. You know the difference between a `WHERE text LIKE` scan and a `JOIN`
-across foreign keys. Vector search is the scan — it finds chunks that *resemble* the
-query. A graph traversal is the join — it finds chunks *connected* to the query's
-entities, even when they share no vocabulary. "Which services call the auth module?"
-needs the join: the answer chunks may never contain the word "auth." aptkit only has
-the scan.
+aptkit's chunks are an unconnected bag — `VectorChunk` has `{id, vector, meta}` and no edges to other chunks. The graph that GraphRAG needs (entities as nodes, relationships as edges) doesn't exist in the data model. That's the gap: vector RAG treats the corpus as a set of independent passages; GraphRAG treats it as a connected structure you can walk.
 
 ## Structure pass
 
-**Layers.** Substrate (flat chunks / entity graph) → unit (chunk / node + edge) →
-retrieval move (cosine similarity / graph traversal).
+Pick the **state** axis: what relational state does each substrate hold?
 
-**Axis — state.** Trace what each substrate stores. Flat: a vector and free-text meta
-per chunk — no links between chunks. Graph: nodes (entities) and edges (relations) —
-the links *are* the data. The axis "are relationships represented?" flips: aptkit's
-meta has `docId`/`chunkIndex` (provenance) but no edges, so relationships exist only
-implicitly in prose, never as queryable structure.
+```
+relational state across the two substrates
+  VECTOR RAG                         GRAPH RAG
+  ┌──────────────────────┐          ┌──────────────────────────────┐
+  │ chunks: a flat SET     │          │ nodes (entities) + edges      │
+  │ no chunk knows another │          │ (relationships)               │
+  │ relation = "close in   │          │ relation = an explicit EDGE   │
+  │  vector space"         │          │  you can traverse             │
+  └──────────────────────┘          └──────────────────────────────┘
+   ★ seam: GraphRAG materializes relationships vector RAG only implies ★
+```
 
-**Seam.** There is no graph seam in aptkit — only the flat `VectorStore`. The
-*would-be* foothold is chunk meta (`docId`, `chunkIndex`, `pipeline.ts:44`): it could
-seed a document-level graph (chunks of the same doc are connected; docs that cite
-each other are connected). Nothing builds edges today; GraphRAG is `not yet
-exercised`.
+The seam is *where relationships live*. In vector RAG, "related" is implicit and approximate — two chunks are related if their vectors are close, which only captures *semantic* similarity. In GraphRAG, relationships are explicit, typed edges ("Priya AUTHORED auth-service", "bug-42 AFFECTS auth-service") you extracted once and can now traverse exactly. Multi-hop questions — chains of 2+ relationships — are where this flips: cosine can't chain, traversal does it natively.
 
 ## How it works
 
-### Move 1 — the mental model
-
-You know two queries. `SELECT * FROM posts WHERE body LIKE '%auth%'` finds posts that
-*mention* auth — that's vector search, by resemblance. `SELECT * FROM services JOIN
-deps ON … WHERE target = 'auth'` finds services that *depend on* auth — that's a
-graph traversal, by connection. The second answer set can be completely disjoint from
-the first: a service can depend on auth without the word "auth" appearing anywhere in
-its description. GraphRAG retrieves by connection, not resemblance.
+**Move 1 — the mental model: corpus as a graph.** GraphRAG runs in two phases — build the graph (offline), traverse it (at query time):
 
 ```
-  Resemblance vs connection — disjoint answer sets
-
-  query: "what's affected if auth breaks?"
-  ┌─ VECTOR (resemblance) ────────┐   ┌─ GRAPH (connection) ───────────┐
-  │ chunks SAYING "auth"          │   │ chunks for services that DEPEND │
-  │ — the auth docs themselves    │   │   on auth (may never say "auth")│
-  └────────────────────────────────┘   └─────────────────────────────────┘
-   vector finds the topic; graph finds the blast radius
+GraphRAG, two phases
+  BUILD (offline, once)                 QUERY (per request)
+  ┌──────────────────────────┐         ┌──────────────────────────┐
+  │ for each chunk:            │         │ extract entities in query  │
+  │  LLM extracts entities +   │         │ locate them as graph nodes │
+  │  relationships             │         │ traverse N hops out (BFS)  │
+  │  → nodes + typed edges      │         │ gather connected chunks    │
+  └──────────────────────────┘         └──────────────────────────┘
+        builds the graph                     walks it for context
 ```
 
-### Move 2 — what GraphRAG adds, and aptkit's flat reality
+The build phase is an LLM extraction job: feed each chunk to a model, ask "what entities and relationships are in this?", accumulate into a graph. The query phase is pure DSA — your territory: find the query's entities as nodes, then BFS/DFS outward to collect connected context.
 
-**aptkit is flat: chunks carry provenance, not relations.** Each chunk's meta is set
-in `indexDocument` (`pipeline.ts:44`):
+**The query-time traversal.** `not yet exercised`. The traversal is exactly the graph BFS you'd write in an interview:
+
+```
+traversal from query entities (pseudocode — DOES NOT EXIST in aptkit)
+function graphRetrieve(query, graph, maxHops = 2):
+    seeds = extractEntities(query)          # "Priya", "auth service"
+    visited, context = set(), []
+    frontier = [(node, 0) for node in seeds if node in graph]
+    while frontier:                          # BFS — your DSA muscle memory
+        node, depth = frontier.pop(0)
+        if node in visited or depth > maxHops: continue
+        visited.add(node)
+        context += node.chunks               # gather chunks attached to this entity
+        for edge in graph.edges(node):       # follow relationships outward
+            frontier.push((edge.target, depth + 1))
+    return context                           # connected, not just similar
+```
+
+```
+multi-hop example cosine CANNOT do
+  query: "customers affected by Priya's auth bug"
+   Priya ──AUTHORED──► auth-service ──HAS_BUG──► bug-42 ──AFFECTS──► [CustomerA, CustomerB]
+     │                                                                      │
+   hop 0                hop 1            hop 2          hop 3 (the answer)
+   cosine: "Priya" and "CustomerA" share NO words/meaning → never co-retrieved
+   graph:  3 hops of typed edges → lands exactly on CustomerA, CustomerB ✓
+```
+
+That chain is the whole point: the answer (CustomerA, CustomerB) is structurally three hops from the query's entities but semantically unrelated to the query text. Vector RAG can't reach it; graph traversal walks straight to it.
+
+**The contract it'd need.** aptkit's `VectorChunk` has nowhere to put edges — GraphRAG needs a new data model:
 
 ```ts
-meta: { ...(doc.meta ?? {}), docId: doc.id, chunkIndex: i, text },
+// what's MISSING — aptkit's chunk has no relational structure
+// packages/retrieval/src/contracts.ts:8-12
+export type VectorChunk = {
+  id: string;
+  vector: number[];
+  meta: Record<string, unknown>;     // ← no entities, no edges; chunks are islands
+};
+// GraphRAG would add: GraphNode { id, type, chunkIds[] }, GraphEdge { from, to, relation }
 ```
 
-`docId` and `chunkIndex` say *where a chunk came from*. They do not say *what it
-relates to*. There is no entity list, no edge table, no traversal — retrieval is
-cosine over independent vectors (`in-memory-vector-store.ts:25`). Two chunks about
-the same entity in different words are neighbors only if their *embeddings* are
-close; structurally they're strangers.
+In buffr's Postgres, the graph has a natural home: an `agents.entities` table and an `agents.edges` table alongside `agents.chunks` — recursive CTEs (`WITH RECURSIVE`) do the traversal in SQL, or you load the graph into memory and BFS it. Either way it's net-new structure.
 
-```
-  aptkit's flat corpus — provenance, no edges
-
-  chunk { vector, meta { docId, chunkIndex, text } }
-                          └─ "where from"     └─ NOT "connected to what"
-   retrieval = cosine(query, each chunk) — no relationship is ever traversed
-```
-
-**GraphRAG's two extra steps (PSEUDOCODE — not yet exercised).** A graph pipeline
-adds an extraction step at index time and a traversal step at query time:
-
-```
-  GraphRAG index step (not built)
-  for each chunk:
-      entities  = llm.extractEntities(chunk.text)     # "auth module", "billing svc"
-      relations = llm.extractRelations(chunk.text)     # billing --depends_on--> auth
-      graph.addNodes(entities); graph.addEdges(relations)
-
-  GraphRAG query step (not built)
-  seeds   = vectorSearch(query)            # entry points (resemblance) — aptkit has this
-  related = graph.traverse(seeds, hops=2)  # connected chunks (connection) — aptkit lacks this
-  return rank(seeds + related)
-```
-
-The vector search still finds the *entry points*; the graph traversal expands to
-chunks *connected* to those entry points that the query's vocabulary would never
-surface.
-
-```
-  Two-substrate retrieval (the target shape)
-
-  query ─► vector search ─► seed chunks ─► graph.traverse(2 hops) ─► connected chunks
-              resemblance            │              connection
-                                     └──► merged & ranked
-```
-
-**Where aptkit's meta could seed a graph.** `docId` already implies one cheap edge:
-chunks of the same document are related. A doc-level graph (nodes = docs, edges =
-"cites"/"same-topic") could be built from existing meta without entity extraction —
-a lighter GraphRAG that aptkit's data *almost* supports. But nothing constructs even
-that; the meta is provenance the search tool reads for citations, not a graph.
-
-### Move 2.5 — current state vs future state
-
-```
-  Phase A (aptkit, now)             Phase B (GraphRAG — not yet exercised)
-  ┌────────────────────────┐        ┌──────────────────────────────────┐
-  │ FLAT corpus             │        │ entity graph alongside vectors     │
-  │ cosine over chunks      │  add   │ extract entities+relations @ index │
-  │ meta = provenance only  │ graph  │ vector seeds ─► traverse ─► merge  │
-  │ no relations traversed  │        │ answers "what connects/depends"    │
-  └────────────────────────┘        └──────────────────────────────────┘
-   docId in meta COULD seed a doc-level graph — nothing builds one
-```
-
-### Move 3 — the principle
-
-Vector search retrieves by resemblance; some questions need retrieval by connection,
-and no amount of better embeddings gives you that — the relationships have to be
-*represented*, not inferred from prose. GraphRAG is the substrate that represents
-them: extract entities and relations at index time, traverse them at query time,
-seed the traversal with vector search. Reach for it only when the questions are
-relational ("what depends on X," "how do these connect"); for a resemblance corpus
-like aptkit's notes, the flat store is correct and a graph is overhead.
+**Move 3 — the principle.** Vector RAG and GraphRAG answer different question shapes. Vector RAG wins on "find me passages about X" — single-hop, similarity-driven, the common case. GraphRAG wins on "what connects X to Y through the corpus" — multi-hop, relationship-driven, where the answer shares no vocabulary with the question. You don't replace one with the other; you reach for the graph when questions are about *connections* and cosine keeps missing because similarity isn't the right relation. The build cost is real (an LLM pass over the whole corpus to extract the graph), so you earn it on corpora where structure is the point — org charts, dependency graphs, knowledge bases with rich cross-references.
 
 ## Primary diagram
 
 ```
-  GraphRAG vs aptkit's flat retrieval
-
-  ┌─ aptkit today (flat) ──────────────────────────────────────┐
-  │ query ─► embed ─► cosine over chunks ─► top-k (resemblance) │
-  │ chunk.meta = {docId, chunkIndex, text}  — no edges          │
-  └────────────────────────────────────────────────────────────┘
-                              vs
-  ┌─ GraphRAG (not yet exercised) ─────────────────────────────┐
-  │ index: extract entities + relations ─► build graph          │
-  │ query: vector seeds ─► graph.traverse(hops) ─► connected    │
-  │        rank(seeds + related)  — resemblance THEN connection  │
-  └────────────────────────────────────────────────────────────┘
-   docId could seed a doc-level graph; nothing constructs it
+GraphRAG vs vector RAG on a multi-hop query (the buildable target)
+   query: "which customers hit Priya's auth bug?"
+        │
+        ├─► VECTOR RAG: embed → cosine → chunks SIMILAR to the query text
+        │     finds: chunks mentioning "auth bug" — MISSES the customers
+        │     (CustomerA shares no words with the query)
+        │
+        └─► GRAPH RAG (gap): extract {Priya, auth-service} → BFS 3 hops
+              Priya ─AUTHORED→ auth-service ─HAS_BUG→ bug-42 ─AFFECTS→ {A, B}
+              gathers the connected chunks → answer the customers ✓
+   ─────────────────────────────────────────────────────────────────────
+   build cost: 1 LLM extraction pass over the corpus (offline, once)
 ```
+
+When the answer is *connected* to the query rather than *similar* to it, traversal reaches what cosine can't.
 
 ## Elaborate
 
-GraphRAG is the most-overreached pattern in retrieval — it's expensive (an LLM
-extraction pass over the whole corpus, plus a graph store) and only pays off for
-genuinely relational questions. aptkit's corpus is a personal knowledge base where
-questions are overwhelmingly "find the note about X" — resemblance, which the flat
-cosine store nails. Naming GraphRAG as `not yet exercised` is the honest call: the
-data (`docId` in meta, `pipeline.ts:44`) hints at a cheap doc-level graph, but
-building entity extraction would be solving a problem aptkit doesn't have. The skill
-is recognizing the *trigger* — relational questions, "what connects/depends" — not
-reaching for the graph by default. Read `05-dense-vs-sparse.md` for the other axis of
-"what vector search misses" and `04-vector-databases.md` for the flat store GraphRAG
-would sit beside.
+GraphRAG was named and popularized by Microsoft Research (2024) — their pipeline adds **community detection** (Leiden clustering over the graph) and **community summaries** so the model can answer global "what are the themes" questions, not just entity lookups. Adjacent: **knowledge graphs** (the decades-old structured-knowledge idea GraphRAG revives with LLM extraction), **entity linking** (resolving "Priya"/"P. Sharma"/"she" to one node — the hard part of the build phase), and **hybrid graph+vector** (use vectors to find seed entities, then traverse — the practical combination most production systems land on). Your DSA strength is the leverage here: the traversal is BFS/DFS over a typed graph, exactly the shape you know cold. Read next: `11-rag.md` (the vector RAG this extends) and `05-dense-vs-sparse.md` / `06-hybrid-retrieval-rrf.md` (the other "different relation" retrieval lanes).
 
 ## Project exercises
 
-### Build a document-level graph from existing chunk meta
-- **Exercise ID:** —  (no curriculum file in repo)
-- **What to build:** a graph where nodes are documents and edges link chunks of the
-  same `docId` (and optionally docs sharing top terms); a `traverse(seedChunks,
-  hops)` that expands vector hits to sibling chunks, merged into the result.
-- **Why it earns its place:** it adds retrieval-by-connection using only data that
-  already exists (`pipeline.ts:44` meta), proving you can recognize when the cheap
-  graph is available without an expensive entity-extraction pass.
-- **Files to touch:** a new `packages/retrieval/src/doc-graph.ts`,
-  `packages/retrieval/src/search-knowledge-base-tool.ts` (expand seeds before
-  `toResult`), a new test in `packages/retrieval/test/`.
-- **Done when:** a test shows a query surfacing one chunk of a doc also returns its
-  sibling chunks via traversal, even when those siblings score low on cosine.
-- **Estimated effort:** `1–2 days`
+### Extract entities from the corpus into a graph, traverse on query
+
+- **Exercise ID:** `EX-RAG-12a`
+- **What to build:** A build step that runs an LLM extraction over each chunk into `GraphNode`/`GraphEdge` structures, plus a `graphRetrieve(query, maxHops)` that extracts query entities and BFS-traverses to gather connected chunks.
+- **Why it earns its place:** It's the substrate aptkit entirely lacks, it answers the multi-hop questions cosine provably can't, and the traversal plays directly to your DSA strength. Case B — net-new from scratch. Phase 2B.
+- **Files to touch:** new `packages/retrieval/src/graph-store.ts` (node/edge model + BFS) and `packages/retrieval/src/graph-extractor.ts` (LLM extraction, injectable transport like `OllamaEmbeddingProvider`); new tables (`agents.entities`, `agents.edges`) alongside `buffr/sql/001_agents_schema.sql` for the durable path.
+- **Done when:** on a fixture with a known 3-hop chain, `graphRetrieve` returns the structurally-connected chunk that the dense store (`packages/retrieval/src/in-memory-vector-store.ts`) provably fails to retrieve, with a test contrasting the two.
+- **Estimated effort:** `≥1 week`
+
+### Build the multi-hop fixture that breaks vector RAG
+
+- **Exercise ID:** `EX-RAG-12b`
+- **What to build:** A small corpus + query set engineered so the answer is N hops from the query entities but lexically/semantically dissimilar to the query — the case where cosine misses and traversal must win.
+- **Why it earns its place:** GraphRAG is only justified by questions vector RAG fails; this fixture is that proof and the regression net for `EX-RAG-12a`. It also sharpens *when* to reach for a graph at all.
+- **Files to touch:** test fixtures alongside `packages/retrieval/src/in-memory-vector-store.ts`.
+- **Done when:** the fixture has ≥2 multi-hop queries where the dense top-5 provably excludes the correct answer chunk.
+- **Estimated effort:** `1–4hr`
 
 ## Interview defense
 
-**Q: "When would you reach for GraphRAG over plain vector search?"**
-When the questions are relational — "what depends on X," "how do these connect,"
-"what's the blast radius if Y breaks." Vector search retrieves by *resemblance*, so
-it finds chunks that mention the topic; it structurally can't find chunks
-*connected* to the topic that share no vocabulary. GraphRAG represents those
-relations as edges and traverses them, seeded by a vector search. For a resemblance
-corpus like aptkit's notes, it's overhead — which is why it's `not yet exercised`.
+**Q: Give a query your vector RAG can't answer but GraphRAG can.**
 
 ```
-  resemblance question ─► vector search   |   connection question ─► graph traversal
+"customers affected by Priya's auth bug"
+   answer = CustomerA, 3 hops away, shares NO words with the query
+   cosine: similarity(query, "CustomerA chunk") ≈ 0 → never retrieved
+   graph: Priya→service→bug→customers, BFS lands on it
 ```
-Anchor: *vector search finds the topic; a graph finds what's connected to it.*
 
-**Q: "Could aptkit support GraphRAG today?"**
-Partially, and cheaply. Chunk meta already carries `docId` (`pipeline.ts:44`), which
-implies a document-level graph: chunks of the same doc are connected, and docs that
-cite each other could be edges — no entity extraction needed. But nothing builds even
-that graph; the meta is provenance the search tool reads for citations
-(`search-knowledge-base-tool.ts:109`), not a traversable structure. Full GraphRAG
-would add an LLM extraction pass aptkit's corpus doesn't justify.
+Anchor: multi-hop questions where the answer is *connected* to the query but not *similar* to it — cosine ranks by similarity and can't chain relationships; graph traversal follows the edges.
+
+**Q: GraphRAG sounds strictly better. Why is most RAG still vector-only?**
 
 ```
-  docId in meta ─► COULD seed a doc-level graph ─► but nothing constructs edges
+build cost: an LLM extraction pass over the ENTIRE corpus (offline, expensive)
+   + entity linking is hard (Priya / P. Sharma / "she" → one node)
+   most queries are single-hop "about X" → cosine already nails them
 ```
-Anchor: *the provenance meta hints at a cheap graph; aptkit ships none — flat is correct here.*
+
+Anchor: GraphRAG pays a heavy offline build (LLM extraction + entity resolution) to win on multi-hop connection questions — most real queries are single-hop similarity, where vector RAG is cheaper and already sufficient.
 
 ## See also
 
-- `05-dense-vs-sparse.md` — the other axis of what vector search misses
-- `04-vector-databases.md` — the flat store GraphRAG would sit beside
-- `01-embeddings.md` — why resemblance, not connection, is what cosine measures
-- `11-rag.md` — the chunk meta (`docId`, `chunkIndex`) that could seed a graph
-- `04-agents-and-tool-use/03-react-pattern.md` — multi-hop reasoning the agent does instead
+- [11-rag.md](11-rag.md) — the vector RAG this extends
+- [05-dense-vs-sparse.md](05-dense-vs-sparse.md) — another "different relation" retrieval lane
+- [06-hybrid-retrieval-rrf.md](06-hybrid-retrieval-rrf.md) — fusing substrates (graph + vector)
